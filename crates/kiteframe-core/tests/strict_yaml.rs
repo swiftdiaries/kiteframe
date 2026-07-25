@@ -44,6 +44,20 @@ fn duplicate_mapping_key_is_rejected_before_deserialization() {
 }
 
 #[test]
+fn duplicate_key_source_range_uses_utf8_byte_offsets() {
+    let fixture = include_str!("../../../tests/fixtures/packages/hostile/duplicate-key/agent.yaml");
+    let yaml = format!("# 🦀\n{fixture}");
+    let expected_start = yaml.find("name: second").unwrap() as u32;
+    let errors = parse_manifest(yaml.as_bytes(), PackageLimits::V1).unwrap_err();
+
+    assert_eq!(
+        errors[0].source_range.unwrap().start,
+        expected_start,
+        "source ranges must use byte offsets"
+    );
+}
+
+#[test]
 fn quoted_duplicate_mapping_key_is_rejected() {
     let yaml = MINIMAL_MANIFEST.replace(
         "metadata: { name: support, version: 0.1.0 }",
@@ -52,6 +66,21 @@ fn quoted_duplicate_mapping_key_is_rejected() {
     let errors = parse_manifest(yaml.as_bytes(), PackageLimits::V1).unwrap_err();
 
     assert!(errors[0].message.as_str().contains("duplicate key"));
+}
+
+#[test]
+fn aliased_scalar_mapping_key_cannot_bypass_duplicate_rejection() {
+    let yaml = MINIMAL_MANIFEST.replace(
+        "    primary: { capabilities: [text, tool-calling] }",
+        "    ? &role primary\n    : { capabilities: [text] }\n    ? *role\n    : { capabilities: [tool-calling] }",
+    );
+    let errors = parse_manifest(yaml.as_bytes(), PackageLimits::V1).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(
+        errors[0].message.as_str().contains("alias mapping keys"),
+        "{errors:?}"
+    );
 }
 
 #[test]

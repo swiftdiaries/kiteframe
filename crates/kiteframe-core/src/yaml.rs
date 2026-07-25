@@ -61,7 +61,6 @@ fn parse_typed<T: DeserializeOwned>(
 
 struct StrictYamlScanner {
     limits: PackageLimits,
-    input_len: usize,
     frames: Vec<CollectionFrame>,
     collection_entries: usize,
     aliases: usize,
@@ -80,7 +79,6 @@ impl StrictYamlScanner {
     fn new(limits: PackageLimits) -> Self {
         Self {
             limits,
-            input_len: 0,
             frames: Vec::new(),
             collection_entries: 0,
             aliases: 0,
@@ -89,7 +87,6 @@ impl StrictYamlScanner {
     }
 
     fn scan(mut self, bytes: &[u8]) -> Result<(), Vec<Diagnostic>> {
-        self.input_len = bytes.len();
         if bytes.len() > self.limits.max_yaml_bytes {
             let start = self.limits.max_yaml_bytes;
             return Err(vec![package_diagnostic(
@@ -110,11 +107,11 @@ impl StrictYamlScanner {
             let (event, mark) = parser.next_token().map_err(|error| {
                 vec![package_diagnostic(
                     "invalid YAML syntax",
-                    Some(marker_range(*error.marker(), bytes.len())),
+                    Some(marker_range(*error.marker(), source)),
                 )]
             })?;
             let stream_ended = matches!(event, Event::StreamEnd);
-            self.handle_event(event, mark);
+            self.handle_event(event, mark, source);
             if let Some(violation) = self.violation {
                 return Err(vec![violation]);
             }
@@ -124,7 +121,7 @@ impl StrictYamlScanner {
         }
     }
 
-    fn node_started(&mut self, scalar_key: Option<&str>, mark: Marker) {
+    fn node_started(&mut self, scalar_key: Option<&str>, mark: Marker, source: &str) {
         let mut added_entry = false;
         let mut duplicate_key = false;
 
@@ -149,10 +146,7 @@ impl StrictYamlScanner {
         }
 
         if duplicate_key {
-            self.reject(
-                "duplicate key in YAML mapping",
-                marker_range(mark, self.input_len),
-            );
+            self.reject("duplicate key in YAML mapping", marker_range(mark, source));
             return;
         }
 
@@ -161,14 +155,14 @@ impl StrictYamlScanner {
             if self.collection_entries > self.limits.max_collection_entries {
                 self.reject(
                     "YAML collection entries limit exceeded",
-                    marker_range(mark, self.input_len),
+                    marker_range(mark, source),
                 );
             }
         }
     }
 
-    fn collection_started(&mut self, frame: CollectionFrame, mark: Marker) {
-        self.node_started(None, mark);
+    fn collection_started(&mut self, frame: CollectionFrame, mark: Marker, source: &str) {
+        self.node_started(None, mark, source);
         if self.violation.is_some() {
             return;
         }
@@ -177,7 +171,7 @@ impl StrictYamlScanner {
         if self.frames.len() > self.limits.max_nesting_depth {
             self.reject(
                 "YAML nesting depth limit exceeded",
-                marker_range(mark, self.input_len),
+                marker_range(mark, source),
             );
         }
     }
@@ -188,25 +182,39 @@ impl StrictYamlScanner {
         }
     }
 
-    fn handle_event(&mut self, event: Event, mark: Marker) {
+    fn mapping_key_expected(&self) -> bool {
+        matches!(
+            self.frames.last(),
+            Some(CollectionFrame::Mapping {
+                expecting_key: true,
+                ..
+            })
+        )
+    }
+
+    fn handle_event(&mut self, event: Event, mark: Marker, source: &str) {
         if self.violation.is_some() {
             return;
         }
 
         match event {
-            Event::Scalar(value, ..) => self.node_started(Some(&value), mark),
+            Event::Scalar(value, ..) => self.node_started(Some(&value), mark, source),
             Event::Alias(..) => {
-                self.node_started(None, mark);
+                if self.mapping_key_expected() {
+                    self.reject(
+                        "YAML alias mapping keys are not allowed",
+                        marker_range(mark, source),
+                    );
+                    return;
+                }
+                self.node_started(None, mark, source);
                 self.aliases += 1;
                 if self.aliases > self.limits.max_aliases {
-                    self.reject(
-                        "YAML alias limit exceeded",
-                        marker_range(mark, self.input_len),
-                    );
+                    self.reject("YAML alias limit exceeded", marker_range(mark, source));
                 }
             }
             Event::SequenceStart(..) => {
-                self.collection_started(CollectionFrame::Sequence, mark);
+                self.collection_started(CollectionFrame::Sequence, mark, source);
             }
             Event::MappingStart(..) => {
                 self.collection_started(
@@ -215,6 +223,7 @@ impl StrictYamlScanner {
                         scalar_keys: HashSet::new(),
                     },
                     mark,
+                    source,
                 );
             }
             Event::SequenceEnd | Event::MappingEnd => {
@@ -246,8 +255,12 @@ fn typed_yaml_diagnostic(error: &serde_yaml_ng::Error) -> Diagnostic {
     package_diagnostic(message, None)
 }
 
-fn marker_range(marker: Marker, input_len: usize) -> SourceRange {
-    byte_range(marker.index(), input_len)
+fn marker_range(marker: Marker, source: &str) -> SourceRange {
+    let byte_index = source
+        .char_indices()
+        .nth(marker.index())
+        .map_or(source.len(), |(index, _)| index);
+    byte_range(byte_index, source.len())
 }
 
 fn byte_range(start: usize, input_len: usize) -> SourceRange {
