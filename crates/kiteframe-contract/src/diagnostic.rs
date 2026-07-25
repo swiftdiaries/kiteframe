@@ -42,6 +42,29 @@ pub enum DiagnosticCode {
     RuntimeConstruction,
 }
 
+impl DiagnosticCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PackageInvalid => "KF-PKG-001",
+            Self::PackageContainment => "KF-PKG-002",
+            Self::LockStale => "KF-LOCK-001",
+            Self::LockTampered => "KF-LOCK-002",
+            Self::CatalogIncompatible => "KF-CAT-001",
+            Self::FeatureUnsupported => "KF-FEAT-001",
+            Self::AdmissionDenied => "KF-AUTH-001",
+            Self::AdmissionExpired => "KF-AUTH-002",
+            Self::InvocationDenied => "KF-AUTH-003",
+            Self::PolicyStale => "KF-AUTH-004",
+            Self::PreconditionMissing => "KF-CAP-001",
+            Self::ResultInvalid => "KF-CAP-002",
+            Self::OutcomeUnknown => "KF-CAP-003",
+            Self::AuditUnavailable => "KF-AUDIT-001",
+            Self::ComponentUnresolved => "KF-RUNTIME-001",
+            Self::RuntimeConstruction => "KF-RUNTIME-002",
+        }
+    }
+}
+
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize, JsonSchema,
 )]
@@ -97,6 +120,12 @@ pub enum RetryClass {
 #[serde(transparent)]
 pub struct SafeMessage(pub String);
 
+impl SafeMessage {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl From<&str> for SafeMessage {
     fn from(value: &str) -> Self {
         Self(value.to_owned())
@@ -120,7 +149,7 @@ pub struct SourceRange {
 }
 
 /// A portable, redacted diagnostic. Details must be populated only with values safe for callers.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Diagnostic {
     pub code: DiagnosticCode,
@@ -173,6 +202,14 @@ impl Ord for Diagnostic {
             ))
     }
 }
+
+impl PartialEq for Diagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Diagnostic {}
 
 impl PartialOrd for Diagnostic {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

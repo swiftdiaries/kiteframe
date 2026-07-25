@@ -37,3 +37,35 @@ fn diagnostics_sort_by_stage_path_range_then_code() {
     diagnostics.sort();
     assert_eq!(diagnostics[0].stage, DiagnosticStage::Parse);
 }
+
+#[test]
+fn diagnostics_with_the_same_ordering_key_are_equal() {
+    let first = Diagnostic::error(
+        DiagnosticCode::PackageInvalid,
+        DiagnosticCategory::Package,
+        DiagnosticStage::Parse,
+        "first safe message",
+    );
+    let second = Diagnostic::error(
+        DiagnosticCode::PackageInvalid,
+        DiagnosticCategory::Package,
+        DiagnosticStage::Parse,
+        "second safe message",
+    );
+
+    assert_eq!(first.cmp(&second), std::cmp::Ordering::Equal);
+    assert_eq!(first, second);
+}
+
+#[test]
+fn diagnostic_code_and_safe_message_expose_string_slices_without_display() {
+    let diagnostic = Diagnostic::error(
+        DiagnosticCode::PackageInvalid,
+        DiagnosticCategory::Package,
+        DiagnosticStage::Parse,
+        "manifest is invalid",
+    );
+
+    assert_eq!(diagnostic.code.as_str(), "KF-PKG-001");
+    assert_eq!(diagnostic.message.as_str(), "manifest is invalid");
+}
