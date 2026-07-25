@@ -115,7 +115,16 @@ fn package_versions_reject_malformed_semantic_versions() {
     for valid in ["0.1.0", "1.2.3-alpha.1+build.5"] {
         assert!(PackageVersion::new(valid).is_ok(), "{valid:?}");
     }
-    for invalid in ["1foo", "1..2", "1+", "1.2", "01.2.3", "1.2.3-", "1.2.3+"] {
+    for invalid in [
+        "1foo",
+        "1..2",
+        "1+",
+        "1.2",
+        "01.2.3",
+        "1.2.3-",
+        "1.2.3+",
+        "18446744073709551616.0.0",
+    ] {
         assert!(PackageVersion::new(invalid).is_err(), "{invalid:?}");
     }
 }
@@ -133,6 +142,7 @@ fn capability_versions_accept_only_v1_caret_constraints() {
         "1.2",
         ">=1.2",
         "^1.2.3-rc.1",
+        "^18446744073709551616.0",
     ] {
         assert!(CapabilityVersion::new(invalid).is_err(), "{invalid:?}");
     }
@@ -148,6 +158,10 @@ fn generated_newtype_patterns_match_rust_validation() {
             ("1..2", false),
             ("1+", false),
             ("1.2.3-", false),
+            ("18446744073709551614.0.0", true),
+            ("18446744073709551615.0.0", true),
+            ("18446744073709551616.0.0", false),
+            ("99999999999999999999.0.0", false),
         ],
         |value| PackageVersion::new(value).is_ok(),
     );
@@ -158,6 +172,10 @@ fn generated_newtype_patterns_match_rust_validation() {
             ("^1.", false),
             ("^1.2+", false),
             (">=1.2", false),
+            ("^18446744073709551614.0", true),
+            ("^18446744073709551615.0", true),
+            ("^18446744073709551616.0", false),
+            ("^99999999999999999999.0", false),
         ],
         |value| CapabilityVersion::new(value).is_ok(),
     );
