@@ -1,6 +1,6 @@
 # Kiteframe Declarative Agent Harness Design
 
-- **Status:** Draft for written review
+- **Status:** Approved
 - **Date:** 2026-07-25
 - **Repository:** `swiftdiaries/kiteframe`
 - **License:** Apache-2.0
@@ -22,9 +22,8 @@ normalization, hashing, feature negotiation, diagnostics, and the immutable
 
 The first runtime adapter targets Deep Agents. It converts resolved Kiteframe
 values into the public `create_deep_agent(...)` construction API and returns a
-`CompiledStateGraph`. OpenHarness is the second-runtime portability target and
-the required portability spike before the portable contract can advance from
-alpha to beta.
+`CompiledStateGraph`. V1 ships and proves this adapter without requiring a
+second-runtime portability spike. OpenHarness is a V2 delivery.
 
 Kiteframe is fail-closed. Required semantics that a runtime cannot represent
 fail compilation. Runtime bindings cannot add portable authority. Every
@@ -77,8 +76,8 @@ V1 has six goals:
    a capability lock, and a selected runtime binding.
 3. Define versioned semantic capabilities independently of endpoints,
    credentials, policy engines, and transports.
-4. Compile the same portable package through a Deep Agents adapter and prove
-   the contract against a second OpenHarness adapter spike.
+4. Compile the portable package through a Deep Agents adapter without adding
+   runtime-specific semantics to the portable contract.
 5. Make unsupported semantics, authorization denial, stale policy, invalid
    provider results, and audit failure typed and visible.
 6. Provide correlation across compilation, runtime execution, capability
@@ -94,7 +93,8 @@ V1 explicitly does not provide:
 - live policy authoring, publication, or policy-model migration control;
 - arbitrary Python, Rust, JavaScript, shell, or module imports from manifests;
 - package signing, provenance attestations, or a public package registry;
-- a production OpenHarness adapter;
+- any second-runtime adapter or portability spike; OpenHarness is a V2
+  delivery;
 - provider-specific model configuration in the portable manifest;
 - generic unrestricted HTTP, MCP, filesystem, or shell escape hatches;
 - a replacement for OpenFGA or a requirement that deployments use OpenFGA;
@@ -183,7 +183,7 @@ The implementation is divided by contract boundary:
 | Telemetry pipeline | Traces, metrics, correlation, and optional classified content references | Authorization or required audit durability |
 
 The dependency direction is one-way: adapters depend on the Rust contract;
-portable core types never depend on Deep Agents, OpenHarness, LangChain,
+portable core types never depend on Deep Agents, other runtime frameworks,
 OpenFGA, or OpenTelemetry SDK object types.
 
 ### Compilation flow
@@ -1113,19 +1113,15 @@ End-to-end fixtures cover:
 - capability and lock tampering;
 - provider and audit outages with no unsafe fallback.
 
-### Portability gate
+### V2 portability boundary
 
-Before V1 moves from alpha to beta, a bounded OpenHarness adapter spike MUST:
+OpenHarness integration and second-runtime portability proof are explicitly
+deferred to V2. They are not V1 implementation tasks, acceptance gates, or
+contract-maturity gates.
 
-1. consume the same golden `ResolvedAgent` fixtures;
-2. implement the same capability and diagnostic contracts;
-3. pass visibility, default-denial, delegation-narrowing, idempotency, and audit
-   ordering tests;
-4. document any runtime-specific gap without changing portable semantics.
-
-The spike is not a production OpenHarness adapter. If the spike requires
-Deep-Agents-specific concepts in `agent.yaml`, the portable contract remains
-alpha and must be revised.
+V2 portability work MUST consume the V1 canonical `ResolvedAgent` contract and
+MUST NOT retroactively add Deep-Agents-specific or OpenHarness-specific
+semantics to `agent.yaml`.
 
 ## Acceptance criteria for implementation planning
 
@@ -1145,9 +1141,10 @@ Written approval of this design requires agreement that:
 - effectful execution is idempotent and audit write-ahead is mandatory;
 - telemetry content capture is off by default;
 - safety claims have corresponding unit, integration, or end-to-end tests;
-- the OpenHarness spike gates beta portability.
+- V1 acceptance does not depend on a second runtime; OpenHarness delivery begins
+  in V2.
 
-After written approval, this document will be marked approved and a single
-implementation plan and OpenSpec change will become Kiteframe's sole task
-tracker. Until then, no runtime code or implementation OpenSpec change is in
+After written approval, this document will be marked approved and waves of
+implementation plans will become Kiteframe's task
+trackers. Until then, no runtime code or implementation plans are in
 scope.
