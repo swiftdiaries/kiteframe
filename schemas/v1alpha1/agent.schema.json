@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentManifest",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "$ref": "#/$defs/AgentSchemaVersion"
+    },
+    "kind": {
+      "$ref": "#/$defs/AgentKind"
+    },
+    "metadata": {
+      "$ref": "#/$defs/PackageIdentity"
+    },
+    "spec": {
+      "$ref": "#/$defs/AgentSpec"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "$defs": {
+    "AgentKind": {
+      "type": "string",
+      "enum": [
+        "Agent"
+      ]
+    },
+    "AgentName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "AgentSchemaVersion": {
+      "type": "string",
+      "enum": [
+        "kiteframe.dev/v1alpha1"
+      ]
+    },
+    "AgentSpec": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CapabilityRequirement"
+          }
+        },
+        "delegation": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DelegationRequirement"
+          }
+        },
+        "features": {
+          "$ref": "#/$defs/FeatureRequirements",
+          "default": {
+            "optional": [],
+            "required": []
+          }
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$": {
+              "$ref": "#/$defs/ModelRequirement"
+            }
+          }
+        },
+        "observability": {
+          "$ref": "#/$defs/ObservabilityRequirements",
+          "default": {
+            "contentCapture": {
+              "allowed": false,
+              "classifications": []
+            }
+          }
+        },
+        "prompt": {
+          "$ref": "#/$defs/PromptRequirement"
+        },
+        "skills": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PackagePath"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "prompt",
+        "models"
+      ]
+    },
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "CapabilityRequirement": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CapabilityName"
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        },
+        "resources": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ResourceSelector"
+          },
+          "uniqueItems": true
+        },
+        "version": {
+          "$ref": "#/$defs/CapabilityVersion"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityVersion": {
+      "type": "string",
+      "pattern": "^\\^?[0-9][0-9A-Za-z.+-]*$"
+    },
+    "ContentCaptureRequirement": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean",
+          "default": false
+        },
+        "classifications": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DataClassification"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "DataClassification": {
+      "type": "string",
+      "enum": [
+        "confidential"
+      ]
+    },
+    "DelegationRequirement": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/PackagePath"
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CapabilityName"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent"
+      ]
+    },
+    "Feature": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*@[1-9][0-9]*$"
+    },
+    "FeatureRequirements": {
+      "type": "object",
+      "properties": {
+        "optional": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Feature"
+          },
+          "uniqueItems": true
+        },
+        "required": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Feature"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "LatencyClass": {
+      "type": "string",
+      "enum": [
+        "interactive"
+      ]
+    },
+    "ModelCapability": {
+      "type": "string",
+      "enum": [
+        "text",
+        "tool-calling"
+      ]
+    },
+    "ModelRequirement": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelCapability"
+          },
+          "uniqueItems": true
+        },
+        "maxLatencyClass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LatencyClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "minContextTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capabilities"
+      ]
+    },
+    "ObservabilityRequirements": {
+      "type": "object",
+      "properties": {
+        "contentCapture": {
+          "$ref": "#/$defs/ContentCaptureRequirement",
+          "default": {
+            "allowed": false,
+            "classifications": []
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "PackageIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/AgentName"
+        },
+        "version": {
+          "$ref": "#/$defs/PackageVersion"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "PackagePath": {
+      "type": "string",
+      "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\u0000-\\u001F\\u007F]).+$"
+    },
+    "PackageVersion": {
+      "type": "string",
+      "pattern": "^[0-9][0-9A-Za-z.+-]*$"
+    },
+    "PromptRequirement": {
+      "type": "object",
+      "properties": {
+        "system": {
+          "$ref": "#/$defs/PackagePath"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "system"
+      ]
+    },
+    "ResourceSelector": {
+      "type": "string",
+      "pattern": "^[^\\u0000-\\u001F\\u007F]+$"
+    }
+  }
+}

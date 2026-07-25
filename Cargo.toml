@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/kiteframe-contract"]
+members = ["crates/kiteframe-contract", "crates/kiteframe-schema"]
 
 [workspace.package]
 edition = "2024"

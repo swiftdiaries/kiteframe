@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RuntimeBinding",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "$ref": "#/$defs/BindingSchemaVersion"
+    },
+    "kind": {
+      "$ref": "#/$defs/RuntimeBindingKind"
+    },
+    "metadata": {
+      "$ref": "#/$defs/RuntimeBindingMetadata"
+    },
+    "spec": {
+      "$ref": "#/$defs/RuntimeBindingSpec"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "$defs": {
+    "BindingContentCapturePolicy": {
+      "type": "object",
+      "properties": {
+        "accessPolicy": {
+          "$ref": "#/$defs/RegistrySymbol"
+        },
+        "classifications": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DataClassification"
+          },
+          "uniqueItems": true
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "encryptedContentStore": {
+          "$ref": "#/$defs/RegistrySymbol"
+        },
+        "redactionPolicy": {
+          "$ref": "#/$defs/RegistrySymbol"
+        },
+        "retentionPolicy": {
+          "$ref": "#/$defs/RegistrySymbol"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "classifications",
+        "redactionPolicy",
+        "retentionPolicy",
+        "accessPolicy",
+        "encryptedContentStore"
+      ]
+    },
+    "BindingSchemaVersion": {
+      "type": "string",
+      "enum": [
+        "kiteframe.dev/binding/v1alpha1"
+      ]
+    },
+    "DataClassification": {
+      "type": "string",
+      "enum": [
+        "confidential"
+      ]
+    },
+    "RegistrySymbol": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "RuntimeBindingKind": {
+      "type": "string",
+      "enum": [
+        "RuntimeBinding"
+      ]
+    },
+    "RuntimeBindingMetadata": {
+      "type": "object",
+      "properties": {
+        "runtime": {
+          "$ref": "#/$defs/RuntimeTarget"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "runtime"
+      ]
+    },
+    "RuntimeBindingSpec": {
+      "type": "object",
+      "properties": {
+        "auditSink": {
+          "$ref": "#/$defs/RegistrySymbol"
+        },
+        "capabilityProvider": {
+          "$ref": "#/$defs/RegistrySymbol"
+        },
+        "components": {
+          "$ref": "#/$defs/TypedComponentSymbols",
+          "default": {
+            "backend": null,
+            "checkpointer": null,
+            "middleware": []
+          }
+        },
+        "contentCapture": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BindingContentCapturePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$": {
+              "$ref": "#/$defs/RegistrySymbol"
+            }
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "models",
+        "capabilityProvider",
+        "auditSink"
+      ]
+    },
+    "RuntimeTarget": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "TypedComponentSymbols": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistrySymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "checkpointer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistrySymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "middleware": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RegistrySymbol"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
