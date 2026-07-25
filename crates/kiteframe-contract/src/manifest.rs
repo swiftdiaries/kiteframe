@@ -5,6 +5,7 @@ use std::{
 };
 
 use schemars::JsonSchema;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{AgentKind, AgentSchemaVersion, PackagePath};
@@ -29,15 +30,23 @@ fn is_symbol(value: &str) -> bool {
 }
 
 fn is_package_version(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_digit())
-        && chars.all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '+' | '-')
-        })
+    Version::parse(value).is_ok()
 }
 
 fn is_capability_version(value: &str) -> bool {
-    is_package_version(value.strip_prefix('^').unwrap_or(value))
+    let Some(version) = value.strip_prefix('^') else {
+        return false;
+    };
+    let components: Vec<_> = version.split('.').collect();
+    (components.len() == 2 || components.len() == 3)
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+                && (*component == "0" || !component.starts_with('0'))
+        })
+        && VersionReq::parse(value).is_ok()
 }
 
 fn is_feature(value: &str) -> bool {
@@ -96,7 +105,7 @@ validated_string!(AgentName, is_symbol, r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$");
 validated_string!(
     PackageVersion,
     is_package_version,
-    r"^[0-9][0-9A-Za-z.+-]*$"
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 );
 validated_string!(ModelRole, is_symbol, r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$");
 validated_string!(
@@ -107,12 +116,12 @@ validated_string!(
 validated_string!(
     CapabilityVersion,
     is_capability_version,
-    r"^\^?[0-9][0-9A-Za-z.+-]*$"
+    r"^\^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:\.(0|[1-9][0-9]*))?$"
 );
 validated_string!(
     ResourceSelector,
     is_resource_selector,
-    r"^[^\u0000-\u001F\u007F]+$"
+    r"^[^\x00-\x1F\x7F-\x9F]+$"
 );
 validated_string!(
     Feature,

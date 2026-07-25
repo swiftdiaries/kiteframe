@@ -13,7 +13,7 @@ pub struct InvalidPackagePath;
 #[schemars(transparent)]
 pub struct PackagePath(
     #[schemars(regex(
-        pattern = r"^(?!/)(?![A-Za-z]:/)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)(?!.*\\)(?!.*[\u0000-\u001F\u007F]).+$"
+        pattern = r"^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\.{1,2}(?:/|$))(?!.*//)(?!.*\\)(?!.*[\x00-\x1F\x7F-\x9F]).+$"
     ))]
     String,
 );
@@ -21,12 +21,14 @@ pub struct PackagePath(
 impl PackagePath {
     pub fn new(path: impl Into<String>) -> Result<Self, InvalidPackagePath> {
         let path = path.into();
-        let first = path.split('/').next().unwrap_or_default();
+        let bytes = path.as_bytes();
+        let has_windows_drive_prefix =
+            bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
         let invalid = path.is_empty()
             || path.starts_with('/')
             || path.contains('\\')
             || path.chars().any(char::is_control)
-            || first.ends_with(':')
+            || has_windows_drive_prefix
             || path
                 .split('/')
                 .any(|segment| segment.is_empty() || segment == "." || segment == "..");

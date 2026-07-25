@@ -8,9 +8,11 @@ repository.workspace = true
 
 [dependencies]
 schemars.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+fancy-regex = "0.16"
 serde_yaml_ng = "0.10"

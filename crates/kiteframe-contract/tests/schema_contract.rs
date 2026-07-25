@@ -1,4 +1,8 @@
-use kiteframe_contract::{AgentManifest, ContentCaptureRequirement, PackagePath, RuntimeBinding};
+use kiteframe_contract::{
+    AgentManifest, CapabilityVersion, ContentCaptureRequirement, PackagePath, PackageVersion,
+    ResourceSelector, RuntimeBinding,
+};
+use schemars::JsonSchema;
 
 const MINIMAL_MANIFEST: &str = r#"
 apiVersion: kiteframe.dev/v1alpha1
@@ -91,8 +95,10 @@ fn package_path_accepts_only_normalized_relative_slash_separated_paths() {
         "../system.md",
         r"prompts\system.md",
         "C:/prompts/system.md",
+        "C:prompts/system.md",
         "prompts/\0system.md",
         "prompts/\nsystem.md",
+        "prompts/\u{85}system.md",
     ] {
         assert!(PackagePath::new(invalid).is_err(), "{invalid:?}");
     }
@@ -102,4 +108,89 @@ fn package_path_accepts_only_normalized_relative_slash_separated_paths() {
 fn package_path_deserialization_enforces_constructor_invariants() {
     assert!(serde_yaml_ng::from_str::<PackagePath>("prompts/system.md").is_ok());
     assert!(serde_yaml_ng::from_str::<PackagePath>("../system.md").is_err());
+}
+
+#[test]
+fn package_versions_reject_malformed_semantic_versions() {
+    for valid in ["0.1.0", "1.2.3-alpha.1+build.5"] {
+        assert!(PackageVersion::new(valid).is_ok(), "{valid:?}");
+    }
+    for invalid in ["1foo", "1..2", "1+", "1.2", "01.2.3", "1.2.3-", "1.2.3+"] {
+        assert!(PackageVersion::new(invalid).is_err(), "{invalid:?}");
+    }
+}
+
+#[test]
+fn capability_versions_accept_only_v1_caret_constraints() {
+    for valid in ["^1.2", "^1.2.3", "^0.1"] {
+        assert!(CapabilityVersion::new(valid).is_ok(), "{valid:?}");
+    }
+    for invalid in [
+        "^1.",
+        "^1.2+",
+        "^1..2",
+        "^01.2",
+        "1.2",
+        ">=1.2",
+        "^1.2.3-rc.1",
+    ] {
+        assert!(CapabilityVersion::new(invalid).is_err(), "{invalid:?}");
+    }
+}
+
+#[test]
+fn generated_newtype_patterns_match_rust_validation() {
+    assert_pattern_parity::<PackageVersion>(
+        &[
+            ("0.1.0", true),
+            ("1.2.3-alpha.1+build.5", true),
+            ("1foo", false),
+            ("1..2", false),
+            ("1+", false),
+            ("1.2.3-", false),
+        ],
+        |value| PackageVersion::new(value).is_ok(),
+    );
+    assert_pattern_parity::<CapabilityVersion>(
+        &[
+            ("^1.2", true),
+            ("^1.2.3", true),
+            ("^1.", false),
+            ("^1.2+", false),
+            (">=1.2", false),
+        ],
+        |value| CapabilityVersion::new(value).is_ok(),
+    );
+    assert_pattern_parity::<PackagePath>(
+        &[
+            ("prompts/system.md", true),
+            ("../system.md", false),
+            ("C:/system.md", false),
+            ("C:system.md", false),
+            ("prompts/\u{85}system.md", false),
+        ],
+        |value| PackagePath::new(value).is_ok(),
+    );
+    assert_pattern_parity::<ResourceSelector>(
+        &[
+            ("tenant:${context.tenant_id}/case:*", true),
+            ("tenant:\ncase", false),
+            ("tenant:\u{85}case", false),
+        ],
+        |value| ResourceSelector::new(value).is_ok(),
+    );
+}
+
+fn assert_pattern_parity<T: JsonSchema>(
+    cases: &[(&str, bool)],
+    rust_accepts: impl Fn(&str) -> bool,
+) {
+    let schema = serde_json::to_value(schemars::schema_for!(T)).unwrap();
+    let pattern = schema["pattern"].as_str().unwrap();
+    let regex = fancy_regex::Regex::new(pattern).unwrap();
+    for &(value, expected) in cases {
+        let schema_accepts = regex.is_match(value).unwrap();
+        assert_eq!(rust_accepts(value), expected, "Rust parity for {value:?}");
+        assert_eq!(schema_accepts, expected, "schema parity for {value:?}");
+    }
 }
