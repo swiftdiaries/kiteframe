@@ -1,0 +1,7 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata:
+  name: first
+  name: second
+  version: 0.1.0
+spec: {}

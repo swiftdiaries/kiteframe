@@ -1,0 +1,13 @@
+[package]
+name = "kiteframe-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kiteframe-contract = { path = "../kiteframe-contract" }
+serde.workspace = true
+serde_yaml_ng.workspace = true
+yaml-rust2.workspace = true
