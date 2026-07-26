@@ -21,6 +21,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
+      - name: Check fuzz workspace formatting
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
+
       - name: Lint all targets
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -46,21 +49,24 @@ jobs:
           fi
 
   fuzz:
-    name: Strict YAML fuzz smoke
+    name: Strict YAML invariant and fuzz gates
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly-2026-07-25
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
       - name: Install nightly Rust
-        run: rustup toolchain install nightly --profile minimal
+        run: rustup toolchain install nightly-2026-07-25 --profile minimal
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
 
-      - name: Run strict YAML fuzz target
-        env:
-          RUSTUP_TOOLCHAIN: nightly
+      - name: Check deterministic strict YAML invariants
+        run: bash fuzz/check-invariants.sh
+
+      - name: Run stochastic strict YAML fuzz smoke
         run: cargo fuzz run strict_yaml -- -max_total_time=10
 
       - name: Upload fuzz crash artifacts

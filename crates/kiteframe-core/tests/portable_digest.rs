@@ -23,8 +23,8 @@ fn yaml_formatting_does_not_change_portable_digest() {
     let a = load_package(fixture("digest/format-a").as_path(), PackageLimits::V1).unwrap();
     let b = load_package(fixture("digest/format-b").as_path(), PackageLimits::V1).unwrap();
 
-    assert_eq!(a.portable_digest, b.portable_digest);
-    assert_eq!(a.portable_digest.to_string(), EXPECTED_FORMAT_DIGEST);
+    assert_eq!(a.portable_digest(), b.portable_digest());
+    assert_eq!(a.portable_digest().to_string(), EXPECTED_FORMAT_DIGEST);
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn prompt_bytes_change_portable_digest() {
     let a = load_package(fixture("digest/prompt-a").as_path(), PackageLimits::V1).unwrap();
     let b = load_package(fixture("digest/prompt-b").as_path(), PackageLimits::V1).unwrap();
 
-    assert_ne!(a.portable_digest, b.portable_digest);
+    assert_ne!(a.portable_digest(), b.portable_digest());
 }
 
 #[test]
@@ -40,7 +40,7 @@ fn skill_bytes_change_portable_digest() {
     let a = load_package(fixture("digest/skill-a").as_path(), PackageLimits::V1).unwrap();
     let b = load_package(fixture("digest/skill-b").as_path(), PackageLimits::V1).unwrap();
 
-    assert_ne!(a.portable_digest, b.portable_digest);
+    assert_ne!(a.portable_digest(), b.portable_digest());
 }
 
 #[test]
@@ -62,7 +62,23 @@ fn binding_change_does_not_change_portable_digest() {
     let b = load_package(fixture("digest/binding-b").as_path(), PackageLimits::V1).unwrap();
 
     assert_ne!(binding_a, binding_b, "fixture bindings must differ");
-    assert_eq!(a.portable_digest, b.portable_digest);
+    assert_eq!(a.portable_digest(), b.portable_digest());
+}
+
+#[test]
+fn accepted_context_token_boundaries_have_distinct_portable_digests() {
+    let lower = load_package(
+        fixture("digest/context-tokens-lower").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap();
+    let upper = load_package(
+        fixture("digest/context-tokens-upper").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap();
+
+    assert_ne!(lower.portable_digest(), upper.portable_digest());
 }
 
 #[test]
@@ -71,10 +87,10 @@ fn child_portable_digest_contributes_to_parent_digest() {
     let b = load_package(fixture("digest/child-b").as_path(), PackageLimits::V1).unwrap();
 
     assert_ne!(
-        a.subagents.values().next().unwrap().portable_digest,
-        b.subagents.values().next().unwrap().portable_digest
+        a.subagents().values().next().unwrap().portable_digest(),
+        b.subagents().values().next().unwrap().portable_digest()
     );
-    assert_ne!(a.portable_digest, b.portable_digest);
+    assert_ne!(a.portable_digest(), b.portable_digest());
 }
 
 #[test]

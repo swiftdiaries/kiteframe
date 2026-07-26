@@ -52,6 +52,30 @@ fn manifest_requires_exact_version_and_kind_literals() {
 }
 
 #[test]
+fn min_context_tokens_are_bounded_to_ijson_safe_u32() {
+    let at_maximum = MINIMAL_MANIFEST.replace("64000", &u32::MAX.to_string());
+    assert!(serde_yaml_ng::from_str::<AgentManifest>(&at_maximum).is_ok());
+
+    for invalid in [
+        u64::from(u32::MAX) + 1,
+        9_007_199_254_740_992,
+        9_007_199_254_740_993,
+    ] {
+        let manifest = MINIMAL_MANIFEST.replace("64000", &invalid.to_string());
+        assert!(
+            serde_yaml_ng::from_str::<AgentManifest>(&manifest).is_err(),
+            "{invalid} must be rejected before canonical hashing"
+        );
+    }
+
+    let schema = serde_json::to_value(schemars::schema_for!(AgentManifest)).unwrap();
+    let property = &schema["$defs"]["ModelRequirement"]["properties"]["minContextTokens"];
+    assert_eq!(property["format"], "uint32");
+    assert_eq!(property["minimum"], 1);
+    assert_eq!(property["maximum"], u64::from(u32::MAX));
+}
+
+#[test]
 fn content_capture_permission_defaults_to_disabled() {
     let manifest = serde_yaml_ng::from_str::<AgentManifest>(MINIMAL_MANIFEST).unwrap();
     assert_eq!(

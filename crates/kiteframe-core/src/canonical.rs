@@ -56,7 +56,7 @@ pub(crate) fn portable_digest(
             PORTABLE_CHILD_DOMAIN,
             [
                 path.as_str().as_bytes(),
-                child.portable_digest.as_bytes().as_slice(),
+                child.portable_digest().as_bytes().as_slice(),
             ],
         );
         chunks.push(entry.as_bytes().to_vec());

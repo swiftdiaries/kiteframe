@@ -13,10 +13,22 @@ fn fixture(name: &str) -> PathBuf {
 fn unreferenced_file_does_not_enter_package() {
     let package = load_package(fixture("minimal").as_path(), PackageLimits::V1).unwrap();
 
-    assert_eq!(package.prompt_assets.len(), 1);
-    assert!(package.prompt_assets.contains_key("prompts/system.md"));
-    assert!(!package.prompt_assets.contains_key("notes/private.txt"));
-    assert!(package.skill_assets.is_empty());
+    assert_eq!(package.prompt_assets().len(), 1);
+    assert!(package.prompt_assets().contains_key("prompts/system.md"));
+    assert!(!package.prompt_assets().contains_key("notes/private.txt"));
+    assert!(package.skill_assets().is_empty());
+}
+
+#[test]
+fn loaded_package_exposes_read_only_views_of_validated_content() {
+    let package = load_package(fixture("minimal").as_path(), PackageLimits::V1).unwrap();
+
+    assert!(package.root().as_path().ends_with("minimal"));
+    assert_eq!(package.manifest().metadata.name.as_str(), "support");
+    assert_eq!(package.prompt_assets().len(), 1);
+    assert!(package.skill_assets().is_empty());
+    assert!(package.subagents().is_empty());
+    assert_eq!(package.portable_digest().to_string().len(), 64);
 }
 
 #[test]
@@ -32,10 +44,10 @@ fn explicitly_selected_runtime_binding_is_loaded_without_scanning_others() {
 #[test]
 fn nested_agent_is_loaded_from_its_declared_manifest() {
     let package = load_package(fixture("nested").as_path(), PackageLimits::V1).unwrap();
-    let child = &package.subagents["agents/escalation/agent.yaml"];
+    let child = &package.subagents()["agents/escalation/agent.yaml"];
 
-    assert_eq!(child.manifest.metadata.name.as_str(), "escalation");
-    assert!(child.prompt_assets.contains_key("prompts/system.md"));
+    assert_eq!(child.manifest().metadata.name.as_str(), "escalation");
+    assert!(child.prompt_assets().contains_key("prompts/system.md"));
 }
 
 #[test]
@@ -97,6 +109,30 @@ fn reference_case_colliding_with_manifest_is_rejected() {
     .unwrap_err();
 
     assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+}
+
+#[test]
+fn exact_path_overlap_across_parent_and_child_packages_is_rejected() {
+    let errors = load_package(
+        fixture("hostile/package-tree-exact-collision").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+    assert!(errors[0].message.as_str().contains("package tree"));
+}
+
+#[test]
+fn case_only_path_overlap_across_parent_and_child_packages_is_rejected() {
+    let errors = load_package(
+        fixture("hostile/package-tree-case-collision").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+    assert!(errors[0].message.as_str().contains("package tree"));
 }
 
 #[test]

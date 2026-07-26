@@ -15,6 +15,8 @@ fn hostile_fixture_corpus_fails_closed() {
         ("alias-limit", "KF-PKG-001"),
         ("traversal", "KF-PKG-002"),
         ("case-collision", "KF-PKG-002"),
+        ("package-tree-exact-collision", "KF-PKG-002"),
+        ("package-tree-case-collision", "KF-PKG-002"),
         ("symlink", "KF-PKG-002"),
         ("non-utf8", "KF-PKG-002"),
         ("nested-cycle", "KF-PKG-001"),

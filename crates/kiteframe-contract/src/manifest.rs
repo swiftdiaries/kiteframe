@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    num::NonZeroU64,
+    num::NonZeroU32,
 };
 
 use schemars::JsonSchema;
@@ -270,7 +270,8 @@ pub enum LatencyClass {
 pub struct ModelRequirement {
     pub capabilities: BTreeSet<ModelCapability>,
     #[serde(default)]
-    pub min_context_tokens: Option<NonZeroU64>,
+    #[schemars(range(min = 1_u32, max = 4_294_967_295_u32))]
+    pub min_context_tokens: Option<NonZeroU32>,
     #[serde(default)]
     pub max_latency_class: Option<LatencyClass>,
     #[serde(default = "default_true")]

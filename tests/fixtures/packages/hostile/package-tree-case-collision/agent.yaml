@@ -1,0 +1,10 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: parent, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  skills: [agents/child/prompts/System.md]
+  models:
+    primary: { capabilities: [text, tool-calling] }
+  delegation:
+    - agent: agents/child/agent.yaml

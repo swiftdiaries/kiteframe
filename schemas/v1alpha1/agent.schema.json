@@ -244,8 +244,9 @@
             "integer",
             "null"
           ],
-          "format": "uint64",
+          "format": "uint32",
           "default": null,
+          "maximum": 4294967295,
           "minimum": 1
         },
         "required": {
