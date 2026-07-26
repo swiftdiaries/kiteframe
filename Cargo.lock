@@ -506,6 +506,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiteframe-resolver"
+version = "0.1.0"
+dependencies = [
+ "jsonschema",
+ "kiteframe-contract",
+ "proptest",
+ "semver",
+ "serde_json",
+]
+
+[[package]]
 name = "kiteframe-schema"
 version = "0.1.0"
 dependencies = [

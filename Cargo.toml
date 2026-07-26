@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/kiteframe-contract",
     "crates/kiteframe-core",
+    "crates/kiteframe-resolver",
     "crates/kiteframe-schema",
 ]
 
