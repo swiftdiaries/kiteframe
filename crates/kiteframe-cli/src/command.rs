@@ -20,7 +20,8 @@ use kiteframe_resolver::{
 
 use crate::render::{
     CheckResult, ExplainCapability, ExplainChild, ExplainFeatures, ExplainResult, InvalidResult,
-    LockResult, feature_names, write_human_diagnostics, write_human_status, write_json,
+    LockResult, feature_names, write_human_diagnostics, write_human_explain, write_human_status,
+    write_json,
 };
 
 const TARGET_DIGEST_DOMAIN: &[u8] = b"runtime-target-catalog";
@@ -139,21 +140,21 @@ fn run_check(args: CheckArgs) -> ExitCategory {
 
     match result {
         Ok(package) => {
-            if args.json {
-                let _ = write_json(&CheckResult {
+            let rendered = if args.json {
+                write_json(&CheckResult {
                     status: "valid",
                     package_identity: &package.manifest().metadata,
                     portable_digest: package.portable_digest(),
-                });
+                })
             } else {
-                let _ = write_human_status(&format!(
+                write_human_status(&format!(
                     "valid: {} {} {}",
                     package.manifest().metadata.name,
                     package.manifest().metadata.version,
                     package.portable_digest()
-                ));
-            }
-            ExitCategory::Success
+                ))
+            };
+            render_success(rendered)
         }
         Err(diagnostics) => render_failure(diagnostics, args.json),
     }
@@ -180,16 +181,16 @@ fn run_lock(args: LockArgs) -> ExitCategory {
 
     match result {
         Ok(lock) => {
-            if args.json {
-                let _ = write_json(&LockResult {
+            let rendered = if args.json {
+                write_json(&LockResult {
                     status: "locked",
                     lock_digest: &lock.lock_digest,
                     capability_count: lock.capabilities.len(),
-                });
+                })
             } else {
-                let _ = write_human_status(&format!("locked: {}", lock.lock_digest));
-            }
-            ExitCategory::Success
+                write_human_status(&format!("locked: {}", lock.lock_digest))
+            };
+            render_success(rendered)
         }
         Err(diagnostics) => render_failure(diagnostics, args.json),
     }
@@ -199,21 +200,12 @@ fn run_explain(args: ExplainArgs) -> ExitCategory {
     match resolve_pipeline(&args.resolution) {
         Ok(output) => {
             let explanation = explain(output);
-            if args.json {
-                let _ = write_json(&explanation);
+            let rendered = if args.json {
+                write_json(&explanation)
             } else {
-                let _ = write_human_status(&format!(
-                    "resolved: {} {}",
-                    explanation.package_identity.name, explanation.portable_digest
-                ));
-                for diagnostic in &explanation.diagnostics {
-                    let _ = write_human_status(&format!(
-                        "{} Warning: {}",
-                        diagnostic.code, diagnostic.message
-                    ));
-                }
-            }
-            ExitCategory::Success
+                write_human_explain(&explanation)
+            };
+            render_success(rendered)
         }
         Err(diagnostics) => render_failure(diagnostics, args.json),
     }
@@ -221,10 +213,7 @@ fn run_explain(args: ExplainArgs) -> ExitCategory {
 
 fn run_compile(args: CompileArgs) -> ExitCategory {
     match resolve_pipeline(&args.resolution) {
-        Ok(output) => {
-            let _ = write_json(&output.resolved);
-            ExitCategory::Success
-        }
+        Ok(output) => render_success(write_json(&output.resolved)),
         Err(diagnostics) => render_failure(diagnostics, args.json),
     }
 }
@@ -500,15 +489,27 @@ fn render_failure(mut diagnostics: Vec<Diagnostic>, json: bool) -> ExitCategory 
             ))
     });
     let exit = exit_category(&diagnostics);
-    if json {
-        let _ = write_json(&InvalidResult {
+    let rendered = if json {
+        write_json(&InvalidResult {
             status: "invalid",
             diagnostics: &diagnostics,
-        });
+        })
     } else {
-        let _ = write_human_diagnostics(&diagnostics);
+        write_human_diagnostics(&diagnostics)
+    };
+    if rendered.is_err() {
+        ExitCategory::RuntimeTarget
+    } else {
+        exit
     }
-    exit
+}
+
+fn render_success(result: std::io::Result<()>) -> ExitCategory {
+    if result.is_ok() {
+        ExitCategory::Success
+    } else {
+        ExitCategory::RuntimeTarget
+    }
 }
 
 fn exit_category(diagnostics: &[Diagnostic]) -> ExitCategory {

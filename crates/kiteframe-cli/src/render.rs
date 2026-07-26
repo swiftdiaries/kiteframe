@@ -96,6 +96,112 @@ pub(crate) fn write_human_diagnostics(diagnostics: &[Diagnostic]) -> io::Result<
     Ok(())
 }
 
+pub(crate) fn write_human_explain(explanation: &ExplainResult) -> io::Result<()> {
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr, "status: {}", explanation.status)?;
+    writeln!(
+        stderr,
+        "package: {} {}",
+        explanation.package_identity.name, explanation.package_identity.version
+    )?;
+    writeln!(stderr, "portable digest: {}", explanation.portable_digest)?;
+    writeln!(stderr, "lock digest: {}", explanation.lock_digest)?;
+
+    if explanation.capabilities.is_empty() {
+        writeln!(stderr, "capabilities: none")?;
+    } else {
+        writeln!(stderr, "capabilities:")?;
+        for capability in &explanation.capabilities {
+            let required = if capability.required {
+                "required"
+            } else {
+                "optional"
+            };
+            writeln!(
+                stderr,
+                "  {}@{} ({required})",
+                capability.identity.name(),
+                capability.identity.version()
+            )?;
+        }
+    }
+
+    if explanation.models.is_empty() {
+        writeln!(stderr, "models: none")?;
+    } else {
+        writeln!(stderr, "models:")?;
+        for (role, symbol) in &explanation.models {
+            writeln!(stderr, "  {role} -> {symbol}")?;
+        }
+    }
+
+    writeln!(stderr, "features:")?;
+    writeln!(
+        stderr,
+        "  required: {}",
+        human_list(&explanation.features.required)
+    )?;
+    writeln!(
+        stderr,
+        "  enabled optional: {}",
+        human_list(&explanation.features.enabled_optional)
+    )?;
+    writeln!(
+        stderr,
+        "  omitted optional: {}",
+        human_list(&explanation.features.omitted_optional)
+    )?;
+
+    if explanation.precedence_decisions.is_empty() {
+        writeln!(stderr, "precedence decisions: none")?;
+    } else {
+        writeln!(stderr, "precedence decisions:")?;
+        for decision in &explanation.precedence_decisions {
+            writeln!(stderr, "  {}: {}", decision.subject, decision.outcome)?;
+        }
+    }
+
+    if explanation.child_delegation_boundaries.is_empty() {
+        writeln!(stderr, "child delegation boundaries: none")?;
+    } else {
+        writeln!(stderr, "child delegation boundaries:")?;
+        for child in &explanation.child_delegation_boundaries {
+            writeln!(
+                stderr,
+                "  {} {} -> {}",
+                child.package_identity.name, child.package_identity.version, child.resolved_digest
+            )?;
+            writeln!(
+                stderr,
+                "    delegated capabilities: {}",
+                human_list(&child.delegated_capabilities)
+            )?;
+        }
+    }
+
+    if explanation.diagnostics.is_empty() {
+        writeln!(stderr, "diagnostics: none")?;
+    } else {
+        writeln!(stderr, "diagnostics:")?;
+        for diagnostic in &explanation.diagnostics {
+            writeln!(
+                stderr,
+                "  {} Warning: {}",
+                diagnostic.code, diagnostic.message
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn write_human_status(message: &str) -> io::Result<()> {
     writeln!(io::stderr().lock(), "{message}")
+}
+
+fn human_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(", ")
+    }
 }

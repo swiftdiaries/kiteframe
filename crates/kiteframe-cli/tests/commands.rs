@@ -131,6 +131,50 @@ fn explain_lists_symbols_without_exposing_package_content() {
 }
 
 #[test]
+fn human_explain_renders_every_safe_resolution_section_to_stderr() {
+    let output = command()
+        .args([
+            "explain",
+            &fixture("support-agent"),
+            "--binding",
+            &fixture("support-agent/bindings/deepagents.yaml"),
+            "--target",
+            &workspace_fixture("components/deepagents-test.json"),
+            "--locked",
+        ])
+        .assert()
+        .success();
+
+    assert!(output.get_output().stdout.is_empty());
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    for expected in [
+        "package: support-agent 0.1.0",
+        "portable digest: 00165f500c6d060e774df30b153642d302ea478fe7b751e2a003a67ff3ac4977",
+        "lock digest: 4a1f12410089007ca5ef1613faad7f5a5b3cf8921fef5cd0a71e75fa3982916e",
+        "capabilities:",
+        "cases.read@1.2.0 (required)",
+        "models:",
+        "primary -> models.anthropic.sonnet",
+        "features:",
+        "required: none",
+        "enabled optional: none",
+        "omitted optional: none",
+        "precedence decisions:",
+        "features: 0 required and 0 optional enabled",
+        "models: 1 roles resolved",
+        "child delegation boundaries: none",
+        "diagnostics: none",
+    ] {
+        assert!(
+            stderr.contains(expected),
+            "missing human explain line: {expected}"
+        );
+    }
+    assert!(!stderr.contains("Help support agents read cases safely."));
+    assert!(!stderr.contains("prompts/system.md"));
+}
+
+#[test]
 fn lock_is_the_command_that_writes_the_default_lock_path() {
     let (_directory, package) = copy_package("support-agent");
     fs::remove_file(package.join("capability.lock")).unwrap();
@@ -203,6 +247,38 @@ fn json_mode_keeps_argument_errors_structured_and_prose_free() {
     let body = parse_single_json(&output.get_output().stdout);
     assert_eq!(body["status"], "invalid");
     assert_eq!(body["diagnostics"][0]["code"], "KF-PKG-001");
+}
+
+#[test]
+fn json_help_is_one_structured_result_without_usage_prose() {
+    for args in [
+        vec!["--json", "--help"],
+        vec!["--help", "--json"],
+        vec!["check", "package", "--json", "--help"],
+    ] {
+        let output = command().args(args).assert().code(2);
+        assert!(output.get_output().stderr.is_empty());
+        let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+        let body = parse_single_json(stdout.as_bytes());
+        assert_eq!(body["status"], "invalid");
+        assert!(!stdout.contains("Usage:"));
+    }
+}
+
+#[test]
+fn json_version_is_one_structured_result_without_version_prose() {
+    for args in [
+        vec!["--json", "--version"],
+        vec!["--version", "--json"],
+        vec!["check", "package", "--json", "--version"],
+    ] {
+        let output = command().args(args).assert().code(2);
+        assert!(output.get_output().stderr.is_empty());
+        let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+        let body = parse_single_json(stdout.as_bytes());
+        assert_eq!(body["status"], "invalid");
+        assert!(!stdout.contains("kiteframe 0.1.0"));
+    }
 }
 
 #[test]
