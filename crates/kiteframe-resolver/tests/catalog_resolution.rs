@@ -2,19 +2,17 @@ use std::collections::{BTreeSet, HashSet};
 
 use kiteframe_contract::{
     ApprovalRequirement, CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts,
-    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CapabilityRequirement,
-    CapabilityVersion, CatalogIdentity, ConfirmationRequirement, ConsentRequirement,
-    EffectClassification, ExecutionMode, FreshnessRequirement, IdempotencyRequirement, NonEmptySet,
-    ResourceSelectorSchema,
+    CapabilityErrorDescriptor, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
+    CapabilityRequirement, CapabilityVersion, CatalogIdentity, ConfirmationRequirement,
+    ConsentRequirement, EffectClassification, EvidenceRequirement, ExecutionMode,
+    FreshnessRequirement, IdempotencyRequirement, NonEmptySet, ResourceSelectorSchema,
 };
-use kiteframe_resolver::{
-    CandidatePolicy, select_capabilities, select_capabilities_with_warnings, validate_catalog,
-};
+use kiteframe_resolver::{CandidatePolicy, select_capabilities_with_warnings, validate_catalog};
 use proptest::prelude::*;
 use serde_json::json;
 
-fn descriptor(name: &str, version: &str) -> CapabilityDescriptor {
-    CapabilityDescriptor::try_new(CapabilityDescriptorParts {
+fn descriptor_parts(name: &str, version: &str) -> CapabilityDescriptorParts {
+    CapabilityDescriptorParts {
         identity: CapabilityIdentity::try_new(
             CapabilityName::new(name).unwrap(),
             CapabilityReleaseVersion::new(version).unwrap(),
@@ -40,15 +38,14 @@ fn descriptor(name: &str, version: &str) -> CapabilityDescriptor {
         confirmation: ConfirmationRequirement::None,
         approval: ApprovalRequirement::None,
         consent: ConsentRequirement::None,
-    })
-    .unwrap()
+    }
 }
 
-fn catalog_with_versions(name: &str, versions: impl IntoIterator<Item = &'static str>) -> Vec<u8> {
-    let descriptors = versions
-        .into_iter()
-        .map(|version| descriptor(name, version))
-        .collect();
+fn descriptor(name: &str, version: &str) -> CapabilityDescriptor {
+    CapabilityDescriptor::try_new(descriptor_parts(name, version)).unwrap()
+}
+
+fn catalog_with_descriptors(descriptors: Vec<CapabilityDescriptor>) -> Vec<u8> {
     serde_json::to_vec(
         &CapabilityCatalog::try_new(
             CatalogIdentity {
@@ -60,6 +57,14 @@ fn catalog_with_versions(name: &str, versions: impl IntoIterator<Item = &'static
         .unwrap(),
     )
     .unwrap()
+}
+
+fn catalog_with_versions(name: &str, versions: impl IntoIterator<Item = &'static str>) -> Vec<u8> {
+    let descriptors = versions
+        .into_iter()
+        .map(|version| descriptor(name, version))
+        .collect();
+    catalog_with_descriptors(descriptors)
 }
 
 fn requirement(name: &str, version: &str, required: bool) -> CapabilityRequirement {
@@ -78,7 +83,7 @@ fn selects_highest_compatible_version() {
         ["1.2.0", "1.9.3", "2.0.0"],
     ))
     .unwrap();
-    let selected = select_capabilities(
+    let selected = select_capabilities_with_warnings(
         &[requirement("cases.read", "^1.2", true)],
         &catalog,
         CandidatePolicy::AllowAll,
@@ -86,7 +91,11 @@ fn selects_highest_compatible_version() {
     .unwrap();
 
     assert_eq!(
-        selected[0].descriptor().identity().version().to_string(),
+        selected.selected()[0]
+            .descriptor()
+            .identity()
+            .version()
+            .to_string(),
         "1.9.3"
     );
 }
@@ -95,7 +104,7 @@ fn selects_highest_compatible_version() {
 fn policy_can_only_remove_candidates() {
     let catalog =
         validate_catalog(&catalog_with_versions("cases.read", ["1.2.0", "1.9.3"])).unwrap();
-    let selected = select_capabilities(
+    let selected = select_capabilities_with_warnings(
         &[requirement("cases.read", "^1.2", true)],
         &catalog,
         CandidatePolicy::exact(["cases.read@1.2.0"]),
@@ -103,7 +112,11 @@ fn policy_can_only_remove_candidates() {
     .unwrap();
 
     assert_eq!(
-        selected[0].descriptor().identity().version().to_string(),
+        selected.selected()[0]
+            .descriptor()
+            .identity()
+            .version()
+            .to_string(),
         "1.2.0"
     );
 }
@@ -123,7 +136,7 @@ fn reordered_catalog_bytes_select_identically_after_canonical_validation() {
 #[test]
 fn required_miss_uses_the_catalog_incompatible_diagnostic() {
     let catalog = validate_catalog(&catalog_with_versions("cases.read", ["1.2.0"])).unwrap();
-    let diagnostics = select_capabilities(
+    let diagnostics = select_capabilities_with_warnings(
         &[requirement("cases.write", "^1.0", true)],
         &catalog,
         CandidatePolicy::AllowAll,
@@ -131,6 +144,30 @@ fn required_miss_uses_the_catalog_incompatible_diagnostic() {
     .unwrap_err();
 
     assert_eq!(diagnostics[0].code.as_str(), "KF-CAT-001");
+}
+
+#[test]
+fn distinct_required_misses_produce_distinct_stably_ordered_diagnostics() {
+    let catalog = validate_catalog(&catalog_with_versions("cases.comment", ["1.2.0"])).unwrap();
+    let diagnostics = select_capabilities_with_warnings(
+        &[
+            requirement("cases.write", "^1.0", true),
+            requirement("cases.read", "^1.0", true),
+        ],
+        &catalog,
+        CandidatePolicy::AllowAll,
+    )
+    .unwrap_err();
+
+    assert_eq!(diagnostics.len(), 2);
+    assert_eq!(
+        diagnostics[0].message.as_str(),
+        "no compatible catalog capability for cases.read ^1.0"
+    );
+    assert_eq!(
+        diagnostics[1].message.as_str(),
+        "no compatible catalog capability for cases.write ^1.0"
+    );
 }
 
 #[test]
@@ -161,6 +198,77 @@ fn support_fixture_is_a_validated_catalog() {
     );
 }
 
+#[test]
+fn validated_descriptor_exposes_independent_canonical_part_digests() {
+    let baseline = validate_catalog(&catalog_with_descriptors(vec![descriptor(
+        "cases.read",
+        "1.2.0",
+    )]))
+    .unwrap()
+    .validated_descriptors()[0]
+        .clone();
+
+    let mut changed_input = descriptor_parts("cases.read", "1.2.0");
+    changed_input.input_schema = json!({"type": "string"});
+    let changed_input = validate_catalog(&catalog_with_descriptors(vec![
+        CapabilityDescriptor::try_new(changed_input).unwrap(),
+    ]))
+    .unwrap()
+    .validated_descriptors()[0]
+        .clone();
+
+    let mut changed_output = descriptor_parts("cases.read", "1.2.0");
+    changed_output.output_schema = json!({"type": "string"});
+    let changed_output = validate_catalog(&catalog_with_descriptors(vec![
+        CapabilityDescriptor::try_new(changed_output).unwrap(),
+    ]))
+    .unwrap()
+    .validated_descriptors()[0]
+        .clone();
+
+    let mut changed_errors = descriptor_parts("cases.read", "1.2.0");
+    changed_errors.stable_errors = vec![
+        CapabilityErrorDescriptor::try_new("not_found", "case", "never", "Case not found").unwrap(),
+    ];
+    let changed_errors = validate_catalog(&catalog_with_descriptors(vec![
+        CapabilityDescriptor::try_new(changed_errors).unwrap(),
+    ]))
+    .unwrap()
+    .validated_descriptors()[0]
+        .clone();
+
+    let mut changed_safety = descriptor_parts("cases.read", "1.2.0");
+    changed_safety.approval = ApprovalRequirement::Required {
+        evidence: EvidenceRequirement {
+            kind: "case-approval".to_owned(),
+            issuer: None,
+        },
+    };
+    let changed_safety = validate_catalog(&catalog_with_descriptors(vec![
+        CapabilityDescriptor::try_new(changed_safety).unwrap(),
+    ]))
+    .unwrap()
+    .validated_descriptors()[0]
+        .clone();
+
+    assert_ne!(
+        baseline.input_schema_digest(),
+        changed_input.input_schema_digest()
+    );
+    assert_ne!(
+        baseline.output_schema_digest(),
+        changed_output.output_schema_digest()
+    );
+    assert_ne!(
+        baseline.stable_error_set_digest(),
+        changed_errors.stable_error_set_digest()
+    );
+    assert_ne!(
+        baseline.safety_metadata_digest(),
+        changed_safety.safety_metadata_digest()
+    );
+}
+
 proptest! {
     #[test]
     fn catalog_order_never_changes_selection(order in prop::collection::vec(0_usize..3, 3)) {
@@ -168,12 +276,12 @@ proptest! {
         let versions = ["1.2.0", "1.9.3", "2.0.0"];
         let ordered = order.into_iter().map(|index| versions[index]).collect::<Vec<_>>();
         let catalog = validate_catalog(&catalog_with_versions("cases.read", ordered)).unwrap();
-        let selected = select_capabilities(
+        let selected = select_capabilities_with_warnings(
             &[requirement("cases.read", "^1.2", true)],
             &catalog,
             CandidatePolicy::AllowAll,
         )
         .unwrap();
-        prop_assert_eq!(selected[0].descriptor().identity().version().to_string(), "1.9.3");
+        prop_assert_eq!(selected.selected()[0].descriptor().identity().version().to_string(), "1.9.3");
     }
 }

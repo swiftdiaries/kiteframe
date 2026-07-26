@@ -11,6 +11,8 @@ jsonschema.workspace = true
 kiteframe-contract = { path = "../kiteframe-contract" }
 semver.workspace = true
 serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 proptest = "1"

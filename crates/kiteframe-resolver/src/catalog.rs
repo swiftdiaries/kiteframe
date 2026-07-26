@@ -6,12 +6,13 @@ use kiteframe_contract::{
 };
 use semver::{Version, VersionReq};
 
-use crate::descriptor::{catalog_invalid, validate_descriptor};
+use crate::descriptor::{ValidatedDescriptor, catalog_invalid, validate_descriptor};
 
 /// A catalog whose canonical digest, descriptor digests, and schemas have been verified.
 #[derive(Clone, Debug)]
 pub struct ValidatedCatalog {
     catalog: CapabilityCatalog,
+    validated_descriptors: Vec<ValidatedDescriptor>,
 }
 
 impl ValidatedCatalog {
@@ -21,6 +22,10 @@ impl ValidatedCatalog {
 
     pub fn descriptors(&self) -> &[CapabilityDescriptor] {
         self.catalog.descriptors()
+    }
+
+    pub fn validated_descriptors(&self) -> &[ValidatedDescriptor] {
+        &self.validated_descriptors
     }
 }
 
@@ -41,7 +46,7 @@ impl CandidatePolicy {
         )
     }
 
-    fn allows(&self, descriptor: &CapabilityDescriptor) -> bool {
+    fn allows(&self, descriptor: &ValidatedDescriptor) -> bool {
         match self {
             Self::AllowAll => true,
             Self::Exact(identities) => identities.contains(&format!(
@@ -56,7 +61,7 @@ impl CandidatePolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectedCapability {
     requirement: CapabilityRequirement,
-    descriptor: CapabilityDescriptor,
+    descriptor: ValidatedDescriptor,
 }
 
 impl SelectedCapability {
@@ -65,6 +70,10 @@ impl SelectedCapability {
     }
 
     pub fn descriptor(&self) -> &CapabilityDescriptor {
+        self.descriptor.descriptor()
+    }
+
+    pub fn validated_descriptor(&self) -> &ValidatedDescriptor {
         &self.descriptor
     }
 }
@@ -92,18 +101,26 @@ pub fn validate_catalog(bytes: &[u8]) -> Result<ValidatedCatalog, Vec<Diagnostic
         )]
     })?;
 
-    let errors: Vec<_> = catalog
+    let validated_descriptors: Result<Vec<_>, _> = catalog
         .descriptors()
         .iter()
-        .filter_map(|descriptor| validate_descriptor(descriptor).err())
+        .cloned()
+        .map(validate_descriptor)
         .collect();
-    if errors.is_empty() {
-        Ok(ValidatedCatalog { catalog })
-    } else {
-        Err(errors)
-    }
+    validated_descriptors
+        .map(|validated_descriptors| ValidatedCatalog {
+            catalog,
+            validated_descriptors,
+        })
+        .map_err(|error| vec![error])
 }
 
+/// Compatibility helper that discards optional-miss warnings.
+///
+/// New resolution and IR assembly must use [`select_capabilities_with_warnings`].
+#[deprecated(
+    note = "use select_capabilities_with_warnings so optional capability misses are retained"
+)]
 pub fn select_capabilities(
     requirements: &[CapabilityRequirement],
     catalog: &ValidatedCatalog,
@@ -134,6 +151,7 @@ pub fn select_capabilities_with_warnings(
                 &right.resources,
             ))
     });
+    requirements.dedup();
 
     let mut selected = Vec::new();
     let mut warnings = Vec::new();
@@ -146,7 +164,7 @@ pub fn select_capabilities_with_warnings(
                 )]
             })?;
         let selected_descriptor = catalog
-            .descriptors()
+            .validated_descriptors()
             .iter()
             .filter(|descriptor| descriptor.identity().name() == &requirement.name)
             .filter(|descriptor| policy_filter.allows(descriptor))
@@ -175,7 +193,6 @@ pub fn select_capabilities_with_warnings(
         Ok(SelectionOutcome { selected, warnings })
     } else {
         errors.sort();
-        errors.dedup();
         Err(errors)
     }
 }
