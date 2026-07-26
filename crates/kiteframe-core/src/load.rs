@@ -4,11 +4,12 @@ use std::{
 };
 
 use kiteframe_contract::{
-    AgentManifest, Diagnostic, PackagePath, RuntimeBinding, ValidatedTextAsset,
+    AgentManifest, Diagnostic, PackagePath, RuntimeBinding, Sha256Digest, ValidatedTextAsset,
 };
 
 use crate::{
     PackageLimits,
+    canonical::portable_digest,
     discover::discover_portable_references,
     parse_binding, parse_manifest,
     path::{
@@ -24,6 +25,7 @@ pub struct AgentPackage {
     pub prompt_assets: BTreeMap<PackagePath, ValidatedTextAsset>,
     pub skill_assets: BTreeMap<PackagePath, ValidatedTextAsset>,
     pub subagents: BTreeMap<PackagePath, AgentPackage>,
+    pub portable_digest: Sha256Digest,
 }
 
 pub fn load_package(root: &Path, limits: PackageLimits) -> Result<AgentPackage, Vec<Diagnostic>> {
@@ -121,12 +123,16 @@ fn assemble_package(
         subagents.insert(path, child);
     }
 
+    let portable_digest =
+        portable_digest(&manifest, &prompt_assets, &skill_assets, &subagents).map_err(single)?;
+
     Ok(AgentPackage {
         root,
         manifest,
         prompt_assets,
         skill_assets,
         subagents,
+        portable_digest,
     })
 }
 

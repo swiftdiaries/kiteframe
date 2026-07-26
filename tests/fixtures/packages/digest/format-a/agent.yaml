@@ -1,0 +1,13 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: digest-example, version: 1.2.3 }
+spec:
+  prompt: { system: prompts/system.md }
+  skills:
+    - skills/first.md
+    - skills/second.md
+  models:
+    primary: { capabilities: [text, tool-calling] }
+  delegation:
+    - agent: agents/child/agent.yaml
+      capabilities: [lookup, summarize]

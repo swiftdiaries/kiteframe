@@ -1,0 +1,16 @@
+# Same typed manifest as format-a, with different YAML presentation.
+kind: "Agent"
+apiVersion: "kiteframe.dev/v1alpha1"
+spec:
+  delegation: [{ capabilities: [summarize, lookup], agent: "agents/child/agent.yaml" }]
+  models:
+    primary:
+      capabilities:
+        - tool-calling
+        - text
+  skills: ["skills/first.md", "skills/second.md"]
+  prompt:
+    system: "prompts/system.md"
+metadata:
+  version: "1.2.3"
+  name: "digest-example"

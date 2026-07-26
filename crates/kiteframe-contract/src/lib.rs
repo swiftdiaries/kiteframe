@@ -2,6 +2,7 @@
 
 mod binding;
 mod diagnostic;
+mod digest;
 mod manifest;
 mod package;
 mod schema;
@@ -14,6 +15,7 @@ pub use diagnostic::{
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity, DiagnosticStage,
     RetryClass, SafeMessage, SourceRange,
 };
+pub use digest::Sha256Digest;
 pub use manifest::{
     AgentManifest, AgentName, AgentSpec, CapabilityName, CapabilityRequirement, CapabilityVersion,
     ContentCaptureRequirement, DataClassification, DelegationRequirement, Feature,

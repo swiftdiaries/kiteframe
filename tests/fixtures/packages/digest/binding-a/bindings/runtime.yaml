@@ -1,0 +1,7 @@
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: local }
+spec:
+  models: { primary: model-a }
+  capabilityProvider: provider-a
+  auditSink: audit-a

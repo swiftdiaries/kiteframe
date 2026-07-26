@@ -1,0 +1,6 @@
+metadata:
+  version: "1.0.0"
+  name: "digest-child"
+spec: { models: { primary: { capabilities: [text] } }, prompt: { system: "prompts/system.md" } }
+kind: "Agent"
+apiVersion: "kiteframe.dev/v1alpha1"

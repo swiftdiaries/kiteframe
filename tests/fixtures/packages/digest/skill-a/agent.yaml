@@ -1,0 +1,8 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: skill-digest, version: 1.0.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  skills: [skills/rules.md]
+  models:
+    primary: { capabilities: [text] }
