@@ -91,10 +91,10 @@ fn validate_schema(value: &Value) -> Result<(), String> {
     let object = value
         .as_object()
         .ok_or_else(|| "JSON Schema must be an object".to_owned())?;
-    if let Some(schema) = object.get("$schema") {
-        if schema != "https://json-schema.org/draft/2020-12/schema" {
-            return Err("schema must use JSON Schema 2020-12".to_owned());
-        }
+    if let Some(schema) = object.get("$schema")
+        && schema != "https://json-schema.org/draft/2020-12/schema"
+    {
+        return Err("schema must use JSON Schema 2020-12".to_owned());
     }
     if !jsonschema::draft202012::meta::is_valid(value) {
         return Err("schema is not valid Draft 2020-12 JSON Schema".to_owned());

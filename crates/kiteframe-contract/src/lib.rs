@@ -27,7 +27,8 @@ pub use capability::{
 };
 pub use catalog::{CapabilityCatalog, CatalogIdentity};
 pub use component::{
-    ComponentKind, ComponentMetadata, ComponentMetadataCatalog, RuntimeTargetDescriptor,
+    ComponentKind, ComponentMetadata, ComponentMetadataCatalog, ModelLatencyClass, ModelMetadata,
+    ModelModality, ResidencyClass, RuntimeTargetDescriptor,
 };
 pub use diagnostic::{
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity, DiagnosticStage,

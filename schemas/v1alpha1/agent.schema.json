@@ -215,7 +215,8 @@
       "type": "string",
       "enum": [
         "text",
-        "tool-calling"
+        "tool-calling",
+        "structured-output"
       ]
     },
     "ModelRequirement": {
@@ -252,6 +253,16 @@
         "required": {
           "type": "boolean",
           "default": true
+        },
+        "residency": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ResidencyClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "additionalProperties": false,
@@ -307,6 +318,10 @@
       "required": [
         "system"
       ]
+    },
+    "ResidencyClass": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
     },
     "ResourceSelector": {
       "type": "string",

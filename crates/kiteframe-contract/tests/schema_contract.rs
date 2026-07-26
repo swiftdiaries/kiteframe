@@ -76,6 +76,31 @@ fn min_context_tokens_are_bounded_to_ijson_safe_u32() {
 }
 
 #[test]
+fn manifest_carries_structured_output_and_exact_residency_constraints() {
+    let manifest = MINIMAL_MANIFEST
+        .replace(
+            "text, tool-calling",
+            "text, tool-calling, structured-output",
+        )
+        .replace(
+            "minContextTokens: 64000",
+            "minContextTokens: 64000, residency: global",
+        );
+
+    let parsed = serde_yaml_ng::from_str::<AgentManifest>(&manifest).unwrap();
+    let primary = parsed
+        .spec
+        .models
+        .iter()
+        .find(|(role, _)| role.as_str() == "primary")
+        .unwrap()
+        .1;
+
+    assert!(primary.residency.is_some());
+    assert_eq!(primary.capabilities.len(), 3);
+}
+
+#[test]
 fn content_capture_permission_defaults_to_disabled() {
     let manifest = serde_yaml_ng::from_str::<AgentManifest>(MINIMAL_MANIFEST).unwrap();
     assert_eq!(
@@ -103,6 +128,23 @@ fn binding_contains_symbols_but_no_executable_or_secret_fields() {
     assert!(!text.contains("endpoint"));
     assert!(!text.contains("capturedContent"));
     assert!(!text.contains("portableGrant"));
+}
+
+#[test]
+fn typed_binding_structurally_rejects_capability_and_delegation_injection() {
+    let binding = r#"
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: deepagents }
+spec:
+  models: { primary: models.anthropic.sonnet }
+  capabilityProvider: capability-providers.primary
+  auditSink: audit-sinks.ledger
+  capabilities: [cases.delete]
+  delegation: [{ agent: agents/undeclared/agent.yaml }]
+"#;
+
+    assert!(serde_yaml_ng::from_str::<RuntimeBinding>(binding).is_err());
 }
 
 #[test]

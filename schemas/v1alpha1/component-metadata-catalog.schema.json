@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComponentMetadataCatalog",
+  "type": "object",
+  "properties": {
+    "components": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$": {
+          "$ref": "#/$defs/ComponentMetadata"
+        }
+      }
+    },
+    "target": {
+      "$ref": "#/$defs/RuntimeTarget"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "target",
+    "components"
+  ],
+  "$defs": {
+    "ComponentKind": {
+      "type": "string",
+      "enum": [
+        "model",
+        "middleware",
+        "backend",
+        "checkpointer",
+        "capability_provider",
+        "audit_sink",
+        "redaction_policy",
+        "retention_policy",
+        "access_policy",
+        "encrypted_content_store"
+      ]
+    },
+    "ComponentMetadata": {
+      "type": "object",
+      "properties": {
+        "durable": {
+          "type": "boolean",
+          "default": false
+        },
+        "features": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "kind": {
+          "$ref": "#/$defs/ComponentKind"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelMetadata"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "ModelLatencyClass": {
+      "type": "string",
+      "enum": [
+        "interactive",
+        "batch"
+      ]
+    },
+    "ModelMetadata": {
+      "type": "object",
+      "properties": {
+        "latencyClass": {
+          "$ref": "#/$defs/ModelLatencyClass"
+        },
+        "maxContextTokens": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "modalities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelModality"
+          },
+          "uniqueItems": true
+        },
+        "residency": {
+          "$ref": "#/$defs/ResidencyClass"
+        },
+        "structuredOutput": {
+          "type": "boolean"
+        },
+        "toolCalling": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "modalities",
+        "toolCalling",
+        "structuredOutput",
+        "maxContextTokens",
+        "residency",
+        "latencyClass"
+      ]
+    },
+    "ModelModality": {
+      "type": "string",
+      "enum": [
+        "text"
+      ]
+    },
+    "ResidencyClass": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "RuntimeTarget": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    }
+  }
+}

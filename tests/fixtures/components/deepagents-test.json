@@ -1,0 +1,59 @@
+{
+  "target": "deepagents",
+  "components": {
+    "access-policies.default": {
+      "kind": "access_policy"
+    },
+    "audit-sinks.ledger": {
+      "kind": "audit_sink"
+    },
+    "backends.workspace": {
+      "kind": "backend"
+    },
+    "capability-providers.primary": {
+      "kind": "capability_provider"
+    },
+    "checkpointers.durable": {
+      "kind": "checkpointer",
+      "durable": true
+    },
+    "content-stores.encrypted": {
+      "kind": "encrypted_content_store"
+    },
+    "middleware.tenant-context": {
+      "kind": "middleware"
+    },
+    "models.anthropic.haiku": {
+      "kind": "model",
+      "model": {
+        "modalities": [
+          "text"
+        ],
+        "toolCalling": true,
+        "structuredOutput": true,
+        "maxContextTokens": 200000,
+        "residency": "global",
+        "latencyClass": "interactive"
+      }
+    },
+    "models.anthropic.sonnet": {
+      "kind": "model",
+      "model": {
+        "modalities": [
+          "text"
+        ],
+        "toolCalling": true,
+        "structuredOutput": true,
+        "maxContextTokens": 200000,
+        "residency": "global",
+        "latencyClass": "interactive"
+      }
+    },
+    "redaction-policies.default": {
+      "kind": "redaction_policy"
+    },
+    "retention-policies.default": {
+      "kind": "retention_policy"
+    }
+  }
+}

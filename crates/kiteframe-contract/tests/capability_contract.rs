@@ -3,14 +3,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use kiteframe_contract::{
     AgentName, ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityErrorDescriptor, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CompilationDecision, CompilationReport, CompilationWarning, ConfirmationRequirement,
-    ConsentRequirement, DelegationRequirement, EffectClassification, ExecutionMode, FeatureId,
-    FreshnessRequirement, IdempotencyRequirement, IrSchemaVersion, JsonSchema2020_12, NonEmptySet,
-    PackageIdentity, PackagePath, PackageVersion, PreconditionDescriptor, ResolvedAgent,
-    ResolvedAgentParts, ResolvedCapabilityRequirement, ResolvedContentCaptureRequirement,
-    ResolvedSubagent, ResourceSelectorSchema, Sha256Digest,
+    CompilationDecision, CompilationReport, CompilationWarning, ComponentMetadataCatalog,
+    ConfirmationRequirement, ConsentRequirement, DelegationRequirement, EffectClassification,
+    ExecutionMode, FeatureId, FreshnessRequirement, IdempotencyRequirement, IrSchemaVersion,
+    JsonSchema2020_12, ModelModality, NonEmptySet, PackageIdentity, PackagePath, PackageVersion,
+    PreconditionDescriptor, ResidencyClass, ResolvedAgent, ResolvedAgentParts,
+    ResolvedCapabilityRequirement, ResolvedContentCaptureRequirement, ResolvedSubagent,
+    ResourceSelectorSchema, Sha256Digest,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 fn descriptor_parts(name: &str, version: &str) -> CapabilityDescriptorParts {
     CapabilityDescriptorParts {
@@ -71,6 +73,51 @@ fn resolved_agent_schema_contains_no_credentials_or_runtime_objects() {
     assert!(!schema.contains("credential"));
     assert!(!schema.contains("endpoint"));
     assert!(!schema.contains("runtimeObject"));
+}
+
+#[test]
+fn component_metadata_carries_typed_model_constraint_evidence() {
+    let catalog: ComponentMetadataCatalog = serde_json::from_value(json!({
+        "target": "deepagents",
+        "components": {
+            "models.anthropic.sonnet": {
+                "kind": "model",
+                "model": {
+                    "modalities": ["text"],
+                    "toolCalling": true,
+                    "structuredOutput": true,
+                    "maxContextTokens": 200000,
+                    "residency": "global",
+                    "latencyClass": "interactive"
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let metadata = catalog.components.values().next().unwrap();
+    let model = metadata.model.as_ref().unwrap();
+
+    assert!(model.modalities.contains(&ModelModality::Text));
+    assert!(model.tool_calling);
+    assert!(model.structured_output);
+    assert_eq!(model.max_context_tokens.get(), 200_000);
+    assert_eq!(model.residency, ResidencyClass::new("global").unwrap());
+}
+
+#[test]
+fn component_metadata_rejects_untyped_model_constraint_fields() {
+    let result = serde_json::from_value::<ComponentMetadataCatalog>(json!({
+        "target": "deepagents",
+        "components": {
+            "models.anthropic.sonnet": {
+                "kind": "model",
+                "modalities": ["text"],
+                "contextWindow": "large"
+            }
+        }
+    }));
+
+    assert!(result.is_err());
 }
 
 #[test]
@@ -170,6 +217,26 @@ fn resolved_digest_orders_capability_requiredness_for_equal_identity_and_resourc
     let second = ResolvedAgent::try_new(second_parts).unwrap();
 
     assert_eq!(first.resolved_digest(), second.resolved_digest());
+}
+
+#[test]
+fn resolved_digest_is_not_an_undomained_wire_hash() {
+    let resolved = ResolvedAgent::try_new(resolved_parts(
+        vec!["team:a"],
+        vec![subagent("child", "1.0.0")],
+        CompilationReport {
+            warnings: Vec::new(),
+            decisions: Vec::new(),
+        },
+    ))
+    .unwrap();
+    let mut wire = serde_json::to_value(&resolved).unwrap();
+    wire.as_object_mut().unwrap().remove("resolvedDigest");
+    let undomained = Sha256Digest::from_bytes(
+        Sha256::digest(serde_json_canonicalizer::to_vec(&wire).unwrap()).into(),
+    );
+
+    assert_ne!(resolved.resolved_digest(), &undomained);
 }
 
 fn resolved_parts(

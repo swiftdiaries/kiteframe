@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use kiteframe_contract::{
     ApprovalRequirement, CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts,
@@ -271,8 +271,14 @@ fn validated_descriptor_exposes_independent_canonical_part_digests() {
 
 proptest! {
     #[test]
-    fn catalog_order_never_changes_selection(order in prop::collection::vec(0_usize..3, 3)) {
-        prop_assume!(HashSet::<usize>::from_iter(order.iter().copied()).len() == 3);
+    fn catalog_order_never_changes_selection(order in prop_oneof![
+        Just(vec![0, 1, 2]),
+        Just(vec![0, 2, 1]),
+        Just(vec![1, 0, 2]),
+        Just(vec![1, 2, 0]),
+        Just(vec![2, 0, 1]),
+        Just(vec![2, 1, 0]),
+    ]) {
         let versions = ["1.2.0", "1.9.3", "2.0.0"];
         let ordered = order.into_iter().map(|index| versions[index]).collect::<Vec<_>>();
         let catalog = validate_catalog(&catalog_with_versions("cases.read", ordered)).unwrap();

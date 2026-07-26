@@ -8,7 +8,7 @@ use schemars::JsonSchema;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
-use crate::{AgentKind, AgentSchemaVersion, PackagePath};
+use crate::{AgentKind, AgentSchemaVersion, PackagePath, ResidencyClass};
 
 fn is_symbol(value: &str) -> bool {
     let mut previous_separator = false;
@@ -218,7 +218,7 @@ pub struct AgentManifest {
     pub spec: AgentSpec,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageIdentity {
     pub name: AgentName,
@@ -255,6 +255,7 @@ pub struct PromptRequirement {
 pub enum ModelCapability {
     Text,
     ToolCalling,
+    StructuredOutput,
 }
 
 #[derive(
@@ -274,6 +275,8 @@ pub struct ModelRequirement {
     pub min_context_tokens: Option<NonZeroU32>,
     #[serde(default)]
     pub max_latency_class: Option<LatencyClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residency: Option<ResidencyClass>,
     #[serde(default = "default_true")]
     #[schemars(default = "default_true")]
     pub required: bool,

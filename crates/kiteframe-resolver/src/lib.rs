@@ -2,7 +2,10 @@
 
 mod catalog;
 mod descriptor;
+mod feature;
 mod lock;
+mod model;
+mod resolve;
 
 #[allow(deprecated)]
 pub use catalog::select_capabilities;
@@ -11,4 +14,6 @@ pub use catalog::{
     select_capabilities_with_warnings, validate_catalog,
 };
 pub use descriptor::ValidatedDescriptor;
+pub use feature::negotiate_features;
 pub use lock::{lock_package, verify_lock, write_lock_atomic};
+pub use resolve::{ResolutionInput, resolve_agent};
