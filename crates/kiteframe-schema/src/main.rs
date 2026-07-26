@@ -5,7 +5,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kiteframe_contract::{AgentManifest, RuntimeBinding};
+use kiteframe_contract::{
+    AgentManifest, CapabilityCatalog, CapabilityDescriptor, CapabilityLock, ResolvedAgent,
+    RuntimeBinding,
+};
 use schemars::JsonSchema;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -35,12 +38,20 @@ fn generate(destination: &Path) -> Result<()> {
     fs::create_dir_all(destination)?;
     write_schema::<AgentManifest>(&destination.join("agent.schema.json"))?;
     write_schema::<RuntimeBinding>(&destination.join("runtime-binding.schema.json"))?;
+    write_schema::<CapabilityDescriptor>(&destination.join("capability-descriptor.schema.json"))?;
+    write_schema::<CapabilityCatalog>(&destination.join("capability-catalog.schema.json"))?;
+    write_schema::<CapabilityLock>(&destination.join("capability-lock.schema.json"))?;
+    write_schema::<ResolvedAgent>(&destination.join("resolved-agent.schema.json"))?;
     Ok(())
 }
 
 fn check(destination: &Path) -> Result<()> {
     check_schema::<AgentManifest>(&destination.join("agent.schema.json"))?;
     check_schema::<RuntimeBinding>(&destination.join("runtime-binding.schema.json"))?;
+    check_schema::<CapabilityDescriptor>(&destination.join("capability-descriptor.schema.json"))?;
+    check_schema::<CapabilityCatalog>(&destination.join("capability-catalog.schema.json"))?;
+    check_schema::<CapabilityLock>(&destination.join("capability-lock.schema.json"))?;
+    check_schema::<ResolvedAgent>(&destination.join("resolved-agent.schema.json"))?;
     Ok(())
 }
 

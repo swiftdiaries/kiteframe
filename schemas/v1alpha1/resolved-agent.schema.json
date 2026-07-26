@@ -1,0 +1,388 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResolvedAgent",
+  "type": "object",
+  "properties": {
+    "bindingDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "capabilityRequirements": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ResolvedCapabilityRequirement"
+      }
+    },
+    "compilationReport": {
+      "$ref": "#/$defs/CompilationReport"
+    },
+    "contentCapture": {
+      "$ref": "#/$defs/ResolvedContentCaptureRequirement"
+    },
+    "lockDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$": {
+          "$ref": "#/$defs/ResolvedModelRequirement"
+        }
+      }
+    },
+    "optionalFeatures": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "packageIdentity": {
+      "$ref": "#/$defs/PackageIdentity"
+    },
+    "portableDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "prompts": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\x00-\\x1F\\x7F-\\x9F]).+$": {
+          "$ref": "#/$defs/ValidatedTextAsset"
+        }
+      }
+    },
+    "requiredFeatures": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "resolvedDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "schemaVersion": {
+      "$ref": "#/$defs/IrSchemaVersion"
+    },
+    "skills": {
+      "type": "object",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\x00-\\x1F\\x7F-\\x9F]).+$": {
+          "$ref": "#/$defs/ValidatedTextAsset"
+        }
+      }
+    },
+    "subagents": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ResolvedSubagent"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "packageIdentity",
+    "portableDigest",
+    "lockDigest",
+    "bindingDigest",
+    "resolvedDigest",
+    "prompts",
+    "skills",
+    "models",
+    "capabilityRequirements",
+    "subagents",
+    "requiredFeatures",
+    "optionalFeatures",
+    "contentCapture",
+    "compilationReport"
+  ],
+  "$defs": {
+    "AgentName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "CapabilityIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CapabilityName"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "CompilationDecision": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "subject",
+        "outcome"
+      ]
+    },
+    "CompilationReport": {
+      "type": "object",
+      "properties": {
+        "decisions": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CompilationDecision"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CompilationWarning"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "CompilationWarning": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ]
+    },
+    "DataClassification": {
+      "type": "string",
+      "enum": [
+        "confidential"
+      ]
+    },
+    "DelegationRequirement": {
+      "type": "object",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/PackagePath"
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/CapabilityName"
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "agent"
+      ]
+    },
+    "IrSchemaVersion": {
+      "type": "string",
+      "enum": [
+        "kiteframe.dev/ir/v1alpha1"
+      ]
+    },
+    "LatencyClass": {
+      "type": "string",
+      "enum": [
+        "interactive"
+      ]
+    },
+    "ModelCapability": {
+      "type": "string",
+      "enum": [
+        "text",
+        "tool-calling"
+      ]
+    },
+    "ModelRequirement": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ModelCapability"
+          },
+          "uniqueItems": true
+        },
+        "maxLatencyClass": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LatencyClass"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "minContextTokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "default": null,
+          "maximum": 4294967295,
+          "minimum": 1
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capabilities"
+      ]
+    },
+    "PackageIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/AgentName"
+        },
+        "version": {
+          "$ref": "#/$defs/PackageVersion"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "PackagePath": {
+      "type": "string",
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*//)(?!.*\\\\)(?!.*[\\x00-\\x1F\\x7F-\\x9F]).+$"
+    },
+    "PackageVersion": {
+      "type": "string",
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4]|18446744073709551615)\\.(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4]|18446744073709551615)\\.(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4]|18446744073709551615)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "ResolvedCapabilityRequirement": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "required",
+        "resources"
+      ]
+    },
+    "ResolvedContentCaptureRequirement": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "classifications": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DataClassification"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "allowed"
+      ]
+    },
+    "ResolvedModelRequirement": {
+      "type": "object",
+      "properties": {
+        "requirement": {
+          "$ref": "#/$defs/ModelRequirement"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "requirement",
+        "symbol"
+      ]
+    },
+    "ResolvedSubagent": {
+      "type": "object",
+      "properties": {
+        "delegation": {
+          "$ref": "#/$defs/DelegationRequirement"
+        },
+        "packageIdentity": {
+          "$ref": "#/$defs/PackageIdentity"
+        },
+        "resolvedDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "packageIdentity",
+        "delegation",
+        "resolvedDigest"
+      ]
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ValidatedTextAsset": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/PackagePath"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "text"
+      ]
+    }
+  }
+}
