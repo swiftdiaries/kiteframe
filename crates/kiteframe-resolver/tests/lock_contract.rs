@@ -357,6 +357,7 @@ fn support_lock_fixture_is_the_canonical_atomic_lock_output() {
     let path = directory.path().join("capability.lock");
     let lock = support_lock();
 
+    assert!(!expected.ends_with('\n'));
     write_lock_atomic(&path, &lock).unwrap();
 
     assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);

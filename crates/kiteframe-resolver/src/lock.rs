@@ -252,10 +252,8 @@ fn lock_digest(lock: &CapabilityLock) -> Result<Sha256Digest, Diagnostic> {
 }
 
 fn canonical_json(lock: &CapabilityLock) -> Result<Vec<u8>, Diagnostic> {
-    let mut bytes = serde_json_canonicalizer::to_vec(lock)
-        .map_err(|_| tampered("capability lock cannot be serialized canonically"))?;
-    bytes.push(b'\n');
-    Ok(bytes)
+    serde_json_canonicalizer::to_vec(lock)
+        .map_err(|_| tampered("capability lock cannot be serialized canonically"))
 }
 
 fn sync_parent_directory(parent: &Path) -> Result<(), Diagnostic> {
