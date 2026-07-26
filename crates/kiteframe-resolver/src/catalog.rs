@@ -16,6 +16,10 @@ pub struct ValidatedCatalog {
 }
 
 impl ValidatedCatalog {
+    pub fn identity(&self) -> &kiteframe_contract::CatalogIdentity {
+        self.catalog.identity()
+    }
+
     pub fn catalog_digest(&self) -> &kiteframe_contract::Sha256Digest {
         self.catalog.catalog_digest()
     }

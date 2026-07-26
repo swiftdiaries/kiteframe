@@ -511,11 +511,14 @@ version = "0.1.0"
 dependencies = [
  "jsonschema",
  "kiteframe-contract",
+ "kiteframe-core",
  "proptest",
  "semver",
+ "serde",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
+ "tempfile",
 ]
 
 [[package]]
