@@ -31,4 +31,7 @@ pub struct CapabilityLock {
 pub enum LockSchemaVersion {
     #[serde(rename = "kiteframe.dev/lock/v1alpha1")]
     V1Alpha1,
+    #[serde(rename = "kiteframe.dev/lock/unsupported")]
+    #[schemars(skip)]
+    Unsupported,
 }

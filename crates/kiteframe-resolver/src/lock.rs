@@ -92,13 +92,13 @@ pub fn verify_lock(
     for capability in &lock.capabilities {
         verify_locked_capability(capability, &mut diagnostics);
     }
+    verify_capability_order(&lock.capabilities, &mut diagnostics);
 
     if let Some(catalog) = catalog {
         verify_catalog(lock, catalog, &mut diagnostics);
     }
 
-    diagnostics.sort();
-    diagnostics.dedup();
+    sort_diagnostics(&mut diagnostics);
     if diagnostics.is_empty() {
         Ok(())
     } else {
@@ -138,7 +138,6 @@ fn verify_catalog(
         ));
     }
 
-    let mut descriptor_mismatch = false;
     for locked in &lock.capabilities {
         let Some(current) = catalog
             .validated_descriptors()
@@ -157,14 +156,13 @@ fn verify_catalog(
             || current.stable_error_set_digest() != &locked.stable_error_set_digest
             || current.safety_metadata_digest() != &locked.safety_metadata_digest
         {
-            descriptor_mismatch = true;
             diagnostics.push(tampered(
                 "capability catalog descriptor does not match locked descriptor",
             ));
         }
     }
 
-    if !descriptor_mismatch && catalog.catalog_digest() != &lock.catalog_digest {
+    if catalog.catalog_digest() != &lock.catalog_digest {
         diagnostics.push(stale(
             "capability catalog digest does not match capability lock",
         ));
@@ -187,7 +185,42 @@ fn verify_lock_contents(lock: &CapabilityLock) -> Result<(), Diagnostic> {
     for capability in &lock.capabilities {
         verify_locked_capability(capability, &mut diagnostics);
     }
+    verify_capability_order(&lock.capabilities, &mut diagnostics);
+    sort_diagnostics(&mut diagnostics);
     diagnostics.into_iter().next().map_or(Ok(()), Err)
+}
+
+fn verify_capability_order(capabilities: &[LockedCapability], diagnostics: &mut Vec<Diagnostic>) {
+    for pair in capabilities.windows(2) {
+        match pair[0].identity.cmp(&pair[1].identity) {
+            std::cmp::Ordering::Less => {}
+            std::cmp::Ordering::Equal => {
+                diagnostics.push(tampered("locked capabilities contain duplicate identity"))
+            }
+            std::cmp::Ordering::Greater => {
+                diagnostics.push(tampered("locked capabilities are not sorted by identity"))
+            }
+        }
+    }
+}
+
+fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
+    diagnostics.sort_by(|left, right| {
+        (
+            left.stage,
+            left.package_path.as_deref(),
+            left.source_range,
+            left.code.as_str(),
+            left.message.as_str(),
+        )
+            .cmp(&(
+                right.stage,
+                right.package_path.as_deref(),
+                right.source_range,
+                right.code.as_str(),
+                right.message.as_str(),
+            ))
+    });
 }
 
 fn verify_locked_capability(capability: &LockedCapability, diagnostics: &mut Vec<Diagnostic>) {
@@ -219,8 +252,10 @@ fn lock_digest(lock: &CapabilityLock) -> Result<Sha256Digest, Diagnostic> {
 }
 
 fn canonical_json(lock: &CapabilityLock) -> Result<Vec<u8>, Diagnostic> {
-    serde_json_canonicalizer::to_vec(lock)
-        .map_err(|_| tampered("capability lock cannot be serialized canonically"))
+    let mut bytes = serde_json_canonicalizer::to_vec(lock)
+        .map_err(|_| tampered("capability lock cannot be serialized canonically"))?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn sync_parent_directory(parent: &Path) -> Result<(), Diagnostic> {
