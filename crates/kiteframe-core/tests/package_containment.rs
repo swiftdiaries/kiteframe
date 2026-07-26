@@ -1,0 +1,175 @@
+use std::path::{Path, PathBuf};
+
+use kiteframe_contract::PackagePath;
+use kiteframe_core::{PackageLimits, load_package, load_runtime_binding};
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/packages")
+        .join(name)
+}
+
+#[test]
+fn unreferenced_file_does_not_enter_package() {
+    let package = load_package(fixture("minimal").as_path(), PackageLimits::V1).unwrap();
+
+    assert_eq!(package.prompt_assets.len(), 1);
+    assert!(package.prompt_assets.contains_key("prompts/system.md"));
+    assert!(!package.prompt_assets.contains_key("notes/private.txt"));
+    assert!(package.skill_assets.is_empty());
+}
+
+#[test]
+fn explicitly_selected_runtime_binding_is_loaded_without_scanning_others() {
+    let selected = PackagePath::new("bindings/deepagents.yaml").unwrap();
+    let binding =
+        load_runtime_binding(fixture("minimal").as_path(), &selected, PackageLimits::V1).unwrap();
+
+    assert_eq!(binding.metadata.runtime.as_str(), "deepagents");
+    load_package(fixture("minimal").as_path(), PackageLimits::V1).unwrap();
+}
+
+#[test]
+fn nested_agent_is_loaded_from_its_declared_manifest() {
+    let package = load_package(fixture("nested").as_path(), PackageLimits::V1).unwrap();
+    let child = &package.subagents["agents/escalation/agent.yaml"];
+
+    assert_eq!(child.manifest.metadata.name.as_str(), "escalation");
+    assert!(child.prompt_assets.contains_key("prompts/system.md"));
+}
+
+#[test]
+fn parent_traversal_is_rejected() {
+    let errors =
+        load_package(fixture("hostile/traversal").as_path(), PackageLimits::V1).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+}
+
+#[test]
+fn absolute_path_is_rejected() {
+    let errors =
+        load_package(fixture("hostile/absolute").as_path(), PackageLimits::V1).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+}
+
+#[test]
+fn case_colliding_references_are_rejected() {
+    let errors = load_package(
+        fixture("hostile/case-collision").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+}
+
+#[test]
+fn reference_case_colliding_with_manifest_is_rejected() {
+    let errors = load_package(
+        fixture("hostile/manifest-case-collision").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+}
+
+#[test]
+fn missing_referenced_file_is_rejected() {
+    let errors =
+        load_package(fixture("hostile/missing-file").as_path(), PackageLimits::V1).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+}
+
+#[test]
+fn non_utf8_referenced_asset_is_rejected() {
+    let errors =
+        load_package(fixture("hostile/non-utf8").as_path(), PackageLimits::V1).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+}
+
+#[test]
+fn nested_identity_cycle_is_rejected() {
+    let errors =
+        load_package(fixture("hostile/nested-cycle").as_path(), PackageLimits::V1).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(errors[0].message.as_str().contains("cycle"));
+}
+
+#[test]
+fn duplicate_sibling_identity_is_rejected() {
+    let errors = load_package(
+        fixture("hostile/duplicate-identity").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(errors[0].message.as_str().contains("duplicate"));
+}
+
+#[test]
+fn referenced_asset_over_per_asset_budget_is_rejected() {
+    let mut limits = PackageLimits::V1;
+    limits.max_text_asset_bytes = 4;
+    let errors = load_package(fixture("hostile/byte-budget").as_path(), limits).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(errors[0].message.as_str().contains("text asset byte limit"));
+}
+
+#[test]
+fn total_referenced_bytes_are_bounded() {
+    let root = fixture("hostile/byte-budget");
+    let referenced_bytes = std::fs::read(root.join("agent.yaml")).unwrap().len()
+        + std::fs::read(root.join("prompts/system.md")).unwrap().len();
+    let mut limits = PackageLimits::V1;
+    limits.max_total_referenced_bytes = referenced_bytes - 1;
+    let errors = load_package(root.as_path(), limits).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(
+        errors[0]
+            .message
+            .as_str()
+            .contains("total referenced byte limit")
+    );
+}
+
+#[test]
+fn nesting_beyond_configured_limit_is_rejected() {
+    let mut limits = PackageLimits::V1;
+    limits.max_subagent_depth = 0;
+    let errors = load_package(fixture("nested").as_path(), limits).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(errors[0].message.as_str().contains("nesting"));
+}
+
+#[test]
+fn v1_containment_limits_are_fixed() {
+    assert_eq!(PackageLimits::V1.max_text_asset_bytes, 4 * 1024 * 1024);
+    assert_eq!(
+        PackageLimits::V1.max_total_referenced_bytes,
+        32 * 1024 * 1024
+    );
+    assert_eq!(PackageLimits::V1.max_subagent_depth, 16);
+}
+
+#[test]
+fn referenced_symlink_is_rejected() {
+    #[cfg(unix)]
+    {
+        let errors =
+            load_package(fixture("hostile/symlink").as_path(), PackageLimits::V1).unwrap_err();
+        assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+    }
+
+    #[cfg(not(unix))]
+    eprintln!("symlink fixture is unsupported on this target");
+}

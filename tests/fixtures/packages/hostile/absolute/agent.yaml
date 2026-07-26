@@ -1,0 +1,7 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: absolute, version: 0.1.0 }
+spec:
+  prompt: { system: /etc/passwd }
+  models:
+    primary: { capabilities: [text] }

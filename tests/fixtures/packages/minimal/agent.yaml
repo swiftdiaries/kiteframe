@@ -1,0 +1,7 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: support, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  models:
+    primary: { capabilities: [text, tool-calling] }

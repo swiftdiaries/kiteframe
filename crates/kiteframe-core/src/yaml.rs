@@ -247,6 +247,14 @@ fn package_diagnostic(message: impl Into<String>, source_range: Option<SourceRan
 
 fn typed_yaml_diagnostic(error: &serde_yaml_ng::Error) -> Diagnostic {
     let error_text = error.to_string();
+    if error_text.contains("package path must be") {
+        return Diagnostic::error(
+            DiagnosticCode::PackageContainment,
+            DiagnosticCategory::Package,
+            DiagnosticStage::Parse,
+            "package path is not a normalized contained relative path",
+        );
+    }
     let message = if error_text.contains("unknown field") {
         "unknown field in YAML document"
     } else {

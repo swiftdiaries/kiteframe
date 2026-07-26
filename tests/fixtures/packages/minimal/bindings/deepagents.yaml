@@ -1,0 +1,7 @@
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: deepagents }
+spec:
+  models: { primary: deepagents-primary }
+  capabilityProvider: local-capabilities
+  auditSink: local-audit

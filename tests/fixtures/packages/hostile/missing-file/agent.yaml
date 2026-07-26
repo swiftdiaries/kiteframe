@@ -1,0 +1,7 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: missing-file, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/missing.md }
+  models:
+    primary: { capabilities: [text] }
