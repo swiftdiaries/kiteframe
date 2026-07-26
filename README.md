@@ -2,8 +2,18 @@
 
 Kiteframe is a Rust-first, runtime-neutral declarative agent layer.
 
-The repository is currently in its founding design phase. No runtime
-implementation will begin until the design has completed written review.
+## Wave 1: portable package checking
+
+Wave 1 validates and hashes portable package bytes only. Its Rust crates
+strictly parse the package manifests, load only referenced UTF-8 non-symlink
+assets beneath the package root, and produce deterministic portable digests.
+The checked-in `AgentManifest` and `RuntimeBinding` JSON schemas are generated
+from those Rust contract types and checked for drift in CI.
+
+This boundary does not resolve capabilities, verify capability locks, build
+runtime objects, or authorize actors. Runtime integration, capability
+resolution, lock verification, and actor authorization belong to later
+delivery waves.
 
 ## Design
 
