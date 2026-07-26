@@ -154,6 +154,24 @@ fn resolved_digest_is_independent_of_nested_collection_order() {
     assert_eq!(first.resolved_digest(), second.resolved_digest());
 }
 
+#[test]
+fn resolved_digest_orders_capability_requiredness_for_equal_identity_and_resources() {
+    let report = CompilationReport {
+        warnings: Vec::new(),
+        decisions: Vec::new(),
+    };
+    let mut first_parts = resolved_parts(Vec::new(), Vec::new(), report.clone());
+    first_parts.capability_requirements =
+        vec![capability_requirement(true), capability_requirement(false)];
+    let first = ResolvedAgent::try_new(first_parts).unwrap();
+    let mut second_parts = resolved_parts(Vec::new(), Vec::new(), report);
+    second_parts.capability_requirements =
+        vec![capability_requirement(false), capability_requirement(true)];
+    let second = ResolvedAgent::try_new(second_parts).unwrap();
+
+    assert_eq!(first.resolved_digest(), second.resolved_digest());
+}
+
 fn resolved_parts(
     resources: Vec<&str>,
     subagents: Vec<ResolvedSubagent>,
@@ -182,6 +200,18 @@ fn resolved_parts(
         optional_features: BTreeSet::new(),
         content_capture: ResolvedContentCaptureRequirement::default(),
         compilation_report,
+    }
+}
+
+fn capability_requirement(required: bool) -> ResolvedCapabilityRequirement {
+    ResolvedCapabilityRequirement {
+        identity: CapabilityIdentity::try_new(
+            CapabilityName::new("cases.read").unwrap(),
+            CapabilityReleaseVersion::new("1.0.0").unwrap(),
+        )
+        .unwrap(),
+        required,
+        resources: vec!["team:a".into()],
     }
 }
 

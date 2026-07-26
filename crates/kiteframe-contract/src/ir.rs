@@ -87,6 +87,7 @@ impl ResolvedAgent {
             a.identity
                 .cmp(&b.identity)
                 .then(a.resources.cmp(&b.resources))
+                .then(a.required.cmp(&b.required))
         });
         parts.capability_requirements.dedup();
         parts.subagents.sort_by(|a, b| {
