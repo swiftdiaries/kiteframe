@@ -79,18 +79,32 @@ pub struct ResolvedAgent {
 }
 impl ResolvedAgent {
     pub fn try_new(mut parts: ResolvedAgentParts) -> Result<Self, String> {
-        parts
-            .capability_requirements
-            .sort_by(|a, b| a.identity.cmp(&b.identity));
+        for requirement in &mut parts.capability_requirements {
+            requirement.resources.sort();
+            requirement.resources.dedup();
+        }
+        parts.capability_requirements.sort_by(|a, b| {
+            a.identity
+                .cmp(&b.identity)
+                .then(a.resources.cmp(&b.resources))
+        });
         parts.capability_requirements.dedup();
-        parts
+        parts.subagents.sort_by(|a, b| {
+            a.package_identity
+                .name
+                .cmp(&b.package_identity.name)
+                .then(a.package_identity.version.cmp(&b.package_identity.version))
+        });
+        if parts
             .subagents
-            .sort_by(|a, b| a.package_identity.name.cmp(&b.package_identity.name));
-        parts
-            .subagents
-            .dedup_by(|a, b| a.package_identity == b.package_identity);
+            .windows(2)
+            .any(|pair| pair[0].package_identity == pair[1].package_identity)
+        {
+            return Err("resolved subagent identities must be unique".to_owned());
+        }
         parts.content_capture.classifications.sort();
         parts.content_capture.classifications.dedup();
+        parts.compilation_report = parts.compilation_report.normalized();
         let digest_value = ResolvedWire {
             schema_version: parts.schema_version,
             package_identity: parts.package_identity.clone(),

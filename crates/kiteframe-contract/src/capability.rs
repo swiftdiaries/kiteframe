@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fmt, num::NonZeroU64};
 
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
@@ -57,7 +57,7 @@ impl CapabilityIdentity {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct JsonSchema2020_12(Value);
 impl JsonSchema2020_12 {
@@ -66,6 +66,19 @@ impl JsonSchema2020_12 {
     }
     pub fn as_value(&self) -> &Value {
         &self.0
+    }
+}
+impl JsonSchema for JsonSchema2020_12 {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "JsonSchema2020_12".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::JsonSchema2020_12").into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "object" })
     }
 }
 impl<'de> Deserialize<'de> for JsonSchema2020_12 {
@@ -83,12 +96,21 @@ fn validate_schema(value: &Value) -> Result<(), String> {
             return Err("schema must use JSON Schema 2020-12".to_owned());
         }
     }
+    if !jsonschema::draft202012::meta::is_valid(value) {
+        return Err("schema is not valid Draft 2020-12 JSON Schema".to_owned());
+    }
+
     fn visit(value: &Value) -> Result<(), String> {
         match value {
             Value::Object(map) => {
-                if let Some(Value::String(reference)) = map.get("$ref") {
-                    if !reference.starts_with('#') {
-                        return Err("remote schema reference is forbidden".to_owned());
+                for (keyword, reference) in map {
+                    if matches!(keyword.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef") {
+                        let Value::String(reference) = reference else {
+                            return Err("schema reference must be a string".to_owned());
+                        };
+                        if !reference.starts_with('#') {
+                            return Err("remote schema reference is forbidden".to_owned());
+                        }
                     }
                 }
                 for value in map.values() {
@@ -104,7 +126,12 @@ fn validate_schema(value: &Value) -> Result<(), String> {
         }
         Ok(())
     }
-    visit(value)
+    visit(value).and_then(|()| {
+        jsonschema::draft202012::options()
+            .build(value)
+            .map(|_| ())
+            .map_err(|_| "schema references must resolve from its bundled definitions".to_owned())
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -119,9 +146,9 @@ impl ResourceSelectorSchema {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(transparent)]
-pub struct NonEmptySet<T: Ord>(BTreeSet<T>);
+pub struct NonEmptySet<T: Ord>(#[schemars(length(min = 1))] BTreeSet<T>);
 impl<T: Ord> NonEmptySet<T> {
     pub fn try_new(values: BTreeSet<T>) -> Result<Self, String> {
         if values.is_empty() {
@@ -132,6 +159,14 @@ impl<T: Ord> NonEmptySet<T> {
     }
     pub fn as_set(&self) -> &BTreeSet<T> {
         &self.0
+    }
+}
+impl<'de, T> Deserialize<'de> for NonEmptySet<T>
+where
+    T: Deserialize<'de> + Ord,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_new(BTreeSet::deserialize(deserializer)?).map_err(D::Error::custom)
     }
 }
 

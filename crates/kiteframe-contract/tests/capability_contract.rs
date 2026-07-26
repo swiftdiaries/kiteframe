@@ -1,11 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kiteframe_contract::{
-    ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
+    AgentName, ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityErrorDescriptor, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    ConfirmationRequirement, ConsentRequirement, EffectClassification, ExecutionMode,
-    FreshnessRequirement, IdempotencyRequirement, NonEmptySet, PreconditionDescriptor,
-    ResolvedAgent, ResourceSelectorSchema,
+    CompilationDecision, CompilationReport, CompilationWarning, ConfirmationRequirement,
+    ConsentRequirement, DelegationRequirement, EffectClassification, ExecutionMode, FeatureId,
+    FreshnessRequirement, IdempotencyRequirement, IrSchemaVersion, JsonSchema2020_12, NonEmptySet,
+    PackageIdentity, PackagePath, PackageVersion, PreconditionDescriptor, ResolvedAgent,
+    ResolvedAgentParts, ResolvedCapabilityRequirement, ResolvedContentCaptureRequirement,
+    ResolvedSubagent, ResourceSelectorSchema, Sha256Digest,
 };
 use serde_json::json;
 
@@ -68,4 +71,134 @@ fn resolved_agent_schema_contains_no_credentials_or_runtime_objects() {
     assert!(!schema.contains("credential"));
     assert!(!schema.contains("endpoint"));
     assert!(!schema.contains("runtimeObject"));
+}
+
+#[test]
+fn schemas_reject_remote_dynamic_references_and_invalid_draft_keywords() {
+    for schema in [
+        json!({"$dynamicRef": "https://example.invalid/case.json"}),
+        json!({"type": 42}),
+        json!({"$ref": "#/$defs/missing"}),
+    ] {
+        assert!(JsonSchema2020_12::try_new(schema).is_err());
+    }
+}
+
+#[test]
+fn execution_modes_reject_an_empty_wire_set() {
+    assert!(serde_json::from_value::<NonEmptySet<ExecutionMode>>(json!([])).is_err());
+}
+
+#[test]
+fn feature_major_must_fit_the_public_numeric_accessor() {
+    assert!(FeatureId::new("kiteframe.capability.deferred@18446744073709551616").is_err());
+}
+
+#[test]
+fn resolved_digest_is_independent_of_nested_collection_order() {
+    let first = ResolvedAgent::try_new(resolved_parts(
+        vec!["team:z", "team:a"],
+        vec![subagent("child", "2.0.0"), subagent("child", "1.0.0")],
+        CompilationReport {
+            warnings: vec![
+                CompilationWarning {
+                    code: "W2".into(),
+                    message: "second".into(),
+                },
+                CompilationWarning {
+                    code: "W1".into(),
+                    message: "first".into(),
+                },
+            ],
+            decisions: vec![
+                CompilationDecision {
+                    subject: "models".into(),
+                    outcome: "selected".into(),
+                },
+                CompilationDecision {
+                    subject: "features".into(),
+                    outcome: "enabled".into(),
+                },
+            ],
+        },
+    ))
+    .unwrap();
+    let second = ResolvedAgent::try_new(resolved_parts(
+        vec!["team:a", "team:z"],
+        vec![subagent("child", "1.0.0"), subagent("child", "2.0.0")],
+        CompilationReport {
+            warnings: vec![
+                CompilationWarning {
+                    code: "W1".into(),
+                    message: "first".into(),
+                },
+                CompilationWarning {
+                    code: "W2".into(),
+                    message: "second".into(),
+                },
+            ],
+            decisions: vec![
+                CompilationDecision {
+                    subject: "features".into(),
+                    outcome: "enabled".into(),
+                },
+                CompilationDecision {
+                    subject: "models".into(),
+                    outcome: "selected".into(),
+                },
+            ],
+        },
+    ))
+    .unwrap();
+
+    assert_eq!(first.resolved_digest(), second.resolved_digest());
+}
+
+fn resolved_parts(
+    resources: Vec<&str>,
+    subagents: Vec<ResolvedSubagent>,
+    compilation_report: CompilationReport,
+) -> ResolvedAgentParts {
+    ResolvedAgentParts {
+        schema_version: IrSchemaVersion::V1Alpha1,
+        package_identity: package_identity("parent", "1.0.0"),
+        portable_digest: Sha256Digest::from_bytes([1; Sha256Digest::BYTE_LENGTH]),
+        lock_digest: Sha256Digest::from_bytes([2; Sha256Digest::BYTE_LENGTH]),
+        binding_digest: Sha256Digest::from_bytes([3; Sha256Digest::BYTE_LENGTH]),
+        prompts: BTreeMap::new(),
+        skills: BTreeMap::new(),
+        models: BTreeMap::new(),
+        capability_requirements: vec![ResolvedCapabilityRequirement {
+            identity: CapabilityIdentity::try_new(
+                CapabilityName::new("cases.read").unwrap(),
+                CapabilityReleaseVersion::new("1.0.0").unwrap(),
+            )
+            .unwrap(),
+            required: true,
+            resources: resources.into_iter().map(str::to_owned).collect(),
+        }],
+        subagents,
+        required_features: BTreeSet::new(),
+        optional_features: BTreeSet::new(),
+        content_capture: ResolvedContentCaptureRequirement::default(),
+        compilation_report,
+    }
+}
+
+fn subagent(name: &str, version: &str) -> ResolvedSubagent {
+    ResolvedSubagent {
+        package_identity: package_identity(name, version),
+        delegation: DelegationRequirement {
+            agent: PackagePath::new("agents/child.yaml").unwrap(),
+            capabilities: BTreeSet::new(),
+        },
+        resolved_digest: Sha256Digest::from_bytes([4; Sha256Digest::BYTE_LENGTH]),
+    }
+}
+
+fn package_identity(name: &str, version: &str) -> PackageIdentity {
+    PackageIdentity {
+        name: AgentName::new(name).unwrap(),
+        version: PackageVersion::new(version).unwrap(),
+    }
 }

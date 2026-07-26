@@ -104,11 +104,7 @@
           "$ref": "#/$defs/EffectClassification"
         },
         "executionModes": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/ExecutionMode"
-          },
-          "uniqueItems": true
+          "$ref": "#/$defs/NonEmptySet"
         },
         "freshness": {
           "$ref": "#/$defs/FreshnessRequirement"
@@ -119,15 +115,21 @@
         "identity": {
           "$ref": "#/$defs/CapabilityIdentity"
         },
-        "inputSchema": true,
-        "outputSchema": true,
+        "inputSchema": {
+          "$ref": "#/$defs/JsonSchema2020_12"
+        },
+        "outputSchema": {
+          "$ref": "#/$defs/JsonSchema2020_12"
+        },
         "preconditions": {
           "type": "array",
           "items": {
             "$ref": "#/$defs/PreconditionDescriptor"
           }
         },
-        "resourceSelectorSchema": true,
+        "resourceSelectorSchema": {
+          "$ref": "#/$defs/JsonSchema2020_12"
+        },
         "stableErrors": {
           "type": "array",
           "items": {
@@ -379,6 +381,9 @@
         "actor_capability_resource_operation"
       ]
     },
+    "JsonSchema2020_12": {
+      "type": "object"
+    },
     "LockSchemaVersion": {
       "type": "string",
       "enum": [
@@ -420,6 +425,14 @@
         "stableErrorSetDigest",
         "safetyMetadataDigest"
       ]
+    },
+    "NonEmptySet": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExecutionMode"
+      },
+      "minItems": 1,
+      "uniqueItems": true
     },
     "PreconditionDescriptor": {
       "type": "object",

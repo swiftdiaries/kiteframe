@@ -19,6 +19,9 @@ impl FeatureId {
         {
             return Err("invalid feature identifier".to_owned());
         }
+        if major.parse::<u64>().is_err() {
+            return Err("feature major version exceeds u64".to_owned());
+        }
         Ok(Self(value))
     }
     pub fn as_str(&self) -> &str {
