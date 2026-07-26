@@ -2,18 +2,26 @@
 
 Kiteframe is a Rust-first, runtime-neutral declarative agent layer.
 
-## Wave 1: portable package checking
+## Wave 2: lock, resolve, and compile
 
-Wave 1 validates and hashes portable package bytes only. Its Rust crates
-strictly parse the package manifests, load only referenced UTF-8 non-symlink
-assets beneath the package root, and produce deterministic portable digests.
-The checked-in `AgentManifest` and `RuntimeBinding` JSON schemas are generated
-from those Rust contract types and checked for drift in CI.
+Kiteframe strictly validates portable packages, selects exact capability
+versions into a self-contained lock, and deterministically resolves a package,
+runtime binding, and target component catalog into canonical `ResolvedAgent`
+IR. The checked-in JSON schemas, resolved support-agent IR and digest record,
+and redacted diagnostic corpus are frozen by exact-byte tests and checked for
+drift in CI.
 
-This boundary does not resolve capabilities, verify capability locks, build
-runtime objects, or authorize actors. Runtime integration, capability
-resolution, lock verification, and actor authorization belong to later
-delivery waves.
+### Trust boundary
+
+- `kiteframe lock` is the only command that mutates package state. It validates
+  the complete selection before atomically replacing `capability.lock`.
+- `kiteframe check` and `kiteframe explain` are read-only. `kiteframe compile`
+  emits canonical IR to stdout or an explicit output artifact; it does not
+  rewrite the package, lock, or binding and does not construct runtime objects.
+- Deterministic resolution narrows declared package requirements against an
+  exact lock and explicit runtime metadata. Actor grants are not an input to
+  resolution, and point-of-use authorization remains a runtime enforcement
+  responsibility outside this compiler boundary.
 
 ## Design
 

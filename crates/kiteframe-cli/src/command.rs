@@ -21,7 +21,7 @@ use kiteframe_resolver::{
 use crate::render::{
     CheckResult, ExplainCapability, ExplainChild, ExplainFeatures, ExplainResult, InvalidResult,
     LockResult, feature_names, write_human_diagnostics, write_human_explain, write_human_status,
-    write_json,
+    write_json, write_json_to_path,
 };
 
 const TARGET_DIGEST_DOMAIN: &[u8] = b"runtime-target-catalog";
@@ -79,6 +79,8 @@ struct CompileArgs {
     resolution: ResolutionArgs,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -213,7 +215,10 @@ fn run_explain(args: ExplainArgs) -> ExitCategory {
 
 fn run_compile(args: CompileArgs) -> ExitCategory {
     match resolve_pipeline(&args.resolution) {
-        Ok(output) => render_success(write_json(&output.resolved)),
+        Ok(output) => render_success(match args.output {
+            Some(path) => write_json_to_path(&path, &output.resolved),
+            None => write_json(&output.resolved),
+        }),
         Err(diagnostics) => render_failure(diagnostics, args.json),
     }
 }

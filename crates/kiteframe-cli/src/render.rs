@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::{self, Write},
+    path::Path,
 };
 
 use kiteframe_contract::{
@@ -80,6 +82,12 @@ pub(crate) fn write_json(value: &impl Serialize) -> io::Result<()> {
     let bytes = serde_json_canonicalizer::to_vec(value)
         .map_err(|error| io::Error::other(error.to_string()))?;
     io::stdout().lock().write_all(&bytes)
+}
+
+pub(crate) fn write_json_to_path(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json_canonicalizer::to_vec(value)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    fs::write(path, bytes)
 }
 
 pub(crate) fn write_human_diagnostics(diagnostics: &[Diagnostic]) -> io::Result<()> {

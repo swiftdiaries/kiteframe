@@ -92,6 +92,34 @@ fn compile_emits_canonical_ir_not_runtime_graph() {
 }
 
 #[test]
+fn compile_writes_canonical_ir_to_an_explicit_output_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let output_path = directory.path().join("support-agent.json");
+    let output = command()
+        .args([
+            "compile",
+            &fixture("support-agent"),
+            "--binding",
+            &fixture("support-agent/bindings/deepagents.yaml"),
+            "--target",
+            &workspace_fixture("components/deepagents-test.json"),
+            "--locked",
+            "--json",
+            "--output",
+            output_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert!(output.get_output().stdout.is_empty());
+    assert!(output.get_output().stderr.is_empty());
+    let bytes = fs::read(output_path).unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["schemaVersion"], "kiteframe.dev/ir/v1alpha1");
+    assert_eq!(serde_json_canonicalizer::to_vec(&body).unwrap(), bytes);
+}
+
+#[test]
 fn explain_lists_symbols_without_exposing_package_content() {
     let checked = command()
         .args(["check", &fixture("support-agent"), "--json"])
