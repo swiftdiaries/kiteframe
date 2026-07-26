@@ -88,27 +88,11 @@ fn fixture_diagnostic(code: DiagnosticCode) -> Diagnostic {
 }
 
 fn render_reserved_diagnostic_fixture() -> String {
-    let diagnostics = [
-        DiagnosticCode::PackageInvalid,
-        DiagnosticCode::PackageContainment,
-        DiagnosticCode::LockStale,
-        DiagnosticCode::LockTampered,
-        DiagnosticCode::CatalogIncompatible,
-        DiagnosticCode::FeatureUnsupported,
-        DiagnosticCode::AdmissionDenied,
-        DiagnosticCode::AdmissionExpired,
-        DiagnosticCode::InvocationDenied,
-        DiagnosticCode::PolicyStale,
-        DiagnosticCode::PreconditionMissing,
-        DiagnosticCode::ResultInvalid,
-        DiagnosticCode::OutcomeUnknown,
-        DiagnosticCode::AuditUnavailable,
-        DiagnosticCode::ComponentUnresolved,
-        DiagnosticCode::RuntimeConstruction,
-    ]
-    .into_iter()
-    .map(fixture_diagnostic)
-    .collect::<Vec<_>>();
+    let diagnostics = DiagnosticCode::ALL
+        .iter()
+        .copied()
+        .map(fixture_diagnostic)
+        .collect::<Vec<_>>();
     let mut rendered = serde_json_canonicalizer::to_string(&diagnostics).unwrap();
     rendered.push('\n');
     rendered
@@ -120,6 +104,27 @@ fn all_diagnostic_codes_have_redacted_json_fixtures() {
     let expected = include_str!("fixtures/diagnostics.json");
 
     assert_eq!(actual, expected);
-    assert!(!actual.contains("secret"));
-    assert!(!actual.contains("prompt"));
+    let values: serde_json::Value = serde_json::from_str(&actual).unwrap();
+    for diagnostic in values.as_array().unwrap() {
+        let object = diagnostic.as_object().unwrap();
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "category",
+                "code",
+                "details",
+                "help",
+                "message",
+                "package_path",
+                "retry",
+                "severity",
+                "source_range",
+                "stage",
+            ]
+        );
+        assert_eq!(object["details"], serde_json::json!({}));
+        assert!(object["help"].is_null());
+        assert!(object["package_path"].is_null());
+        assert!(object["source_range"].is_null());
+    }
 }

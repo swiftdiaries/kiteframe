@@ -215,12 +215,73 @@ fn run_explain(args: ExplainArgs) -> ExitCategory {
 
 fn run_compile(args: CompileArgs) -> ExitCategory {
     match resolve_pipeline(&args.resolution) {
-        Ok(output) => render_success(match args.output {
-            Some(path) => write_json_to_path(&path, &output.resolved),
-            None => write_json(&output.resolved),
-        }),
+        Ok(output) => match args.output {
+            Some(path) => {
+                let result =
+                    validated_compile_output_path(&args.resolution, &path).and_then(|path| {
+                        write_json_to_path(&path, &output.resolved)
+                            .map_err(|_| compile_output_diagnostic(false))
+                    });
+                match result {
+                    Ok(()) => ExitCategory::Success,
+                    Err(diagnostic) => render_failure(vec![diagnostic], args.json),
+                }
+            }
+            None => render_success(write_json(&output.resolved)),
+        },
         Err(diagnostics) => render_failure(diagnostics, args.json),
     }
+}
+
+fn validated_compile_output_path(
+    args: &ResolutionArgs,
+    output: &Path,
+) -> Result<PathBuf, Diagnostic> {
+    let output = canonicalize_output_path(output).map_err(|_| compile_output_diagnostic(false))?;
+    let package_root =
+        fs::canonicalize(&args.package).map_err(|_| compile_output_diagnostic(false))?;
+    let protected_inputs = [
+        package_root.join("agent.yaml"),
+        package_root.join("capability.lock"),
+        fs::canonicalize(&args.binding).map_err(|_| compile_output_diagnostic(false))?,
+        fs::canonicalize(&args.target).map_err(|_| compile_output_diagnostic(false))?,
+    ];
+
+    if output.starts_with(&package_root) || protected_inputs.contains(&output) {
+        return Err(compile_output_diagnostic(true));
+    }
+
+    Ok(output)
+}
+
+fn canonicalize_output_path(path: &Path) -> std::io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(file_name) = path.file_name() else {
+                return Err(error);
+            };
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            fs::canonicalize(parent).map(|parent| parent.join(file_name))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn compile_output_diagnostic(overlap: bool) -> Diagnostic {
+    diagnostic(
+        DiagnosticCode::RuntimeConstruction,
+        DiagnosticCategory::Runtime,
+        DiagnosticStage::Runtime,
+        if overlap {
+            "compiled IR output path overlaps protected input"
+        } else {
+            "compiled IR output cannot be written"
+        },
+    )
 }
 
 struct PipelineOutput {

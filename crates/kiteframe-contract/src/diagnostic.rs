@@ -3,66 +3,49 @@ use std::{cmp::Ordering, collections::BTreeMap};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Stable V1 machine-readable diagnostic code.
-#[derive(
-    Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize, JsonSchema,
-)]
-pub enum DiagnosticCode {
-    #[serde(rename = "KF-PKG-001")]
-    PackageInvalid,
-    #[serde(rename = "KF-PKG-002")]
-    PackageContainment,
-    #[serde(rename = "KF-LOCK-001")]
-    LockStale,
-    #[serde(rename = "KF-LOCK-002")]
-    LockTampered,
-    #[serde(rename = "KF-CAT-001")]
-    CatalogIncompatible,
-    #[serde(rename = "KF-FEAT-001")]
-    FeatureUnsupported,
-    #[serde(rename = "KF-AUTH-001")]
-    AdmissionDenied,
-    #[serde(rename = "KF-AUTH-002")]
-    AdmissionExpired,
-    #[serde(rename = "KF-AUTH-003")]
-    InvocationDenied,
-    #[serde(rename = "KF-AUTH-004")]
-    PolicyStale,
-    #[serde(rename = "KF-CAP-001")]
-    PreconditionMissing,
-    #[serde(rename = "KF-CAP-002")]
-    ResultInvalid,
-    #[serde(rename = "KF-CAP-003")]
-    OutcomeUnknown,
-    #[serde(rename = "KF-AUDIT-001")]
-    AuditUnavailable,
-    #[serde(rename = "KF-RUNTIME-001")]
-    ComponentUnresolved,
-    #[serde(rename = "KF-RUNTIME-002")]
-    RuntimeConstruction,
+macro_rules! define_diagnostic_codes {
+    ($($variant:ident => $wire:literal),+ $(,)?) => {
+        /// Stable V1 machine-readable diagnostic code.
+        #[derive(
+            Clone, Copy, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Serialize, JsonSchema,
+        )]
+        pub enum DiagnosticCode {
+            $(
+                #[serde(rename = $wire)]
+                $variant,
+            )+
+        }
+
+        impl DiagnosticCode {
+            /// Complete stable V1 diagnostic-code inventory.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $wire,)+
+                }
+            }
+        }
+    };
 }
 
-impl DiagnosticCode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::PackageInvalid => "KF-PKG-001",
-            Self::PackageContainment => "KF-PKG-002",
-            Self::LockStale => "KF-LOCK-001",
-            Self::LockTampered => "KF-LOCK-002",
-            Self::CatalogIncompatible => "KF-CAT-001",
-            Self::FeatureUnsupported => "KF-FEAT-001",
-            Self::AdmissionDenied => "KF-AUTH-001",
-            Self::AdmissionExpired => "KF-AUTH-002",
-            Self::InvocationDenied => "KF-AUTH-003",
-            Self::PolicyStale => "KF-AUTH-004",
-            Self::PreconditionMissing => "KF-CAP-001",
-            Self::ResultInvalid => "KF-CAP-002",
-            Self::OutcomeUnknown => "KF-CAP-003",
-            Self::AuditUnavailable => "KF-AUDIT-001",
-            Self::ComponentUnresolved => "KF-RUNTIME-001",
-            Self::RuntimeConstruction => "KF-RUNTIME-002",
-        }
-    }
+define_diagnostic_codes! {
+    PackageInvalid => "KF-PKG-001",
+    PackageContainment => "KF-PKG-002",
+    LockStale => "KF-LOCK-001",
+    LockTampered => "KF-LOCK-002",
+    CatalogIncompatible => "KF-CAT-001",
+    FeatureUnsupported => "KF-FEAT-001",
+    AdmissionDenied => "KF-AUTH-001",
+    AdmissionExpired => "KF-AUTH-002",
+    InvocationDenied => "KF-AUTH-003",
+    PolicyStale => "KF-AUTH-004",
+    PreconditionMissing => "KF-CAP-001",
+    ResultInvalid => "KF-CAP-002",
+    OutcomeUnknown => "KF-CAP-003",
+    AuditUnavailable => "KF-AUDIT-001",
+    ComponentUnresolved => "KF-RUNTIME-001",
+    RuntimeConstruction => "KF-RUNTIME-002",
 }
 
 #[derive(

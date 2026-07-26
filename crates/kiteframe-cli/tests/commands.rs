@@ -4,7 +4,7 @@ use std::{
 };
 
 use assert_cmd::{Command, cargo::cargo_bin_cmd};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn command() -> Command {
     cargo_bin_cmd!("kiteframe")
@@ -114,9 +114,175 @@ fn compile_writes_canonical_ir_to_an_explicit_output_path() {
     assert!(output.get_output().stdout.is_empty());
     assert!(output.get_output().stderr.is_empty());
     let bytes = fs::read(output_path).unwrap();
+    assert_eq!(
+        bytes,
+        include_bytes!("../../../tests/fixtures/resolved/support-agent.json")
+    );
     let body: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["schemaVersion"], "kiteframe.dev/ir/v1alpha1");
-    assert_eq!(serde_json_canonicalizer::to_vec(&body).unwrap(), bytes);
+    let digests = serde_json_canonicalizer::to_vec(&json!({
+        "bindingDigest": body["bindingDigest"],
+        "lockDigest": body["lockDigest"],
+        "portableDigest": body["portableDigest"],
+        "resolvedDigest": body["resolvedDigest"],
+    }))
+    .unwrap();
+    assert_eq!(
+        digests,
+        include_bytes!("../../../tests/fixtures/resolved/support-agent.digests.json")
+    );
+}
+
+fn assert_compile_output_rejected(package: &Path, target: &Path, output: &Path) {
+    let result = command()
+        .args([
+            "compile",
+            package.to_str().unwrap(),
+            "--binding",
+            package.join("bindings/deepagents.yaml").to_str().unwrap(),
+            "--target",
+            target.to_str().unwrap(),
+            "--locked",
+            "--json",
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert!(result.get_output().stderr.is_empty());
+    let body = parse_single_json(&result.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["code"], "KF-RUNTIME-002");
+    assert_eq!(
+        body["diagnostics"][0]["message"],
+        "compiled IR output path overlaps protected input"
+    );
+}
+
+#[test]
+fn compile_rejects_outputs_inside_the_package_and_preserves_consumed_inputs() {
+    for protected_relative in ["agent.yaml", "capability.lock", "bindings/deepagents.yaml"] {
+        let (_directory, package) = copy_package("support-agent");
+        let protected = package.join(protected_relative);
+        let before = fs::read(&protected).unwrap();
+
+        assert_compile_output_rejected(
+            &package,
+            Path::new(&workspace_fixture("components/deepagents-test.json")),
+            &protected,
+        );
+
+        assert_eq!(fs::read(protected).unwrap(), before);
+    }
+
+    let (_directory, package) = copy_package("support-agent");
+    let new_package_artifact = package.join("resolved.json");
+    assert_compile_output_rejected(
+        &package,
+        Path::new(&workspace_fixture("components/deepagents-test.json")),
+        &new_package_artifact,
+    );
+    assert!(!new_package_artifact.exists());
+}
+
+#[test]
+fn compile_rejects_an_output_that_overlaps_the_target_input() {
+    let (directory, package) = copy_package("support-agent");
+    let target = directory.path().join("target.json");
+    fs::copy(
+        workspace_fixture("components/deepagents-test.json"),
+        &target,
+    )
+    .unwrap();
+    let before = fs::read(&target).unwrap();
+
+    assert_compile_output_rejected(&package, &target, &target);
+
+    assert_eq!(fs::read(target).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn compile_rejects_symlink_aliases_to_package_and_target_inputs() {
+    use std::os::unix::fs::symlink;
+
+    let (directory, package) = copy_package("support-agent");
+    let target = directory.path().join("target.json");
+    fs::copy(
+        workspace_fixture("components/deepagents-test.json"),
+        &target,
+    )
+    .unwrap();
+    let package_alias = directory.path().join("package-alias");
+    symlink(&package, &package_alias).unwrap();
+    let package_alias_output = package_alias.join("resolved.json");
+    assert_compile_output_rejected(&package, &target, &package_alias_output);
+    assert!(!package.join("resolved.json").exists());
+
+    let target_alias = directory.path().join("target-alias.json");
+    symlink(&target, &target_alias).unwrap();
+    let before = fs::read(&target).unwrap();
+    assert_compile_output_rejected(&package, &target, &target_alias);
+    assert_eq!(fs::read(target).unwrap(), before);
+}
+
+#[test]
+fn compile_output_write_failures_are_redacted_structured_diagnostics() {
+    let directory = tempfile::tempdir().unwrap();
+    let sentinels = [
+        "credential-LEAK",
+        "token-LEAK",
+        "argument-LEAK",
+        "result-LEAK",
+    ];
+    let sensitive = sentinels.join("_");
+    let output_path = directory.path().join("missing").join(sensitive);
+    let base_args = [
+        "compile",
+        &fixture("support-agent"),
+        "--binding",
+        &fixture("support-agent/bindings/deepagents.yaml"),
+        "--target",
+        &workspace_fixture("components/deepagents-test.json"),
+        "--locked",
+        "--output",
+        output_path.to_str().unwrap(),
+    ];
+
+    let json_output = command()
+        .args(base_args)
+        .arg("--json")
+        .assert()
+        .failure()
+        .code(5);
+    assert!(json_output.get_output().stderr.is_empty());
+    let body = parse_single_json(&json_output.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["code"], "KF-RUNTIME-002");
+    assert_eq!(
+        body["diagnostics"][0]["message"],
+        "compiled IR output cannot be written"
+    );
+    let json = String::from_utf8_lossy(&json_output.get_output().stdout);
+    for sentinel in sentinels {
+        assert!(
+            !json.contains(sentinel),
+            "JSON diagnostic leaked {sentinel}"
+        );
+    }
+
+    let human_output = command().args(base_args).assert().failure().code(5);
+    assert!(human_output.get_output().stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&human_output.get_output().stderr);
+    assert_eq!(
+        stderr,
+        "KF-RUNTIME-002 Error: compiled IR output cannot be written\n"
+    );
+    for sentinel in sentinels {
+        assert!(
+            !stderr.contains(sentinel),
+            "human diagnostic leaked {sentinel}"
+        );
+    }
 }
 
 #[test]
