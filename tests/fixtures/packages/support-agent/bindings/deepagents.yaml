@@ -1,0 +1,7 @@
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: deepagents }
+spec:
+  models: { primary: models.anthropic.sonnet }
+  capabilityProvider: capability-providers.primary
+  auditSink: audit-sinks.ledger

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/kiteframe-cli",
     "crates/kiteframe-contract",
     "crates/kiteframe-core",
     "crates/kiteframe-resolver",
@@ -14,6 +15,7 @@ license = "Apache-2.0"
 repository = "https://github.com/swiftdiaries/kiteframe"
 
 [workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
 jsonschema = { version = "0.40", default-features = false }
 schemars = "1"
 semver = "1"

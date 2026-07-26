@@ -1,0 +1,321 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+
+use assert_cmd::{Command, cargo::cargo_bin_cmd};
+use serde_json::Value;
+
+fn command() -> Command {
+    cargo_bin_cmd!("kiteframe")
+}
+
+fn fixture(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/packages")
+        .join(name)
+        .display()
+        .to_string()
+}
+
+fn workspace_fixture(name: &str) -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures")
+        .join(name)
+        .display()
+        .to_string()
+}
+
+fn parse_single_json(stdout: &[u8]) -> Value {
+    let mut stream = serde_json::Deserializer::from_slice(stdout).into_iter::<Value>();
+    let value = stream.next().expect("one JSON value").expect("valid JSON");
+    assert!(
+        stream.next().is_none(),
+        "stdout contained more than one JSON value"
+    );
+    value
+}
+
+fn copy_package(source: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("package");
+    fs::create_dir_all(destination.join("bindings")).unwrap();
+    fs::create_dir_all(destination.join("prompts")).unwrap();
+    for relative in [
+        "agent.yaml",
+        "capability.lock",
+        "bindings/deepagents.yaml",
+        "prompts/system.md",
+    ] {
+        fs::copy(
+            Path::new(&fixture(source)).join(relative),
+            destination.join(relative),
+        )
+        .unwrap();
+    }
+    (directory, destination)
+}
+
+#[test]
+fn check_locked_does_not_require_catalog_access() {
+    let output = command()
+        .args(["check", &fixture("support-agent"), "--locked", "--json"])
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .assert()
+        .success();
+
+    assert!(output.get_output().stderr.is_empty());
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["status"], "valid");
+}
+
+#[test]
+fn compile_emits_canonical_ir_not_runtime_graph() {
+    let output = command()
+        .args([
+            "compile",
+            &fixture("support-agent"),
+            "--binding",
+            &fixture("support-agent/bindings/deepagents.yaml"),
+            "--target",
+            &workspace_fixture("components/deepagents-test.json"),
+            "--locked",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    assert!(output.get_output().stderr.is_empty());
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["schemaVersion"], "kiteframe.dev/ir/v1alpha1");
+    assert!(body.get("compiledGraph").is_none());
+}
+
+#[test]
+fn explain_lists_symbols_without_exposing_package_content() {
+    let checked = command()
+        .args(["check", &fixture("support-agent"), "--json"])
+        .assert()
+        .success();
+    let checked_body = parse_single_json(&checked.get_output().stdout);
+
+    let output = command()
+        .args([
+            "explain",
+            &fixture("support-agent"),
+            "--binding",
+            &fixture("support-agent/bindings/deepagents.yaml"),
+            "--target",
+            &workspace_fixture("components/deepagents-test.json"),
+            "--locked",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let body = parse_single_json(stdout.as_bytes());
+    assert_eq!(body["status"], "resolved");
+    assert_eq!(body["portableDigest"], checked_body["portableDigest"]);
+    assert_eq!(
+        body["models"]["primary"],
+        Value::String("models.anthropic.sonnet".to_owned())
+    );
+    assert_eq!(
+        body["capabilities"][0]["identity"]["version"],
+        Value::String("1.2.0".to_owned())
+    );
+    assert!(!stdout.contains("Help support agents read cases safely."));
+    assert!(!stdout.contains("\"prompts\""));
+    assert!(!stdout.contains("\"skills\""));
+}
+
+#[test]
+fn lock_is_the_command_that_writes_the_default_lock_path() {
+    let (_directory, package) = copy_package("support-agent");
+    fs::remove_file(package.join("capability.lock")).unwrap();
+
+    let output = command()
+        .args([
+            "lock",
+            package.to_str().unwrap(),
+            "--catalog",
+            &workspace_fixture("catalogs/support-v1.json"),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["status"], "locked");
+    assert!(package.join("capability.lock").is_file());
+}
+
+#[test]
+fn non_mutating_commands_leave_the_package_unchanged() {
+    let (_directory, package) = copy_package("support-agent");
+    let lock_path = package.join("capability.lock");
+    let before = fs::read(&lock_path).unwrap();
+
+    for subcommand in ["check", "explain", "compile"] {
+        let mut invocation = command();
+        invocation.arg(subcommand).arg(&package);
+        if subcommand != "check" {
+            invocation
+                .arg("--binding")
+                .arg(package.join("bindings/deepagents.yaml"))
+                .arg("--target")
+                .arg(workspace_fixture("components/deepagents-test.json"));
+        }
+        invocation.args(["--locked", "--json"]).assert().success();
+        assert_eq!(fs::read(&lock_path).unwrap(), before);
+    }
+}
+
+#[test]
+fn invalid_packages_use_the_stable_package_exit_category() {
+    let output = command()
+        .args(["check", &fixture("hostile/missing-file"), "--json"])
+        .assert()
+        .code(2);
+
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["status"], "invalid");
+    assert_eq!(body["diagnostics"][0]["category"], "package");
+}
+
+#[test]
+fn json_mode_keeps_argument_errors_structured_and_prose_free() {
+    let output = command()
+        .args([
+            "compile",
+            &fixture("support-agent"),
+            "--binding",
+            &fixture("support-agent/bindings/deepagents.yaml"),
+            "--target",
+            &workspace_fixture("components/deepagents-test.json"),
+            "--json",
+        ])
+        .assert()
+        .code(2);
+
+    assert!(output.get_output().stderr.is_empty());
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["status"], "invalid");
+    assert_eq!(body["diagnostics"][0]["code"], "KF-PKG-001");
+}
+
+#[test]
+fn stale_locks_use_the_stable_lock_or_catalog_exit_category() {
+    let (_directory, package) = copy_package("support-agent");
+    fs::write(package.join("prompts/system.md"), "changed").unwrap();
+
+    let output = command()
+        .args(["check", package.to_str().unwrap(), "--locked", "--json"])
+        .assert()
+        .code(3);
+
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["category"], "lock");
+}
+
+#[test]
+fn unsupported_features_use_the_stable_resolution_exit_category() {
+    let (_directory, package) = copy_package("support-agent");
+    fs::write(
+        package.join("agent.yaml"),
+        r#"apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: support-agent, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  models:
+    primary: { capabilities: [text, tool-calling] }
+  capabilities:
+    - { name: cases.read, version: "^1.0", required: true }
+  features:
+    required: [kiteframe.capability.point-of-use-auth@1]
+"#,
+    )
+    .unwrap();
+    command()
+        .args([
+            "lock",
+            package.to_str().unwrap(),
+            "--catalog",
+            &workspace_fixture("catalogs/support-v1.json"),
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let output = command()
+        .args([
+            "compile",
+            package.to_str().unwrap(),
+            "--binding",
+            package.join("bindings/deepagents.yaml").to_str().unwrap(),
+            "--target",
+            &workspace_fixture("components/deepagents-test.json"),
+            "--locked",
+            "--json",
+        ])
+        .assert()
+        .code(4);
+
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["category"], "feature");
+}
+
+#[test]
+fn runtime_target_failures_use_the_stable_runtime_exit_category() {
+    let (_directory, package) = copy_package("support-agent");
+    let target_path = package.join("wrong-target.json");
+    fs::write(
+        &target_path,
+        r#"{"target":"other-runtime","components":{}}"#,
+    )
+    .unwrap();
+
+    let output = command()
+        .args([
+            "compile",
+            package.to_str().unwrap(),
+            "--binding",
+            package.join("bindings/deepagents.yaml").to_str().unwrap(),
+            "--target",
+            target_path.to_str().unwrap(),
+            "--locked",
+            "--json",
+        ])
+        .assert()
+        .code(5);
+
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["category"], "runtime");
+}
+
+#[test]
+fn target_adapter_rejects_missing_explicit_target_metadata() {
+    let (_directory, package) = copy_package("support-agent");
+    let target_path = package.join("missing-target.json");
+    fs::write(&target_path, r#"{"components":{}}"#).unwrap();
+
+    let output = command()
+        .args([
+            "compile",
+            package.to_str().unwrap(),
+            "--binding",
+            package.join("bindings/deepagents.yaml").to_str().unwrap(),
+            "--target",
+            target_path.to_str().unwrap(),
+            "--locked",
+            "--json",
+        ])
+        .assert()
+        .code(5);
+
+    let body = parse_single_json(&output.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["code"], "KF-RUNTIME-001");
+    assert_eq!(body["diagnostics"][0]["category"], "runtime");
+}
