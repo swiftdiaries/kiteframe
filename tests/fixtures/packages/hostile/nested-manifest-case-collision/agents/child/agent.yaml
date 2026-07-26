@@ -1,0 +1,8 @@
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: collision-child, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  skills: [Agent.yaml]
+  models:
+    primary: { capabilities: [text] }

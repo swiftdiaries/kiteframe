@@ -39,6 +39,29 @@ fn nested_agent_is_loaded_from_its_declared_manifest() {
 }
 
 #[test]
+fn nested_manifest_must_be_named_agent_yaml() {
+    let errors = load_package(
+        fixture("hostile/nested-non-agent-manifest").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(errors[0].message.as_str().contains("nested agent manifest"));
+}
+
+#[test]
+fn nested_reference_case_colliding_with_implicit_manifest_is_rejected() {
+    let errors = load_package(
+        fixture("hostile/nested-manifest-case-collision").as_path(),
+        PackageLimits::V1,
+    )
+    .unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-002");
+}
+
+#[test]
 fn parent_traversal_is_rejected() {
     let errors =
         load_package(fixture("hostile/traversal").as_path(), PackageLimits::V1).unwrap_err();
@@ -130,6 +153,34 @@ fn total_referenced_bytes_are_bounded() {
         + std::fs::read(root.join("prompts/system.md")).unwrap().len();
     let mut limits = PackageLimits::V1;
     limits.max_total_referenced_bytes = referenced_bytes - 1;
+    let errors = load_package(root.as_path(), limits).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+    assert!(
+        errors[0]
+            .message
+            .as_str()
+            .contains("total referenced byte limit")
+    );
+}
+
+#[test]
+fn total_referenced_byte_budget_is_shared_with_nested_packages() {
+    let root = fixture("hostile/nested-byte-budget");
+    let child_root = root.join("agents/child");
+    let root_bytes = std::fs::read(root.join("agent.yaml")).unwrap().len()
+        + std::fs::read(root.join("prompts/system.md")).unwrap().len();
+    let child_bytes = std::fs::read(child_root.join("agent.yaml")).unwrap().len()
+        + std::fs::read(child_root.join("prompts/system.md"))
+            .unwrap()
+            .len();
+    let combined_boundary = root_bytes + child_bytes - 1;
+    assert!(root_bytes <= combined_boundary);
+    assert!(child_bytes <= combined_boundary);
+
+    let mut limits = PackageLimits::V1;
+    limits.max_total_referenced_bytes = combined_boundary;
+    load_package(child_root.as_path(), limits).expect("child inputs fit independently");
     let errors = load_package(root.as_path(), limits).unwrap_err();
 
     assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
