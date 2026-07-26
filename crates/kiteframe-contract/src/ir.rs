@@ -170,6 +170,9 @@ impl ResolvedAgent {
     pub fn binding_digest(&self) -> &Sha256Digest {
         &self.binding_digest
     }
+    pub fn lock_digest(&self) -> &Sha256Digest {
+        &self.lock_digest
+    }
 }
 
 fn resolved_digest(parts: &ResolvedAgentParts) -> Result<Sha256Digest, String> {
