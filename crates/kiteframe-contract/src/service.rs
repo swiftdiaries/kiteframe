@@ -266,7 +266,7 @@ impl DelegationAncestry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -705,7 +705,7 @@ fn canonical_digest<T: Serialize>(domain: &[u8], value: &T) -> Result<Sha256Dige
     Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvocationRequest {
     invocation_id: InvocationId,
@@ -858,6 +858,28 @@ impl Suspension {
     }
 }
 
+/// A diagnostic that proves an unknown result must be reconciled through status first.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct StatusFirstDiagnostic(Diagnostic);
+
+impl StatusFirstDiagnostic {
+    pub fn try_new(diagnostic: Diagnostic) -> Result<Self, String> {
+        validate_status_first(&diagnostic)?;
+        Ok(Self(diagnostic))
+    }
+
+    pub fn diagnostic(&self) -> &Diagnostic {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusFirstDiagnostic {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_new(Diagnostic::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
 pub enum InvocationOutcome {
@@ -882,7 +904,7 @@ pub enum InvocationOutcome {
     },
     OutcomeUnknown {
         invocation_id: InvocationId,
-        diagnostic: Diagnostic,
+        diagnostic: StatusFirstDiagnostic,
     },
 }
 
@@ -891,18 +913,16 @@ impl InvocationOutcome {
         invocation_id: InvocationId,
         diagnostic: Diagnostic,
     ) -> Result<Self, String> {
-        validate_status_first(&diagnostic)?;
         Ok(Self::OutcomeUnknown {
             invocation_id,
-            diagnostic,
+            diagnostic: StatusFirstDiagnostic::try_new(diagnostic)?,
         })
     }
 
     pub fn diagnostic(&self) -> Option<&Diagnostic> {
         match self {
-            Self::Denied { diagnostic, .. } | Self::OutcomeUnknown { diagnostic, .. } => {
-                Some(diagnostic)
-            }
+            Self::Denied { diagnostic, .. } => Some(diagnostic),
+            Self::OutcomeUnknown { diagnostic, .. } => Some(diagnostic.diagnostic()),
             _ => None,
         }
     }
@@ -999,7 +1019,7 @@ pub enum InvocationStatus {
     },
     OutcomeUnknown {
         invocation_id: InvocationId,
-        diagnostic: Diagnostic,
+        diagnostic: StatusFirstDiagnostic,
     },
 }
 
@@ -1008,10 +1028,9 @@ impl InvocationStatus {
         invocation_id: InvocationId,
         diagnostic: Diagnostic,
     ) -> Result<Self, String> {
-        validate_status_first(&diagnostic)?;
         Ok(Self::OutcomeUnknown {
             invocation_id,
-            diagnostic,
+            diagnostic: StatusFirstDiagnostic::try_new(diagnostic)?,
         })
     }
 }

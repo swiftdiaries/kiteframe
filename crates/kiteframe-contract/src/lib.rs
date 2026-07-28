@@ -62,6 +62,6 @@ pub use service::{
     CapabilityGrant, CapabilityGrantParts, CapabilityGrantSet, CapabilityGrantSetParts,
     CatalogRequest, DelegationAncestry, EvidenceReferences, IdempotencyKey, InvocationId,
     InvocationOutcome, InvocationRequest, InvocationStatus, NormalizedResourceSelector,
-    PolicyRevision, RequestedCapability, SessionRef, StableCapabilityError, Suspension, TaskRef,
-    Timestamp, TraceContext,
+    PolicyRevision, RequestedCapability, SessionRef, StableCapabilityError, StatusFirstDiagnostic,
+    Suspension, TaskRef, Timestamp, TraceContext,
 };

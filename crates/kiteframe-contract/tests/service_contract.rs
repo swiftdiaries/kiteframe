@@ -4,12 +4,12 @@ use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
     CapabilityDescriptor, CapabilityDescriptorParts, CapabilityGrant, CapabilityGrantParts,
     CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, CapabilityName,
-    CapabilityReleaseVersion, ConfirmationRequirement, ConsentRequirement, DelegationAncestry,
-    Diagnostic, EffectClassification, EvidenceReferences, EvidenceRequirement, ExecutionMode,
-    IdempotencyRequirement, IdempotencyScope, InvocationId, InvocationOutcome, InvocationRequest,
-    InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
+    CapabilityReleaseVersion, CatalogRequest, ConfirmationRequirement, ConsentRequirement,
+    DelegationAncestry, Diagnostic, EffectClassification, EvidenceReferences, EvidenceRequirement,
+    ExecutionMode, IdempotencyRequirement, IdempotencyScope, InvocationId, InvocationOutcome,
+    InvocationRequest, InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
     PreconditionDescriptor, RequestedCapability, ResourceSelectorSchema, RetryClass, SessionRef,
-    Sha256Digest, TaskRef, Timestamp, TraceContext,
+    Sha256Digest, StatusFirstDiagnostic, TaskRef, Timestamp, TraceContext,
 };
 use serde_json::json;
 
@@ -36,11 +36,41 @@ fn effectful_invocation_requires_an_idempotency_key() {
 
 #[test]
 fn outcome_unknown_requires_status_first_retry() {
-    let outcome = InvocationOutcome::OutcomeUnknown {
-        invocation_id: InvocationId::new("inv-1").unwrap(),
-        diagnostic: Diagnostic::outcome_unknown("status is required"),
-    };
+    let outcome = InvocationOutcome::outcome_unknown(
+        InvocationId::new("inv-1").unwrap(),
+        Diagnostic::outcome_unknown("status is required"),
+    )
+    .unwrap();
     assert_eq!(outcome.diagnostic().unwrap().retry, RetryClass::StatusFirst);
+}
+
+#[test]
+fn status_first_diagnostic_rejects_a_non_status_first_retry() {
+    let diagnostic = Diagnostic::error(
+        kiteframe_contract::DiagnosticCode::OutcomeUnknown,
+        kiteframe_contract::DiagnosticCategory::Capability,
+        kiteframe_contract::DiagnosticStage::Invoke,
+        "status is required",
+    );
+    assert!(StatusFirstDiagnostic::try_new(diagnostic).is_err());
+}
+
+#[test]
+fn catalog_request_deserialization_uses_validated_trace_context() {
+    let request = CatalogRequest::new(
+        Some(digest(9)),
+        TraceContext::try_new(valid_traceparent(), None, BTreeMap::new()).unwrap(),
+    );
+    let decoded =
+        serde_json::from_value::<CatalogRequest>(serde_json::to_value(request).unwrap()).unwrap();
+    assert_eq!(decoded.known_catalog_digest(), Some(&digest(9)));
+}
+
+#[test]
+fn invocation_request_deserialization_rejects_raw_evidence_payloads() {
+    let mut wire = serde_json::to_value(invocation_request(Some("idem-1"))).unwrap();
+    wire["evidenceRefs"] = json!({"approval": {"signedBy": "alice"}});
+    assert!(serde_json::from_value::<InvocationRequest>(wire).is_err());
 }
 
 #[test]

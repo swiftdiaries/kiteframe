@@ -105,7 +105,7 @@
       "type": "object",
       "properties": {
         "diagnostic": {
-          "$ref": "#/$defs/Diagnostic"
+          "$ref": "#/$defs/StatusFirstDiagnostic"
         },
         "invocation_id": {
           "type": "string"
@@ -302,6 +302,10 @@
         "retry",
         "message"
       ]
+    },
+    "StatusFirstDiagnostic": {
+      "description": "A diagnostic that proves an unknown result must be reconciled through status first.",
+      "$ref": "#/$defs/Diagnostic"
     },
     "Suspension": {
       "type": "object",
