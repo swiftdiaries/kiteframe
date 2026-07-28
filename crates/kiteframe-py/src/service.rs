@@ -1,9 +1,12 @@
 use std::sync::{Arc, LazyLock};
 
 use kiteframe_contract::{
+    AdmissionRequest as ContractAdmissionRequest, CapabilityCatalog as ContractCapabilityCatalog,
     CapabilityGrant as ContractCapabilityGrant, CapabilityGrantSet as ContractCapabilityGrantSet,
-    Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage,
-    InvocationOutcome as ContractInvocationOutcome, InvocationStatus as ContractInvocationStatus,
+    CatalogRequest as ContractCatalogRequest, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticStage, InvocationOutcome as ContractInvocationOutcome,
+    InvocationRequest as ContractInvocationRequest, InvocationStatus as ContractInvocationStatus,
+    TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::{prelude::*, types::PyTuple};
@@ -11,6 +14,26 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 
 use crate::error::diagnostic_error;
 
+static CATALOG_REQUEST_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/catalog-request.schema.json"
+    ))
+});
+static ADMISSION_REQUEST_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/admission-request.schema.json"
+    ))
+});
+static INVOCATION_REQUEST_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/invocation-request.schema.json"
+    ))
+});
+static CAPABILITY_CATALOG_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/capability-catalog.schema.json"
+    ))
+});
 static CAPABILITY_GRANT_SET_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     locked_response_validator(include_bytes!(
         "../../../schemas/v1alpha1/capability-grant-set.schema.json"
@@ -26,6 +49,276 @@ static INVOCATION_STATUS_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new
         "../../../schemas/v1alpha1/invocation-status.schema.json"
     ))
 });
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "CatalogRequest"
+)]
+pub struct PyCatalogRequest {
+    inner: Arc<ContractCatalogRequest>,
+}
+
+impl From<ContractCatalogRequest> for PyCatalogRequest {
+    fn from(inner: ContractCatalogRequest) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCatalogRequest {
+    #[staticmethod]
+    #[pyo3(name = "default")]
+    pub fn py_default(py: Python<'_>) -> PyResult<Self> {
+        let secrets = py.import("secrets")?;
+        let trace_id: String = secrets.call_method1("token_hex", (16,))?.extract()?;
+        let parent_id: String = secrets.call_method1("token_hex", (8,))?.extract()?;
+        let traceparent = format!("00-{trace_id}-{parent_id}-01");
+        let trace_context = TraceContext::try_new(traceparent, None, Default::default())
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+        Ok(ContractCatalogRequest::new(None, trace_context).into())
+    }
+
+    #[getter]
+    pub fn known_catalog_digest(&self) -> Option<String> {
+        self.inner.known_catalog_digest().map(ToString::to_string)
+    }
+
+    #[getter]
+    pub fn traceparent(&self) -> &str {
+        self.inner.trace_context().traceparent()
+    }
+
+    #[getter]
+    pub fn tracestate(&self) -> Option<&str> {
+        self.inner.trace_context().tracestate()
+    }
+
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "AdmissionRequest"
+)]
+pub struct PyAdmissionRequest {
+    inner: Arc<ContractAdmissionRequest>,
+}
+
+impl From<ContractAdmissionRequest> for PyAdmissionRequest {
+    fn from(inner: ContractAdmissionRequest) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAdmissionRequest {
+    #[getter]
+    pub fn traceparent(&self) -> &str {
+        self.inner.trace_context().traceparent()
+    }
+
+    #[getter]
+    pub fn tracestate(&self) -> Option<&str> {
+        self.inner.trace_context().tracestate()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn required_capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        capability_identities(py, self.inner.required_capabilities())
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn optional_capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        capability_identities(py, self.inner.optional_capabilities())
+    }
+
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
+    }
+}
+
+fn capability_identities<'py>(
+    py: Python<'py>,
+    capabilities: &[kiteframe_contract::RequestedCapability],
+) -> PyResult<Bound<'py, PyTuple>> {
+    let identities = capabilities
+        .iter()
+        .map(|request| {
+            PyTuple::new(
+                py,
+                [
+                    request.capability().name().as_str(),
+                    request.capability().version().as_str(),
+                ],
+            )
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    PyTuple::new(py, identities)
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "InvocationRequest"
+)]
+pub struct PyInvocationRequest {
+    inner: Arc<ContractInvocationRequest>,
+}
+
+impl From<ContractInvocationRequest> for PyInvocationRequest {
+    fn from(inner: ContractInvocationRequest) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyInvocationRequest {
+    #[getter]
+    pub fn invocation_id(&self) -> &str {
+        self.inner.invocation_id().as_str()
+    }
+
+    #[getter]
+    pub fn admission_id(&self) -> &str {
+        self.inner.admission_id().as_str()
+    }
+
+    #[getter]
+    pub fn capability_name(&self) -> &str {
+        self.inner.capability().name().as_str()
+    }
+
+    #[getter]
+    pub fn capability_version(&self) -> &str {
+        self.inner.capability().version().as_str()
+    }
+
+    #[getter]
+    pub fn selected_resource(&self) -> &str {
+        self.inner.selected_resource().as_str()
+    }
+
+    #[getter]
+    pub fn idempotency_key(&self) -> Option<&str> {
+        self.inner
+            .idempotency_key()
+            .map(kiteframe_contract::IdempotencyKey::as_str)
+    }
+
+    #[getter]
+    pub fn traceparent(&self) -> &str {
+        self.inner.trace_context().traceparent()
+    }
+
+    #[getter]
+    pub fn tracestate(&self) -> Option<&str> {
+        self.inner.trace_context().tracestate()
+    }
+
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "CapabilityCatalog"
+)]
+pub struct PyCapabilityCatalog {
+    inner: Arc<ContractCapabilityCatalog>,
+}
+
+impl From<ContractCapabilityCatalog> for PyCapabilityCatalog {
+    fn from(inner: ContractCapabilityCatalog) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCapabilityCatalog {
+    #[getter]
+    pub fn name(&self) -> &str {
+        &self.inner.identity().name
+    }
+
+    #[getter]
+    pub fn revision(&self) -> &str {
+        &self.inner.identity().revision
+    }
+
+    #[getter]
+    pub fn catalog_digest(&self) -> String {
+        self.inner.catalog_digest().to_string()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.str, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn descriptor_digests<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .descriptors()
+                .iter()
+                .map(|descriptor| descriptor.descriptor_digest().to_string()),
+        )
+    }
+
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
+    }
+}
 
 #[gen_stub_pyclass]
 #[pyclass(
@@ -296,8 +589,33 @@ impl PyInvocationStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderResponseError {
     MalformedJson,
+    NonCanonical,
     LockedSchema,
     Contract,
+}
+
+pub fn load_catalog_request_inner(
+    bytes: &[u8],
+) -> Result<ContractCatalogRequest, ProviderResponseError> {
+    validate_canonical_locked_response(bytes, &CATALOG_REQUEST_SCHEMA)
+}
+
+pub fn load_admission_request_inner(
+    bytes: &[u8],
+) -> Result<ContractAdmissionRequest, ProviderResponseError> {
+    validate_canonical_locked_response(bytes, &ADMISSION_REQUEST_SCHEMA)
+}
+
+pub fn load_invocation_request_inner(
+    bytes: &[u8],
+) -> Result<ContractInvocationRequest, ProviderResponseError> {
+    validate_canonical_locked_response(bytes, &INVOCATION_REQUEST_SCHEMA)
+}
+
+pub fn load_capability_catalog_inner(
+    bytes: &[u8],
+) -> Result<ContractCapabilityCatalog, ProviderResponseError> {
+    validate_canonical_locked_response(bytes, &CAPABILITY_CATALOG_SCHEMA)
 }
 
 pub fn load_capability_grant_set_inner(
@@ -335,10 +653,91 @@ where
 {
     let response =
         serde_json::from_slice(bytes).map_err(|_| ProviderResponseError::MalformedJson)?;
+    validate_locked_value(response, validator)
+}
+
+fn validate_canonical_locked_response<T>(
+    bytes: &[u8],
+    validator: &jsonschema::Validator,
+) -> Result<T, ProviderResponseError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let response =
+        serde_json::from_slice(bytes).map_err(|_| ProviderResponseError::MalformedJson)?;
+    if canonical_json(&response).map_err(|_| ProviderResponseError::MalformedJson)? != bytes {
+        return Err(ProviderResponseError::NonCanonical);
+    }
+    validate_locked_value(response, validator)
+}
+
+fn validate_locked_value<T>(
+    response: serde_json::Value,
+    validator: &jsonschema::Validator,
+) -> Result<T, ProviderResponseError>
+where
+    T: serde::de::DeserializeOwned,
+{
     if !validator.is_valid(&response) {
         return Err(ProviderResponseError::LockedSchema);
     }
     serde_json::from_value(response).map_err(|_| ProviderResponseError::Contract)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_catalog_request(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+) -> PyResult<PyCatalogRequest> {
+    load_catalog_request_inner(bytes)
+        .map(PyCatalogRequest::from)
+        .map_err(provider_response_error)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_admission_request(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+) -> PyResult<PyAdmissionRequest> {
+    load_admission_request_inner(bytes)
+        .map(PyAdmissionRequest::from)
+        .map_err(provider_response_error)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_invocation_request(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+) -> PyResult<PyInvocationRequest> {
+    load_invocation_request_inner(bytes)
+        .map(PyInvocationRequest::from)
+        .map_err(provider_response_error)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_capability_catalog(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+) -> PyResult<PyCapabilityCatalog> {
+    load_capability_catalog_inner(bytes)
+        .map(PyCapabilityCatalog::from)
+        .map_err(provider_response_error)
 }
 
 #[gen_stub_pyfunction]
@@ -383,11 +782,17 @@ pub fn load_invocation_status(
         .map_err(provider_response_error)
 }
 
-fn provider_response_error(_: ProviderResponseError) -> PyErr {
+fn provider_response_error(error: ProviderResponseError) -> PyErr {
+    let message = match error {
+        ProviderResponseError::NonCanonical => "provider payload is not canonical",
+        ProviderResponseError::MalformedJson
+        | ProviderResponseError::LockedSchema
+        | ProviderResponseError::Contract => "provider response is invalid",
+    };
     diagnostic_error(vec![Diagnostic::error(
         DiagnosticCode::ResultInvalid,
         DiagnosticCategory::Capability,
         DiagnosticStage::Invoke,
-        "provider response is invalid",
+        message,
     )])
 }

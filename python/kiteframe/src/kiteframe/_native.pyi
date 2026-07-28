@@ -6,20 +6,52 @@ import os
 import pathlib
 import typing
 __all__ = [
+    "AdmissionRequest",
+    "CapabilityCatalog",
     "CapabilityGrant",
     "CapabilityGrantSet",
+    "CatalogRequest",
     "InvocationOutcome",
+    "InvocationRequest",
     "InvocationStatus",
     "KiteframeDiagnosticError",
     "ResolvedAgent",
     "ResolvedCapabilityRequirement",
     "ResolvedSubagent",
+    "load_admission_request",
+    "load_capability_catalog",
     "load_capability_grant_set",
+    "load_catalog_request",
     "load_invocation_outcome",
+    "load_invocation_request",
     "load_invocation_status",
     "load_resolved_agent",
     "resolve_package",
 ]
+
+@typing.final
+class AdmissionRequest:
+    @property
+    def traceparent(self) -> builtins.str: ...
+    @property
+    def tracestate(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def required_capabilities(self) -> builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]: ...
+    @property
+    def optional_capabilities(self) -> builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]: ...
+    def canonical_json(self) -> builtins.bytes: ...
+
+@typing.final
+class CapabilityCatalog:
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def revision(self) -> builtins.str: ...
+    @property
+    def catalog_digest(self) -> builtins.str: ...
+    @property
+    def descriptor_digests(self) -> builtins.tuple[builtins.str, ...]: ...
+    def canonical_json(self) -> builtins.bytes: ...
 
 @typing.final
 class CapabilityGrant:
@@ -57,11 +89,43 @@ class CapabilityGrantSet:
     def canonical_json(self) -> builtins.bytes: ...
 
 @typing.final
+class CatalogRequest:
+    @property
+    def known_catalog_digest(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def traceparent(self) -> builtins.str: ...
+    @property
+    def tracestate(self) -> typing.Optional[builtins.str]: ...
+    @staticmethod
+    def default() -> CatalogRequest: ...
+    def canonical_json(self) -> builtins.bytes: ...
+
+@typing.final
 class InvocationOutcome:
     @property
     def status(self) -> typing.Literal["succeeded", "failed", "denied", "suspended", "deferred", "outcome_unknown"]: ...
     @property
     def invocation_id(self) -> builtins.str: ...
+    def canonical_json(self) -> builtins.bytes: ...
+
+@typing.final
+class InvocationRequest:
+    @property
+    def invocation_id(self) -> builtins.str: ...
+    @property
+    def admission_id(self) -> builtins.str: ...
+    @property
+    def capability_name(self) -> builtins.str: ...
+    @property
+    def capability_version(self) -> builtins.str: ...
+    @property
+    def selected_resource(self) -> builtins.str: ...
+    @property
+    def idempotency_key(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def traceparent(self) -> builtins.str: ...
+    @property
+    def tracestate(self) -> typing.Optional[builtins.str]: ...
     def canonical_json(self) -> builtins.bytes: ...
 
 @typing.final
@@ -73,6 +137,11 @@ class InvocationStatus:
     def canonical_json(self) -> builtins.bytes: ...
 
 class KiteframeDiagnosticError(builtins.Exception):
+    @property
+    def code(self) -> builtins.str:
+        r"""
+        Stable code from the first canonical diagnostic.
+        """
     @property
     def diagnostics_json(self) -> builtins.bytes:
         r"""
@@ -119,9 +188,17 @@ class ResolvedSubagent:
     @property
     def delegated_capabilities(self) -> builtins.tuple[builtins.str, ...]: ...
 
+def load_admission_request(bytes: builtins.bytes) -> AdmissionRequest: ...
+
+def load_capability_catalog(bytes: builtins.bytes) -> CapabilityCatalog: ...
+
 def load_capability_grant_set(bytes: builtins.bytes) -> CapabilityGrantSet: ...
 
+def load_catalog_request(bytes: builtins.bytes) -> CatalogRequest: ...
+
 def load_invocation_outcome(bytes: builtins.bytes) -> InvocationOutcome: ...
+
+def load_invocation_request(bytes: builtins.bytes) -> InvocationRequest: ...
 
 def load_invocation_status(bytes: builtins.bytes) -> InvocationStatus: ...
 

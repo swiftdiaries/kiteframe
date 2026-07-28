@@ -472,7 +472,92 @@ rtk git add python/kiteframe/src/kiteframe python/kiteframe/tests/test_registry.
 rtk git commit -m "feat: add frozen component registry"
 ```
 
-### Task 5: Define adapter-facing provider protocols and a strict async HTTP client
+### Task 5: Add native provider request and catalog boundary projections
+
+**Files:**
+- Modify: `crates/kiteframe-py/src/service.rs`
+- Modify: `crates/kiteframe-py/src/lib.rs`
+- Modify: `crates/kiteframe-py/src/error.rs`
+- Modify: `crates/kiteframe-schema/src/main.rs`
+- Modify: `python/kiteframe/src/kiteframe/__init__.py`
+- Modify: `python/kiteframe/src/kiteframe/_native.pyi`
+- Create: `crates/kiteframe-py/tests/provider_request_projection.rs`
+- Create: `python/kiteframe/tests/test_native_provider_requests.py`
+
+**Interfaces:**
+- Consumes: Rust-owned `CatalogRequest`, `AdmissionRequest`, `InvocationRequest`, `CapabilityCatalog`, canonical JSON, locked schemas, diagnostics, and the existing schema-first native response boundary.
+- Produces: frozen native `CatalogRequest`, `AdmissionRequest`, `InvocationRequest`, and `CapabilityCatalog`; `CatalogRequest.default()`; and canonical-only `load_catalog_request(...)`, `load_admission_request(...)`, `load_invocation_request(...)`, and `load_capability_catalog(...)` entrypoints.
+
+- [ ] **Step 1: Write failing native request and catalog boundary tests**
+
+```python
+import pytest
+from kiteframe import (
+    CatalogRequest,
+    load_admission_request,
+    load_capability_catalog,
+    load_invocation_request,
+)
+
+
+def test_catalog_request_is_factory_only_and_canonical() -> None:
+    with pytest.raises(TypeError):
+        CatalogRequest()  # type: ignore[call-arg]
+    assert CatalogRequest.default().canonical_json()
+
+
+def test_provider_requests_are_frozen_and_reject_noncanonical_bytes(valid_invocation: bytes) -> None:
+    request = load_invocation_request(valid_invocation)
+    with pytest.raises(AttributeError):
+        request.invocation_id = "forged"  # type: ignore[misc]
+    with pytest.raises(Exception, match="canonical"):
+        load_invocation_request(b" " + valid_invocation)
+
+
+def test_catalog_loader_rejects_schema_invalid_output(schema_invalid_catalog: bytes) -> None:
+    with pytest.raises(Exception) as error:
+        load_capability_catalog(schema_invalid_catalog)
+    assert error.value.code == "KF-CAP-002"
+```
+
+- [ ] **Step 2: Run the focused boundary tests**
+
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_native_provider_requests.py -q`
+
+Expected: FAIL because native request/catalog projections and loaders do not exist.
+
+- [ ] **Step 3: Add frozen request/catalog projections and canonical loaders**
+
+Expose only read-only scalar/tuple properties plus `canonical_json() -> bytes`. `CatalogRequest.default()` is the sole public factory for its empty request; no native request/catalog class receives a public `#[new]` method. Every `load_*` entrypoint must deserialize only canonical bytes, validate the corresponding checked-in locked schema before typed Rust deserialization, and map parse, schema, and contract failures to redacted `KiteframeDiagnosticError` with stable code `KF-CAP-002`.
+
+`CapabilityCatalog` validation uses the existing Rust catalog validator; Python must not parse descriptors, negotiate features, compute catalog digests, or select versions. `AdmissionRequest` and `InvocationRequest` preserve the Rust request invariants already enforced by their typed deserializers.
+
+- [ ] **Step 4: Generate and check native stubs**
+
+Run: `rtk cargo run -p kiteframe-schema -- --python-stubs python/kiteframe/src/kiteframe/_native.pyi`
+
+Run: `rtk cargo run -p kiteframe-schema -- --check-python-stubs python/kiteframe/src/kiteframe/_native.pyi`
+
+Expected: all request/catalog values and loaders appear as immutable/read-only native APIs; no public value constructors appear.
+
+- [ ] **Step 5: Run native request/catalog verification**
+
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_native_provider_requests.py -q`
+
+Expected: PASS.
+
+Run: `rtk cargo test -p kiteframe-py --test provider_request_projection`
+
+Expected: PASS for canonical-byte rejection and locked-schema-before-contract ordering.
+
+- [ ] **Step 6: Commit the native provider dependency boundary**
+
+```bash
+rtk git add docs/superpowers/plans/2026-07-25-kiteframe-v1-wave-3-python-contract.md crates/kiteframe-py crates/kiteframe-schema python/kiteframe/src/kiteframe python/kiteframe/tests
+rtk git commit -m "feat: expose native provider request contracts"
+```
+
+### Task 6: Define adapter-facing provider protocols and a strict async HTTP client
 
 **Files:**
 - Create: `python/kiteframe/src/kiteframe/provider/__init__.py`
@@ -576,7 +661,7 @@ rtk git add python/kiteframe/src/kiteframe/provider python/kiteframe/tests/provi
 rtk git commit -m "feat: add capability provider client"
 ```
 
-### Task 6: Gate cross-language schemas, redaction, and package quality
+### Task 7: Gate cross-language schemas, redaction, and package quality
 
 **Files:**
 - Create: `python/kiteframe/tests/test_diagnostic_redaction.py`

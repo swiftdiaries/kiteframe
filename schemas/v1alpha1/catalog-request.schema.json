@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CatalogRequest",
+  "type": "object",
+  "properties": {
+    "knownCatalogDigest": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "traceContext": {
+      "$ref": "#/$defs/TraceContext"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "traceContext"
+  ],
+  "$defs": {
+    "BaggageCorrelationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "TraceContext": {
+      "type": "object",
+      "properties": {
+        "baggage": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/BaggageCorrelationId"
+          }
+        },
+        "traceparent": {
+          "type": "string"
+        },
+        "tracestate": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "traceparent"
+      ]
+    }
+  }
+}

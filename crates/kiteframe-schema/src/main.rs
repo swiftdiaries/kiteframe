@@ -7,8 +7,8 @@ use std::{
 
 use kiteframe_contract::{
     AdmissionRequest, AgentManifest, CapabilityCatalog, CapabilityDescriptor, CapabilityGrantSet,
-    CapabilityLock, ComponentMetadataCatalog, Diagnostic, InvocationOutcome, InvocationRequest,
-    InvocationStatus, ResolvedAgent, RuntimeBinding,
+    CapabilityLock, CatalogRequest, ComponentMetadataCatalog, Diagnostic, InvocationOutcome,
+    InvocationRequest, InvocationStatus, ResolvedAgent, RuntimeBinding,
 };
 use schemars::JsonSchema;
 
@@ -47,6 +47,7 @@ fn generate(destination: &Path) -> Result<()> {
     )?;
     write_schema::<Diagnostic>(&destination.join("diagnostic.schema.json"))?;
     write_schema::<ResolvedAgent>(&destination.join("resolved-agent.schema.json"))?;
+    write_schema::<CatalogRequest>(&destination.join("catalog-request.schema.json"))?;
     write_schema::<AdmissionRequest>(&destination.join("admission-request.schema.json"))?;
     write_schema::<CapabilityGrantSet>(&destination.join("capability-grant-set.schema.json"))?;
     write_schema::<InvocationRequest>(&destination.join("invocation-request.schema.json"))?;
@@ -66,6 +67,7 @@ fn check(destination: &Path) -> Result<()> {
     )?;
     check_schema::<Diagnostic>(&destination.join("diagnostic.schema.json"))?;
     check_schema::<ResolvedAgent>(&destination.join("resolved-agent.schema.json"))?;
+    check_schema::<CatalogRequest>(&destination.join("catalog-request.schema.json"))?;
     check_schema::<AdmissionRequest>(&destination.join("admission-request.schema.json"))?;
     check_schema::<CapabilityGrantSet>(&destination.join("capability-grant-set.schema.json"))?;
     check_schema::<InvocationRequest>(&destination.join("invocation-request.schema.json"))?;

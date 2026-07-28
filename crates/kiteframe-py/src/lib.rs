@@ -10,13 +10,19 @@ use ir::{PyResolvedAgent, PyResolvedCapabilityRequirement, PyResolvedSubagent};
 use pyo3::prelude::*;
 use pyo3_stub_gen::{StubGenConfig, StubInfo};
 pub use service::{
-    ProviderResponseError, PyCapabilityGrant, PyCapabilityGrantSet, PyInvocationOutcome,
-    PyInvocationStatus, load_capability_grant_set_inner, load_invocation_outcome_inner,
-    load_invocation_status_inner,
+    ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCapabilityGrant,
+    PyCapabilityGrantSet, PyCatalogRequest, PyInvocationOutcome, PyInvocationRequest,
+    PyInvocationStatus, load_admission_request_inner, load_capability_catalog_inner,
+    load_capability_grant_set_inner, load_catalog_request_inner, load_invocation_outcome_inner,
+    load_invocation_request_inner, load_invocation_status_inner,
 };
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyCatalogRequest>()?;
+    module.add_class::<PyAdmissionRequest>()?;
+    module.add_class::<PyInvocationRequest>()?;
+    module.add_class::<PyCapabilityCatalog>()?;
     module.add_class::<PyCapabilityGrant>()?;
     module.add_class::<PyCapabilityGrantSet>()?;
     module.add_class::<PyInvocationOutcome>()?;
@@ -30,6 +36,10 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add_function(wrap_pyfunction!(validate::load_resolved_agent, module)?)?;
     module.add_function(wrap_pyfunction!(validate::resolve_package, module)?)?;
+    module.add_function(wrap_pyfunction!(service::load_catalog_request, module)?)?;
+    module.add_function(wrap_pyfunction!(service::load_admission_request, module)?)?;
+    module.add_function(wrap_pyfunction!(service::load_invocation_request, module)?)?;
+    module.add_function(wrap_pyfunction!(service::load_capability_catalog, module)?)?;
     module.add_function(wrap_pyfunction!(
         service::load_capability_grant_set,
         module

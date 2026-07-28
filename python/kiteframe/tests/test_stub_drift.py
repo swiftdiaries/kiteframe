@@ -40,8 +40,12 @@ def test_rust_owned_stub_classes_are_read_only_and_nonconstructible() -> None:
     assert "KiteframeDiagnosticError" in classes
 
     for name in [
+        "AdmissionRequest",
+        "CapabilityCatalog",
         "CapabilityGrant",
         "CapabilityGrantSet",
+        "CatalogRequest",
+        "InvocationRequest",
         "InvocationOutcome",
         "InvocationStatus",
         "ResolvedAgent",
@@ -55,6 +59,12 @@ def test_rust_owned_stub_classes_are_read_only_and_nonconstructible() -> None:
         }
         assert "__init__" not in methods
         assert "__new__" not in methods
+        if name == "CatalogRequest":
+            assert any(
+                isinstance(decorator, ast.Name)
+                and decorator.id == "staticmethod"
+                for decorator in methods["default"].decorator_list
+            )
         assert all(
             any(
                 isinstance(decorator, ast.Name)
@@ -62,5 +72,5 @@ def test_rust_owned_stub_classes_are_read_only_and_nonconstructible() -> None:
                 for decorator in method.decorator_list
             )
             for method_name, method in methods.items()
-            if method_name != "canonical_json"
+            if method_name not in {"canonical_json", "default"}
         )
