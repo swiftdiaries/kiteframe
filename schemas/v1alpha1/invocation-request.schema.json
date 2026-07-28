@@ -50,6 +50,10 @@
     "traceContext"
   ],
   "$defs": {
+    "BaggageCorrelationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
     "CapabilityIdentity": {
       "type": "object",
       "properties": {
@@ -76,7 +80,7 @@
         "baggage": {
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/$defs/BaggageCorrelationId"
           }
         },
         "traceparent": {

@@ -42,6 +42,12 @@
     "resolvedDigest": {
       "$ref": "#/$defs/Sha256Digest"
     },
+    "resolvedRequirements": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ResolvedCapabilityRequirement"
+      }
+    },
     "session": {
       "type": "string"
     },
@@ -63,11 +69,16 @@
     "resolvedDigest",
     "requiredCapabilities",
     "optionalCapabilities",
+    "resolvedRequirements",
     "delegationAncestry",
     "contextualFacts",
     "traceContext"
   ],
   "$defs": {
+    "BaggageCorrelationId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$"
+    },
     "CapabilityIdentity": {
       "type": "object",
       "properties": {
@@ -107,6 +118,29 @@
         "resources"
       ]
     },
+    "ResolvedCapabilityRequirement": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "required",
+        "resources"
+      ]
+    },
     "Sha256Digest": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
@@ -117,7 +151,7 @@
         "baggage": {
           "type": "object",
           "additionalProperties": {
-            "type": "string"
+            "$ref": "#/$defs/BaggageCorrelationId"
           }
         },
         "traceparent": {

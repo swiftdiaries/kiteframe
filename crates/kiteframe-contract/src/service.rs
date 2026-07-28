@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -49,6 +49,51 @@ string_ref!(InvocationId, "invocation ID is required");
 string_ref!(IdempotencyKey, "idempotency key is required");
 string_ref!(NormalizedResourceSelector, "resource selector is required");
 
+/// A fixed-width, non-secret correlation identifier permitted in W3C baggage.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct BaggageCorrelationId(String);
+
+impl BaggageCorrelationId {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(
+                "baggage correlation ID must be 32 lowercase hexadecimal characters".to_owned(),
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for BaggageCorrelationId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+impl JsonSchema for BaggageCorrelationId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "BaggageCorrelationId".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::BaggageCorrelationId").into()
+    }
+
+    fn json_schema(_: &mut SchemaGenerator) -> Schema {
+        json_schema!({ "type": "string", "pattern": "^[0-9a-f]{32}$" })
+    }
+}
+
 /// Unix seconds. Provider adapters obtain time from their deployment rather than from packages.
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,
@@ -73,7 +118,7 @@ pub struct TraceContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tracestate: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    baggage: BTreeMap<String, String>,
+    baggage: BTreeMap<String, BaggageCorrelationId>,
 }
 
 impl TraceContext {
@@ -103,14 +148,15 @@ impl TraceContext {
             if !Self::ALLOWED_BAGGAGE_KEYS.contains(&key.as_str()) {
                 return Err("baggage key is not allowlisted".to_owned());
             }
-            if value.trim().is_empty() || contains_sensitive_baggage_content(value) {
-                return Err("baggage must contain only safe correlation values".to_owned());
-            }
+            BaggageCorrelationId::new(value.clone())?;
         }
         Ok(Self {
             traceparent,
             tracestate,
-            baggage,
+            baggage: baggage
+                .into_iter()
+                .map(|(key, value)| BaggageCorrelationId::new(value).map(|value| (key, value)))
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -122,7 +168,7 @@ impl TraceContext {
         self.tracestate.as_deref()
     }
 
-    pub fn baggage(&self) -> &BTreeMap<String, String> {
+    pub fn baggage(&self) -> &BTreeMap<String, BaggageCorrelationId> {
         &self.baggage
     }
 }
@@ -163,20 +209,6 @@ fn valid_traceparent(value: &str) -> bool {
             .all(|part| part.bytes().all(|byte| byte.is_ascii_hexdigit()))
         && trace.bytes().any(|byte| byte != b'0')
         && parent.bytes().any(|byte| byte != b'0')
-}
-
-fn contains_sensitive_baggage_content(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    [
-        "credential",
-        "authorization",
-        "prompt",
-        "argument",
-        "result",
-        "tuple",
-    ]
-    .iter()
-    .any(|forbidden| value.contains(forbidden))
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, JsonSchema)]
@@ -234,7 +266,7 @@ impl DelegationAncestry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CatalogRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,7 +337,7 @@ pub struct AdmissionRequestParts {
     pub trace_context: TraceContext,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdmissionRequest {
     actor: ActorRef,
@@ -317,6 +349,7 @@ pub struct AdmissionRequest {
     resolved_digest: Sha256Digest,
     required_capabilities: Vec<RequestedCapability>,
     optional_capabilities: Vec<RequestedCapability>,
+    resolved_requirements: Vec<ResolvedCapabilityRequirement>,
     delegation_ancestry: DelegationAncestry,
     contextual_facts: BTreeMap<String, String>,
     trace_context: TraceContext,
@@ -373,6 +406,7 @@ impl AdmissionRequest {
             resolved_digest: parts.resolved_digest,
             required_capabilities: parts.required_capabilities,
             optional_capabilities: parts.optional_capabilities,
+            resolved_requirements: parts.resolved_requirements,
             delegation_ancestry: parts.delegation_ancestry,
             contextual_facts: parts.contextual_facts,
             trace_context: parts.trace_context,
@@ -389,6 +423,45 @@ impl AdmissionRequest {
 
     pub fn trace_context(&self) -> &TraceContext {
         &self.trace_context
+    }
+}
+
+impl<'de> Deserialize<'de> for AdmissionRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            actor: ActorRef,
+            agent: AgentRef,
+            task: TaskRef,
+            session: SessionRef,
+            portable_digest: Sha256Digest,
+            lock_digest: Sha256Digest,
+            resolved_digest: Sha256Digest,
+            required_capabilities: Vec<RequestedCapability>,
+            optional_capabilities: Vec<RequestedCapability>,
+            resolved_requirements: Vec<ResolvedCapabilityRequirement>,
+            delegation_ancestry: DelegationAncestry,
+            contextual_facts: BTreeMap<String, String>,
+            trace_context: TraceContext,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(AdmissionRequestParts {
+            actor: raw.actor,
+            agent: raw.agent,
+            task: raw.task,
+            session: raw.session,
+            portable_digest: raw.portable_digest,
+            lock_digest: raw.lock_digest,
+            resolved_digest: raw.resolved_digest,
+            required_capabilities: raw.required_capabilities,
+            optional_capabilities: raw.optional_capabilities,
+            resolved_requirements: raw.resolved_requirements,
+            delegation_ancestry: raw.delegation_ancestry,
+            contextual_facts: raw.contextual_facts,
+            trace_context: raw.trace_context,
+        })
+        .map_err(|errors| D::Error::custom(errors[0].message.as_str()))
     }
 }
 
@@ -409,7 +482,7 @@ pub struct CapabilityGrantParts {
     pub resources: Vec<NormalizedResourceSelector>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityGrant {
     capability: CapabilityIdentity,
@@ -435,6 +508,23 @@ impl CapabilityGrant {
 
     pub fn resources(&self) -> &[NormalizedResourceSelector] {
         &self.resources
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityGrant {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            capability: CapabilityIdentity,
+            resources: Vec<NormalizedResourceSelector>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(CapabilityGrantParts {
+            capability: raw.capability,
+            resources: raw.resources,
+        })
+        .map_err(D::Error::custom)
     }
 }
 
@@ -615,7 +705,7 @@ fn canonical_digest<T: Serialize>(domain: &[u8], value: &T) -> Result<Sha256Dige
     Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvocationRequest {
     invocation_id: InvocationId,
@@ -768,7 +858,7 @@ impl Suspension {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
 pub enum InvocationOutcome {
     Succeeded {
@@ -797,6 +887,17 @@ pub enum InvocationOutcome {
 }
 
 impl InvocationOutcome {
+    pub fn outcome_unknown(
+        invocation_id: InvocationId,
+        diagnostic: Diagnostic,
+    ) -> Result<Self, String> {
+        validate_status_first(&diagnostic)?;
+        Ok(Self::OutcomeUnknown {
+            invocation_id,
+            diagnostic,
+        })
+    }
+
     pub fn diagnostic(&self) -> Option<&Diagnostic> {
         match self {
             Self::Denied { diagnostic, .. } | Self::OutcomeUnknown { diagnostic, .. } => {
@@ -807,7 +908,74 @@ impl InvocationOutcome {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for InvocationOutcome {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
+        enum Raw {
+            Succeeded {
+                invocation_id: InvocationId,
+                result: Value,
+            },
+            Failed {
+                invocation_id: InvocationId,
+                error: StableCapabilityError,
+            },
+            Denied {
+                invocation_id: InvocationId,
+                diagnostic: Diagnostic,
+            },
+            Suspended {
+                invocation_id: InvocationId,
+                suspension: Suspension,
+            },
+            Deferred {
+                invocation_id: InvocationId,
+            },
+            OutcomeUnknown {
+                invocation_id: InvocationId,
+                diagnostic: Diagnostic,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Succeeded {
+                invocation_id,
+                result,
+            } => Ok(Self::Succeeded {
+                invocation_id,
+                result,
+            }),
+            Raw::Failed {
+                invocation_id,
+                error,
+            } => Ok(Self::Failed {
+                invocation_id,
+                error,
+            }),
+            Raw::Denied {
+                invocation_id,
+                diagnostic,
+            } => Ok(Self::Denied {
+                invocation_id,
+                diagnostic,
+            }),
+            Raw::Suspended {
+                invocation_id,
+                suspension,
+            } => Ok(Self::Suspended {
+                invocation_id,
+                suspension,
+            }),
+            Raw::Deferred { invocation_id } => Ok(Self::Deferred { invocation_id }),
+            Raw::OutcomeUnknown {
+                invocation_id,
+                diagnostic,
+            } => Self::outcome_unknown(invocation_id, diagnostic).map_err(D::Error::custom),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
 pub enum InvocationStatus {
     Pending {
@@ -833,6 +1001,93 @@ pub enum InvocationStatus {
         invocation_id: InvocationId,
         diagnostic: Diagnostic,
     },
+}
+
+impl InvocationStatus {
+    pub fn outcome_unknown(
+        invocation_id: InvocationId,
+        diagnostic: Diagnostic,
+    ) -> Result<Self, String> {
+        validate_status_first(&diagnostic)?;
+        Ok(Self::OutcomeUnknown {
+            invocation_id,
+            diagnostic,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for InvocationStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
+        enum Raw {
+            Pending {
+                invocation_id: InvocationId,
+            },
+            Suspended {
+                invocation_id: InvocationId,
+                suspension: Suspension,
+            },
+            Succeeded {
+                invocation_id: InvocationId,
+                result: Value,
+            },
+            Failed {
+                invocation_id: InvocationId,
+                error: StableCapabilityError,
+            },
+            Denied {
+                invocation_id: InvocationId,
+                diagnostic: Diagnostic,
+            },
+            OutcomeUnknown {
+                invocation_id: InvocationId,
+                diagnostic: Diagnostic,
+            },
+        }
+        match Raw::deserialize(deserializer)? {
+            Raw::Pending { invocation_id } => Ok(Self::Pending { invocation_id }),
+            Raw::Suspended {
+                invocation_id,
+                suspension,
+            } => Ok(Self::Suspended {
+                invocation_id,
+                suspension,
+            }),
+            Raw::Succeeded {
+                invocation_id,
+                result,
+            } => Ok(Self::Succeeded {
+                invocation_id,
+                result,
+            }),
+            Raw::Failed {
+                invocation_id,
+                error,
+            } => Ok(Self::Failed {
+                invocation_id,
+                error,
+            }),
+            Raw::Denied {
+                invocation_id,
+                diagnostic,
+            } => Ok(Self::Denied {
+                invocation_id,
+                diagnostic,
+            }),
+            Raw::OutcomeUnknown {
+                invocation_id,
+                diagnostic,
+            } => Self::outcome_unknown(invocation_id, diagnostic).map_err(D::Error::custom),
+        }
+    }
+}
+
+fn validate_status_first(diagnostic: &Diagnostic) -> Result<(), String> {
+    if diagnostic.retry != RetryClass::StatusFirst {
+        return Err("outcome_unknown diagnostics must require a status-first retry".to_owned());
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<SafeMessage>) -> Diagnostic {

@@ -75,6 +75,15 @@ fn trace_context_deserialization_rejects_non_allowlisted_baggage() {
 }
 
 #[test]
+fn trace_context_rejects_an_opaque_bearer_secret_in_allowlisted_baggage() {
+    let baggage = BTreeMap::from([(
+        String::from("kiteframe.session_id"),
+        String::from("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.signature"),
+    )]);
+    assert!(TraceContext::try_new(valid_traceparent(), None, baggage).is_err());
+}
+
+#[test]
 fn evidence_references_reject_raw_payloads() {
     assert!(
         EvidenceReferences::try_new(BTreeMap::from([(
@@ -137,6 +146,53 @@ fn admission_rejects_resource_selector_broader_than_resolved_requirement() {
     })
     .unwrap_err();
     assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+}
+
+#[test]
+fn admission_deserialization_rejects_duplicate_capability_versions() {
+    let mut wire = serde_json::to_value(valid_admission_request()).unwrap();
+    let required = wire["requiredCapabilities"].as_array_mut().unwrap();
+    required.push(required[0].clone());
+    assert!(serde_json::from_value::<AdmissionRequest>(wire).is_err());
+}
+
+#[test]
+fn admission_deserialization_rejects_a_selector_broader_than_its_resolved_requirement() {
+    let mut wire = serde_json::to_value(valid_admission_request()).unwrap();
+    wire["requiredCapabilities"][0]["resources"] = json!(["tenant:t1/case:*"]);
+    let error = serde_json::from_value::<AdmissionRequest>(wire).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("broader than the resolved requirement")
+    );
+}
+
+#[test]
+fn capability_grant_deserialization_rejects_empty_resources() {
+    let mut wire = serde_json::to_value(grant_set_parts().grants.remove(0)).unwrap();
+    wire["resources"] = json!([]);
+    assert!(serde_json::from_value::<CapabilityGrant>(wire).is_err());
+}
+
+#[test]
+fn outcome_unknown_deserialization_rejects_non_status_first_retry() {
+    let wire = json!({
+        "status": "outcome_unknown",
+        "invocation_id": "inv-1",
+        "diagnostic": diagnostic_with_retry("never")
+    });
+    assert!(serde_json::from_value::<InvocationOutcome>(wire).is_err());
+}
+
+#[test]
+fn status_unknown_deserialization_rejects_non_status_first_retry() {
+    let wire = json!({
+        "status": "outcome_unknown",
+        "invocation_id": "inv-1",
+        "diagnostic": diagnostic_with_retry("never")
+    });
+    assert!(serde_json::from_value::<InvocationStatus>(wire).is_err());
 }
 
 fn invocation_request(idempotency_key: Option<&str>) -> InvocationRequest {
@@ -211,6 +267,50 @@ fn capability_identity() -> CapabilityIdentity {
 
 fn valid_traceparent() -> String {
     String::from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+}
+
+fn valid_admission_request() -> AdmissionRequest {
+    AdmissionRequest::try_new(AdmissionRequestParts {
+        actor: ActorRef::new("actor:alice").unwrap(),
+        agent: AgentRef::new("agent:case-worker").unwrap(),
+        task: TaskRef::new("task:triage").unwrap(),
+        session: SessionRef::new("session:1").unwrap(),
+        portable_digest: digest(1),
+        lock_digest: digest(2),
+        resolved_digest: digest(3),
+        required_capabilities: vec![
+            RequestedCapability::try_new(
+                capability_identity(),
+                vec![NormalizedResourceSelector::new("tenant:t1/case:case-1").unwrap()],
+            )
+            .unwrap(),
+        ],
+        optional_capabilities: Vec::new(),
+        resolved_requirements: vec![kiteframe_contract::ResolvedCapabilityRequirement {
+            identity: capability_identity(),
+            required: true,
+            resources: vec![String::from("tenant:t1/case:case-1")],
+        }],
+        delegation_ancestry: DelegationAncestry::default(),
+        contextual_facts: BTreeMap::new(),
+        trace_context: TraceContext::try_new(valid_traceparent(), None, BTreeMap::new()).unwrap(),
+    })
+    .unwrap()
+}
+
+fn diagnostic_with_retry(retry: &str) -> serde_json::Value {
+    json!({
+        "code": "KF-CAP-003",
+        "category": "capability",
+        "severity": "error",
+        "stage": "invoke",
+        "package_path": null,
+        "source_range": null,
+        "message": "status is required",
+        "help": null,
+        "retry": retry,
+        "details": {}
+    })
 }
 
 fn grant_set_parts() -> CapabilityGrantSetParts {
