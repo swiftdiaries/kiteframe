@@ -9,11 +9,19 @@ permissions:
 
 jobs:
   wave-2:
-    name: Wave 2 gates
+    name: Wave 2 and 3 gates
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
 
       - name: Show Rust toolchain
         run: rustup show active-toolchain
@@ -32,6 +40,27 @@ jobs:
 
       - name: Check generated schemas
         run: cargo run -p kiteframe-schema -- --check schemas/v1alpha1
+
+      - name: Check generated Python stubs
+        run: >-
+          cargo run -p kiteframe-schema --
+          --check-python-stubs python/kiteframe/src/kiteframe/_native.pyi
+
+      - name: Build Python native extension
+        working-directory: python/kiteframe
+        run: uv run --project . maturin develop
+
+      - name: Test Python package
+        working-directory: python/kiteframe
+        run: uv run --project . pytest -q
+
+      - name: Lint Python package
+        working-directory: python/kiteframe
+        run: uv run --project . ruff check src tests
+
+      - name: Type-check Python package
+        working-directory: python/kiteframe
+        run: uv run --project . pyright
 
       - name: Check portable dependency boundary
         shell: bash

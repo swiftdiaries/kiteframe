@@ -5,9 +5,9 @@ from collections.abc import Mapping
 from urllib.parse import quote
 
 _TRACEPARENT = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
-_TRACESTATE_SIMPLE_KEY = re.compile(r"^[a-z0-9][a-z0-9_\-*/]{0,255}$")
+_TRACESTATE_SIMPLE_KEY = re.compile(r"^[a-z][a-z0-9_\-*/]{0,255}$")
 _TRACESTATE_TENANT_KEY = re.compile(
-    r"^[a-z0-9][a-z0-9_\-*/]{0,240}@[a-z0-9][a-z0-9_\-*/]{0,13}$"
+    r"^[a-z0-9][a-z0-9_\-*/]{0,240}@[a-z][a-z0-9_\-*/]{0,13}$"
 )
 _TRACESTATE_VALUE = re.compile(
     r"^[\x21-\x2b\x2d-\x3c\x3e-\x7e]"

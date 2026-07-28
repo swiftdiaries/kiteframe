@@ -1,3 +1,6 @@
 [alias]
 test-contract = "test -p kiteframe-contract"
 lint-contract = "clippy -p kiteframe-contract --all-targets -- -D warnings"
+
+[env]
+PYO3_PYTHON = "python3"

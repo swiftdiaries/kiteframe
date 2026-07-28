@@ -591,7 +591,10 @@ def test_trace_headers_reject_reserved_traceparent_version() -> None:
         trace_headers(traceparent=f"ff-{VALID_TRACEPARENT[3:]}")
 
 
-@pytest.mark.parametrize("tracestate", [",", "vendor=", "Vendor=value", "a=1,a=2"])
+@pytest.mark.parametrize(
+    "tracestate",
+    [",", "vendor=", "Vendor=value", "a=1,a=2", "1vendor=value"],
+)
 def test_trace_headers_reject_invalid_tracestate(tracestate: str) -> None:
     with pytest.raises(ValueError, match="tracestate"):
         trace_headers(

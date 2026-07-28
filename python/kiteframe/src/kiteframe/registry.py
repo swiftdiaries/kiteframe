@@ -1,10 +1,9 @@
 """Deployment-owned component registration for runtime adapters."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Mapping
-
 
 COMPONENT_UNRESOLVED = "KF-RUNTIME-001"
 
@@ -45,6 +44,13 @@ class RegistryKey:
     symbol: str
 
 
+def _validate_component_kind(kind: object) -> ComponentKind:
+    """Reject strings and other lookalikes at the deployment boundary."""
+    if not isinstance(kind, ComponentKind):
+        raise TypeError("kind must be a ComponentKind")
+    return kind
+
+
 def validate_registry_symbol(symbol: str) -> str:
     """Validate the same symbol grammar as Rust's ``RegistrySymbol``."""
     if not isinstance(symbol, str) or not symbol:
@@ -52,9 +58,15 @@ def validate_registry_symbol(symbol: str) -> str:
 
     previous_separator = False
     for index, character in enumerate(symbol):
-        if character.isascii() and character.islower() and character.isalpha():
-            previous_separator = False
-        elif character.isascii() and character.isdigit() and index > 0:
+        is_lowercase_letter = (
+            character.isascii()
+            and character.islower()
+            and character.isalpha()
+        )
+        is_noninitial_digit = (
+            character.isascii() and character.isdigit() and index > 0
+        )
+        if is_lowercase_letter or is_noninitial_digit:
             previous_separator = False
         elif character in "._-" and index > 0 and not previous_separator:
             previous_separator = True
@@ -78,6 +90,7 @@ class ComponentRegistry:
         if self._frozen:
             raise RuntimeError("component registry is frozen")
 
+        kind = _validate_component_kind(kind)
         symbol = validate_registry_symbol(symbol)
         if symbol in self._symbols:
             raise DuplicateComponentRegistrationError(
@@ -108,8 +121,35 @@ class FrozenComponentRegistry:
         entries: Mapping[RegistryKey, object],
         symbols: Mapping[str, ComponentKind],
     ) -> None:
-        object.__setattr__(self, "_entries", MappingProxyType(dict(entries)))
-        object.__setattr__(self, "_symbols", MappingProxyType(dict(symbols)))
+        entries_snapshot: dict[RegistryKey, object] = {}
+        expected_symbols: dict[str, ComponentKind] = {}
+        for key, value in entries.items():
+            if not isinstance(key, RegistryKey):
+                raise TypeError("registry entry key must be a RegistryKey")
+            kind = _validate_component_kind(key.kind)
+            symbol = validate_registry_symbol(key.symbol)
+            if symbol in expected_symbols:
+                raise ValueError("registry mappings are inconsistent")
+            entries_snapshot[RegistryKey(kind, symbol)] = value
+            expected_symbols[symbol] = kind
+
+        symbols_snapshot = {
+            validate_registry_symbol(symbol): _validate_component_kind(kind)
+            for symbol, kind in symbols.items()
+        }
+        if symbols_snapshot != expected_symbols:
+            raise ValueError("registry mappings are inconsistent")
+
+        object.__setattr__(
+            self,
+            "_entries",
+            MappingProxyType(entries_snapshot),
+        )
+        object.__setattr__(
+            self,
+            "_symbols",
+            MappingProxyType(symbols_snapshot),
+        )
 
     def resolve(self, kind: ComponentKind, symbol: str) -> object:
         try:

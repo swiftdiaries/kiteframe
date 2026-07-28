@@ -56,6 +56,17 @@ fn status_first_diagnostic_rejects_a_non_status_first_retry() {
 }
 
 #[test]
+fn status_first_diagnostic_schema_requires_status_first_retry() {
+    let schema = serde_json::to_value(schemars::schema_for!(InvocationStatus)).unwrap();
+    let status_first = &schema["$defs"]["StatusFirstDiagnostic"];
+
+    assert_eq!(
+        status_first["properties"]["retry"]["const"],
+        json!("status_first")
+    );
+}
+
+#[test]
 fn catalog_request_deserialization_uses_validated_trace_context() {
     let request = CatalogRequest::new(
         Some(digest(9)),

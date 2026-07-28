@@ -11,6 +11,7 @@ from kiteframe._native import (
     CapabilityGrantSet,
     InvocationOutcome,
     InvocationStatus,
+    KiteframeDiagnosticError,
     load_capability_grant_set,
     load_invocation_outcome,
     load_invocation_status,
@@ -147,7 +148,7 @@ def test_invocation_variants_are_stable_frozen_projections(
 
 
 def test_invalid_provider_output_never_becomes_a_projection() -> None:
-    with pytest.raises(Exception) as caught:
+    with pytest.raises(KiteframeDiagnosticError) as caught:
         load_invocation_outcome(
             b'{"invocation_id":"inv-1","status":"not-a-status"}'
         )

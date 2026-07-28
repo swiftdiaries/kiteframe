@@ -859,7 +859,7 @@ impl Suspension {
 }
 
 /// A diagnostic that proves an unknown result must be reconciled through status first.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct StatusFirstDiagnostic(Diagnostic);
 
@@ -877,6 +877,30 @@ impl StatusFirstDiagnostic {
 impl<'de> Deserialize<'de> for StatusFirstDiagnostic {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Self::try_new(Diagnostic::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+impl JsonSchema for StatusFirstDiagnostic {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "StatusFirstDiagnostic".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        concat!(module_path!(), "::StatusFirstDiagnostic").into()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let mut schema = generator.subschema_for::<Diagnostic>();
+        schema.insert(
+            "description".to_owned(),
+            "A diagnostic that proves an unknown result must be reconciled through status first."
+                .into(),
+        );
+        schema.insert(
+            "properties".to_owned(),
+            serde_json::json!({"retry": {"const": "status_first"}}),
+        );
+        schema
     }
 }
 

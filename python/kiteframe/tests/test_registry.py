@@ -5,6 +5,8 @@ import pytest
 from kiteframe.registry import (
     ComponentKind,
     ComponentRegistry,
+    ComponentUnresolvedError,
+    DuplicateComponentRegistrationError,
     FrozenComponentRegistry,
     RegistryKey,
 )
@@ -16,7 +18,10 @@ def test_duplicate_registration_is_rejected_without_overwrite() -> None:
 
     registry.register(ComponentKind.MODEL, "models.primary", first)
 
-    with pytest.raises(ValueError, match="already registered") as duplicate:
+    with pytest.raises(
+        DuplicateComponentRegistrationError,
+        match="already registered",
+    ) as duplicate:
         registry.register(ComponentKind.MODEL, "models.primary", object())
 
     assert duplicate.value.code == "KF-RUNTIME-001"
@@ -38,10 +43,17 @@ def test_wrong_kind_and_absent_symbol_use_component_unresolved(
     registry.register(ComponentKind.BACKEND, "backends.workspace", object())
     frozen = registry.freeze()
 
-    with pytest.raises(Exception) as unresolved:
+    with pytest.raises(ComponentUnresolvedError) as unresolved:
         frozen.resolve(kind, symbol)
 
     assert unresolved.value.code == "KF-RUNTIME-001"
+
+
+def test_registration_rejects_non_component_kind() -> None:
+    registry = ComponentRegistry()
+
+    with pytest.raises(TypeError, match="ComponentKind"):
+        registry.register("model", "models.primary", object())  # type: ignore[arg-type]
 
 
 def test_frozen_registry_cannot_be_mutated() -> None:
@@ -64,6 +76,16 @@ def test_frozen_registry_constructor_snapshots_mutable_mappings() -> None:
     symbols["models.primary"] = ComponentKind.BACKEND
 
     assert frozen.resolve(ComponentKind.MODEL, "models.primary") is first
+
+
+def test_frozen_registry_rejects_inconsistent_constructor_mappings() -> None:
+    key = RegistryKey(ComponentKind.MODEL, "models.primary")
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        FrozenComponentRegistry(
+            {key: object()},
+            {"models.primary": ComponentKind.BACKEND},
+        )
 
 
 def test_frozen_registries_are_isolated_across_100_concurrent_tasks() -> None:

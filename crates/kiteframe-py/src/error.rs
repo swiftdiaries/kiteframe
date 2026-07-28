@@ -1,4 +1,4 @@
-use kiteframe_contract::Diagnostic;
+use kiteframe_contract::{Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage};
 use kiteframe_core::canonical_json;
 use pyo3::{
     PyErr, Python,
@@ -80,7 +80,12 @@ pub(crate) fn diagnostic_error(mut diagnostics: Vec<Diagnostic>) -> PyErr {
 }
 
 pub(crate) fn ir_parse_error(_: serde_json::Error) -> PyErr {
-    PyValueError::new_err("ResolvedAgent JSON is invalid")
+    diagnostic_error(vec![Diagnostic::error(
+        DiagnosticCode::PackageInvalid,
+        DiagnosticCategory::Package,
+        DiagnosticStage::Validate,
+        "ResolvedAgent JSON is invalid",
+    )])
 }
 
 pub(crate) fn canonical_ir_error() -> PyErr {

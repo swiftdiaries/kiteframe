@@ -305,6 +305,11 @@
     },
     "StatusFirstDiagnostic": {
       "description": "A diagnostic that proves an unknown result must be reconciled through status first.",
+      "properties": {
+        "retry": {
+          "const": "status_first"
+        }
+      },
       "$ref": "#/$defs/Diagnostic"
     },
     "Suspension": {
