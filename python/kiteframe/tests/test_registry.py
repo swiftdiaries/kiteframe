@@ -2,7 +2,12 @@ import asyncio
 
 import pytest
 
-from kiteframe.registry import ComponentKind, ComponentRegistry
+from kiteframe.registry import (
+    ComponentKind,
+    ComponentRegistry,
+    FrozenComponentRegistry,
+    RegistryKey,
+)
 
 
 def test_duplicate_registration_is_rejected_without_overwrite() -> None:
@@ -45,6 +50,20 @@ def test_frozen_registry_cannot_be_mutated() -> None:
 
     with pytest.raises(RuntimeError, match="frozen"):
         registry.register(ComponentKind.MODEL, "models.late", object())
+
+
+def test_frozen_registry_constructor_snapshots_mutable_mappings() -> None:
+    first = object()
+    second = object()
+    key = RegistryKey(ComponentKind.MODEL, "models.primary")
+    entries = {key: first}
+    symbols = {"models.primary": ComponentKind.MODEL}
+
+    frozen = FrozenComponentRegistry(entries, symbols)
+    entries[key] = second
+    symbols["models.primary"] = ComponentKind.BACKEND
+
+    assert frozen.resolve(ComponentKind.MODEL, "models.primary") is first
 
 
 def test_frozen_registries_are_isolated_across_100_concurrent_tasks() -> None:

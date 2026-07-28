@@ -96,12 +96,20 @@ class ComponentRegistry:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class FrozenComponentRegistry:
     """An immutable, instance-scoped snapshot for runtime construction."""
 
     _entries: Mapping[RegistryKey, object]
     _symbols: Mapping[str, ComponentKind]
+
+    def __init__(
+        self,
+        entries: Mapping[RegistryKey, object],
+        symbols: Mapping[str, ComponentKind],
+    ) -> None:
+        object.__setattr__(self, "_entries", MappingProxyType(dict(entries)))
+        object.__setattr__(self, "_symbols", MappingProxyType(dict(symbols)))
 
     def resolve(self, kind: ComponentKind, symbol: str) -> object:
         try:
