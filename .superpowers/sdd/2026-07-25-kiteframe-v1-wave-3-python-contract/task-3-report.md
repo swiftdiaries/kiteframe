@@ -431,3 +431,123 @@ staging.
    `kiteframe._native` only. It does not modify the pure-Python public
    re-export surface or implement the registry/client work assigned to Tasks
    4 and 5.
+
+## Fix round 1: locked-schema response boundary
+
+### Finding addressed
+
+The three native provider-response loaders previously called
+`serde_json::from_slice` directly. That enforced Rust deserialization and
+semantic constructors but did not validate the raw response against the
+checked-in response schema before projection.
+
+The native response boundary now:
+
+1. parses the raw response into a generic JSON value;
+2. validates that value with a lazily compiled Draft 2020-12 validator backed
+   by the corresponding checked-in schema under `schemas/v1alpha1/`;
+3. deserializes the schema-valid value into the Rust-owned response type; and
+4. maps every failure phase to the same redacted Python `KF-CAP-002`
+   diagnostic.
+
+`validate_locked_response` is shared by grant-set, invocation-outcome, and
+invocation-status loading. The locked schemas are embedded with
+`include_bytes!`, so the validator cannot silently select a runtime or
+deployment-local schema. This change adds no HTTP, registry, or Task 5 client
+behavior.
+
+The internal `ProviderResponseError` phase classification keeps tests able to
+prove both boundaries without exposing provider payload details to Python:
+
+- `LockedSchema` proves schema rejection occurs before typed deserialization;
+- `Contract` proves schema-valid values still pass through Rust semantic
+  constructors.
+
+### Named coverage
+
+- `grant_set_response_boundary_rejects_locked_schema_violation`
+- `invocation_outcome_response_boundary_rejects_locked_schema_violation`
+- `invocation_status_response_boundary_rejects_locked_schema_violation`
+- `provider_loaders_reject_contract_invalid_response_after_schema_validation`
+
+Each locked-schema case supplies a response with an additional property
+forbidden by that exact checked-in schema and asserts the schema-phase error.
+The contract-phase case supplies a schema-valid deferred outcome whose blank
+invocation ID is rejected only by the Rust `InvocationId` constructor.
+
+### Red evidence
+
+Before production changes:
+
+```text
+rtk env -u CONDA_PREFIX PYO3_PYTHON=/opt/homebrew/bin/python3 \
+  cargo test -p kiteframe-py --test service_projection
+
+error[E0432]: unresolved import `_native::ProviderResponseError`
+  --> crates/kiteframe-py/tests/service_projection.rs:2:5
+   |
+2  |     ProviderResponseError, ...
+   |     ^^^^^^^^^^^^^^^^^^^^^ no `ProviderResponseError` in the root
+
+error: could not compile `kiteframe-py` (test "service_projection") due to 1 previous error
+```
+
+This failed because the boundary had no distinguishable locked-schema phase.
+
+### Focused green evidence
+
+```text
+rtk env -u CONDA_PREFIX PYO3_PYTHON=/opt/homebrew/bin/python3 \
+  cargo test -p kiteframe-py --test service_projection
+
+running 6 tests
+test grant_set_projection_exposes_only_stable_scalar_and_tuple_values ... ok
+test invocation_outcome_response_boundary_rejects_locked_schema_violation ... ok
+test invocation_status_response_boundary_rejects_locked_schema_violation ... ok
+test provider_loaders_reject_contract_invalid_response_after_schema_validation ... ok
+test invocation_loaders_validate_and_preserve_stable_variants ... ok
+test grant_set_response_boundary_rejects_locked_schema_violation ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+### Full verification
+
+```text
+rtk env -u CONDA_PREFIX PYO3_PYTHON=/opt/homebrew/bin/python3 \
+  cargo test -p kiteframe-contract -p kiteframe-py -p kiteframe-schema
+```
+
+Exit `0`: 58 non-doc Rust tests passed; both doc-test suites passed.
+
+```text
+cd python/kiteframe
+rtk env -u CONDA_PREFIX uv run --project . maturin develop
+rtk env -u CONDA_PREFIX uv run --project . pytest -q
+
+.................                                                        [100%]
+17 passed in 7.84s
+```
+
+The first sandboxed nested-Python invocation could not read uv's external
+cache and exited with:
+
+```text
+error: failed to open file `/Users/adhita/.cache/uv/sdists-v7/.git`:
+Operation not permitted (os error 1)
+```
+
+The identical commands succeeded after granting the required cache access.
+
+The following all exited `0`:
+
+```text
+rtk cargo fmt --all -- --check
+rtk env -u CONDA_PREFIX PYO3_PYTHON=/opt/homebrew/bin/python3 \
+  cargo clippy -p kiteframe-contract -p kiteframe-py \
+  -p kiteframe-schema --all-targets -- -D warnings
+rtk env -u CONDA_PREFIX PYO3_PYTHON=/opt/homebrew/bin/python3 \
+  cargo run -p kiteframe-schema -- \
+  --check-python-stubs python/kiteframe/src/kiteframe/_native.pyi
+rtk git diff --check
+```

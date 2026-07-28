@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use kiteframe_contract::{
     CapabilityGrant as ContractCapabilityGrant, CapabilityGrantSet as ContractCapabilityGrantSet,
@@ -10,6 +10,22 @@ use pyo3::{prelude::*, types::PyTuple};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
 use crate::error::diagnostic_error;
+
+static CAPABILITY_GRANT_SET_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/capability-grant-set.schema.json"
+    ))
+});
+static INVOCATION_OUTCOME_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/invocation-outcome.schema.json"
+    ))
+});
+static INVOCATION_STATUS_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/invocation-status.schema.json"
+    ))
+});
 
 #[gen_stub_pyclass]
 #[pyclass(
@@ -277,20 +293,52 @@ impl PyInvocationStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderResponseError {
+    MalformedJson,
+    LockedSchema,
+    Contract,
+}
+
 pub fn load_capability_grant_set_inner(
     bytes: &[u8],
-) -> serde_json::Result<ContractCapabilityGrantSet> {
-    serde_json::from_slice(bytes)
+) -> Result<ContractCapabilityGrantSet, ProviderResponseError> {
+    validate_locked_response(bytes, &CAPABILITY_GRANT_SET_SCHEMA)
 }
 
 pub fn load_invocation_outcome_inner(
     bytes: &[u8],
-) -> serde_json::Result<ContractInvocationOutcome> {
-    serde_json::from_slice(bytes)
+) -> Result<ContractInvocationOutcome, ProviderResponseError> {
+    validate_locked_response(bytes, &INVOCATION_OUTCOME_SCHEMA)
 }
 
-pub fn load_invocation_status_inner(bytes: &[u8]) -> serde_json::Result<ContractInvocationStatus> {
-    serde_json::from_slice(bytes)
+pub fn load_invocation_status_inner(
+    bytes: &[u8],
+) -> Result<ContractInvocationStatus, ProviderResponseError> {
+    validate_locked_response(bytes, &INVOCATION_STATUS_SCHEMA)
+}
+
+fn locked_response_validator(schema_bytes: &[u8]) -> jsonschema::Validator {
+    let schema = serde_json::from_slice(schema_bytes)
+        .expect("checked-in locked response schema must contain valid JSON");
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .expect("checked-in locked response schema must compile")
+}
+
+fn validate_locked_response<T>(
+    bytes: &[u8],
+    validator: &jsonschema::Validator,
+) -> Result<T, ProviderResponseError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    let response =
+        serde_json::from_slice(bytes).map_err(|_| ProviderResponseError::MalformedJson)?;
+    if !validator.is_valid(&response) {
+        return Err(ProviderResponseError::LockedSchema);
+    }
+    serde_json::from_value(response).map_err(|_| ProviderResponseError::Contract)
 }
 
 #[gen_stub_pyfunction]
@@ -335,7 +383,7 @@ pub fn load_invocation_status(
         .map_err(provider_response_error)
 }
 
-fn provider_response_error(_: serde_json::Error) -> PyErr {
+fn provider_response_error(_: ProviderResponseError) -> PyErr {
     diagnostic_error(vec![Diagnostic::error(
         DiagnosticCode::ResultInvalid,
         DiagnosticCategory::Capability,

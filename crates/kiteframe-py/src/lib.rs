@@ -10,8 +10,9 @@ use ir::{PyResolvedAgent, PyResolvedCapabilityRequirement, PyResolvedSubagent};
 use pyo3::prelude::*;
 use pyo3_stub_gen::{StubGenConfig, StubInfo};
 pub use service::{
-    PyCapabilityGrant, PyCapabilityGrantSet, PyInvocationOutcome, PyInvocationStatus,
-    load_capability_grant_set_inner, load_invocation_outcome_inner, load_invocation_status_inner,
+    ProviderResponseError, PyCapabilityGrant, PyCapabilityGrantSet, PyInvocationOutcome,
+    PyInvocationStatus, load_capability_grant_set_inner, load_invocation_outcome_inner,
+    load_invocation_status_inner,
 };
 
 #[pymodule]

@@ -842,11 +842,13 @@ dependencies = [
 name = "kiteframe-py"
 version = "0.1.0"
 dependencies = [
+ "jsonschema",
  "kiteframe-contract",
  "kiteframe-core",
  "kiteframe-resolver",
  "pyo3",
  "pyo3-stub-gen",
+ "serde",
  "serde_json",
 ]
 

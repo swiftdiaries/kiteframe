@@ -1,6 +1,6 @@
 use _native::{
-    PyCapabilityGrantSet, PyInvocationOutcome, PyInvocationStatus, load_invocation_outcome_inner,
-    load_invocation_status_inner,
+    ProviderResponseError, PyCapabilityGrantSet, PyInvocationOutcome, PyInvocationStatus,
+    load_capability_grant_set_inner, load_invocation_outcome_inner, load_invocation_status_inner,
 };
 use kiteframe_contract::{
     ActorRef, AdmissionId, AgentRef, CapabilityGrant, CapabilityGrantParts, CapabilityGrantSet,
@@ -40,10 +40,44 @@ fn invocation_loaders_validate_and_preserve_stable_variants() {
 }
 
 #[test]
-fn provider_loaders_reject_unknown_variants() {
-    assert!(
-        load_invocation_outcome_inner(br#"{"invocation_id":"inv-1","status":"not-a-status"}"#)
-            .is_err()
+fn provider_loaders_reject_contract_invalid_response_after_schema_validation() {
+    assert_eq!(
+        load_invocation_outcome_inner(br#"{"invocation_id":" ","status":"deferred"}"#).unwrap_err(),
+        ProviderResponseError::Contract
+    );
+}
+
+#[test]
+fn grant_set_response_boundary_rejects_locked_schema_violation() {
+    let mut response = serde_json::to_value(grant_set()).unwrap();
+    response
+        .as_object_mut()
+        .unwrap()
+        .insert("schemaOnlyField".to_owned(), serde_json::json!(true));
+
+    assert_eq!(
+        load_capability_grant_set_inner(&serde_json::to_vec(&response).unwrap()).unwrap_err(),
+        ProviderResponseError::LockedSchema
+    );
+}
+
+#[test]
+fn invocation_outcome_response_boundary_rejects_locked_schema_violation() {
+    let response = br#"{"invocation_id":"inv-1","status":"deferred","schema_only_field":true}"#;
+
+    assert_eq!(
+        load_invocation_outcome_inner(response).unwrap_err(),
+        ProviderResponseError::LockedSchema
+    );
+}
+
+#[test]
+fn invocation_status_response_boundary_rejects_locked_schema_violation() {
+    let response = br#"{"invocation_id":"inv-1","status":"pending","schema_only_field":true}"#;
+
+    assert_eq!(
+        load_invocation_status_inner(response).unwrap_err(),
+        ProviderResponseError::LockedSchema
     );
 }
 
