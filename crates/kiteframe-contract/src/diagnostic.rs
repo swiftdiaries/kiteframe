@@ -169,6 +169,17 @@ impl Diagnostic {
             details: BTreeMap::new(),
         }
     }
+
+    pub fn outcome_unknown(message: impl Into<SafeMessage>) -> Self {
+        let mut diagnostic = Self::error(
+            DiagnosticCode::OutcomeUnknown,
+            DiagnosticCategory::Capability,
+            DiagnosticStage::Invoke,
+            message,
+        );
+        diagnostic.retry = RetryClass::StatusFirst;
+        diagnostic
+    }
 }
 
 impl Ord for Diagnostic {

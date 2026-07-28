@@ -12,6 +12,7 @@ mod lock;
 mod manifest;
 mod package;
 mod schema;
+mod service;
 
 pub use binding::{
     BindingContentCapturePolicy, RegistrySymbol, RuntimeBinding, RuntimeBindingMetadata,
@@ -55,4 +56,12 @@ pub use package::{InvalidPackagePath, PackagePath, ValidatedTextAsset};
 pub use schema::{
     AGENT_API_VERSION, AgentKind, AgentSchemaVersion, BINDING_API_VERSION, BindingSchemaVersion,
     RuntimeBindingKind,
+};
+pub use service::{
+    ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, CapabilityGrant,
+    CapabilityGrantParts, CapabilityGrantSet, CapabilityGrantSetParts, CatalogRequest,
+    DelegationAncestry, EvidenceReferences, IdempotencyKey, InvocationId, InvocationOutcome,
+    InvocationRequest, InvocationStatus, NormalizedResourceSelector, PolicyRevision,
+    RequestedCapability, SessionRef, StableCapabilityError, Suspension, TaskRef, Timestamp,
+    TraceContext,
 };

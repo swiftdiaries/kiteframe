@@ -427,6 +427,9 @@ impl CapabilityDescriptor {
     pub fn approval(&self) -> &ApprovalRequirement {
         &self.approval
     }
+    pub fn idempotency(&self) -> &IdempotencyRequirement {
+        &self.idempotency
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

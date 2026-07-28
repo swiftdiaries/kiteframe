@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CapabilityGrantSet",
+  "type": "object",
+  "properties": {
+    "actor": {
+      "type": "string"
+    },
+    "admissionId": {
+      "type": "string"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "catalogDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "expiresAt": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "grantDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "grants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapabilityGrant"
+      }
+    },
+    "issuedAt": {
+      "$ref": "#/$defs/Timestamp"
+    },
+    "policyRevision": {
+      "type": "string"
+    },
+    "session": {
+      "type": "string"
+    },
+    "task": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "admissionId",
+    "actor",
+    "agent",
+    "task",
+    "session",
+    "policyRevision",
+    "catalogDigest",
+    "issuedAt",
+    "expiresAt",
+    "grants",
+    "grantDigest"
+  ],
+  "$defs": {
+    "CapabilityGrant": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "resources"
+      ]
+    },
+    "CapabilityIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CapabilityName"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "Timestamp": {
+      "description": "Unix seconds. Provider adapters obtain time from their deployment rather than from packages.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  }
+}

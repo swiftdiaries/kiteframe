@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdmissionRequest",
+  "type": "object",
+  "properties": {
+    "actor": {
+      "type": "string"
+    },
+    "agent": {
+      "type": "string"
+    },
+    "contextualFacts": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "delegationAncestry": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lockDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "optionalCapabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RequestedCapability"
+      }
+    },
+    "portableDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "requiredCapabilities": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/RequestedCapability"
+      }
+    },
+    "resolvedDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "session": {
+      "type": "string"
+    },
+    "task": {
+      "type": "string"
+    },
+    "traceContext": {
+      "$ref": "#/$defs/TraceContext"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "actor",
+    "agent",
+    "task",
+    "session",
+    "portableDigest",
+    "lockDigest",
+    "resolvedDigest",
+    "requiredCapabilities",
+    "optionalCapabilities",
+    "delegationAncestry",
+    "contextualFacts",
+    "traceContext"
+  ],
+  "$defs": {
+    "CapabilityIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CapabilityName"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "RequestedCapability": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "resources"
+      ]
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "TraceContext": {
+      "type": "object",
+      "properties": {
+        "baggage": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "traceparent": {
+          "type": "string"
+        },
+        "tracestate": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "traceparent"
+      ]
+    }
+  }
+}

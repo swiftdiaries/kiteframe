@@ -1,0 +1,319 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvocationOutcome",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "invocation_id": {
+          "type": "string"
+        },
+        "result": true,
+        "status": {
+          "type": "string",
+          "const": "succeeded"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "invocation_id",
+        "result"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/StableCapabilityError"
+        },
+        "invocation_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "const": "failed"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "invocation_id",
+        "error"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "diagnostic": {
+          "$ref": "#/$defs/Diagnostic"
+        },
+        "invocation_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "const": "denied"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "invocation_id",
+        "diagnostic"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "invocation_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "const": "suspended"
+        },
+        "suspension": {
+          "$ref": "#/$defs/Suspension"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "invocation_id",
+        "suspension"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "invocation_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "const": "deferred"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "invocation_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "diagnostic": {
+          "$ref": "#/$defs/Diagnostic"
+        },
+        "invocation_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "const": "outcome_unknown"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "invocation_id",
+        "diagnostic"
+      ]
+    }
+  ],
+  "$defs": {
+    "Diagnostic": {
+      "description": "A portable, redacted diagnostic. Details must be populated only with values safe for callers.",
+      "type": "object",
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/DiagnosticCategory"
+        },
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "help": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/SafeMessage"
+        },
+        "package_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryClass"
+        },
+        "severity": {
+          "$ref": "#/$defs/DiagnosticSeverity"
+        },
+        "source_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "$ref": "#/$defs/DiagnosticStage"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "category",
+        "severity",
+        "stage",
+        "message",
+        "retry",
+        "details"
+      ]
+    },
+    "DiagnosticCategory": {
+      "type": "string",
+      "enum": [
+        "package",
+        "lock",
+        "catalog",
+        "feature",
+        "authorization",
+        "capability",
+        "audit",
+        "runtime"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable V1 machine-readable diagnostic code.",
+      "type": "string",
+      "enum": [
+        "KF-PKG-001",
+        "KF-PKG-002",
+        "KF-LOCK-001",
+        "KF-LOCK-002",
+        "KF-CAT-001",
+        "KF-FEAT-001",
+        "KF-AUTH-001",
+        "KF-AUTH-002",
+        "KF-AUTH-003",
+        "KF-AUTH-004",
+        "KF-CAP-001",
+        "KF-CAP-002",
+        "KF-CAP-003",
+        "KF-AUDIT-001",
+        "KF-RUNTIME-001",
+        "KF-RUNTIME-002",
+        "KF-CLI-001",
+        "KF-CLI-002"
+      ]
+    },
+    "DiagnosticSeverity": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning"
+      ]
+    },
+    "DiagnosticStage": {
+      "type": "string",
+      "enum": [
+        "parse",
+        "validate",
+        "lock",
+        "resolve",
+        "admit",
+        "invoke",
+        "audit",
+        "runtime"
+      ]
+    },
+    "RetryClass": {
+      "type": "string",
+      "enum": [
+        "never",
+        "after_refresh",
+        "after_user_action",
+        "status_first"
+      ]
+    },
+    "SafeMessage": {
+      "description": "A caller-supplied message that is safe to render to users.",
+      "type": "string"
+    },
+    "SourceRange": {
+      "description": "A half-open byte range within a package source file.",
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end"
+      ]
+    },
+    "StableCapabilityError": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "$ref": "#/$defs/SafeMessage"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryClass"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "category",
+        "retry",
+        "message"
+      ]
+    },
+    "Suspension": {
+      "type": "object",
+      "properties": {
+        "checkpointRef": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "checkpointRef"
+      ]
+    }
+  }
+}

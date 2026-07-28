@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "InvocationRequest",
+  "type": "object",
+  "properties": {
+    "admissionId": {
+      "type": "string"
+    },
+    "arguments": true,
+    "capability": {
+      "$ref": "#/$defs/CapabilityIdentity"
+    },
+    "evidenceRefs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "idempotencyKey": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "invocationId": {
+      "type": "string"
+    },
+    "preconditions": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "selectedResource": {
+      "type": "string"
+    },
+    "traceContext": {
+      "$ref": "#/$defs/TraceContext"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "invocationId",
+    "admissionId",
+    "capability",
+    "selectedResource",
+    "arguments",
+    "preconditions",
+    "evidenceRefs",
+    "traceContext"
+  ],
+  "$defs": {
+    "CapabilityIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CapabilityName"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "TraceContext": {
+      "type": "object",
+      "properties": {
+        "baggage": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "traceparent": {
+          "type": "string"
+        },
+        "tracestate": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "traceparent"
+      ]
+    }
+  }
+}
