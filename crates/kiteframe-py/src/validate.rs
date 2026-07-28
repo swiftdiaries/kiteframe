@@ -5,12 +5,12 @@ use std::{
 };
 
 use kiteframe_contract::{
-    CapabilityLock, ComponentMetadataCatalog, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, FeatureSet, PackageIdentity, PackagePath, ResolvedAgent,
-    RuntimeTargetDescriptor,
+    CapabilityLock, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage,
+    PackageIdentity, PackagePath, ResolvedAgent,
 };
 use kiteframe_core::{
-    AgentPackage, PackageLimits, canonical_json, hash_domain, load_package, load_runtime_binding,
+    AgentPackage, PackageLimits, canonical_json, load_package, load_runtime_binding,
+    load_runtime_target_catalog,
 };
 use kiteframe_resolver::{ResolutionInput, resolve_agent, verify_lock};
 use pyo3::prelude::*;
@@ -19,8 +19,6 @@ use crate::{
     error::{canonical_ir_error, diagnostic_error, ir_parse_error},
     ir::PyResolvedAgent,
 };
-
-const TARGET_DIGEST_DOMAIN: &[u8] = b"runtime-target-catalog";
 
 #[pyfunction]
 pub(crate) fn load_resolved_agent(bytes: &[u8]) -> PyResult<PyResolvedAgent> {
@@ -54,7 +52,7 @@ fn resolve_package_inner(
     verify_lock(&package, &lock, None)?;
     let binding_path = package_relative_path(&package, binding_path)?;
     let binding = load_runtime_binding(package.root().as_path(), &binding_path, PackageLimits::V1)?;
-    let (target, components) = read_target_catalog(target_path)?;
+    let (target, components) = load_runtime_target_catalog(target_path)?;
     let child_locks = read_child_locks(&package)?;
 
     resolve_agent(ResolutionInput {
@@ -65,45 +63,6 @@ fn resolve_package_inner(
         target,
         components,
     })
-}
-
-fn read_target_catalog(
-    path: &Path,
-) -> Result<(RuntimeTargetDescriptor, ComponentMetadataCatalog), Vec<Diagnostic>> {
-    let bytes = read_file(
-        path,
-        DiagnosticCode::ComponentUnresolved,
-        DiagnosticCategory::Runtime,
-        DiagnosticStage::Resolve,
-        "runtime target metadata cannot be read",
-    )?;
-    let components: ComponentMetadataCatalog = serde_json::from_slice(&bytes).map_err(|_| {
-        single_diagnostic(
-            DiagnosticCode::ComponentUnresolved,
-            DiagnosticCategory::Runtime,
-            DiagnosticStage::Resolve,
-            "runtime target metadata is invalid",
-        )
-    })?;
-    let canonical = canonical_json(&components).map_err(|_| {
-        single_diagnostic(
-            DiagnosticCode::ComponentUnresolved,
-            DiagnosticCategory::Runtime,
-            DiagnosticStage::Resolve,
-            "runtime target metadata cannot be canonicalized",
-        )
-    })?;
-    let supported_features: FeatureSet = components
-        .components
-        .values()
-        .flat_map(|component| component.features.iter().cloned())
-        .collect();
-    let target = RuntimeTargetDescriptor {
-        target: components.target.clone(),
-        supported_features,
-        target_digest: hash_domain(TARGET_DIGEST_DOMAIN, [canonical.as_slice()]),
-    };
-    Ok((target, components))
 }
 
 fn read_child_locks(

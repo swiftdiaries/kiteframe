@@ -4,17 +4,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use kiteframe_contract::{
-    CapabilityLock, ComponentMetadataCatalog, FeatureSet, PackageIdentity, PackagePath,
-    RuntimeTargetDescriptor,
-};
+use kiteframe_contract::{CapabilityLock, PackageIdentity, PackagePath};
 use kiteframe_core::{
-    PackageLimits, canonical_json, hash_domain, load_package, load_runtime_binding,
+    PackageLimits, canonical_json, load_package, load_runtime_binding, load_runtime_target_catalog,
 };
 use kiteframe_resolver::{ResolutionInput, resolve_agent};
 use serde_json::{Value, json};
-
-const TARGET_DIGEST_DOMAIN: &[u8] = b"runtime-target-catalog";
 
 fn workspace_fixture(path: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -33,21 +28,8 @@ fn resolution_fixture() -> ResolutionInput {
         PackageLimits::V1,
     )
     .unwrap();
-    let components: ComponentMetadataCatalog = serde_json::from_slice(
-        &fs::read(workspace_fixture("components/deepagents-test.json")).unwrap(),
-    )
-    .unwrap();
-    let canonical_components = canonical_json(&components).unwrap();
-    let supported_features: FeatureSet = components
-        .components
-        .values()
-        .flat_map(|component| component.features.iter().cloned())
-        .collect();
-    let target = RuntimeTargetDescriptor {
-        target: components.target.clone(),
-        supported_features,
-        target_digest: hash_domain(TARGET_DIGEST_DOMAIN, [canonical_components.as_slice()]),
-    };
+    let (target, components) =
+        load_runtime_target_catalog(&workspace_fixture("components/deepagents-test.json")).unwrap();
 
     ResolutionInput {
         package,

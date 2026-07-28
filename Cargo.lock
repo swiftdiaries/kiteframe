@@ -654,9 +654,11 @@ dependencies = [
  "kiteframe-contract",
  "proptest",
  "serde",
+ "serde_json",
  "serde_json_canonicalizer",
  "serde_yaml_ng",
  "sha2",
+ "tempfile",
  "yaml-rust2",
 ]
 

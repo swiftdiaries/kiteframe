@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 kiteframe-contract = { path = "../kiteframe-contract" }
 serde.workspace = true
+serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
@@ -16,3 +17,4 @@ yaml-rust2.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
