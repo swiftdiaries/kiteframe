@@ -283,10 +283,12 @@
       "type": "object",
       "properties": {
         "category": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "code": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "message": {
           "$ref": "#/$defs/SafeMessage"
@@ -316,7 +318,8 @@
       "type": "object",
       "properties": {
         "checkpointRef": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": false,

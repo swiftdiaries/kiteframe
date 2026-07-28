@@ -2,6 +2,8 @@ import ast
 import subprocess
 from pathlib import Path
 
+import kiteframe
+
 
 def workspace_root() -> Path:
     return Path(__file__).resolve().parents[3]
@@ -28,6 +30,25 @@ def test_generated_native_stub_has_no_drift() -> None:
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_generated_native_stub_has_exactly_one_final_newline() -> None:
+    stub = native_stub_path().read_bytes()
+    assert stub.endswith(b"\n")
+    assert not stub.endswith(b"\n\n")
+
+
+def test_public_package_exports_service_response_contracts() -> None:
+    expected = {
+        "CapabilityGrantSet",
+        "InvocationOutcome",
+        "InvocationStatus",
+        "load_capability_grant_set",
+        "load_invocation_outcome",
+        "load_invocation_status",
+    }
+    assert expected <= set(kiteframe.__all__)
+    assert all(hasattr(kiteframe, name) for name in expected)
 
 
 def test_rust_owned_stub_classes_are_read_only_and_nonconstructible() -> None:

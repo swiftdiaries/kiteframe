@@ -4,9 +4,9 @@ use kiteframe_contract::{
     AdmissionRequest as ContractAdmissionRequest, CapabilityCatalog as ContractCapabilityCatalog,
     CapabilityGrant as ContractCapabilityGrant, CapabilityGrantSet as ContractCapabilityGrantSet,
     CatalogRequest as ContractCatalogRequest, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, InvocationOutcome as ContractInvocationOutcome,
-    InvocationRequest as ContractInvocationRequest, InvocationStatus as ContractInvocationStatus,
-    TraceContext,
+    DiagnosticStage, InvocationId as ContractInvocationId,
+    InvocationOutcome as ContractInvocationOutcome, InvocationRequest as ContractInvocationRequest,
+    InvocationStatus as ContractInvocationStatus, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::{prelude::*, types::PyTuple};
@@ -592,6 +592,7 @@ pub enum ProviderResponseError {
     NonCanonical,
     LockedSchema,
     Contract,
+    Correlation,
 }
 
 pub fn load_catalog_request_inner(
@@ -636,6 +637,39 @@ pub fn load_invocation_status_inner(
     validate_locked_response(bytes, &INVOCATION_STATUS_SCHEMA)
 }
 
+pub fn load_capability_grant_set_for_request_inner(
+    bytes: &[u8],
+    request: &ContractAdmissionRequest,
+) -> Result<ContractCapabilityGrantSet, ProviderResponseError> {
+    let response = load_capability_grant_set_inner(bytes)?;
+    response
+        .validate_against(request)
+        .map_err(|_| ProviderResponseError::Correlation)?;
+    Ok(response)
+}
+
+pub fn load_invocation_outcome_for_request_inner(
+    bytes: &[u8],
+    request: &ContractInvocationRequest,
+) -> Result<ContractInvocationOutcome, ProviderResponseError> {
+    let response = load_invocation_outcome_inner(bytes)?;
+    response
+        .validate_against(request)
+        .map_err(|_| ProviderResponseError::Correlation)?;
+    Ok(response)
+}
+
+pub fn load_invocation_status_for_invocation_id_inner(
+    bytes: &[u8],
+    invocation_id: &ContractInvocationId,
+) -> Result<ContractInvocationStatus, ProviderResponseError> {
+    let response = load_invocation_status_inner(bytes)?;
+    response
+        .validate_invocation_id(invocation_id)
+        .map_err(|_| ProviderResponseError::Correlation)?;
+    Ok(response)
+}
+
 fn locked_response_validator(schema_bytes: &[u8]) -> jsonschema::Validator {
     let schema = serde_json::from_slice(schema_bytes)
         .expect("checked-in locked response schema must contain valid JSON");
@@ -661,14 +695,15 @@ fn validate_canonical_locked_response<T>(
     validator: &jsonschema::Validator,
 ) -> Result<T, ProviderResponseError>
 where
-    T: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned + serde::Serialize,
 {
     let response =
         serde_json::from_slice(bytes).map_err(|_| ProviderResponseError::MalformedJson)?;
-    if canonical_json(&response).map_err(|_| ProviderResponseError::MalformedJson)? != bytes {
+    let typed = validate_locked_value(response, validator)?;
+    if canonical_json(&typed).map_err(|_| ProviderResponseError::Contract)? != bytes {
         return Err(ProviderResponseError::NonCanonical);
     }
-    validate_locked_value(response, validator)
+    Ok(typed)
 }
 
 fn validate_locked_value<T>(
@@ -782,12 +817,60 @@ pub fn load_invocation_status(
         .map_err(provider_response_error)
 }
 
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_capability_grant_set_for_request(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+    request: &PyAdmissionRequest,
+) -> PyResult<PyCapabilityGrantSet> {
+    load_capability_grant_set_for_request_inner(bytes, request.inner.as_ref())
+        .map(PyCapabilityGrantSet::from)
+        .map_err(provider_response_error)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_invocation_outcome_for_request(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+    request: &PyInvocationRequest,
+) -> PyResult<PyInvocationOutcome> {
+    load_invocation_outcome_for_request_inner(bytes, request.inner.as_ref())
+        .map(PyInvocationOutcome::from)
+        .map_err(provider_response_error)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_invocation_status_for_invocation_id(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+    invocation_id: &str,
+) -> PyResult<PyInvocationStatus> {
+    let invocation_id = ContractInvocationId::new(invocation_id)
+        .map_err(|_| provider_response_error(ProviderResponseError::Correlation))?;
+    load_invocation_status_for_invocation_id_inner(bytes, &invocation_id)
+        .map(PyInvocationStatus::from)
+        .map_err(provider_response_error)
+}
+
 fn provider_response_error(error: ProviderResponseError) -> PyErr {
     let message = match error {
         ProviderResponseError::NonCanonical => "provider payload is not canonical",
         ProviderResponseError::MalformedJson
         | ProviderResponseError::LockedSchema
-        | ProviderResponseError::Contract => "provider response is invalid",
+        | ProviderResponseError::Contract
+        | ProviderResponseError::Correlation => "provider response is invalid",
     };
     diagnostic_error(vec![Diagnostic::error(
         DiagnosticCode::ResultInvalid,

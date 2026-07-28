@@ -9,7 +9,8 @@ use kiteframe_contract::{
     ExecutionMode, IdempotencyRequirement, IdempotencyScope, InvocationId, InvocationOutcome,
     InvocationRequest, InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
     PreconditionDescriptor, RequestedCapability, ResourceSelectorSchema, RetryClass, SessionRef,
-    Sha256Digest, StatusFirstDiagnostic, TaskRef, Timestamp, TraceContext,
+    Sha256Digest, StableCapabilityError, StatusFirstDiagnostic, Suspension, TaskRef, Timestamp,
+    TraceContext,
 };
 use serde_json::json;
 
@@ -125,6 +126,143 @@ fn trace_context_rejects_an_opaque_bearer_secret_in_allowlisted_baggage() {
 }
 
 #[test]
+fn trace_context_rejects_noncanonical_traceparent_values() {
+    for traceparent in [
+        valid_traceparent().to_uppercase(),
+        valid_traceparent().replacen("00-", "01-", 1),
+        valid_traceparent().replacen("00-", "ff-", 1),
+        String::from("00-00000000000000000000000000000000-00f067aa0ba902b7-01"),
+        String::from("00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"),
+    ] {
+        assert!(
+            TraceContext::try_new(traceparent, None, BTreeMap::new()).is_err(),
+            "invalid traceparent was accepted"
+        );
+    }
+}
+
+#[test]
+fn trace_context_enforces_the_canonical_tracestate_subset() {
+    for tracestate in [
+        "vendor=value\r\nforged=member",
+        "vendor=one,vendor=two",
+        "1vendor=value",
+        "vendor=value, next=two",
+        "vendor=välue",
+    ] {
+        assert!(
+            TraceContext::try_new(
+                valid_traceparent(),
+                Some(tracestate.to_owned()),
+                BTreeMap::new(),
+            )
+            .is_err(),
+            "invalid tracestate was accepted: {tracestate:?}"
+        );
+    }
+
+    assert!(
+        TraceContext::try_new(
+            valid_traceparent(),
+            Some(String::from("vendor=value,1tenant@system=value two")),
+            BTreeMap::new(),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn trace_context_schema_expresses_native_wire_bounds() {
+    let schema = serde_json::to_value(schemars::schema_for!(CatalogRequest)).unwrap();
+    let trace = &schema["$defs"]["TraceContext"]["properties"];
+
+    assert_eq!(
+        trace["traceparent"]["pattern"],
+        json!("^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+    );
+    assert_eq!(trace["tracestate"]["minLength"], json!(1));
+    assert_eq!(trace["tracestate"]["maxLength"], json!(512));
+    assert_eq!(trace["tracestate"]["pattern"], json!("^[ -~]+$"));
+}
+
+#[test]
+fn wire_deserialization_cannot_bypass_service_value_invariants() {
+    assert!(
+        serde_json::from_value::<DelegationAncestry>(json!([
+            "agent:case-worker",
+            "agent:case-worker"
+        ]))
+        .is_err()
+    );
+
+    let requested = serde_json::from_value::<RequestedCapability>(json!({
+        "capability": {
+            "name": "cases.comment",
+            "version": "1.0.0"
+        },
+        "resources": [
+            "tenant:t1/case:case-2",
+            "tenant:t1/case:case-1",
+            "tenant:t1/case:case-1"
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        requested
+            .resources()
+            .iter()
+            .map(NormalizedResourceSelector::as_str)
+            .collect::<Vec<_>>(),
+        vec!["tenant:t1/case:case-1", "tenant:t1/case:case-2"]
+    );
+
+    for wire in [
+        json!({
+            "code": "",
+            "category": "capability",
+            "retry": "never",
+            "message": "safe"
+        }),
+        json!({
+            "code": "stable.error",
+            "category": " ",
+            "retry": "never",
+            "message": "safe"
+        }),
+    ] {
+        assert!(serde_json::from_value::<StableCapabilityError>(wire).is_err());
+    }
+    assert!(serde_json::from_value::<Suspension>(json!({"checkpointRef": "   "})).is_err());
+}
+
+#[test]
+fn service_schemas_express_non_bypassable_collection_and_text_invariants() {
+    let admission = serde_json::to_value(schemars::schema_for!(AdmissionRequest)).unwrap();
+    assert_eq!(
+        admission["$defs"]["DelegationAncestry"]["uniqueItems"],
+        json!(true)
+    );
+    assert_eq!(
+        admission["$defs"]["RequestedCapability"]["properties"]["resources"]["uniqueItems"],
+        json!(true)
+    );
+
+    let outcome = serde_json::to_value(schemars::schema_for!(InvocationOutcome)).unwrap();
+    assert_eq!(
+        outcome["$defs"]["StableCapabilityError"]["properties"]["code"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        outcome["$defs"]["StableCapabilityError"]["properties"]["category"]["minLength"],
+        json!(1)
+    );
+    assert_eq!(
+        outcome["$defs"]["Suspension"]["properties"]["checkpointRef"]["minLength"],
+        json!(1)
+    );
+}
+
+#[test]
 fn evidence_references_reject_raw_payloads() {
     assert!(
         EvidenceReferences::try_new(BTreeMap::from([(
@@ -157,6 +295,87 @@ fn grant_set_rejects_duplicate_capability_versions() {
     parts.grants.push(parts.grants[0].clone());
     let errors = CapabilityGrantSet::try_new(parts).unwrap_err();
     assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+}
+
+#[test]
+fn grant_set_validation_rejects_mismatched_admission_identity() {
+    let request = valid_admission_request();
+
+    for parts in [
+        CapabilityGrantSetParts {
+            actor: ActorRef::new("actor:bob").unwrap(),
+            ..grant_set_parts()
+        },
+        CapabilityGrantSetParts {
+            agent: AgentRef::new("agent:other").unwrap(),
+            ..grant_set_parts()
+        },
+        CapabilityGrantSetParts {
+            task: TaskRef::new("task:other").unwrap(),
+            ..grant_set_parts()
+        },
+        CapabilityGrantSetParts {
+            session: SessionRef::new("session:other").unwrap(),
+            ..grant_set_parts()
+        },
+    ] {
+        let response = CapabilityGrantSet::try_new(parts).unwrap();
+        let error = response.validate_against(&request).unwrap_err();
+        assert_eq!(error.code.as_str(), "KF-CAP-002");
+    }
+}
+
+#[test]
+fn grant_set_validation_rejects_unrequested_or_broader_grants() {
+    let request = valid_admission_request();
+
+    let mut unrequested = grant_set_parts();
+    unrequested.grants = vec![
+        CapabilityGrant::try_new(CapabilityGrantParts {
+            capability: capability_identity_with_name("cases.close"),
+            resources: vec![NormalizedResourceSelector::new("tenant:t1/case:case-1").unwrap()],
+        })
+        .unwrap(),
+    ];
+    let response = CapabilityGrantSet::try_new(unrequested).unwrap();
+    let error = response.validate_against(&request).unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-CAP-002");
+
+    let mut broader = grant_set_parts();
+    broader.grants = vec![
+        CapabilityGrant::try_new(CapabilityGrantParts {
+            capability: capability_identity(),
+            resources: vec![NormalizedResourceSelector::new("tenant:t1/case:*").unwrap()],
+        })
+        .unwrap(),
+    ];
+    let response = CapabilityGrantSet::try_new(broader).unwrap();
+    let error = response.validate_against(&request).unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-CAP-002");
+}
+
+#[test]
+fn invocation_outcome_validation_rejects_a_different_invocation() {
+    let request = invocation_request(None);
+    let outcome = InvocationOutcome::Succeeded {
+        invocation_id: InvocationId::new("inv-other").unwrap(),
+        result: json!({"ok": true}),
+    };
+
+    let error = outcome.validate_against(&request).unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-CAP-002");
+}
+
+#[test]
+fn invocation_status_validation_rejects_a_different_invocation() {
+    let status = InvocationStatus::Pending {
+        invocation_id: InvocationId::new("inv-other").unwrap(),
+    };
+
+    let error = status
+        .validate_invocation_id(&InvocationId::new("inv-1").unwrap())
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-CAP-002");
 }
 
 #[test]
@@ -299,8 +518,12 @@ fn descriptor(
 }
 
 fn capability_identity() -> CapabilityIdentity {
+    capability_identity_with_name("cases.comment")
+}
+
+fn capability_identity_with_name(name: &str) -> CapabilityIdentity {
     CapabilityIdentity::try_new(
-        CapabilityName::new("cases.comment").unwrap(),
+        CapabilityName::new(name).unwrap(),
         CapabilityReleaseVersion::new("1.0.0").unwrap(),
     )
     .unwrap()

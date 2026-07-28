@@ -13,8 +13,10 @@ pub use service::{
     ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCapabilityGrant,
     PyCapabilityGrantSet, PyCatalogRequest, PyInvocationOutcome, PyInvocationRequest,
     PyInvocationStatus, load_admission_request_inner, load_capability_catalog_inner,
-    load_capability_grant_set_inner, load_catalog_request_inner, load_invocation_outcome_inner,
-    load_invocation_request_inner, load_invocation_status_inner,
+    load_capability_grant_set_for_request_inner, load_capability_grant_set_inner,
+    load_catalog_request_inner, load_invocation_outcome_for_request_inner,
+    load_invocation_outcome_inner, load_invocation_request_inner,
+    load_invocation_status_for_invocation_id_inner, load_invocation_status_inner,
 };
 
 #[pymodule]
@@ -44,8 +46,20 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         service::load_capability_grant_set,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        service::load_capability_grant_set_for_request,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(service::load_invocation_outcome, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        service::load_invocation_outcome_for_request,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(service::load_invocation_status, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        service::load_invocation_status_for_invocation_id,
+        module
+    )?)?;
     Ok(())
 }
 

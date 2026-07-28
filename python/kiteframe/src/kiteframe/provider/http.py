@@ -1,8 +1,8 @@
 """Strict async client for the Kiteframe V1 capability provider profile."""
 
 import json
-from collections.abc import Mapping
-from typing import Any, Self
+from collections.abc import Callable, Mapping
+from typing import Any, Concatenate, ParamSpec, Self, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -17,9 +17,9 @@ from kiteframe._native import (
     InvocationStatus,
     KiteframeDiagnosticError,
     load_capability_catalog,
-    load_capability_grant_set,
-    load_invocation_outcome,
-    load_invocation_status,
+    load_capability_grant_set_for_request,
+    load_invocation_outcome_for_request,
+    load_invocation_status_for_invocation_id,
 )
 
 from .trace import trace_headers
@@ -115,6 +115,8 @@ _DIAGNOSTIC_CODE_ORDER = {
 _DIAGNOSTIC_RETRIES = frozenset(
     {"never", "after_refresh", "after_user_action", "status_first"}
 )
+_LoaderParameters = ParamSpec("_LoaderParameters")
+_Response = TypeVar("_Response")
 
 
 class ProviderTransportError(RuntimeError):
@@ -166,6 +168,10 @@ def _request_headers(
 
 
 async def _bounded_body(response: httpx.Response) -> bytes:
+    content_encoding = response.headers.get("content-encoding")
+    if content_encoding is not None and content_encoding.strip().lower() != "identity":
+        raise ProviderTransportError("provider returned a forbidden content encoding")
+
     content_length = response.headers.get("content-length")
     if content_length is not None:
         try:
@@ -183,6 +189,18 @@ async def _bounded_body(response: httpx.Response) -> bytes:
             raise ProviderTransportError("provider response exceeded body limit")
         body.extend(chunk)
     return bytes(body)
+
+
+def _load_native_response(
+    loader: Callable[Concatenate[bytes, _LoaderParameters], _Response],
+    body: bytes,
+    *args: _LoaderParameters.args,
+    **kwargs: _LoaderParameters.kwargs,
+) -> _Response:
+    try:
+        return loader(body, *args, **kwargs)
+    finally:
+        body = b""
 
 
 def _optional_string(
@@ -207,11 +225,16 @@ def _sanitize_diagnostic(diagnostic: object) -> dict[str, Any]:
     retry = diagnostic.get("retry")
     details = diagnostic.get("details")
     if (
-        code not in _DIAGNOSTIC_CODES
+        not isinstance(code, str)
+        or code not in _DIAGNOSTIC_CODES
+        or not isinstance(category, str)
         or category not in _DIAGNOSTIC_CATEGORIES
+        or not isinstance(severity, str)
         or severity not in {"error", "warning"}
+        or not isinstance(stage, str)
         or stage not in _DIAGNOSTIC_STAGES
         or not isinstance(message, str)
+        or not isinstance(retry, str)
         or retry not in _DIAGNOSTIC_RETRIES
         or not isinstance(details, dict)
     ):
@@ -269,33 +292,30 @@ def _diagnostic_error(
         diagnostics = [
             _sanitize_diagnostic(diagnostic) for diagnostic in raw_diagnostics
         ]
-    except (
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        ValueError,
-        ProviderTransportError,
-    ):
+        diagnostics.sort(
+            key=lambda diagnostic: (
+                _DIAGNOSTIC_STAGE_ORDER[diagnostic["stage"]],
+                diagnostic.get("package_path") is not None,
+                diagnostic.get("package_path") or "",
+                diagnostic.get("source_range") is not None,
+                (diagnostic.get("source_range") or {}).get("start", 0),
+                (diagnostic.get("source_range") or {}).get("end", 0),
+                _DIAGNOSTIC_CODE_ORDER[diagnostic["code"]],
+            )
+        )
+        error = KiteframeDiagnosticError(_REDACTED_PROVIDER_MESSAGE)
+        for attribute, value in (
+            ("code", diagnostics[0]["code"]),
+            ("diagnostics_json", _canonical_json(diagnostics)),
+        ):
+            setattr(error, attribute, value)
+        return error
+    except Exception:
         return ProviderTransportError(
             "provider returned an invalid diagnostic response"
         )
-    diagnostics.sort(
-        key=lambda diagnostic: (
-            _DIAGNOSTIC_STAGE_ORDER[diagnostic["stage"]],
-            diagnostic.get("package_path") is not None,
-            diagnostic.get("package_path") or "",
-            diagnostic.get("source_range") is not None,
-            (diagnostic.get("source_range") or {}).get("start", 0),
-            (diagnostic.get("source_range") or {}).get("end", 0),
-            _DIAGNOSTIC_CODE_ORDER[diagnostic["code"]],
-        )
-    )
-    error = KiteframeDiagnosticError(_REDACTED_PROVIDER_MESSAGE)
-    for attribute, value in (
-        ("code", diagnostics[0]["code"]),
-        ("diagnostics_json", _canonical_json(diagnostics)),
-    ):
-        setattr(error, attribute, value)
-    return error
+    finally:
+        body = b""
 
 
 class ProviderHttpClient:
@@ -350,12 +370,14 @@ class ProviderHttpClient:
         )
         if request.known_catalog_digest is not None:
             headers["if-none-match"] = f'"{request.known_catalog_digest}"'
-        body = await self._request(
-            "GET",
-            "/v1/capability-catalog",
-            headers=headers,
+        return _load_native_response(
+            load_capability_catalog,
+            await self._request(
+                "GET",
+                "/v1/capability-catalog",
+                headers=headers,
+            ),
         )
-        return load_capability_catalog(body)
 
     async def admit(
         self,
@@ -363,16 +385,19 @@ class ProviderHttpClient:
     ) -> CapabilityGrantSet:
         if not isinstance(request, AdmissionRequest):
             raise TypeError("admission request must be a native AdmissionRequest")
-        body = await self._request(
-            "POST",
-            "/v1/capability-admissions",
-            headers=_request_headers(
-                request,
-                baggage_allowlist=self._baggage_allowlist,
+        return _load_native_response(
+            load_capability_grant_set_for_request,
+            await self._request(
+                "POST",
+                "/v1/capability-admissions",
+                headers=_request_headers(
+                    request,
+                    baggage_allowlist=self._baggage_allowlist,
+                ),
+                content=request.canonical_json(),
             ),
-            content=request.canonical_json(),
+            request,
         )
-        return load_capability_grant_set(body)
 
     async def invoke(
         self,
@@ -381,16 +406,19 @@ class ProviderHttpClient:
         if not isinstance(request, InvocationRequest):
             raise TypeError("invocation request must be a native InvocationRequest")
         name = quote(request.capability_name, safe=".")
-        body = await self._request(
-            "POST",
-            f"/v1/capability-invocations/{name}",
-            headers=_request_headers(
-                request,
-                baggage_allowlist=self._baggage_allowlist,
+        return _load_native_response(
+            load_invocation_outcome_for_request,
+            await self._request(
+                "POST",
+                f"/v1/capability-invocations/{name}",
+                headers=_request_headers(
+                    request,
+                    baggage_allowlist=self._baggage_allowlist,
+                ),
+                content=request.canonical_json(),
             ),
-            content=request.canonical_json(),
+            request,
         )
-        return load_invocation_outcome(body)
 
     async def status(self, invocation_id: str) -> InvocationStatus:
         # Mirrors InvocationId::new's nonblank rule, then excludes RFC 3986
@@ -405,11 +433,14 @@ class ProviderHttpClient:
         ):
             raise ValueError("invocation ID must be a non-empty string")
         encoded_invocation_id = quote(invocation_id, safe="")
-        body = await self._request(
-            "GET",
-            f"/v1/capability-invocations/{encoded_invocation_id}",
+        return _load_native_response(
+            load_invocation_status_for_invocation_id,
+            await self._request(
+                "GET",
+                f"/v1/capability-invocations/{encoded_invocation_id}",
+            ),
+            invocation_id,
         )
-        return load_invocation_status(body)
 
     async def _request(
         self,
@@ -419,7 +450,11 @@ class ProviderHttpClient:
         headers: Mapping[str, str] | None = None,
         content: bytes | None = None,
     ) -> bytes:
-        request_headers = {"accept": "application/json", **(headers or {})}
+        request_headers = {
+            "accept": "application/json",
+            "accept-encoding": "identity",
+            **(headers or {}),
+        }
         if content is not None:
             request_headers["content-type"] = "application/json"
         body = b""

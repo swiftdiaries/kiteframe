@@ -77,9 +77,14 @@ fn check(destination: &Path) -> Result<()> {
 }
 
 fn python_stub_bytes() -> Result<Vec<u8>> {
-    Ok(kiteframe_native::python_stub()
+    let stub = kiteframe_native::python_stub()
         .map_err(|error| format!("Python stub generation failed: {error}"))?
-        .into_bytes())
+        .trim_end_matches(['\r', '\n'])
+        .as_bytes()
+        .to_vec();
+    let mut bytes = stub;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn write_python_stub(destination: &Path) -> Result<()> {

@@ -114,8 +114,10 @@ impl Timestamp {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TraceContext {
+    #[schemars(regex(pattern = r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"))]
     traceparent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 512), regex(pattern = r"^[ -~]+$"))]
     tracestate: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     baggage: BTreeMap<String, BaggageCorrelationId>,
@@ -140,9 +142,9 @@ impl TraceContext {
         }
         if tracestate
             .as_deref()
-            .is_some_and(|value| value.trim().is_empty())
+            .is_some_and(|value| !valid_tracestate(value))
         {
-            return Err("tracestate must not be empty when present".to_owned());
+            return Err("tracestate must use the canonical W3C subset".to_owned());
         }
         for (key, value) in &baggage {
             if !Self::ALLOWED_BAGGAGE_KEYS.contains(&key.as_str()) {
@@ -200,15 +202,85 @@ fn valid_traceparent(value: &str) -> bool {
     ) else {
         return false;
     };
-    version.len() == 2
+    version == "00"
         && trace.len() == 32
         && parent.len() == 16
         && flags.len() == 2
-        && [version, trace, parent, flags]
+        && [trace, parent, flags]
             .into_iter()
-            .all(|part| part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .all(|part| part.bytes().all(is_lower_hex))
         && trace.bytes().any(|byte| byte != b'0')
         && parent.bytes().any(|byte| byte != b'0')
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
+fn valid_tracestate(value: &str) -> bool {
+    if value.is_empty() || value.len() > 512 || !value.is_ascii() {
+        return false;
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut member_count = 0;
+    for member in value.split(',') {
+        member_count += 1;
+        if member_count > 32 || member.trim() != member {
+            return false;
+        }
+        let Some((key, member_value)) = member.split_once('=') else {
+            return false;
+        };
+        if member_value.contains('=')
+            || !valid_tracestate_key(key)
+            || !valid_tracestate_value(member_value)
+            || !seen.insert(key)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_tracestate_key(key: &str) -> bool {
+    if let Some((tenant, system)) = key.split_once('@') {
+        valid_tracestate_key_part(tenant, 241, true) && valid_tracestate_key_part(system, 14, false)
+    } else {
+        valid_tracestate_key_part(key, 256, false)
+    }
+}
+
+fn valid_tracestate_key_part(value: &str, max_length: usize, digit_first: bool) -> bool {
+    let bytes = value.as_bytes();
+    let Some(first) = bytes.first() else {
+        return false;
+    };
+    bytes.len() <= max_length
+        && (first.is_ascii_lowercase() || (digit_first && first.is_ascii_digit()))
+        && bytes.iter().copied().skip(1).all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'-' | b'*' | b'/')
+        })
+}
+
+fn valid_tracestate_value(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let (Some(first), Some(last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    bytes.len() <= 256
+        && valid_tracestate_non_space(*first)
+        && valid_tracestate_non_space(*last)
+        && bytes
+            .iter()
+            .copied()
+            .all(|byte| byte == b' ' || valid_tracestate_non_space(byte))
+}
+
+fn valid_tracestate_non_space(byte: u8) -> bool {
+    matches!(byte, 0x21..=0x2b | 0x2d..=0x3c | 0x3e..=0x7e)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, JsonSchema)]
@@ -246,9 +318,9 @@ impl<'de> Deserialize<'de> for EvidenceReferences {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(transparent)]
-pub struct DelegationAncestry(Vec<AgentRef>);
+pub struct DelegationAncestry(#[schemars(extend("uniqueItems" = true))] Vec<AgentRef>);
 
 impl DelegationAncestry {
     pub fn try_new(mut agents: Vec<AgentRef>) -> Result<Self, String> {
@@ -291,11 +363,33 @@ impl CatalogRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for DelegationAncestry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let agents = Vec::<AgentRef>::deserialize(deserializer)?;
+        Self::try_new(agents).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestedCapability {
     capability: CapabilityIdentity,
+    #[schemars(extend("uniqueItems" = true))]
     resources: Vec<NormalizedResourceSelector>,
+}
+
+impl<'de> Deserialize<'de> for RequestedCapability {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            capability: CapabilityIdentity,
+            resources: Vec<NormalizedResourceSelector>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(raw.capability, raw.resources).map_err(D::Error::custom)
+    }
 }
 
 impl RequestedCapability {
@@ -589,6 +683,45 @@ impl CapabilityGrantSet {
         })
     }
 
+    pub fn validate_against(&self, request: &AdmissionRequest) -> Result<(), Diagnostic> {
+        if self.actor != request.actor
+            || self.agent != request.agent
+            || self.task != request.task
+            || self.session != request.session
+        {
+            return Err(result_invalid(
+                DiagnosticStage::Admit,
+                "capability grant identity does not match its admission request",
+            ));
+        }
+
+        for grant in &self.grants {
+            let Some(requested) = request
+                .required_capabilities
+                .iter()
+                .chain(&request.optional_capabilities)
+                .find(|requested| requested.capability == grant.capability)
+            else {
+                return Err(result_invalid(
+                    DiagnosticStage::Admit,
+                    "capability grant exceeds the admission request",
+                ));
+            };
+            if grant.resources.iter().any(|granted| {
+                !requested
+                    .resources
+                    .iter()
+                    .any(|requested| selector_is_subset_of(granted.as_str(), requested.as_str()))
+            }) {
+                return Err(result_invalid(
+                    DiagnosticStage::Admit,
+                    "capability grant resources exceed the admission request",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn admission_id(&self) -> &AdmissionId {
         &self.admission_id
     }
@@ -808,10 +941,12 @@ impl InvocationRequest {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StableCapabilityError {
+    #[schemars(length(min = 1))]
     code: String,
+    #[schemars(length(min = 1))]
     category: String,
     retry: RetryClass,
     message: SafeMessage,
@@ -838,10 +973,40 @@ impl StableCapabilityError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+impl<'de> Deserialize<'de> for StableCapabilityError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            code: String,
+            category: String,
+            retry: RetryClass,
+            message: SafeMessage,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(raw.code, raw.category, raw.retry, raw.message).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Suspension {
+    #[schemars(length(min = 1))]
     checkpoint_ref: String,
+}
+
+impl<'de> Deserialize<'de> for Suspension {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            checkpoint_ref: String,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(raw.checkpoint_ref).map_err(D::Error::custom)
+    }
 }
 
 impl Suspension {
@@ -950,6 +1115,21 @@ impl InvocationOutcome {
             _ => None,
         }
     }
+
+    pub fn invocation_id(&self) -> &InvocationId {
+        match self {
+            Self::Succeeded { invocation_id, .. }
+            | Self::Failed { invocation_id, .. }
+            | Self::Denied { invocation_id, .. }
+            | Self::Suspended { invocation_id, .. }
+            | Self::Deferred { invocation_id }
+            | Self::OutcomeUnknown { invocation_id, .. } => invocation_id,
+        }
+    }
+
+    pub fn validate_against(&self, request: &InvocationRequest) -> Result<(), Diagnostic> {
+        validate_response_invocation_id(self.invocation_id(), request.invocation_id())
+    }
 }
 
 impl<'de> Deserialize<'de> for InvocationOutcome {
@@ -1057,6 +1237,21 @@ impl InvocationStatus {
             diagnostic: StatusFirstDiagnostic::try_new(diagnostic)?,
         })
     }
+
+    pub fn invocation_id(&self) -> &InvocationId {
+        match self {
+            Self::Pending { invocation_id }
+            | Self::Suspended { invocation_id, .. }
+            | Self::Succeeded { invocation_id, .. }
+            | Self::Failed { invocation_id, .. }
+            | Self::Denied { invocation_id, .. }
+            | Self::OutcomeUnknown { invocation_id, .. } => invocation_id,
+        }
+    }
+
+    pub fn validate_invocation_id(&self, invocation_id: &InvocationId) -> Result<(), Diagnostic> {
+        validate_response_invocation_id(self.invocation_id(), invocation_id)
+    }
 }
 
 impl<'de> Deserialize<'de> for InvocationStatus {
@@ -1131,6 +1326,28 @@ fn validate_status_first(diagnostic: &Diagnostic) -> Result<(), String> {
         return Err("outcome_unknown diagnostics must require a status-first retry".to_owned());
     }
     Ok(())
+}
+
+fn validate_response_invocation_id(
+    actual: &InvocationId,
+    expected: &InvocationId,
+) -> Result<(), Diagnostic> {
+    if actual != expected {
+        return Err(result_invalid(
+            DiagnosticStage::Invoke,
+            "provider response invocation ID does not match the request",
+        ));
+    }
+    Ok(())
+}
+
+fn result_invalid(stage: DiagnosticStage, message: impl Into<SafeMessage>) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::ResultInvalid,
+        DiagnosticCategory::Capability,
+        stage,
+        message,
+    )
 }
 
 fn invalid(message: impl Into<SafeMessage>) -> Diagnostic {

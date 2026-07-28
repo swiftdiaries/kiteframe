@@ -84,13 +84,17 @@
           }
         },
         "traceparent": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
         },
         "tracestate": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[ -~]+$"
         }
       },
       "additionalProperties": false,

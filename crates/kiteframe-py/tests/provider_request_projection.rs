@@ -2,17 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use _native::{
     ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCatalogRequest,
-    PyInvocationRequest, load_capability_catalog_inner, load_catalog_request_inner,
-    load_invocation_request_inner,
+    PyInvocationRequest, load_capability_catalog_inner,
+    load_capability_grant_set_for_request_inner, load_catalog_request_inner,
+    load_invocation_outcome_for_request_inner, load_invocation_request_inner,
+    load_invocation_status_for_invocation_id_inner,
 };
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
-    CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts, CapabilityIdentity,
+    CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts, CapabilityGrant,
+    CapabilityGrantParts, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
     CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CatalogRequest,
     ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
-    EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId, InvocationRequest,
-    NonEmptySet, NormalizedResourceSelector, RequestedCapability, ResourceSelectorSchema,
-    SessionRef, Sha256Digest, TaskRef, TraceContext,
+    EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId, InvocationOutcome,
+    InvocationRequest, InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
+    RequestedCapability, ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef, Timestamp,
+    TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::prelude::*;
@@ -67,6 +71,103 @@ fn provider_request_boundary_rejects_noncanonical_bytes() {
     assert_eq!(
         load_invocation_request_inner(&bytes).unwrap_err(),
         ProviderResponseError::NonCanonical
+    );
+}
+
+#[test]
+fn canonical_admission_loader_rejects_normalizable_resource_order() {
+    let mut wire = serde_json::to_value(admission_request()).unwrap();
+    wire["requiredCapabilities"][0]["resources"] =
+        json!(["tenant:t1/case:case-2", "tenant:t1/case:case-1"]);
+    wire["resolvedRequirements"][0]["resources"] =
+        json!(["tenant:t1/case:case-1", "tenant:t1/case:case-2"]);
+    let bytes = canonical_json(&wire).unwrap();
+
+    assert_eq!(
+        _native::load_admission_request_inner(&bytes).unwrap_err(),
+        ProviderResponseError::NonCanonical
+    );
+}
+
+#[test]
+fn canonical_catalog_loader_rejects_normalizable_descriptor_order() {
+    let catalog = CapabilityCatalog::try_new(
+        CatalogIdentity {
+            name: String::from("provider.test"),
+            revision: String::from("revision-1"),
+        },
+        vec![
+            descriptor_with_name("cases.close"),
+            descriptor_with_name("cases.comment"),
+        ],
+    )
+    .unwrap();
+    let mut wire = serde_json::to_value(catalog).unwrap();
+    wire["descriptors"].as_array_mut().unwrap().reverse();
+    let bytes = canonical_json(&wire).unwrap();
+
+    assert_eq!(
+        load_capability_catalog_inner(&bytes).unwrap_err(),
+        ProviderResponseError::NonCanonical
+    );
+}
+
+#[test]
+fn locked_request_schemas_reject_noncanonical_trace_headers() {
+    let mut uppercase = serde_json::to_value(catalog_request()).unwrap();
+    uppercase["traceContext"]["traceparent"] = json!(valid_traceparent().to_uppercase());
+    assert_eq!(
+        load_catalog_request_inner(&canonical_json(&uppercase).unwrap()).unwrap_err(),
+        ProviderResponseError::LockedSchema
+    );
+
+    let mut injected = serde_json::to_value(catalog_request()).unwrap();
+    injected["traceContext"]["tracestate"] = json!("vendor=value\r\nforged=member");
+    assert_eq!(
+        load_catalog_request_inner(&canonical_json(&injected).unwrap()).unwrap_err(),
+        ProviderResponseError::LockedSchema
+    );
+}
+
+#[test]
+fn correlated_admission_loader_rejects_a_valid_response_for_another_actor() {
+    let mut parts = grant_set_parts();
+    parts.actor = ActorRef::new("actor:bob").unwrap();
+    let response = CapabilityGrantSet::try_new(parts).unwrap();
+
+    assert_eq!(
+        load_capability_grant_set_for_request_inner(
+            &canonical_json(&response).unwrap(),
+            &admission_request(),
+        )
+        .unwrap_err(),
+        ProviderResponseError::Correlation
+    );
+}
+
+#[test]
+fn correlated_invocation_loaders_reject_another_invocation_id() {
+    let request = invocation_request();
+    let outcome = InvocationOutcome::Succeeded {
+        invocation_id: InvocationId::new("inv-other").unwrap(),
+        result: json!({"ok": true}),
+    };
+    assert_eq!(
+        load_invocation_outcome_for_request_inner(&canonical_json(&outcome).unwrap(), &request,)
+            .unwrap_err(),
+        ProviderResponseError::Correlation
+    );
+
+    let status = InvocationStatus::Pending {
+        invocation_id: InvocationId::new("inv-other").unwrap(),
+    };
+    assert_eq!(
+        load_invocation_status_for_invocation_id_inner(
+            &canonical_json(&status).unwrap(),
+            request.invocation_id(),
+        )
+        .unwrap_err(),
+        ProviderResponseError::Correlation
     );
 }
 
@@ -175,9 +276,34 @@ fn capability_catalog() -> CapabilityCatalog {
     .unwrap()
 }
 
+fn grant_set_parts() -> CapabilityGrantSetParts {
+    CapabilityGrantSetParts {
+        admission_id: AdmissionId::new("adm-1").unwrap(),
+        actor: ActorRef::new("actor:alice").unwrap(),
+        agent: AgentRef::new("agent:case-worker").unwrap(),
+        task: TaskRef::new("task:triage").unwrap(),
+        session: SessionRef::new("session:1").unwrap(),
+        policy_revision: PolicyRevision::new("policy:7").unwrap(),
+        catalog_digest: Sha256Digest::from_bytes([8; Sha256Digest::BYTE_LENGTH]),
+        issued_at: Timestamp::new(100),
+        expires_at: Timestamp::new(200),
+        grants: vec![
+            CapabilityGrant::try_new(CapabilityGrantParts {
+                capability: capability_identity(),
+                resources: vec![NormalizedResourceSelector::new("tenant:t1/case:case-1").unwrap()],
+            })
+            .unwrap(),
+        ],
+    }
+}
+
 fn descriptor() -> CapabilityDescriptor {
+    descriptor_with_name("cases.comment")
+}
+
+fn descriptor_with_name(name: &str) -> CapabilityDescriptor {
     CapabilityDescriptor::try_new(CapabilityDescriptorParts {
-        identity: capability_identity(),
+        identity: capability_identity_with_name(name),
         summary: String::from("Comment on a case"),
         input_schema: json!({"type": "object"}),
         output_schema: json!({"type": "object"}),
@@ -197,8 +323,12 @@ fn descriptor() -> CapabilityDescriptor {
 }
 
 fn capability_identity() -> CapabilityIdentity {
+    capability_identity_with_name("cases.comment")
+}
+
+fn capability_identity_with_name(name: &str) -> CapabilityIdentity {
     CapabilityIdentity::try_new(
-        CapabilityName::new("cases.comment").unwrap(),
+        CapabilityName::new(name).unwrap(),
         CapabilityReleaseVersion::new("1.0.0").unwrap(),
     )
     .unwrap()

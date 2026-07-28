@@ -1,3 +1,4 @@
+import gzip
 import hashlib
 import json
 
@@ -131,7 +132,7 @@ def capability_catalog_bytes() -> bytes:
     return canonical_bytes({**wire, "catalogDigest": digest})
 
 
-def grant_set_bytes() -> bytes:
+def grant_set_bytes(**overrides: object) -> bytes:
     grant_set = {
         "actor": "actor:alice",
         "admissionId": "adm-1",
@@ -152,10 +153,25 @@ def grant_set_bytes() -> bytes:
         "session": "session:1",
         "task": "task:triage",
     }
+    grant_set.update(overrides)
     digest = hashlib.sha256(
         b"kiteframe:capability-grant-set:v1\0" + canonical_bytes(grant_set)
     ).hexdigest()
     return canonical_bytes({**grant_set, "grantDigest": digest})
+
+
+def traceback_retains(error: BaseException, secret: str) -> bool:
+    traceback = error.__traceback__
+    while traceback is not None:
+        filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
+        if "/kiteframe/provider/http.py" in filename:
+            for value in traceback.tb_frame.f_locals.values():
+                if isinstance(value, str) and secret in value:
+                    return True
+                if isinstance(value, (bytes, bytearray)) and secret.encode() in value:
+                    return True
+        traceback = traceback.tb_next
+    return False
 
 
 def diagnostic_envelope() -> bytes:
@@ -290,6 +306,126 @@ async def test_client_does_not_follow_redirects() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "mismatch"),
+    [
+        ("actor", "actor:bob"),
+        ("agent", "agent:other"),
+        ("task", "task:other"),
+        ("session", "session:other"),
+    ],
+)
+async def test_admit_rejects_a_valid_grant_for_another_admission_identity(
+    field: str,
+    mismatch: str,
+) -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            content=grant_set_bytes(**{field: mismatch}),
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(KiteframeDiagnosticError) as error:
+            await client.admit(admission_request())
+    finally:
+        await client.aclose()
+
+    assert error.value.code == "KF-CAP-002"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "grants",
+    [
+        [
+            {
+                "capability": {
+                    "name": "cases.close",
+                    "version": "1.0.0",
+                },
+                "resources": ["tenant:t1/case:case-1"],
+            }
+        ],
+        [
+            {
+                "capability": {
+                    "name": "cases.comment",
+                    "version": "1.0.0",
+                },
+                "resources": ["tenant:t1/case:*"],
+            }
+        ],
+    ],
+)
+async def test_admit_rejects_unrequested_or_broader_grants(
+    grants: list[dict[str, object]],
+) -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            content=grant_set_bytes(grants=grants),
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(KiteframeDiagnosticError) as error:
+            await client.admit(admission_request())
+    finally:
+        await client.aclose()
+
+    assert error.value.code == "KF-CAP-002"
+
+
+@pytest.mark.asyncio
+async def test_invoke_rejects_a_valid_outcome_for_another_invocation() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            content=canonical_bytes(
+                {
+                    "invocation_id": "inv-other",
+                    "result": {"ok": True},
+                    "status": "succeeded",
+                }
+            ),
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(KiteframeDiagnosticError) as error:
+            await client.invoke(invocation_request())
+    finally:
+        await client.aclose()
+
+    assert error.value.code == "KF-CAP-002"
+
+
+@pytest.mark.asyncio
+async def test_status_rejects_a_valid_status_for_another_invocation() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            content=canonical_bytes(
+                {
+                    "invocation_id": "inv-other",
+                    "status": "pending",
+                }
+            ),
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(KiteframeDiagnosticError) as error:
+            await client.status("inv-1")
+    finally:
+        await client.aclose()
+
+    assert error.value.code == "KF-CAP-002"
+
+
+@pytest.mark.asyncio
 async def test_invalid_result_never_reaches_caller() -> None:
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
@@ -344,6 +480,31 @@ async def test_response_body_is_bounded_before_parsing() -> None:
             await client.catalog(CatalogRequest.default())
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_compressed_response_is_rejected_before_decoding() -> None:
+    seen_accept_encoding: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_accept_encoding.append(request.headers["accept-encoding"])
+        return httpx.Response(
+            200,
+            content=gzip.compress(b"x" * (PROVIDER_RESPONSE_LIMIT_BYTES + 1)),
+            headers={"content-encoding": "gzip"},
+        )
+
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ProviderTransportError, match="content encoding"):
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+    assert seen_accept_encoding == ["identity"]
 
 
 @pytest.mark.asyncio
@@ -441,6 +602,97 @@ async def test_malformed_diagnostic_does_not_retain_raw_exception(
     assert "provider-secret-value" not in str(error.value)
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_unhashable_diagnostic_enum_is_totally_redacted() -> None:
+    secret = "provider-secret-value"
+    body = canonical_bytes(
+        {
+            "diagnostics": [
+                {
+                    "category": "authorization",
+                    "code": [secret],
+                    "details": {},
+                    "help": None,
+                    "message": secret,
+                    "package_path": None,
+                    "retry": "never",
+                    "severity": "error",
+                    "source_range": None,
+                    "stage": "admit",
+                }
+            ]
+        }
+    )
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(500, content=body)
+        ),
+    )
+    try:
+        with pytest.raises(ProviderTransportError) as error:
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+    assert secret not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert not traceback_retains(error.value, secret)
+
+
+@pytest.mark.asyncio
+async def test_deeply_nested_diagnostic_is_totally_redacted() -> None:
+    secret = "provider-secret-value"
+    body = (
+        b'{"diagnostics":'
+        + b"[" * 1_100
+        + canonical_bytes(secret)
+        + b"]" * 1_100
+        + b"}"
+    )
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(500, content=body)
+        ),
+    )
+    try:
+        with pytest.raises(ProviderTransportError) as error:
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+    assert secret not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert not traceback_retains(error.value, secret)
+
+
+@pytest.mark.asyncio
+async def test_invalid_success_body_is_absent_from_public_traceback_locals() -> None:
+    secret = "provider-secret-value"
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=canonical_bytes({"secret": secret}),
+            )
+        ),
+    )
+    try:
+        with pytest.raises(KiteframeDiagnosticError) as error:
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+    assert error.value.code == "KF-CAP-002"
+    assert secret not in str(error.value)
+    assert secret.encode() not in error.value.diagnostics_json
+    assert not traceback_retains(error.value, secret)
 
 
 @pytest.mark.asyncio

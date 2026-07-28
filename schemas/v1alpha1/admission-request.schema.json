@@ -16,10 +16,7 @@
       }
     },
     "delegationAncestry": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
+      "$ref": "#/$defs/DelegationAncestry"
     },
     "lockDigest": {
       "$ref": "#/$defs/Sha256Digest"
@@ -99,6 +96,13 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
     },
+    "DelegationAncestry": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
     "RequestedCapability": {
       "type": "object",
       "properties": {
@@ -109,7 +113,8 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "uniqueItems": true
         }
       },
       "additionalProperties": false,
@@ -155,13 +160,17 @@
           }
         },
         "traceparent": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$"
         },
         "tracestate": {
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "maxLength": 512,
+          "minLength": 1,
+          "pattern": "^[ -~]+$"
         }
       },
       "additionalProperties": false,
