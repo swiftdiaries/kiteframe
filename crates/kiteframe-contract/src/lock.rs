@@ -1,20 +1,46 @@
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::{CapabilityDescriptor, CapabilityIdentity, FeatureSet, Sha256Digest};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LockedCapability {
-    pub identity: CapabilityIdentity,
-    pub descriptor: CapabilityDescriptor,
-    pub descriptor_digest: Sha256Digest,
-    pub input_schema_digest: Sha256Digest,
-    pub output_schema_digest: Sha256Digest,
-    pub stable_error_set_digest: Sha256Digest,
-    pub safety_metadata_digest: Sha256Digest,
+    identity: CapabilityIdentity,
+    descriptor: CapabilityDescriptor,
+    descriptor_digest: Sha256Digest,
+    input_schema_digest: Sha256Digest,
+    output_schema_digest: Sha256Digest,
+    stable_error_set_digest: Sha256Digest,
+    safety_metadata_digest: Sha256Digest,
 }
 impl LockedCapability {
+    pub fn try_new(
+        identity: CapabilityIdentity,
+        descriptor: CapabilityDescriptor,
+        descriptor_digest: Sha256Digest,
+        input_schema_digest: Sha256Digest,
+        output_schema_digest: Sha256Digest,
+        stable_error_set_digest: Sha256Digest,
+        safety_metadata_digest: Sha256Digest,
+    ) -> Result<Self, String> {
+        if identity != *descriptor.identity()
+            || descriptor_digest != *descriptor.descriptor_digest()
+        {
+            return Err(
+                "locked capability descriptor identity or digest does not match".to_owned(),
+            );
+        }
+        Ok(Self {
+            identity,
+            descriptor,
+            descriptor_digest,
+            input_schema_digest,
+            output_schema_digest,
+            stable_error_set_digest,
+            safety_metadata_digest,
+        })
+    }
     pub fn identity(&self) -> &CapabilityIdentity {
         &self.identity
     }
@@ -35,6 +61,32 @@ impl LockedCapability {
     }
     pub fn safety_metadata_digest(&self) -> &Sha256Digest {
         &self.safety_metadata_digest
+    }
+}
+impl<'de> Deserialize<'de> for LockedCapability {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            identity: CapabilityIdentity,
+            descriptor: CapabilityDescriptor,
+            descriptor_digest: Sha256Digest,
+            input_schema_digest: Sha256Digest,
+            output_schema_digest: Sha256Digest,
+            stable_error_set_digest: Sha256Digest,
+            safety_metadata_digest: Sha256Digest,
+        }
+        let raw = Raw::deserialize(d)?;
+        Self::try_new(
+            raw.identity,
+            raw.descriptor,
+            raw.descriptor_digest,
+            raw.input_schema_digest,
+            raw.output_schema_digest,
+            raw.stable_error_set_digest,
+            raw.safety_metadata_digest,
+        )
+        .map_err(D::Error::custom)
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -30,18 +30,19 @@ pub fn lock_package(
         .iter()
         .map(|selected| {
             let descriptor = selected.validated_descriptor();
-            LockedCapability {
-                identity: descriptor.identity().clone(),
-                descriptor: descriptor.descriptor().clone(),
-                descriptor_digest: *descriptor.descriptor().descriptor_digest(),
-                input_schema_digest: *descriptor.input_schema_digest(),
-                output_schema_digest: *descriptor.output_schema_digest(),
-                stable_error_set_digest: *descriptor.stable_error_set_digest(),
-                safety_metadata_digest: *descriptor.safety_metadata_digest(),
-            }
+            LockedCapability::try_new(
+                descriptor.identity().clone(),
+                descriptor.descriptor().clone(),
+                *descriptor.descriptor().descriptor_digest(),
+                *descriptor.input_schema_digest(),
+                *descriptor.output_schema_digest(),
+                *descriptor.stable_error_set_digest(),
+                *descriptor.safety_metadata_digest(),
+            )
+            .expect("validated descriptor must produce a locked capability")
         })
         .collect();
-    capabilities.sort_by(|left, right| left.identity.cmp(&right.identity));
+    capabilities.sort_by(|left, right| left.identity().cmp(right.identity()));
 
     let mut lock = CapabilityLock {
         schema_version: LockSchemaVersion::V1Alpha1,
@@ -171,19 +172,19 @@ fn verify_catalog(
         let Some(current) = catalog
             .validated_descriptors()
             .iter()
-            .find(|descriptor| descriptor.identity() == &locked.identity)
+            .find(|descriptor| descriptor.identity() == locked.identity())
         else {
             diagnostics.push(stale(
                 "locked capability version is absent from capability catalog",
             ));
             continue;
         };
-        if current.descriptor() != &locked.descriptor
-            || current.descriptor().descriptor_digest() != &locked.descriptor_digest
-            || current.input_schema_digest() != &locked.input_schema_digest
-            || current.output_schema_digest() != &locked.output_schema_digest
-            || current.stable_error_set_digest() != &locked.stable_error_set_digest
-            || current.safety_metadata_digest() != &locked.safety_metadata_digest
+        if current.descriptor() != locked.descriptor()
+            || current.descriptor().descriptor_digest() != locked.descriptor_digest()
+            || current.input_schema_digest() != locked.input_schema_digest()
+            || current.output_schema_digest() != locked.output_schema_digest()
+            || current.stable_error_set_digest() != locked.stable_error_set_digest()
+            || current.safety_metadata_digest() != locked.safety_metadata_digest()
         {
             diagnostics.push(tampered(
                 "capability catalog descriptor does not match locked descriptor",
@@ -221,7 +222,7 @@ fn verify_lock_contents(lock: &CapabilityLock) -> Result<(), Diagnostic> {
 
 fn verify_capability_order(capabilities: &[LockedCapability], diagnostics: &mut Vec<Diagnostic>) {
     for pair in capabilities.windows(2) {
-        match pair[0].identity.cmp(&pair[1].identity) {
+        match pair[0].identity().cmp(pair[1].identity()) {
             std::cmp::Ordering::Less => {}
             std::cmp::Ordering::Equal => {
                 diagnostics.push(tampered("locked capabilities contain duplicate identity"))
@@ -253,20 +254,20 @@ fn sort_diagnostics(diagnostics: &mut [Diagnostic]) {
 }
 
 fn verify_locked_capability(capability: &LockedCapability, diagnostics: &mut Vec<Diagnostic>) {
-    if capability.identity != *capability.descriptor.identity()
-        || capability.descriptor_digest != *capability.descriptor.descriptor_digest()
+    if capability.identity() != capability.descriptor().identity()
+        || capability.descriptor_digest() != capability.descriptor().descriptor_digest()
     {
         diagnostics.push(tampered(
             "locked capability descriptor identity or digest does not match",
         ));
         return;
     }
-    match validate_descriptor(capability.descriptor.clone()) {
+    match validate_descriptor(capability.descriptor().clone()) {
         Ok(descriptor)
-            if descriptor.input_schema_digest() == &capability.input_schema_digest
-                && descriptor.output_schema_digest() == &capability.output_schema_digest
-                && descriptor.stable_error_set_digest() == &capability.stable_error_set_digest
-                && descriptor.safety_metadata_digest() == &capability.safety_metadata_digest => {}
+            if descriptor.input_schema_digest() == capability.input_schema_digest()
+                && descriptor.output_schema_digest() == capability.output_schema_digest()
+                && descriptor.stable_error_set_digest() == capability.stable_error_set_digest()
+                && descriptor.safety_metadata_digest() == capability.safety_metadata_digest() => {}
         Ok(_) => diagnostics.push(tampered(
             "locked capability descriptor part digest does not match",
         )),

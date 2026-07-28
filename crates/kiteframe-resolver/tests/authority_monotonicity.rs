@@ -314,10 +314,10 @@ proptest! {
         )
         .unwrap();
         let broad_freshness =
-            serde_json::to_value(&broad_lock.capabilities[0].descriptor).unwrap()["freshness"]
+            serde_json::to_value(broad_lock.capabilities[0].descriptor()).unwrap()["freshness"]
                 .clone();
         let narrow_freshness =
-            serde_json::to_value(&narrow_lock.capabilities[0].descriptor).unwrap()["freshness"]
+            serde_json::to_value(narrow_lock.capabilities[0].descriptor()).unwrap()["freshness"]
                 .clone();
 
         let broad = resolve_agent(input(

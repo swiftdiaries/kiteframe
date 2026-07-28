@@ -322,30 +322,24 @@ fn offline_verification_rejects_each_embedded_descriptor_digest_change() {
     let lock = support_lock();
 
     for changed in [
-        {
-            let mut lock = lock.clone();
-            lock.capabilities[0].input_schema_digest = Sha256Digest::from_bytes([1; 32]);
-            lock
-        },
-        {
-            let mut lock = lock.clone();
-            lock.capabilities[0].output_schema_digest = Sha256Digest::from_bytes([2; 32]);
-            lock
-        },
-        {
-            let mut lock = lock.clone();
-            lock.capabilities[0].stable_error_set_digest = Sha256Digest::from_bytes([3; 32]);
-            lock
-        },
-        {
-            let mut lock = lock.clone();
-            lock.capabilities[0].safety_metadata_digest = Sha256Digest::from_bytes([4; 32]);
-            lock
-        },
+        tampered_part_digest(&lock, "inputSchemaDigest", [1; 32]),
+        tampered_part_digest(&lock, "outputSchemaDigest", [2; 32]),
+        tampered_part_digest(&lock, "stableErrorSetDigest", [3; 32]),
+        tampered_part_digest(&lock, "safetyMetadataDigest", [4; 32]),
     ] {
         let errors = verify_lock(&package, &changed, None).unwrap_err();
         assert_eq!(errors[0].code.as_str(), "KF-LOCK-002");
     }
+}
+
+fn tampered_part_digest(
+    lock: &kiteframe_contract::CapabilityLock,
+    field: &str,
+    value: [u8; Sha256Digest::BYTE_LENGTH],
+) -> kiteframe_contract::CapabilityLock {
+    let mut wire = serde_json::to_value(lock).unwrap();
+    wire["capabilities"][0][field] = json!(Sha256Digest::from_bytes(value));
+    serde_json::from_value(wire).unwrap()
 }
 
 #[test]

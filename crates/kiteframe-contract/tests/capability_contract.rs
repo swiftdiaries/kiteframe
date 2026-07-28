@@ -107,6 +107,19 @@ fn descriptor_exposes_every_runtime_consumed_semantic() {
 }
 
 #[test]
+fn resolved_requirement_wire_rejects_empty_resources_and_normalizes_duplicates() {
+    let requirement = capability_requirement(true);
+    let mut empty = serde_json::to_value(&requirement).unwrap();
+    empty["resources"] = json!([]);
+    assert!(serde_json::from_value::<ResolvedCapabilityRequirement>(empty).is_err());
+
+    let mut duplicated = serde_json::to_value(requirement).unwrap();
+    duplicated["resources"] = json!(["team:z", "team:a", "team:z"]);
+    let normalized: ResolvedCapabilityRequirement = serde_json::from_value(duplicated).unwrap();
+    assert_eq!(normalized.resources(), ["team:a", "team:z"]);
+}
+
+#[test]
 fn remote_schema_reference_is_rejected() {
     let mut parts = descriptor_parts("cases.read", "1.2.0");
     parts.input_schema = json!({
@@ -335,15 +348,16 @@ fn capability_requirement(required: bool) -> ResolvedCapabilityRequirement {
 fn locked_capability() -> LockedCapability {
     let descriptor =
         CapabilityDescriptor::try_new(descriptor_parts("cases.read", "1.0.0")).unwrap();
-    LockedCapability {
-        identity: descriptor.identity().clone(),
-        descriptor,
-        descriptor_digest: Sha256Digest::from_bytes([4; Sha256Digest::BYTE_LENGTH]),
-        input_schema_digest: Sha256Digest::from_bytes([5; Sha256Digest::BYTE_LENGTH]),
-        output_schema_digest: Sha256Digest::from_bytes([6; Sha256Digest::BYTE_LENGTH]),
-        stable_error_set_digest: Sha256Digest::from_bytes([7; Sha256Digest::BYTE_LENGTH]),
-        safety_metadata_digest: Sha256Digest::from_bytes([8; Sha256Digest::BYTE_LENGTH]),
-    }
+    LockedCapability::try_new(
+        descriptor.identity().clone(),
+        descriptor.clone(),
+        *descriptor.descriptor_digest(),
+        Sha256Digest::from_bytes([5; Sha256Digest::BYTE_LENGTH]),
+        Sha256Digest::from_bytes([6; Sha256Digest::BYTE_LENGTH]),
+        Sha256Digest::from_bytes([7; Sha256Digest::BYTE_LENGTH]),
+        Sha256Digest::from_bytes([8; Sha256Digest::BYTE_LENGTH]),
+    )
+    .unwrap()
 }
 
 fn subagent(name: &str, version: &str) -> ResolvedSubagent {

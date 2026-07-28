@@ -31,17 +31,17 @@ impl From<ResolvedCapabilityRequirement> for PyResolvedCapabilityRequirement {
 impl PyResolvedCapabilityRequirement {
     #[getter]
     fn name(&self) -> &str {
-        self.inner.identity.name().as_str()
+        self.inner.identity().name().as_str()
     }
 
     #[getter]
     fn version(&self) -> &str {
-        self.inner.identity.version().as_str()
+        self.inner.identity().version().as_str()
     }
 
     #[getter]
     fn required(&self) -> bool {
-        self.inner.required
+        self.inner.required()
     }
 
     #[getter]
@@ -50,7 +50,28 @@ impl PyResolvedCapabilityRequirement {
         imports = ("builtins",)
     ))]
     fn resources<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        PyTuple::new(py, &self.inner.resources)
+        PyTuple::new(py, self.inner.resources())
+    }
+
+    #[getter]
+    fn descriptor_digest(&self) -> String {
+        self.inner.descriptor_digest().to_string()
+    }
+    #[getter]
+    fn input_schema_digest(&self) -> String {
+        self.inner.input_schema_digest().to_string()
+    }
+    #[getter]
+    fn output_schema_digest(&self) -> String {
+        self.inner.output_schema_digest().to_string()
+    }
+    #[getter]
+    fn stable_error_set_digest(&self) -> String {
+        self.inner.stable_error_set_digest().to_string()
+    }
+    #[getter]
+    fn safety_metadata_digest(&self) -> String {
+        self.inner.safety_metadata_digest().to_string()
     }
 }
 
@@ -190,6 +211,21 @@ impl PyResolvedAgent {
     #[getter]
     fn lock_digest(&self) -> String {
         self.inner.lock_digest().to_string()
+    }
+
+    #[getter]
+    fn catalog_name(&self) -> &str {
+        &self.inner.catalog_identity().name
+    }
+
+    #[getter]
+    fn catalog_revision(&self) -> &str {
+        &self.inner.catalog_identity().revision
+    }
+
+    #[getter]
+    fn catalog_digest(&self) -> String {
+        self.inner.catalog_digest().to_string()
     }
 
     #[getter]

@@ -311,12 +311,12 @@ fn resolve_capabilities(
         let version_requirement = VersionReq::parse(requirement.version.as_str())
             .map_err(|_| vec![package_invalid("capability requirement version is invalid")])?;
         let selected = lock.capabilities.iter().find(|capability| {
-            capability.identity.name() == &requirement.name
-                && Version::parse(capability.identity.version().as_str())
+            capability.identity().name() == &requirement.name
+                && Version::parse(capability.identity().version().as_str())
                     .is_ok_and(|version| version_requirement.matches(&version))
         });
         if let Some(capability) = selected {
-            matched.insert(capability.identity.clone());
+            matched.insert(capability.identity().clone());
             resolved.push(
                 ResolvedCapabilityRequirement::try_new(
                     capability.clone(),
@@ -348,7 +348,7 @@ fn resolve_capabilities(
     if lock
         .capabilities
         .iter()
-        .any(|capability| !matched.contains(&capability.identity))
+        .any(|capability| !matched.contains(capability.identity()))
     {
         return Err(vec![lock_stale(
             "capability lock contains a selection not declared by the package",

@@ -199,23 +199,26 @@ fn resolved_requirement_retains_the_exact_verified_lock_entry() {
     assert_eq!(resolved.catalog_identity().revision, "v1");
     assert_eq!(resolved.catalog_digest(), &expected_catalog_digest);
     assert_eq!(requirement.locked_capability(), &expected);
-    assert_eq!(requirement.descriptor(), &expected.descriptor);
-    assert_eq!(requirement.descriptor_digest(), &expected.descriptor_digest);
+    assert_eq!(requirement.descriptor(), expected.descriptor());
+    assert_eq!(
+        requirement.descriptor_digest(),
+        expected.descriptor_digest()
+    );
     assert_eq!(
         requirement.input_schema_digest(),
-        &expected.input_schema_digest
+        expected.input_schema_digest()
     );
     assert_eq!(
         requirement.output_schema_digest(),
-        &expected.output_schema_digest
+        expected.output_schema_digest()
     );
     assert_eq!(
         requirement.stable_error_set_digest(),
-        &expected.stable_error_set_digest
+        expected.stable_error_set_digest()
     );
     assert_eq!(
         requirement.safety_metadata_digest(),
-        &expected.safety_metadata_digest
+        expected.safety_metadata_digest()
     );
 }
 

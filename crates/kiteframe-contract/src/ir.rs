@@ -35,11 +35,12 @@ impl ResolvedModelRequirement {
         &self.symbol
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolvedCapabilityRequirement {
     locked_capability: LockedCapability,
     required: bool,
+    #[schemars(length(min = 1))]
     resources: Vec<String>,
 }
 impl ResolvedCapabilityRequirement {
@@ -88,6 +89,19 @@ impl ResolvedCapabilityRequirement {
     }
     pub fn resources(&self) -> &[String] {
         &self.resources
+    }
+}
+impl<'de> Deserialize<'de> for ResolvedCapabilityRequirement {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            locked_capability: LockedCapability,
+            required: bool,
+            resources: Vec<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        Self::try_new(raw.locked_capability, raw.required, raw.resources).map_err(D::Error::custom)
     }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

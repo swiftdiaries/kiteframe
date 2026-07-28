@@ -14,9 +14,9 @@ use kiteframe_contract::{
     CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CatalogRequest,
     ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
     EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId, InvocationOutcome,
-    InvocationRequest, InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
-    RequestedCapability, ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef, Timestamp,
-    TraceContext,
+    InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet, NormalizedResourceSelector,
+    PolicyRevision, RequestedCapability, ResolvedCapabilityRequirement, ResourceSelectorSchema,
+    SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::prelude::*;
@@ -61,6 +61,36 @@ fn request_and_catalog_projections_expose_only_stable_values() {
             1
         );
     });
+}
+
+#[test]
+fn resolved_requirement_projection_exposes_exact_locked_semantics() {
+    let descriptor = descriptor();
+    let requirement = ResolvedCapabilityRequirement::try_new(
+        LockedCapability::try_new(
+            descriptor.identity().clone(),
+            descriptor.clone(),
+            *descriptor.descriptor_digest(),
+            Sha256Digest::from_bytes([4; Sha256Digest::BYTE_LENGTH]),
+            Sha256Digest::from_bytes([5; Sha256Digest::BYTE_LENGTH]),
+            Sha256Digest::from_bytes([6; Sha256Digest::BYTE_LENGTH]),
+            Sha256Digest::from_bytes([7; Sha256Digest::BYTE_LENGTH]),
+        )
+        .unwrap(),
+        true,
+        vec!["tenant:t1".to_owned()],
+    )
+    .unwrap();
+    let projected = _native::PyResolvedCapabilityRequirement::from(requirement);
+
+    assert_eq!(
+        projected.descriptor_digest(),
+        descriptor.descriptor_digest().to_string()
+    );
+    assert_eq!(projected.input_schema_digest(), "04".repeat(32));
+    assert_eq!(projected.output_schema_digest(), "05".repeat(32));
+    assert_eq!(projected.stable_error_set_digest(), "06".repeat(32));
+    assert_eq!(projected.safety_metadata_digest(), "07".repeat(32));
 }
 
 #[test]
@@ -234,11 +264,7 @@ fn admission_request() -> AdmissionRequest {
             .unwrap(),
         ],
         optional_capabilities: Vec::new(),
-        resolved_requirements: vec![kiteframe_contract::ResolvedCapabilityRequirement {
-            identity: capability_identity(),
-            required: true,
-            resources: vec![String::from("tenant:t1/case:case-1")],
-        }],
+        resolved_requirements: vec![resolved_requirement()],
         delegation_ancestry: DelegationAncestry::default(),
         contextual_facts: BTreeMap::new(),
         trace_context: trace_context(),
@@ -299,6 +325,25 @@ fn grant_set_parts() -> CapabilityGrantSetParts {
 
 fn descriptor() -> CapabilityDescriptor {
     descriptor_with_name("cases.comment")
+}
+
+fn resolved_requirement() -> ResolvedCapabilityRequirement {
+    let descriptor = descriptor();
+    ResolvedCapabilityRequirement::try_new(
+        LockedCapability::try_new(
+            descriptor.identity().clone(),
+            descriptor.clone(),
+            *descriptor.descriptor_digest(),
+            Sha256Digest::from_bytes([4; Sha256Digest::BYTE_LENGTH]),
+            Sha256Digest::from_bytes([5; Sha256Digest::BYTE_LENGTH]),
+            Sha256Digest::from_bytes([6; Sha256Digest::BYTE_LENGTH]),
+            Sha256Digest::from_bytes([7; Sha256Digest::BYTE_LENGTH]),
+        )
+        .unwrap(),
+        true,
+        vec![String::from("tenant:t1/case:case-1")],
+    )
+    .unwrap()
 }
 
 fn descriptor_with_name(name: &str) -> CapabilityDescriptor {

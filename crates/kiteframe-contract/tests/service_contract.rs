@@ -527,14 +527,18 @@ fn capability_identity_with_name(name: &str) -> CapabilityIdentity {
 
 fn resolved_requirement() -> ResolvedCapabilityRequirement {
     ResolvedCapabilityRequirement::try_new(
-        LockedCapability {
-            identity: capability_identity(),
-            descriptor: read_only_descriptor(),
-            descriptor_digest: digest(4),
-            input_schema_digest: digest(5),
-            output_schema_digest: digest(6),
-            stable_error_set_digest: digest(7),
-            safety_metadata_digest: digest(8),
+        {
+            let descriptor = read_only_descriptor();
+            LockedCapability::try_new(
+                capability_identity(),
+                descriptor.clone(),
+                *descriptor.descriptor_digest(),
+                digest(5),
+                digest(6),
+                digest(7),
+                digest(8),
+            )
+            .unwrap()
         },
         true,
         vec![String::from("tenant:t1/case:case-1")],
