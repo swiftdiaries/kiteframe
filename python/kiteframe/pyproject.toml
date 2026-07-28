@@ -8,11 +8,15 @@ version = "0.1.0"
 description = "Immutable Python projections for the Kiteframe Rust core"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+dependencies = [
+    "httpx>=0.28,<1",
+]
 
 [tool.uv]
 dev-dependencies = [
     "maturin>=1.0,<2.0",
     "pytest>=8",
+    "pytest-asyncio>=0.24",
 ]
 
 [tool.maturin]

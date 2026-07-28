@@ -278,7 +278,7 @@ Run from `python/kiteframe`: `rtk uv run --project . maturin develop`
 
 Expected: builds `kiteframe._native` against Python 3.11+.
 
-Run: `rtk uv run --project python/kiteframe pytest tests/test_native_immutability.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_native_immutability.py -q`
 
 Expected: PASS.
 
@@ -328,7 +328,7 @@ def test_digest_tuple_matches_rust_fixture() -> None:
 
 - [ ] **Step 2: Run golden tests**
 
-Run: `rtk uv run --project python/kiteframe pytest tests/test_native_golden.py tests/test_stub_drift.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_native_golden.py tests/test_stub_drift.py -q`
 
 Expected: FAIL because service projections and generated stubs are incomplete.
 
@@ -355,7 +355,7 @@ Expected: PASS with no drift.
 
 - [ ] **Step 5: Run cross-language tests**
 
-Run: `rtk uv run --project python/kiteframe pytest tests/test_native_golden.py tests/test_stub_drift.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_native_golden.py tests/test_stub_drift.py -q`
 
 Expected: PASS.
 
@@ -415,7 +415,7 @@ def test_frozen_registry_cannot_be_mutated() -> None:
 
 - [ ] **Step 2: Run registry tests**
 
-Run: `rtk uv run --project python/kiteframe pytest tests/test_registry.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_registry.py -q`
 
 Expected: FAIL because `registry.py` does not exist.
 
@@ -453,7 +453,7 @@ class ComponentRegistry:
 
 - [ ] **Step 4: Run registry tests**
 
-Run: `rtk uv run --project python/kiteframe pytest tests/test_registry.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_registry.py -q`
 
 Expected: PASS.
 
@@ -461,7 +461,7 @@ Expected: PASS.
 
 Add a test that freezes two registries with the same symbol bound to distinct objects, resolves them in 100 concurrent tasks, and asserts no cross-registry value appears.
 
-Run: `rtk uv run --project python/kiteframe pytest tests/test_registry.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_registry.py -q`
 
 Expected: PASS.
 
@@ -605,7 +605,7 @@ def test_baggage_drops_sensitive_and_unlisted_keys() -> None:
 
 - [ ] **Step 2: Run provider client tests**
 
-Run: `rtk uv run --project python/kiteframe pytest tests/provider/test_http_client.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/provider/test_http_client.py -q`
 
 Expected: FAIL because provider protocols and client do not exist.
 
@@ -650,7 +650,7 @@ Implement only the four V1 routes. Reject every 3xx response, cap response bodie
 
 - [ ] **Step 5: Run client tests**
 
-Run: `rtk uv run --project python/kiteframe pytest tests/provider/test_http_client.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/provider/test_http_client.py -q`
 
 Expected: PASS for catalog ETag, admission, invocation, status, redirects, TLS requirement, body limits, W3C propagation, baggage filtering, structured diagnostics, and invalid response bodies.
 
@@ -696,7 +696,7 @@ def test_python_cannot_mutate_grant_then_reserialize(valid_grant_json: bytes) ->
 
 - [ ] **Step 2: Run the new tests**
 
-Run: `rtk uv run --project python/kiteframe pytest tests/test_diagnostic_redaction.py tests/test_service_round_trip.py -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest tests/test_diagnostic_redaction.py tests/test_service_round_trip.py -q`
 
 Expected: PASS after every native projection uses frozen classes and redacted errors.
 
@@ -714,15 +714,15 @@ Run: `rtk cargo test --workspace --all-features`
 
 Expected: PASS.
 
-Run: `rtk uv run --project python/kiteframe pytest -q`
+Run from `python/kiteframe`: `rtk uv run --project . pytest -q`
 
 Expected: PASS.
 
-Run: `rtk uv run --project python/kiteframe ruff check src tests`
+Run from `python/kiteframe`: `rtk uv run --project . ruff check src tests`
 
 Expected: PASS.
 
-Run: `rtk uv run --project python/kiteframe pyright`
+Run from `python/kiteframe`: `rtk uv run --project . pyright`
 
 Expected: PASS.
 
