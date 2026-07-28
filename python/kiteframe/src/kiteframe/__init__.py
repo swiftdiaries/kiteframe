@@ -8,9 +8,19 @@ from ._native import (
     load_resolved_agent,
     resolve_package,
 )
+from .registry import (
+    ComponentKind,
+    ComponentRegistry,
+    ComponentUnresolvedError,
+    FrozenComponentRegistry,
+)
 
 __all__ = [
     "KiteframeDiagnosticError",
+    "ComponentKind",
+    "ComponentRegistry",
+    "ComponentUnresolvedError",
+    "FrozenComponentRegistry",
     "ResolvedAgent",
     "ResolvedCapabilityRequirement",
     "ResolvedSubagent",
