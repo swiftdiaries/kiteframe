@@ -4,7 +4,17 @@ import re
 from collections.abc import Mapping
 from urllib.parse import quote
 
-_TRACEPARENT = re.compile(r"^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+_TRACEPARENT = re.compile(r"^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$")
+_TRACESTATE_SIMPLE_KEY = re.compile(r"^[a-z0-9][a-z0-9_\-*/]{0,255}$")
+_TRACESTATE_TENANT_KEY = re.compile(
+    r"^[a-z0-9][a-z0-9_\-*/]{0,240}@[a-z0-9][a-z0-9_\-*/]{0,13}$"
+)
+_TRACESTATE_VALUE = re.compile(
+    r"^[\x21-\x2b\x2d-\x3c\x3e-\x7e]"
+    r"[\x20-\x2b\x2d-\x3c\x3e-\x7e]{0,254}"
+    r"[\x21-\x2b\x2d-\x3c\x3e-\x7e]$"
+    r"|^[\x21-\x2b\x2d-\x3c\x3e-\x7e]$"
+)
 _BAGGAGE_KEY = re.compile(r"^[A-Za-z0-9!#$%&'*+\-.^_`|~]+$")
 _SENSITIVE_KEY_PARTS = (
     "argument",
@@ -37,6 +47,35 @@ def _valid_traceparent(value: str) -> bool:
     return trace_id != "0" * 32 and parent_id != "0" * 16
 
 
+def _valid_tracestate(value: str) -> bool:
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    if not value or len(encoded) > _MAX_TRACESTATE_BYTES:
+        return False
+
+    members = value.split(",")
+    if len(members) > 32:
+        return False
+    seen: set[str] = set()
+    for member in members:
+        if member.count("=") != 1 or member.strip() != member:
+            return False
+        key, member_value = member.split("=", 1)
+        if (
+            key in seen
+            or (
+                _TRACESTATE_SIMPLE_KEY.fullmatch(key) is None
+                and _TRACESTATE_TENANT_KEY.fullmatch(key) is None
+            )
+            or _TRACESTATE_VALUE.fullmatch(member_value) is None
+        ):
+            return False
+        seen.add(key)
+    return True
+
+
 def trace_headers(
     *,
     traceparent: str,
@@ -44,18 +83,19 @@ def trace_headers(
     baggage: Mapping[str, str] | None = None,
     baggage_allowlist: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
-    """Return safe W3C headers, dropping unlisted or sensitive baggage."""
+    """Return safe W3C version-00 headers and canonical tracestate members.
+
+    The accepted tracestate contract is intentionally narrower than the W3C
+    receive grammar: it requires a non-empty comma-separated ``key=value``
+    list without optional whitespace or empty members.
+    """
 
     if not _valid_traceparent(traceparent):
         raise ValueError("traceparent is not a valid W3C trace parent")
 
     headers = {"traceparent": traceparent}
     if tracestate is not None:
-        if (
-            not tracestate
-            or _contains_header_break(tracestate)
-            or len(tracestate.encode("utf-8")) > _MAX_TRACESTATE_BYTES
-        ):
+        if _contains_header_break(tracestate) or not _valid_tracestate(tracestate):
             raise ValueError("tracestate is not a valid W3C trace state")
         headers["tracestate"] = tracestate
 

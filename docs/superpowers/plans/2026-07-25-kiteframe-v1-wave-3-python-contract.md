@@ -17,7 +17,7 @@
 - An absent symbol, duplicate symbol, or wrong-kind symbol fails with `KF-RUNTIME-001` before runtime construction.
 - Registries are instance-scoped and frozen before compilation; no process-global mutable registry is permitted.
 - Provider redirects are disabled, TLS is required outside an explicit in-memory test transport, and response bodies always use the stable Kiteframe contract.
-- `traceparent` and `tracestate` propagate. `baggage` is allowlisted and never carries credentials, prompts, arguments, results, or authorization tuples.
+- `traceparent` and `tracestate` propagate for provider calls that carry a native request. The V1 `status(invocation_id)` lookup has no caller trace context and is explicitly exempt; it must not invent ambient trace state. `baggage` is allowlisted and never carries credentials, prompts, arguments, results, or authorization tuples.
 - Provider output is validated against Rust-owned response types and locked JSON schemas before an adapter receives it.
 
 ---
@@ -569,7 +569,7 @@ rtk git commit -m "feat: expose native provider request contracts"
 
 **Interfaces:**
 - Consumes: frozen native request/response values and diagnostics.
-- Produces: `CatalogProvider`, `AdmissionProvider`, `CapabilityInvoker`, `AuditSink` Protocols and `ProviderHttpClient`.
+- Produces: `CatalogProvider`, `AdmissionProvider`, `CapabilityInvoker` Protocols and `ProviderHttpClient`. `AuditSink` requires immutable audit record/receipt contracts and is explicitly deferred to V2.
 
 - [ ] **Step 1: Write failing client security and parsing tests**
 
@@ -619,6 +619,8 @@ class AdmissionProvider(Protocol):
 class CapabilityInvoker(Protocol):
     async def invoke(self, request: InvocationRequest) -> InvocationOutcome: ...
 
+    # V1 status lookups carry only an invocation ID and are exempt from caller
+    # trace propagation; no ambient trace state may be invented.
     async def status(self, invocation_id: str) -> InvocationStatus: ...
 ```
 
@@ -632,9 +634,11 @@ class ProviderHttpClient:
         self,
         base_url: str,
         *,
-        transport: httpx.AsyncBaseTransport | None = None,
+        transport: httpx.MockTransport | None = None,
         baggage_allowlist: frozenset[str] = frozenset(),
     ) -> None:
+        if transport is not None and not isinstance(transport, httpx.MockTransport):
+            raise TypeError("transport must be an httpx.MockTransport")
         require_https(base_url, allow_mock=transport is not None)
         self._client = httpx.AsyncClient(
             base_url=base_url,
@@ -646,13 +650,13 @@ class ProviderHttpClient:
         self._baggage_allowlist = baggage_allowlist
 ```
 
-Implement only the four V1 routes. Reject every 3xx response, cap response bodies at the provider-response limit, parse structured diagnostic bodies for non-2xx statuses, and send canonical JSON bytes from native request objects.
+Implement only the four V1 routes. Reject every 3xx response, cap response bodies at the provider-response limit, parse structured diagnostic bodies for non-2xx statuses, and send canonical JSON bytes from native request objects. Non-2xx exceptions retain only enum-controlled diagnostic fields and the stable code; all provider free-form values, raw bodies, and exception causes are removed. Restrict status IDs to the native nonblank grammar and reject HTTP dot segments. Accept only W3C traceparent version `00` and an explicitly documented canonical tracestate subset.
 
 - [ ] **Step 5: Run client tests**
 
 Run from `python/kiteframe`: `rtk uv run --project . pytest tests/provider/test_http_client.py -q`
 
-Expected: PASS for catalog ETag, admission, invocation, status, redirects, TLS requirement, body limits, W3C propagation, baggage filtering, structured diagnostics, and invalid response bodies.
+Expected: PASS for catalog ETag, admission, invocation, status, redirects, TLS and mock-transport restrictions, body limits, W3C syntax and propagation, baggage filtering, redacted structured diagnostics without retained causes, and invalid response bodies.
 
 - [ ] **Step 6: Commit the provider client boundary**
 

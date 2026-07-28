@@ -22,9 +22,10 @@ from kiteframe._native import (
     load_invocation_status,
 )
 
-from .trace import _is_sensitive_key, trace_headers
+from .trace import trace_headers
 
 PROVIDER_RESPONSE_LIMIT_BYTES = 1_048_576
+_REDACTED_PROVIDER_MESSAGE = "provider request failed"
 _DIAGNOSTIC_CODES = frozenset(
     {
         "KF-PKG-001",
@@ -184,18 +185,6 @@ async def _bounded_body(response: httpx.Response) -> bytes:
     return bytes(body)
 
 
-def _sanitize_detail(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _sanitize_detail(child)
-            for key, child in value.items()
-            if isinstance(key, str) and not _is_sensitive_key(key)
-        }
-    if isinstance(value, list):
-        return [_sanitize_detail(child) for child in value]
-    return value
-
-
 def _optional_string(
     diagnostic: Mapping[str, Any],
     key: str,
@@ -245,19 +234,23 @@ def _sanitize_diagnostic(diagnostic: object) -> dict[str, Any]:
     sanitized: dict[str, Any] = {
         "category": category,
         "code": code,
-        "details": _sanitize_detail(details),
-        "help": _optional_string(diagnostic, "help"),
-        "message": message,
-        "package_path": _optional_string(diagnostic, "package_path"),
+        "details": {},
+        "help": None,
+        "message": _REDACTED_PROVIDER_MESSAGE,
+        "package_path": None,
         "retry": retry,
         "severity": severity,
-        "source_range": source_range,
+        "source_range": None,
         "stage": stage,
     }
+    _optional_string(diagnostic, "help")
+    _optional_string(diagnostic, "package_path")
     return sanitized
 
 
-def _diagnostic_error(body: bytes) -> KiteframeDiagnosticError:
+def _diagnostic_error(
+    body: bytes,
+) -> KiteframeDiagnosticError | ProviderTransportError:
     def reject_non_json_constant(_: str) -> None:
         raise ValueError("non-JSON numeric constant")
 
@@ -266,17 +259,25 @@ def _diagnostic_error(body: bytes) -> KiteframeDiagnosticError:
             body,
             parse_constant=reject_non_json_constant,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise ProviderTransportError(
+        raw_diagnostics = (
+            envelope.get("diagnostics") if isinstance(envelope, dict) else envelope
+        )
+        if not isinstance(raw_diagnostics, list) or not raw_diagnostics:
+            raise ProviderTransportError(
+                "provider returned an invalid diagnostic response"
+            )
+        diagnostics = [
+            _sanitize_diagnostic(diagnostic) for diagnostic in raw_diagnostics
+        ]
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        ProviderTransportError,
+    ):
+        return ProviderTransportError(
             "provider returned an invalid diagnostic response"
-        ) from error
-
-    raw_diagnostics = (
-        envelope.get("diagnostics") if isinstance(envelope, dict) else envelope
-    )
-    if not isinstance(raw_diagnostics, list) or not raw_diagnostics:
-        raise ProviderTransportError("provider returned an invalid diagnostic response")
-    diagnostics = [_sanitize_diagnostic(diagnostic) for diagnostic in raw_diagnostics]
+        )
     diagnostics.sort(
         key=lambda diagnostic: (
             _DIAGNOSTIC_STAGE_ORDER[diagnostic["stage"]],
@@ -288,7 +289,7 @@ def _diagnostic_error(body: bytes) -> KiteframeDiagnosticError:
             _DIAGNOSTIC_CODE_ORDER[diagnostic["code"]],
         )
     )
-    error = KiteframeDiagnosticError(diagnostics[0]["message"])
+    error = KiteframeDiagnosticError(_REDACTED_PROVIDER_MESSAGE)
     for attribute, value in (
         ("code", diagnostics[0]["code"]),
         ("diagnostics_json", _canonical_json(diagnostics)),
@@ -304,12 +305,17 @@ class ProviderHttpClient:
         self,
         base_url: str,
         *,
-        transport: httpx.AsyncBaseTransport | None = None,
+        transport: httpx.MockTransport | None = None,
         baggage_allowlist: frozenset[str] = frozenset(),
     ) -> None:
+        if transport is not None and not isinstance(
+            transport,
+            httpx.MockTransport,
+        ):
+            raise TypeError("transport must be an httpx.MockTransport")
         require_https(
             base_url,
-            allow_mock=isinstance(transport, httpx.MockTransport),
+            allow_mock=transport is not None,
         )
         self._client = httpx.AsyncClient(
             base_url=base_url,
@@ -387,9 +393,12 @@ class ProviderHttpClient:
         return load_invocation_outcome(body)
 
     async def status(self, invocation_id: str) -> InvocationStatus:
+        # Mirrors InvocationId::new's nonblank rule, then excludes RFC 3986
+        # dot segments that HTTPX would normalize outside the fixed route.
         if (
             not isinstance(invocation_id, str)
-            or not invocation_id
+            or not invocation_id.strip()
+            or invocation_id in {".", ".."}
             or "\r" in invocation_id
             or "\n" in invocation_id
             or "\0" in invocation_id
@@ -413,6 +422,10 @@ class ProviderHttpClient:
         request_headers = {"accept": "application/json", **(headers or {})}
         if content is not None:
             request_headers["content-type"] = "application/json"
+        body = b""
+        status_code: int | None = None
+        failure_message: str | None = None
+        response: httpx.Response | None = None
         try:
             async with self._client.stream(
                 method,
@@ -420,16 +433,33 @@ class ProviderHttpClient:
                 headers=request_headers,
                 content=content,
             ) as response:
-                if 300 <= response.status_code < 400:
-                    raise ProviderTransportError(
-                        "provider redirect-class response is forbidden"
-                    )
-                body = await _bounded_body(response)
-        except httpx.HTTPError as error:
-            raise ProviderTransportError("provider request failed") from error
+                status_code = response.status_code
+                if not 300 <= status_code < 400:
+                    body = await _bounded_body(response)
+        except httpx.HTTPError:
+            failure_message = "provider request failed"
+        except ProviderTransportError as error:
+            failure_message = str(error)
+        response = None
 
-        if not 200 <= response.status_code < 300:
-            raise _diagnostic_error(body)
+        if failure_message is not None:
+            body = b""
+            content = None
+            raise ProviderTransportError(failure_message)
+        if status_code is None:
+            body = b""
+            content = None
+            raise ProviderTransportError("provider request failed")
+        if 300 <= status_code < 400:
+            content = None
+            raise ProviderTransportError(
+                "provider redirect-class response is forbidden"
+            )
+        if not 200 <= status_code < 300:
+            diagnostic_error = _diagnostic_error(body)
+            body = b""
+            content = None
+            raise diagnostic_error
         return body
 
 

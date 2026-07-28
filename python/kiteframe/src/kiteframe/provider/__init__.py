@@ -8,7 +8,6 @@ from .http import (
 )
 from .protocols import (
     AdmissionProvider,
-    AuditSink,
     CapabilityInvoker,
     CatalogProvider,
 )
@@ -17,7 +16,6 @@ from .trace import trace_headers
 __all__ = [
     "PROVIDER_RESPONSE_LIMIT_BYTES",
     "AdmissionProvider",
-    "AuditSink",
     "CapabilityInvoker",
     "CatalogProvider",
     "ProviderHttpClient",

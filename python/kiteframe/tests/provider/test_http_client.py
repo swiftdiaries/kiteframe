@@ -10,6 +10,7 @@ from kiteframe import (
     load_admission_request,
     load_catalog_request,
     load_invocation_request,
+    provider,
 )
 from kiteframe._native import (
     CapabilityCatalog,
@@ -181,6 +182,38 @@ def diagnostic_envelope() -> bytes:
     )
 
 
+def unsafe_diagnostic_envelope(secret: str) -> bytes:
+    return canonical_bytes(
+        {
+            "diagnostics": [
+                {
+                    "category": "authorization",
+                    "code": "KF-AUTH-001",
+                    "details": {
+                        "apparentlySafe": secret,
+                        "nested": [secret],
+                    },
+                    "help": secret,
+                    "message": secret,
+                    "package_path": secret,
+                    "retry": "after_user_action",
+                    "severity": "error",
+                    "source_range": {"end": 9, "start": 1},
+                    "stage": "admit",
+                }
+            ]
+        }
+    )
+
+
+class UnsafeTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(
+        self,
+        request: httpx.Request,
+    ) -> httpx.Response:
+        return httpx.Response(200, content=capability_catalog_bytes())
+
+
 @pytest.mark.asyncio
 async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None:
     seen: list[httpx.Request] = []
@@ -328,9 +361,44 @@ async def test_structured_http_diagnostic_is_sanitized_and_raised() -> None:
     assert error.value.code == "KF-AUTH-001"
     assert b"must-not-escape" not in error.value.diagnostics_json
     assert b"prompt" not in error.value.diagnostics_json
-    assert json.loads(error.value.diagnostics_json)[0]["details"] == {
-        "policyRevision": "policy:7"
-    }
+    assert json.loads(error.value.diagnostics_json)[0]["details"] == {}
+
+
+@pytest.mark.asyncio
+async def test_non_2xx_diagnostic_redacts_all_provider_free_form_values() -> None:
+    secret = "provider-secret-value"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            403,
+            content=unsafe_diagnostic_envelope(secret),
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(KiteframeDiagnosticError) as error:
+            await client.admit(admission_request())
+    finally:
+        await client.aclose()
+
+    assert str(error.value) == "provider request failed"
+    assert secret not in str(error.value)
+    assert secret.encode() not in error.value.diagnostics_json
+    assert json.loads(error.value.diagnostics_json) == [
+        {
+            "category": "authorization",
+            "code": "KF-AUTH-001",
+            "details": {},
+            "help": None,
+            "message": "provider request failed",
+            "package_path": None,
+            "retry": "after_user_action",
+            "severity": "error",
+            "source_range": None,
+            "stage": "admit",
+        }
+    ]
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -349,6 +417,53 @@ async def test_malformed_http_error_never_exposes_response_body() -> None:
         await client.aclose()
 
     assert "super-secret" not in str(error.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"diagnostics":[provider-secret-value',
+        b"\xffprovider-secret-value",
+    ],
+)
+async def test_malformed_diagnostic_does_not_retain_raw_exception(
+    body: bytes,
+) -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(500, content=body))
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(ProviderTransportError) as error:
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+    assert "provider-secret-value" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_httpx_failure_does_not_retain_raw_exception() -> None:
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            "provider-secret-value",
+            request=request,
+        )
+
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(fail),
+    )
+    try:
+        with pytest.raises(ProviderTransportError) as error:
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+    assert "provider-secret-value" not in str(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
 
 
 @pytest.mark.asyncio
@@ -377,15 +492,23 @@ def test_tls_is_required_outside_mock_transport() -> None:
     with pytest.raises(ValueError, match="HTTPS"):
         ProviderHttpClient("http://provider.test")
 
-    with pytest.raises(ValueError, match="HTTPS"):
+    with pytest.raises(TypeError, match="MockTransport"):
         ProviderHttpClient(
             "http://provider.test",
-            transport=httpx.AsyncHTTPTransport(),
+            transport=httpx.AsyncHTTPTransport(),  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError, match="HTTPS"):
         ProviderHttpClient(
             "ftp://provider.test",
             transport=httpx.MockTransport(lambda request: httpx.Response(500)),
+        )
+
+
+def test_arbitrary_async_transport_cannot_bypass_tls() -> None:
+    with pytest.raises(TypeError, match="MockTransport"):
+        ProviderHttpClient(
+            "https://provider.test",
+            transport=UnsafeTransport(),  # type: ignore[arg-type]
         )
 
 
@@ -406,6 +529,38 @@ async def test_mock_transport_may_use_plaintext_without_network_io() -> None:
         await client.aclose()
 
     assert isinstance(catalog, CapabilityCatalog)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invocation_id", [".", ".."])
+async def test_status_rejects_path_normalizing_dot_segments(
+    invocation_id: str,
+) -> None:
+    transport = httpx.MockTransport(
+        lambda request: pytest.fail("invalid status ID reached transport")
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(ValueError, match="invocation ID"):
+            await client.status(invocation_id)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invocation_id", [" ", "\t"])
+async def test_status_enforces_native_nonblank_invocation_id(
+    invocation_id: str,
+) -> None:
+    transport = httpx.MockTransport(
+        lambda request: pytest.fail("invalid status ID reached transport")
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(ValueError, match="invocation ID"):
+            await client.status(invocation_id)
+    finally:
+        await client.aclose()
 
 
 def test_baggage_drops_sensitive_and_unlisted_keys() -> None:
@@ -429,3 +584,21 @@ def test_baggage_drops_sensitive_and_unlisted_keys() -> None:
 def test_trace_headers_reject_header_injection() -> None:
     with pytest.raises(ValueError, match="traceparent"):
         trace_headers(traceparent=f"{VALID_TRACEPARENT}\r\nx-secret: value")
+
+
+def test_trace_headers_reject_reserved_traceparent_version() -> None:
+    with pytest.raises(ValueError, match="traceparent"):
+        trace_headers(traceparent=f"ff-{VALID_TRACEPARENT[3:]}")
+
+
+@pytest.mark.parametrize("tracestate", [",", "vendor=", "Vendor=value", "a=1,a=2"])
+def test_trace_headers_reject_invalid_tracestate(tracestate: str) -> None:
+    with pytest.raises(ValueError, match="tracestate"):
+        trace_headers(
+            traceparent=VALID_TRACEPARENT,
+            tracestate=tracestate,
+        )
+
+
+def test_v1_provider_api_does_not_expose_audit_sink() -> None:
+    assert not hasattr(provider, "AuditSink")

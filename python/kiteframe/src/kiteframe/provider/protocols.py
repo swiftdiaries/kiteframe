@@ -1,6 +1,6 @@
 """Structural provider contracts at the Python adapter boundary."""
 
-from typing import Protocol, TypeVar, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from kiteframe._native import (
     AdmissionRequest,
@@ -11,9 +11,6 @@ from kiteframe._native import (
     InvocationRequest,
     InvocationStatus,
 )
-
-AuditRecordT_contra = TypeVar("AuditRecordT_contra", contravariant=True)
-DurableAuditReceiptT_co = TypeVar("DurableAuditReceiptT_co", covariant=True)
 
 
 @runtime_checkable
@@ -39,21 +36,8 @@ class CapabilityInvoker(Protocol):
     async def status(self, invocation_id: str) -> InvocationStatus: ...
 
 
-@runtime_checkable
-class AuditSink(
-    Protocol[AuditRecordT_contra, DurableAuditReceiptT_co],
-):
-    """Typed append boundary for immutable audit values supplied by a backend."""
-
-    async def append(
-        self,
-        record: AuditRecordT_contra,
-    ) -> DurableAuditReceiptT_co: ...
-
-
 __all__ = [
     "AdmissionProvider",
-    "AuditSink",
     "CapabilityInvoker",
     "CatalogProvider",
 ]
