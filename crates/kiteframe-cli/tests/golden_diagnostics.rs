@@ -32,6 +32,11 @@ fn fixture_diagnostic(code: DiagnosticCode) -> Diagnostic {
             DiagnosticStage::Resolve,
             "required feature is unsupported",
         ),
+        DiagnosticCode::CompileOutput => (
+            DiagnosticCategory::Runtime,
+            DiagnosticStage::Runtime,
+            "compiled IR output failed",
+        ),
         DiagnosticCode::AdmissionDenied => (
             DiagnosticCategory::Authorization,
             DiagnosticStage::Admit,

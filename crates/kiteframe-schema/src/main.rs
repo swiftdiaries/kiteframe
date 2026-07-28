@@ -7,7 +7,7 @@ use std::{
 
 use kiteframe_contract::{
     AgentManifest, CapabilityCatalog, CapabilityDescriptor, CapabilityLock,
-    ComponentMetadataCatalog, ResolvedAgent, RuntimeBinding,
+    ComponentMetadataCatalog, Diagnostic, ResolvedAgent, RuntimeBinding,
 };
 use schemars::JsonSchema;
 
@@ -44,6 +44,7 @@ fn generate(destination: &Path) -> Result<()> {
     write_schema::<ComponentMetadataCatalog>(
         &destination.join("component-metadata-catalog.schema.json"),
     )?;
+    write_schema::<Diagnostic>(&destination.join("diagnostic.schema.json"))?;
     write_schema::<ResolvedAgent>(&destination.join("resolved-agent.schema.json"))?;
     Ok(())
 }
@@ -57,6 +58,7 @@ fn check(destination: &Path) -> Result<()> {
     check_schema::<ComponentMetadataCatalog>(
         &destination.join("component-metadata-catalog.schema.json"),
     )?;
+    check_schema::<Diagnostic>(&destination.join("diagnostic.schema.json"))?;
     check_schema::<ResolvedAgent>(&destination.join("resolved-agent.schema.json"))?;
     Ok(())
 }

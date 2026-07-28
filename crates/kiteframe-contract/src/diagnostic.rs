@@ -46,6 +46,7 @@ define_diagnostic_codes! {
     AuditUnavailable => "KF-AUDIT-001",
     ComponentUnresolved => "KF-RUNTIME-001",
     RuntimeConstruction => "KF-RUNTIME-002",
+    CompileOutput => "KF-CLI-001",
 }
 
 #[derive(

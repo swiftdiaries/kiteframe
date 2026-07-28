@@ -152,7 +152,7 @@ fn assert_compile_output_rejected(package: &Path, target: &Path, output: &Path) 
 
     assert!(result.get_output().stderr.is_empty());
     let body = parse_single_json(&result.get_output().stdout);
-    assert_eq!(body["diagnostics"][0]["code"], "KF-RUNTIME-002");
+    assert_eq!(body["diagnostics"][0]["code"], "KF-CLI-001");
     assert_eq!(
         body["diagnostics"][0]["message"],
         "compiled IR output path overlaps protected input"
@@ -257,7 +257,7 @@ fn compile_output_write_failures_are_redacted_structured_diagnostics() {
         .code(5);
     assert!(json_output.get_output().stderr.is_empty());
     let body = parse_single_json(&json_output.get_output().stdout);
-    assert_eq!(body["diagnostics"][0]["code"], "KF-RUNTIME-002");
+    assert_eq!(body["diagnostics"][0]["code"], "KF-CLI-001");
     assert_eq!(
         body["diagnostics"][0]["message"],
         "compiled IR output cannot be written"
@@ -275,7 +275,7 @@ fn compile_output_write_failures_are_redacted_structured_diagnostics() {
     let stderr = String::from_utf8_lossy(&human_output.get_output().stderr);
     assert_eq!(
         stderr,
-        "KF-RUNTIME-002 Error: compiled IR output cannot be written\n"
+        "KF-CLI-001 Error: compiled IR output cannot be written\n"
     );
     for sentinel in sentinels {
         assert!(

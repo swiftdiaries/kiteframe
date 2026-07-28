@@ -19,6 +19,22 @@ fn stable_code_serializes_as_reserved_wire_value() {
 }
 
 #[test]
+fn compile_output_has_a_dedicated_stable_wire_code() {
+    let diagnostic = Diagnostic::error(
+        DiagnosticCode::CompileOutput,
+        DiagnosticCategory::Runtime,
+        DiagnosticStage::Runtime,
+        "compiled IR output cannot be written",
+    );
+
+    assert_eq!(diagnostic.code.as_str(), "KF-CLI-001");
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap()["code"],
+        "KF-CLI-001"
+    );
+}
+
+#[test]
 fn diagnostics_sort_by_stage_path_range_then_code() {
     let mut diagnostics = [
         Diagnostic::error(

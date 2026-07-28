@@ -1004,6 +1004,7 @@ V1 reserves these stable codes and meanings:
 | `KF-AUDIT-001` | `AUDIT_UNAVAILABLE` | A required durable audit append failed. |
 | `KF-RUNTIME-001` | `COMPONENT_UNRESOLVED` | A trusted registry symbol is absent or has the wrong kind. |
 | `KF-RUNTIME-002` | `RUNTIME_CONSTRUCTION` | Public runtime construction failed. |
+| `KF-CLI-001` | `COMPILE_OUTPUT` | A compile output path is protected or its artifact cannot be emitted. |
 
 Codes are stable within V1. Messages may improve, but callers branch only on
 codes and typed details. Diagnostics never include credentials, raw policy

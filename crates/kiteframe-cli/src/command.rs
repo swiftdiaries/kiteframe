@@ -273,7 +273,7 @@ fn canonicalize_output_path(path: &Path) -> std::io::Result<PathBuf> {
 
 fn compile_output_diagnostic(overlap: bool) -> Diagnostic {
     diagnostic(
-        DiagnosticCode::RuntimeConstruction,
+        DiagnosticCode::CompileOutput,
         DiagnosticCategory::Runtime,
         DiagnosticStage::Runtime,
         if overlap {
