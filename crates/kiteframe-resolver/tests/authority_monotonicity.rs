@@ -200,7 +200,7 @@ fn input(
 
 fn capability_resources(resolved: &kiteframe_contract::ResolvedAgent) -> BTreeSet<String> {
     resolved.capability_requirements()[0]
-        .resources
+        .resources()
         .iter()
         .cloned()
         .collect()
@@ -259,6 +259,16 @@ proptest! {
 
         let broad =
             resolve_agent(input(broad_package, broad_lock, BTreeMap::new())).unwrap();
+        if narrow_values.is_empty() {
+            let errors = resolve_agent(input(narrow_package, narrow_lock, BTreeMap::new()))
+                .unwrap_err();
+            let has_empty_resource_error = errors.iter().any(|error| {
+                error.message.as_str()
+                    == "resolved capability requires at least one resource selector"
+            });
+            prop_assert!(has_empty_resource_error);
+            return Ok(());
+        }
         let narrow =
             resolve_agent(input(narrow_package, narrow_lock, BTreeMap::new())).unwrap();
         let broad_resources = capability_resources(&broad);
@@ -330,9 +340,27 @@ proptest! {
             narrow_freshness["maxAdmissionAgeSeconds"].as_u64(),
             Some(short)
         );
-        prop_assert_eq!(
+        prop_assert_ne!(
             broad.capability_requirements(),
             narrow.capability_requirements()
+        );
+        prop_assert_eq!(
+            broad.capability_requirements()[0]
+                .descriptor()
+                .freshness()
+                .max_admission_age_seconds
+                .unwrap()
+                .get(),
+            long
+        );
+        prop_assert_eq!(
+            narrow.capability_requirements()[0]
+                .descriptor()
+                .freshness()
+                .max_admission_age_seconds
+                .unwrap()
+                .get(),
+            short
         );
     }
 }

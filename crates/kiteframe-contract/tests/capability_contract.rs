@@ -3,10 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use kiteframe_contract::{
     AgentName, ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityErrorDescriptor, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CompilationDecision, CompilationReport, CompilationWarning, ComponentMetadataCatalog,
-    ConfirmationRequirement, ConsentRequirement, DelegationRequirement, EffectClassification,
-    ExecutionMode, FeatureId, FreshnessRequirement, IdempotencyRequirement, IrSchemaVersion,
-    JsonSchema2020_12, ModelModality, NonEmptySet, PackageIdentity, PackagePath, PackageVersion,
+    CatalogIdentity, CompilationDecision, CompilationReport, CompilationWarning,
+    ComponentMetadataCatalog, ConfirmationRequirement, ConsentRequirement, DelegationRequirement,
+    EffectClassification, EvidenceRequirement, ExecutionMode, FeatureId, FreshnessRequirement,
+    IdempotencyRequirement, IdempotencyScope, IrSchemaVersion, JsonSchema2020_12, LockedCapability,
+    ModelModality, NonEmptySet, PackageIdentity, PackagePath, PackageVersion,
     PreconditionDescriptor, ResidencyClass, ResolvedAgent, ResolvedAgentParts,
     ResolvedCapabilityRequirement, ResolvedContentCaptureRequirement, ResolvedSubagent,
     ResourceSelectorSchema, Sha256Digest,
@@ -55,6 +56,54 @@ fn effectful_descriptor_requires_idempotency() {
     let errors = CapabilityDescriptor::try_new(parts).unwrap_err();
     assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
     assert!(errors[0].message.as_str().contains("idempotency"));
+}
+
+#[test]
+fn descriptor_exposes_every_runtime_consumed_semantic() {
+    let mut parts = descriptor_parts("cases.comment", "1.0.0");
+    parts.summary = "Comment on a case".to_owned();
+    parts.effect = EffectClassification::ReversibleWrite;
+    parts.idempotency = IdempotencyRequirement::Required {
+        scope: IdempotencyScope::ActorCapabilityResourceOperation,
+        retention_seconds: std::num::NonZeroU64::new(60).unwrap(),
+    };
+    parts.preconditions = vec![PreconditionDescriptor {
+        name: "case-version".to_owned(),
+        kind: kiteframe_contract::PreconditionKind::EntityVersion,
+        required: true,
+    }];
+    parts.confirmation = ConfirmationRequirement::Required {
+        evidence: EvidenceRequirement {
+            kind: "user-confirmation".to_owned(),
+            issuer: None,
+        },
+    };
+    let descriptor = CapabilityDescriptor::try_new(parts).unwrap();
+
+    assert_eq!(descriptor.summary(), "Comment on a case");
+    assert!(!descriptor.stable_errors().is_empty());
+    assert!(
+        descriptor
+            .execution_modes()
+            .as_set()
+            .contains(&ExecutionMode::Immediate)
+    );
+    assert!(
+        descriptor
+            .resource_selector_schema()
+            .as_schema()
+            .as_value()
+            .is_object()
+    );
+    assert_eq!(descriptor.effect(), EffectClassification::ReversibleWrite);
+    assert_eq!(descriptor.freshness(), &FreshnessRequirement::default());
+    assert!(!descriptor.preconditions().is_empty());
+    assert!(matches!(
+        descriptor.confirmation(),
+        ConfirmationRequirement::Required { .. }
+    ));
+    assert!(matches!(descriptor.approval(), ApprovalRequirement::None));
+    assert!(matches!(descriptor.consent(), ConsentRequirement::None));
 }
 
 #[test]
@@ -249,19 +298,27 @@ fn resolved_parts(
         package_identity: package_identity("parent", "1.0.0"),
         portable_digest: Sha256Digest::from_bytes([1; Sha256Digest::BYTE_LENGTH]),
         lock_digest: Sha256Digest::from_bytes([2; Sha256Digest::BYTE_LENGTH]),
+        catalog_identity: CatalogIdentity {
+            name: "test".to_owned(),
+            revision: "v1".to_owned(),
+        },
+        catalog_digest: Sha256Digest::from_bytes([3; Sha256Digest::BYTE_LENGTH]),
         binding_digest: Sha256Digest::from_bytes([3; Sha256Digest::BYTE_LENGTH]),
         prompts: BTreeMap::new(),
         skills: BTreeMap::new(),
         models: BTreeMap::new(),
-        capability_requirements: vec![ResolvedCapabilityRequirement {
-            identity: CapabilityIdentity::try_new(
-                CapabilityName::new("cases.read").unwrap(),
-                CapabilityReleaseVersion::new("1.0.0").unwrap(),
+        capability_requirements: vec![
+            ResolvedCapabilityRequirement::try_new(
+                locked_capability(),
+                true,
+                if resources.is_empty() {
+                    vec!["team:a".to_owned()]
+                } else {
+                    resources.into_iter().map(str::to_owned).collect()
+                },
             )
             .unwrap(),
-            required: true,
-            resources: resources.into_iter().map(str::to_owned).collect(),
-        }],
+        ],
         subagents,
         required_features: BTreeSet::new(),
         optional_features: BTreeSet::new(),
@@ -271,14 +328,21 @@ fn resolved_parts(
 }
 
 fn capability_requirement(required: bool) -> ResolvedCapabilityRequirement {
-    ResolvedCapabilityRequirement {
-        identity: CapabilityIdentity::try_new(
-            CapabilityName::new("cases.read").unwrap(),
-            CapabilityReleaseVersion::new("1.0.0").unwrap(),
-        )
-        .unwrap(),
-        required,
-        resources: vec!["team:a".into()],
+    ResolvedCapabilityRequirement::try_new(locked_capability(), required, vec!["team:a".into()])
+        .unwrap()
+}
+
+fn locked_capability() -> LockedCapability {
+    let descriptor =
+        CapabilityDescriptor::try_new(descriptor_parts("cases.read", "1.0.0")).unwrap();
+    LockedCapability {
+        identity: descriptor.identity().clone(),
+        descriptor,
+        descriptor_digest: Sha256Digest::from_bytes([4; Sha256Digest::BYTE_LENGTH]),
+        input_schema_digest: Sha256Digest::from_bytes([5; Sha256Digest::BYTE_LENGTH]),
+        output_schema_digest: Sha256Digest::from_bytes([6; Sha256Digest::BYTE_LENGTH]),
+        stable_error_set_digest: Sha256Digest::from_bytes([7; Sha256Digest::BYTE_LENGTH]),
+        safety_metadata_digest: Sha256Digest::from_bytes([8; Sha256Digest::BYTE_LENGTH]),
     }
 }
 

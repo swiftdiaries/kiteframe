@@ -6,4 +6,4 @@ spec:
   models:
     primary: { capabilities: [text, tool-calling] }
   capabilities:
-    - { name: cases.read, version: "^1.0", required: true }
+    - { name: cases.read, version: "^1.0", required: true, resources: [tenant:support] }

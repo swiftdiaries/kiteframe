@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kiteframe_contract::{
-    CapabilityLock, CompilationDecision, CompilationReport, CompilationWarning, ComponentKind,
-    ComponentMetadataCatalog, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage,
-    FeatureId, FeatureSet, IrSchemaVersion, PackageIdentity, ResolvedAgent, ResolvedAgentParts,
-    ResolvedCapabilityRequirement, ResolvedContentCaptureRequirement, ResolvedSubagent,
-    RuntimeBinding, RuntimeTargetDescriptor, Sha256Digest,
+    CapabilityLock, CatalogIdentity, CompilationDecision, CompilationReport, CompilationWarning,
+    ComponentKind, ComponentMetadataCatalog, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticStage, FeatureId, FeatureSet, IrSchemaVersion, PackageIdentity, ResolvedAgent,
+    ResolvedAgentParts, ResolvedCapabilityRequirement, ResolvedContentCaptureRequirement,
+    ResolvedSubagent, RuntimeBinding, RuntimeTargetDescriptor, Sha256Digest,
 };
 use kiteframe_core::{AgentPackage, canonical_json, hash_domain};
 use semver::{Version, VersionReq};
@@ -174,6 +174,11 @@ fn resolve_package(
         package_identity: identity,
         portable_digest: *package.portable_digest(),
         lock_digest: lock.lock_digest,
+        catalog_identity: CatalogIdentity {
+            name: lock.catalog_identity.clone(),
+            revision: lock.catalog_revision.clone(),
+        },
+        catalog_digest: lock.catalog_digest,
         binding_digest,
         prompts: package.prompt_assets().clone(),
         skills: package.skill_assets().clone(),
@@ -312,15 +317,18 @@ fn resolve_capabilities(
         });
         if let Some(capability) = selected {
             matched.insert(capability.identity.clone());
-            resolved.push(ResolvedCapabilityRequirement {
-                identity: capability.identity.clone(),
-                required: requirement.required,
-                resources: requirement
-                    .resources
-                    .iter()
-                    .map(|resource| resource.as_str().to_owned())
-                    .collect(),
-            });
+            resolved.push(
+                ResolvedCapabilityRequirement::try_new(
+                    capability.clone(),
+                    requirement.required,
+                    requirement
+                        .resources
+                        .iter()
+                        .map(|resource| resource.as_str().to_owned())
+                        .collect(),
+                )
+                .map_err(|message| vec![package_invalid(message)])?,
+            );
         } else if requirement.required {
             return Err(vec![lock_stale(format!(
                 "required capability {} is absent from exact lock",

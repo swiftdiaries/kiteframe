@@ -7,10 +7,10 @@ use kiteframe_contract::{
     CapabilityReleaseVersion, CatalogRequest, ConfirmationRequirement, ConsentRequirement,
     DelegationAncestry, Diagnostic, EffectClassification, EvidenceReferences, EvidenceRequirement,
     ExecutionMode, IdempotencyRequirement, IdempotencyScope, InvocationId, InvocationOutcome,
-    InvocationRequest, InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
-    PreconditionDescriptor, RequestedCapability, ResourceSelectorSchema, RetryClass, SessionRef,
-    Sha256Digest, StableCapabilityError, StatusFirstDiagnostic, Suspension, TaskRef, Timestamp,
-    TraceContext,
+    InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet, NormalizedResourceSelector,
+    PolicyRevision, PreconditionDescriptor, RequestedCapability, ResolvedCapabilityRequirement,
+    ResourceSelectorSchema, RetryClass, SessionRef, Sha256Digest, StableCapabilityError,
+    StatusFirstDiagnostic, Suspension, TaskRef, Timestamp, TraceContext,
 };
 use serde_json::json;
 
@@ -395,11 +395,7 @@ fn admission_rejects_resource_selector_broader_than_resolved_requirement() {
         resolved_digest: digest(3),
         required_capabilities: vec![request],
         optional_capabilities: Vec::new(),
-        resolved_requirements: vec![kiteframe_contract::ResolvedCapabilityRequirement {
-            identity: capability_identity(),
-            required: true,
-            resources: vec![String::from("tenant:t1/case:case-1")],
-        }],
+        resolved_requirements: vec![resolved_requirement()],
         delegation_ancestry: DelegationAncestry::default(),
         contextual_facts: BTreeMap::new(),
         trace_context: TraceContext::try_new(valid_traceparent(), None, BTreeMap::new()).unwrap(),
@@ -529,6 +525,23 @@ fn capability_identity_with_name(name: &str) -> CapabilityIdentity {
     .unwrap()
 }
 
+fn resolved_requirement() -> ResolvedCapabilityRequirement {
+    ResolvedCapabilityRequirement::try_new(
+        LockedCapability {
+            identity: capability_identity(),
+            descriptor: read_only_descriptor(),
+            descriptor_digest: digest(4),
+            input_schema_digest: digest(5),
+            output_schema_digest: digest(6),
+            stable_error_set_digest: digest(7),
+            safety_metadata_digest: digest(8),
+        },
+        true,
+        vec![String::from("tenant:t1/case:case-1")],
+    )
+    .unwrap()
+}
+
 fn valid_traceparent() -> String {
     String::from("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
 }
@@ -550,11 +563,7 @@ fn valid_admission_request() -> AdmissionRequest {
             .unwrap(),
         ],
         optional_capabilities: Vec::new(),
-        resolved_requirements: vec![kiteframe_contract::ResolvedCapabilityRequirement {
-            identity: capability_identity(),
-            required: true,
-            resources: vec![String::from("tenant:t1/case:case-1")],
-        }],
+        resolved_requirements: vec![resolved_requirement()],
         delegation_ancestry: DelegationAncestry::default(),
         contextual_facts: BTreeMap::new(),
         trace_context: TraceContext::try_new(valid_traceparent(), None, BTreeMap::new()).unwrap(),

@@ -5,9 +5,9 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CapabilityIdentity, CompilationReport, DataClassification, DelegationRequirement, FeatureSet,
-    ModelRequirement, ModelRole, PackageIdentity, PackagePath, RegistrySymbol, Sha256Digest,
-    ValidatedTextAsset,
+    CapabilityDescriptor, CapabilityIdentity, CatalogIdentity, CompilationReport,
+    DataClassification, DelegationRequirement, FeatureSet, LockedCapability, ModelRequirement,
+    ModelRole, PackageIdentity, PackagePath, RegistrySymbol, Sha256Digest, ValidatedTextAsset,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -38,9 +38,57 @@ impl ResolvedModelRequirement {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolvedCapabilityRequirement {
-    pub identity: CapabilityIdentity,
-    pub required: bool,
-    pub resources: Vec<String>,
+    locked_capability: LockedCapability,
+    required: bool,
+    resources: Vec<String>,
+}
+impl ResolvedCapabilityRequirement {
+    pub fn try_new(
+        locked_capability: LockedCapability,
+        required: bool,
+        mut resources: Vec<String>,
+    ) -> Result<Self, String> {
+        resources.sort();
+        resources.dedup();
+        if resources.is_empty() {
+            return Err("resolved capability requires at least one resource selector".to_owned());
+        }
+        Ok(Self {
+            locked_capability,
+            required,
+            resources,
+        })
+    }
+    pub fn identity(&self) -> &CapabilityIdentity {
+        self.locked_capability.identity()
+    }
+    pub fn locked_capability(&self) -> &LockedCapability {
+        &self.locked_capability
+    }
+    pub fn descriptor(&self) -> &CapabilityDescriptor {
+        self.locked_capability.descriptor()
+    }
+    pub fn descriptor_digest(&self) -> &Sha256Digest {
+        self.locked_capability.descriptor_digest()
+    }
+    pub fn input_schema_digest(&self) -> &Sha256Digest {
+        self.locked_capability.input_schema_digest()
+    }
+    pub fn output_schema_digest(&self) -> &Sha256Digest {
+        self.locked_capability.output_schema_digest()
+    }
+    pub fn stable_error_set_digest(&self) -> &Sha256Digest {
+        self.locked_capability.stable_error_set_digest()
+    }
+    pub fn safety_metadata_digest(&self) -> &Sha256Digest {
+        self.locked_capability.safety_metadata_digest()
+    }
+    pub fn required(&self) -> bool {
+        self.required
+    }
+    pub fn resources(&self) -> &[String] {
+        &self.resources
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -62,6 +110,8 @@ pub struct ResolvedAgentParts {
     pub package_identity: PackageIdentity,
     pub portable_digest: Sha256Digest,
     pub lock_digest: Sha256Digest,
+    pub catalog_identity: CatalogIdentity,
+    pub catalog_digest: Sha256Digest,
     pub binding_digest: Sha256Digest,
     pub prompts: BTreeMap<PackagePath, ValidatedTextAsset>,
     pub skills: BTreeMap<PackagePath, ValidatedTextAsset>,
@@ -80,6 +130,8 @@ pub struct ResolvedAgent {
     package_identity: PackageIdentity,
     portable_digest: Sha256Digest,
     lock_digest: Sha256Digest,
+    catalog_identity: CatalogIdentity,
+    catalog_digest: Sha256Digest,
     binding_digest: Sha256Digest,
     resolved_digest: Sha256Digest,
     prompts: BTreeMap<PackagePath, ValidatedTextAsset>,
@@ -94,15 +146,11 @@ pub struct ResolvedAgent {
 }
 impl ResolvedAgent {
     pub fn try_new(mut parts: ResolvedAgentParts) -> Result<Self, String> {
-        for requirement in &mut parts.capability_requirements {
-            requirement.resources.sort();
-            requirement.resources.dedup();
-        }
         parts.capability_requirements.sort_by(|a, b| {
-            a.identity
-                .cmp(&b.identity)
-                .then(a.resources.cmp(&b.resources))
-                .then(a.required.cmp(&b.required))
+            a.identity()
+                .cmp(b.identity())
+                .then(a.resources().cmp(b.resources()))
+                .then(a.required().cmp(&b.required()))
         });
         parts.capability_requirements.dedup();
         parts.subagents.sort_by(|a, b| {
@@ -127,6 +175,8 @@ impl ResolvedAgent {
             package_identity: parts.package_identity,
             portable_digest: parts.portable_digest,
             lock_digest: parts.lock_digest,
+            catalog_identity: parts.catalog_identity,
+            catalog_digest: parts.catalog_digest,
             binding_digest: parts.binding_digest,
             resolved_digest,
             prompts: parts.prompts,
@@ -148,6 +198,12 @@ impl ResolvedAgent {
     }
     pub fn package_identity(&self) -> &PackageIdentity {
         &self.package_identity
+    }
+    pub fn catalog_identity(&self) -> &CatalogIdentity {
+        &self.catalog_identity
+    }
+    pub fn catalog_digest(&self) -> &Sha256Digest {
+        &self.catalog_digest
     }
     pub fn capability_requirements(&self) -> &[ResolvedCapabilityRequirement] {
         &self.capability_requirements
@@ -188,6 +244,10 @@ fn resolved_digest(parts: &ResolvedAgentParts) -> Result<Sha256Digest, String> {
         [parts.portable_digest.as_bytes().as_slice()],
     );
     let lock = hash_domain(b"resolved/lock", [parts.lock_digest.as_bytes().as_slice()]);
+    let catalog = canonical_component(
+        b"resolved/catalog",
+        &(&parts.catalog_identity, &parts.catalog_digest),
+    )?;
     let binding = hash_domain(
         b"resolved/binding",
         [parts.binding_digest.as_bytes().as_slice()],
@@ -208,6 +268,7 @@ fn resolved_digest(parts: &ResolvedAgentParts) -> Result<Sha256Digest, String> {
         identity,
         portable,
         lock,
+        catalog,
         binding,
         prompts,
         skills,
@@ -259,6 +320,8 @@ impl<'de> Deserialize<'de> for ResolvedAgent {
             package_identity: PackageIdentity,
             portable_digest: Sha256Digest,
             lock_digest: Sha256Digest,
+            catalog_identity: CatalogIdentity,
+            catalog_digest: Sha256Digest,
             binding_digest: Sha256Digest,
             resolved_digest: Sha256Digest,
             prompts: BTreeMap<PackagePath, ValidatedTextAsset>,
@@ -277,6 +340,8 @@ impl<'de> Deserialize<'de> for ResolvedAgent {
             package_identity: raw.package_identity,
             portable_digest: raw.portable_digest,
             lock_digest: raw.lock_digest,
+            catalog_identity: raw.catalog_identity,
+            catalog_digest: raw.catalog_digest,
             binding_digest: raw.binding_digest,
             prompts: raw.prompts,
             skills: raw.skills,

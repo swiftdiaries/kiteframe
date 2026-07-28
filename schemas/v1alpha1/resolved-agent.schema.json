@@ -12,6 +12,12 @@
         "$ref": "#/$defs/ResolvedCapabilityRequirement"
       }
     },
+    "catalogDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "catalogIdentity": {
+      "$ref": "#/$defs/CatalogIdentity"
+    },
     "compilationReport": {
       "$ref": "#/$defs/CompilationReport"
     },
@@ -87,6 +93,8 @@
     "packageIdentity",
     "portableDigest",
     "lockDigest",
+    "catalogIdentity",
+    "catalogDigest",
     "bindingDigest",
     "resolvedDigest",
     "prompts",
@@ -103,6 +111,138 @@
     "AgentName": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "ApprovalRequirement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/EvidenceRequirement"
+            },
+            "kind": {
+              "type": "string",
+              "const": "required"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence"
+          ]
+        }
+      ]
+    },
+    "CapabilityDescriptor": {
+      "type": "object",
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/ApprovalRequirement"
+        },
+        "confirmation": {
+          "$ref": "#/$defs/ConfirmationRequirement"
+        },
+        "consent": {
+          "$ref": "#/$defs/ConsentRequirement"
+        },
+        "descriptorDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "effect": {
+          "$ref": "#/$defs/EffectClassification"
+        },
+        "executionModes": {
+          "$ref": "#/$defs/NonEmptySet"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessRequirement"
+        },
+        "idempotency": {
+          "$ref": "#/$defs/IdempotencyRequirement"
+        },
+        "identity": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "inputSchema": {
+          "$ref": "#/$defs/JsonSchema2020_12"
+        },
+        "outputSchema": {
+          "$ref": "#/$defs/JsonSchema2020_12"
+        },
+        "preconditions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PreconditionDescriptor"
+          }
+        },
+        "resourceSelectorSchema": {
+          "$ref": "#/$defs/JsonSchema2020_12"
+        },
+        "stableErrors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapabilityErrorDescriptor"
+          }
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "summary",
+        "inputSchema",
+        "outputSchema",
+        "stableErrors",
+        "executionModes",
+        "resourceSelectorSchema",
+        "effect",
+        "idempotency",
+        "freshness",
+        "preconditions",
+        "confirmation",
+        "approval",
+        "consent",
+        "descriptorDigest"
+      ]
+    },
+    "CapabilityErrorDescriptor": {
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "$ref": "#/$defs/SafeMessage"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryClass"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "category",
+        "retry",
+        "message"
+      ]
     },
     "CapabilityIdentity": {
       "type": "object",
@@ -123,6 +263,22 @@
     "CapabilityName": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "CatalogIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "revision"
+      ]
     },
     "CompilationDecision": {
       "type": "object",
@@ -176,6 +332,74 @@
         "message"
       ]
     },
+    "ConfirmationRequirement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/EvidenceRequirement"
+            },
+            "kind": {
+              "type": "string",
+              "const": "required"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence"
+          ]
+        }
+      ]
+    },
+    "ConsentRequirement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/EvidenceRequirement"
+            },
+            "kind": {
+              "type": "string",
+              "const": "required"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence"
+          ]
+        }
+      ]
+    },
     "DataClassification": {
       "type": "string",
       "enum": [
@@ -202,16 +426,165 @@
         "agent"
       ]
     },
+    "EffectClassification": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "reversible_write",
+        "irreversible_write",
+        "external_side_effect"
+      ]
+    },
+    "EvidenceRequirement": {
+      "type": "object",
+      "properties": {
+        "issuer": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "ExecutionMode": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "deferred",
+        "suspendable"
+      ]
+    },
+    "FreshnessRequirement": {
+      "type": "object",
+      "properties": {
+        "maxAdmissionAgeSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "maxInputAgeSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "policyRevisionRequired": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "IdempotencyRequirement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "required"
+            },
+            "retention_seconds": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            },
+            "scope": {
+              "$ref": "#/$defs/IdempotencyScope"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "scope",
+            "retention_seconds"
+          ]
+        }
+      ]
+    },
+    "IdempotencyScope": {
+      "type": "string",
+      "enum": [
+        "actor_capability_resource_operation"
+      ]
+    },
     "IrSchemaVersion": {
       "type": "string",
       "enum": [
         "kiteframe.dev/ir/v1alpha1"
       ]
     },
+    "JsonSchema2020_12": {
+      "type": "object"
+    },
     "LatencyClass": {
       "type": "string",
       "enum": [
         "interactive"
+      ]
+    },
+    "LockedCapability": {
+      "type": "object",
+      "properties": {
+        "descriptor": {
+          "$ref": "#/$defs/CapabilityDescriptor"
+        },
+        "descriptorDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "identity": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "inputSchemaDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "outputSchemaDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "safetyMetadataDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "stableErrorSetDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "descriptor",
+        "descriptorDigest",
+        "inputSchemaDigest",
+        "outputSchemaDigest",
+        "stableErrorSetDigest",
+        "safetyMetadataDigest"
       ]
     },
     "ModelCapability": {
@@ -273,6 +646,14 @@
         "capabilities"
       ]
     },
+    "NonEmptySet": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExecutionMode"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
     "PackageIdentity": {
       "type": "object",
       "properties": {
@@ -297,6 +678,33 @@
       "type": "string",
       "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4]|18446744073709551615)\\.(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4]|18446744073709551615)\\.(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0-0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0-0][0-9]{1}|1844674407370955161[0-4]|18446744073709551615)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
     },
+    "PreconditionDescriptor": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PreconditionKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind"
+      ]
+    },
+    "PreconditionKind": {
+      "type": "string",
+      "enum": [
+        "entity_version",
+        "etag"
+      ]
+    },
     "RegistrySymbol": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
@@ -308,8 +716,8 @@
     "ResolvedCapabilityRequirement": {
       "type": "object",
       "properties": {
-        "identity": {
-          "$ref": "#/$defs/CapabilityIdentity"
+        "lockedCapability": {
+          "$ref": "#/$defs/LockedCapability"
         },
         "required": {
           "type": "boolean"
@@ -323,7 +731,7 @@
       },
       "additionalProperties": false,
       "required": [
-        "identity",
+        "lockedCapability",
         "required",
         "resources"
       ]
@@ -382,6 +790,19 @@
         "delegation",
         "resolvedDigest"
       ]
+    },
+    "RetryClass": {
+      "type": "string",
+      "enum": [
+        "never",
+        "after_refresh",
+        "after_user_action",
+        "status_first"
+      ]
+    },
+    "SafeMessage": {
+      "description": "A caller-supplied message that is safe to render to users.",
+      "type": "string"
     },
     "Sha256Digest": {
       "type": "string",

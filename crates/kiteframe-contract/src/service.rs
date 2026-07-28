@@ -473,7 +473,7 @@ impl AdmissionRequest {
             let Some(resolved) = parts
                 .resolved_requirements
                 .iter()
-                .find(|resolved| resolved.identity == request.capability)
+                .find(|resolved| resolved.identity() == &request.capability)
             else {
                 return Err(vec![invalid(
                     "requested capability is not a resolved requirement",
@@ -481,7 +481,7 @@ impl AdmissionRequest {
             };
             if request.resources.iter().any(|requested| {
                 !resolved
-                    .resources
+                    .resources()
                     .iter()
                     .any(|allowed| selector_is_subset_of(requested.as_str(), allowed))
             }) {

@@ -172,6 +172,53 @@ fn resolution_fixture() -> ResolutionInput {
     }
 }
 
+fn locked_resolution_fixture() -> ResolutionInput {
+    let manifest = format!(
+        "{}  capabilities:\n    - {{ name: cases.read, version: ^1.0, required: true, resources: [tenant:support] }}\n",
+        root_manifest("kiteframe.capability.point-of-use-auth@1", true)
+    );
+    let package = package(&manifest, None);
+    let catalog =
+        validate_catalog(&fs::read(fixture("catalogs/support-v1.json")).unwrap()).unwrap();
+    let lock = lock_package(&package, &catalog, CandidatePolicy::AllowAll).unwrap();
+    let mut input = resolution_fixture();
+    input.package = package;
+    input.lock = lock;
+    input
+}
+
+#[test]
+fn resolved_requirement_retains_the_exact_verified_lock_entry() {
+    let input = locked_resolution_fixture();
+    let expected = input.lock.capabilities[0].clone();
+    let expected_catalog_digest = input.lock.catalog_digest;
+    let resolved = resolve_agent(input).unwrap();
+    let requirement = &resolved.capability_requirements()[0];
+
+    assert_eq!(resolved.catalog_identity().name, "support");
+    assert_eq!(resolved.catalog_identity().revision, "v1");
+    assert_eq!(resolved.catalog_digest(), &expected_catalog_digest);
+    assert_eq!(requirement.locked_capability(), &expected);
+    assert_eq!(requirement.descriptor(), &expected.descriptor);
+    assert_eq!(requirement.descriptor_digest(), &expected.descriptor_digest);
+    assert_eq!(
+        requirement.input_schema_digest(),
+        &expected.input_schema_digest
+    );
+    assert_eq!(
+        requirement.output_schema_digest(),
+        &expected.output_schema_digest
+    );
+    assert_eq!(
+        requirement.stable_error_set_digest(),
+        &expected.stable_error_set_digest
+    );
+    assert_eq!(
+        requirement.safety_metadata_digest(),
+        &expected.safety_metadata_digest
+    );
+}
+
 fn refresh_lock_digest(lock: &mut kiteframe_contract::CapabilityLock) {
     let mut material = serde_json::to_value(&*lock).unwrap();
     material.as_object_mut().unwrap().remove("lockDigest");

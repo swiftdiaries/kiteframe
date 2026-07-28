@@ -364,8 +364,8 @@ fn explain(output: PipelineOutput) -> ExplainResult {
         .capability_requirements()
         .iter()
         .map(|requirement| ExplainCapability {
-            identity: requirement.identity.clone(),
-            required: requirement.required,
+            identity: requirement.identity().clone(),
+            required: requirement.required(),
         })
         .collect();
     let models = resolved

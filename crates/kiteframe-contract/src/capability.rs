@@ -415,6 +415,9 @@ impl CapabilityDescriptor {
     pub fn identity(&self) -> &CapabilityIdentity {
         &self.identity
     }
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
     pub fn descriptor_digest(&self) -> &Sha256Digest {
         &self.descriptor_digest
     }
@@ -424,11 +427,35 @@ impl CapabilityDescriptor {
     pub fn output_schema(&self) -> &JsonSchema2020_12 {
         &self.output_schema
     }
+    pub fn stable_errors(&self) -> &[CapabilityErrorDescriptor] {
+        &self.stable_errors
+    }
+    pub fn execution_modes(&self) -> &NonEmptySet<ExecutionMode> {
+        &self.execution_modes
+    }
+    pub fn resource_selector_schema(&self) -> &ResourceSelectorSchema {
+        &self.resource_selector_schema
+    }
+    pub fn effect(&self) -> EffectClassification {
+        self.effect
+    }
+    pub fn freshness(&self) -> &FreshnessRequirement {
+        &self.freshness
+    }
+    pub fn preconditions(&self) -> &[PreconditionDescriptor] {
+        &self.preconditions
+    }
+    pub fn confirmation(&self) -> &ConfirmationRequirement {
+        &self.confirmation
+    }
     pub fn approval(&self) -> &ApprovalRequirement {
         &self.approval
     }
     pub fn idempotency(&self) -> &IdempotencyRequirement {
         &self.idempotency
+    }
+    pub fn consent(&self) -> &ConsentRequirement {
+        &self.consent
     }
 }
 #[derive(Serialize)]
