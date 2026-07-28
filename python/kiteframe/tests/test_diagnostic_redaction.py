@@ -1,9 +1,11 @@
 import json
+import shutil
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
-from kiteframe import KiteframeDiagnosticError, load_resolved_agent
+from kiteframe import KiteframeDiagnosticError, load_resolved_agent, resolve_package
 from kiteframe._native import (
     load_capability_catalog,
     load_capability_grant_set,
@@ -64,3 +66,36 @@ def test_native_provider_diagnostics_never_expose_invalid_output(
     assert error.value.code == "KF-CAP-002"
     assert secret.encode() not in error.value.diagnostics_json
     assert secret not in str(error.value)
+
+
+def test_resolve_package_diagnostics_redact_missing_component_symbol(
+    tmp_path: Path,
+) -> None:
+    workspace = Path(__file__).resolve().parents[3]
+    secret = "sk-live-secret"
+    package = tmp_path / "support-agent"
+    shutil.copytree(
+        workspace / "tests/fixtures/packages/support-agent",
+        package,
+    )
+    binding = package / "bindings/deepagents.yaml"
+    binding.write_text(
+        binding.read_text(encoding="utf-8").replace(
+            "capability-providers.primary",
+            secret,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        resolve_package(
+            package,
+            binding,
+            workspace / "tests/fixtures/components/deepagents-test.json",
+        )
+
+    public = json.loads(error.value.diagnostics_json)
+    assert error.value.code == "KF-RUNTIME-001"
+    assert public[0]["category"] == "runtime"
+    assert secret not in str(error.value)
+    assert secret.encode() not in error.value.diagnostics_json

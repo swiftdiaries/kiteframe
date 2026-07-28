@@ -79,6 +79,25 @@ pub(crate) fn diagnostic_error(mut diagnostics: Vec<Diagnostic>) -> PyErr {
     })
 }
 
+pub(crate) fn package_resolution_error(diagnostics: Vec<Diagnostic>) -> PyErr {
+    let diagnostics = diagnostics
+        .into_iter()
+        .map(|diagnostic| Diagnostic {
+            code: diagnostic.code,
+            category: diagnostic.category,
+            severity: diagnostic.severity,
+            stage: diagnostic.stage,
+            package_path: None,
+            source_range: None,
+            message: "Kiteframe package resolution failed".into(),
+            help: None,
+            retry: diagnostic.retry,
+            details: Default::default(),
+        })
+        .collect();
+    diagnostic_error(diagnostics)
+}
+
 pub(crate) fn ir_parse_error(_: serde_json::Error) -> PyErr {
     diagnostic_error(vec![Diagnostic::error(
         DiagnosticCode::PackageInvalid,

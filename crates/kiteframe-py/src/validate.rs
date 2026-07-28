@@ -17,7 +17,7 @@ use pyo3::prelude::*;
 use pyo3_stub_gen::derive::gen_stub_pyfunction;
 
 use crate::{
-    error::{canonical_ir_error, diagnostic_error, ir_parse_error},
+    error::{canonical_ir_error, diagnostic_error, ir_parse_error, package_resolution_error},
     ir::PyResolvedAgent,
 };
 
@@ -48,7 +48,7 @@ pub(crate) fn resolve_package(
 ) -> PyResult<PyResolvedAgent> {
     resolve_package_inner(&package, &binding, &target)
         .map(PyResolvedAgent::from)
-        .map_err(diagnostic_error)
+        .map_err(package_resolution_error)
 }
 
 fn resolve_package_inner(
