@@ -1,0 +1,24 @@
+[package]
+name = "kiteframe-py"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kiteframe-contract = { path = "../kiteframe-contract" }
+kiteframe-core = { path = "../kiteframe-core" }
+kiteframe-resolver = { path = "../kiteframe-resolver" }
+pyo3.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pyo3 = { workspace = true, features = ["auto-initialize"] }

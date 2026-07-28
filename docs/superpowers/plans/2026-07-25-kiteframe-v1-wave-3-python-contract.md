@@ -217,7 +217,7 @@ def test_noncanonical_ir_is_rejected(golden_ir: bytes) -> None:
 
 - [ ] **Step 2: Run Python tests before the extension exists**
 
-Run: `rtk uv run --project python/kiteframe maturin develop`
+Run from `python/kiteframe`: `rtk uv run --project . maturin develop`
 
 Expected: FAIL because the Python project and extension crate do not exist.
 
@@ -274,7 +274,7 @@ Map `Vec<Diagnostic>` to a `KiteframeDiagnosticError` whose public `.diagnostics
 
 - [ ] **Step 5: Build and run immutability tests**
 
-Run: `rtk uv run --project python/kiteframe maturin develop`
+Run from `python/kiteframe`: `rtk uv run --project . maturin develop`
 
 Expected: builds `kiteframe._native` against Python 3.11+.
 

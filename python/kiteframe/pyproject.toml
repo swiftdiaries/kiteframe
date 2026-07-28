@@ -1,0 +1,22 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kiteframe"
+version = "0.1.0"
+description = "Immutable Python projections for the Kiteframe Rust core"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+
+[tool.uv]
+dev-dependencies = [
+    "maturin>=1.0,<2.0",
+    "pytest>=8",
+]
+
+[tool.maturin]
+features = ["extension-module"]
+manifest-path = "../../crates/kiteframe-py/Cargo.toml"
+module-name = "kiteframe._native"
+python-source = "src"

@@ -4,6 +4,7 @@ members = [
     "crates/kiteframe-cli",
     "crates/kiteframe-contract",
     "crates/kiteframe-core",
+    "crates/kiteframe-py",
     "crates/kiteframe-resolver",
     "crates/kiteframe-schema",
 ]
@@ -17,6 +18,7 @@ repository = "https://github.com/swiftdiaries/kiteframe"
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
 jsonschema = { version = "0.40", default-features = false }
+pyo3 = "0.29"
 schemars = "1"
 semver = "1"
 serde = { version = "1", features = ["derive"] }
