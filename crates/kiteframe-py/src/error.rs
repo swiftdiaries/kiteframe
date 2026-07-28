@@ -5,8 +5,35 @@ use pyo3::{
     exceptions::{PyException, PyRuntimeError, PyValueError},
     types::{PyAnyMethods, PyBytes},
 };
+use pyo3_stub_gen::{
+    TypeInfo,
+    type_info::{MemberInfo, PyMethodsInfo},
+};
 
-pyo3::create_exception!(_native, KiteframeDiagnosticError, PyException);
+pyo3_stub_gen::create_exception!(kiteframe._native, KiteframeDiagnosticError, PyException);
+
+fn diagnostics_json_type() -> TypeInfo {
+    TypeInfo::builtin("bytes")
+}
+
+pyo3_stub_gen::inventory::submit! {
+    PyMethodsInfo {
+        struct_id: std::any::TypeId::of::<KiteframeDiagnosticError>,
+        attrs: &[],
+        getters: &[MemberInfo {
+            name: "diagnostics_json",
+            r#type: diagnostics_json_type,
+            doc: "Canonical, redacted diagnostic bytes.",
+            default: None,
+            deprecated: None,
+        }],
+        setters: &[],
+        methods: &[],
+        file: file!(),
+        line: line!(),
+        column: column!(),
+    }
+}
 
 pub(crate) fn diagnostic_error(mut diagnostics: Vec<Diagnostic>) -> PyErr {
     diagnostics.sort();

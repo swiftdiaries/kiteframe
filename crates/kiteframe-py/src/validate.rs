@@ -14,14 +14,22 @@ use kiteframe_core::{
 };
 use kiteframe_resolver::{ResolutionInput, resolve_agent, verify_lock};
 use pyo3::prelude::*;
+use pyo3_stub_gen::derive::gen_stub_pyfunction;
 
 use crate::{
     error::{canonical_ir_error, diagnostic_error, ir_parse_error},
     ir::PyResolvedAgent,
 };
 
+#[gen_stub_pyfunction]
 #[pyfunction]
-pub(crate) fn load_resolved_agent(bytes: &[u8]) -> PyResult<PyResolvedAgent> {
+pub(crate) fn load_resolved_agent(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+) -> PyResult<PyResolvedAgent> {
     let resolved: ResolvedAgent = serde_json::from_slice(bytes).map_err(ir_parse_error)?;
     let canonical =
         canonical_json(&resolved).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))?;
@@ -31,6 +39,7 @@ pub(crate) fn load_resolved_agent(bytes: &[u8]) -> PyResult<PyResolvedAgent> {
     Ok(resolved.into())
 }
 
+#[gen_stub_pyfunction]
 #[pyfunction]
 pub(crate) fn resolve_package(
     package: PathBuf,

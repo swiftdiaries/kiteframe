@@ -18,6 +18,7 @@ kiteframe-contract = { path = "../kiteframe-contract" }
 kiteframe-core = { path = "../kiteframe-core" }
 kiteframe-resolver = { path = "../kiteframe-resolver" }
 pyo3.workspace = true
+pyo3-stub-gen.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

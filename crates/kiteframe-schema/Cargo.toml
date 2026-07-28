@@ -9,5 +9,6 @@ publish = false
 
 [dependencies]
 kiteframe-contract = { path = "../kiteframe-contract" }
+kiteframe-native = { package = "kiteframe-py", path = "../kiteframe-py" }
 schemars.workspace = true
 serde_json.workspace = true

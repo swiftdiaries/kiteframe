@@ -143,6 +143,9 @@ impl ResolvedAgent {
     pub fn resolved_digest(&self) -> &Sha256Digest {
         &self.resolved_digest
     }
+    pub fn portable_digest(&self) -> &Sha256Digest {
+        &self.portable_digest
+    }
     pub fn package_identity(&self) -> &PackageIdentity {
         &self.package_identity
     }

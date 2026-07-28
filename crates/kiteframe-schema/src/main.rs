@@ -74,8 +74,29 @@ fn check(destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn python_stub_bytes() -> Result<Vec<u8>> {
+    Ok(kiteframe_native::python_stub()
+        .map_err(|error| format!("Python stub generation failed: {error}"))?
+        .into_bytes())
+}
+
+fn write_python_stub(destination: &Path) -> Result<()> {
+    fs::write(destination, python_stub_bytes()?)?;
+    Ok(())
+}
+
+fn check_python_stub(destination: &Path) -> Result<()> {
+    let checked_in = fs::read(destination)?;
+    let generated = python_stub_bytes()?;
+    if checked_in != generated {
+        return Err(format!("Python stub drift detected: {}", destination.display()).into());
+    }
+    Ok(())
+}
+
 fn usage() -> &'static str {
-    "usage: kiteframe-schema [--check] <schema-directory>"
+    "usage: kiteframe-schema [--check] <schema-directory> | \
+     --python-stubs <stub-file> | --check-python-stubs <stub-file>"
 }
 
 fn main() -> Result<()> {
@@ -83,6 +104,12 @@ fn main() -> Result<()> {
     match arguments.as_slice() {
         [destination] => generate(&PathBuf::from(destination)),
         [flag, destination] if flag == "--check" => check(&PathBuf::from(destination)),
+        [flag, destination] if flag == "--python-stubs" => {
+            write_python_stub(&PathBuf::from(destination))
+        }
+        [flag, destination] if flag == "--check-python-stubs" => {
+            check_python_stub(&PathBuf::from(destination))
+        }
         _ => Err(usage().into()),
     }
 }
