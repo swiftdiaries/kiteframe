@@ -14,6 +14,7 @@ use kiteframe_resolver::{
     CandidatePolicy, ResolutionInput, lock_package, resolve_agent, validate_catalog,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -171,6 +172,14 @@ fn resolution_fixture() -> ResolutionInput {
     }
 }
 
+fn refresh_lock_digest(lock: &mut kiteframe_contract::CapabilityLock) {
+    let mut material = serde_json::to_value(&*lock).unwrap();
+    material.as_object_mut().unwrap().remove("lockDigest");
+    lock.lock_digest = Sha256Digest::from_bytes(
+        Sha256::digest(serde_json_canonicalizer::to_vec(&material).unwrap()).into(),
+    );
+}
+
 fn binding_capture() -> BindingContentCapturePolicy {
     BindingContentCapturePolicy {
         enabled: true,
@@ -196,6 +205,28 @@ fn unsupported_required_feature_stops_resolution() {
     let errors = resolve_agent(input).unwrap_err();
 
     assert_eq!(errors[0].code.as_str(), "KF-FEAT-001");
+}
+
+#[test]
+fn resolution_rejects_lock_feature_drift_before_target_negotiation() {
+    let mut input = resolution_fixture();
+    input
+        .lock
+        .resolved_features
+        .remove(&FeatureId::new("kiteframe.capability.deferred@1").unwrap());
+    refresh_lock_digest(&mut input.lock);
+
+    let errors = resolve_agent(input).unwrap_err();
+
+    assert!(errors.iter().any(|error| {
+        error.code.as_str() == "KF-LOCK-001"
+            && error.message.as_str() == "package requested features do not match capability lock"
+    }));
+    assert!(
+        errors
+            .iter()
+            .all(|error| error.code.as_str() != "KF-FEAT-001")
+    );
 }
 
 #[test]

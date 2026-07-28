@@ -572,6 +572,13 @@ versions. Negotiation has three outcomes:
 - a required feature is unsupported or has an incompatible version:
   compilation fails.
 
+Feature handling is explicitly two-phase. The compatibility field
+`CapabilityLock.resolvedFeatures` freezes the canonical package-requested set
+(`required ∪ optional`) and lock verification exact-matches it against the
+verified package. Only after that check does resolution compare the request
+with the target; the enabled and omitted target result is recorded only in
+`ResolvedAgent`.
+
 Features include both portable semantics and runtime obligations, such as
 point-of-use authorization, deferred invocation, checkpoint suspension,
 dynamic tool visibility, and delegation narrowing.
@@ -1005,6 +1012,7 @@ V1 reserves these stable codes and meanings:
 | `KF-RUNTIME-001` | `COMPONENT_UNRESOLVED` | A trusted registry symbol is absent or has the wrong kind. |
 | `KF-RUNTIME-002` | `RUNTIME_CONSTRUCTION` | Public runtime construction failed. |
 | `KF-CLI-001` | `COMPILE_OUTPUT` | A compile output path is protected or its artifact cannot be emitted. |
+| `KF-CLI-002` | `LOCK_OUTPUT` | An explicit lock output path is protected or its artifact cannot be emitted. |
 
 Codes are stable within V1. Messages may improve, but callers branch only on
 codes and typed details. Diagnostics never include credentials, raw policy

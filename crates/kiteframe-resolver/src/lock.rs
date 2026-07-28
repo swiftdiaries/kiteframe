@@ -1,8 +1,8 @@
 use std::{fs::File, io::Write, path::Path};
 
 use kiteframe_contract::{
-    CapabilityLock, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage, FeatureSet,
-    LockSchemaVersion, LockedCapability, Sha256Digest,
+    CapabilityLock, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage, FeatureId,
+    FeatureSet, LockSchemaVersion, LockedCapability, Sha256Digest,
 };
 use kiteframe_core::AgentPackage;
 use serde::Serialize;
@@ -21,6 +21,7 @@ pub fn lock_package(
     catalog: &ValidatedCatalog,
     policy: CandidatePolicy,
 ) -> Result<CapabilityLock, Vec<Diagnostic>> {
+    let requested_features = package_requested_features(package)?;
     let selection =
         select_capabilities_with_warnings(&package.manifest().spec.capabilities, catalog, policy)?;
 
@@ -49,9 +50,9 @@ pub fn lock_package(
         catalog_digest: *catalog.catalog_digest(),
         catalog_revision: catalog.identity().revision.clone(),
         resolver_version: RESOLVER_VERSION.to_owned(),
-        // Feature negotiation is intentionally deferred to Task 4. A Task 3 lock has no
-        // negotiated features rather than inferring support from a package declaration.
-        resolved_features: FeatureSet::new(),
+        // Compatibility field: this is the canonical package-requested set. Target negotiation
+        // occurs only during resolution and is recorded in ResolvedAgent.
+        resolved_features: requested_features,
         capabilities,
         lock_digest: Sha256Digest::from_bytes([0; Sha256Digest::BYTE_LENGTH]),
     };
@@ -79,6 +80,13 @@ pub fn verify_lock(
     if lock.resolver_version != RESOLVER_VERSION {
         diagnostics.push(stale("capability lock resolver version is unsupported"));
     }
+    match package_requested_features(package) {
+        Ok(requested_features) if lock.resolved_features != requested_features => diagnostics.push(
+            stale("package requested features do not match capability lock"),
+        ),
+        Err(mut errors) => diagnostics.append(&mut errors),
+        Ok(_) => {}
+    }
     match lock_digest(lock) {
         Ok(digest) if digest != lock.lock_digest => {
             diagnostics.push(tampered(
@@ -104,6 +112,27 @@ pub fn verify_lock(
     } else {
         Err(diagnostics)
     }
+}
+
+fn package_requested_features(package: &AgentPackage) -> Result<FeatureSet, Vec<Diagnostic>> {
+    package
+        .manifest()
+        .spec
+        .features
+        .required
+        .iter()
+        .chain(&package.manifest().spec.features.optional)
+        .map(|feature| {
+            FeatureId::new(feature.as_str()).map_err(|_| {
+                vec![Diagnostic::error(
+                    DiagnosticCode::PackageInvalid,
+                    DiagnosticCategory::Package,
+                    DiagnosticStage::Lock,
+                    "validated package contains an invalid feature identifier",
+                )]
+            })
+        })
+        .collect()
 }
 
 /// Canonically serializes and atomically replaces a lock only after its self-contained contents

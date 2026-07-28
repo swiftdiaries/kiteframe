@@ -173,11 +173,18 @@ fn run_lock(args: LockArgs) -> ExitCategory {
         )?;
         let catalog = validate_catalog(&catalog_bytes)?;
         let lock = lock_package(&package, &catalog, CandidatePolicy::AllowAll)?;
-        let output = args
-            .output
-            .clone()
-            .unwrap_or_else(|| default_lock_path(&package));
-        write_lock_atomic(&output, &lock).map_err(|diagnostic| vec![diagnostic])?;
+        match args.output.as_deref() {
+            Some(output) => {
+                let output = validated_lock_output_path(&package, &args.catalog, output)
+                    .map_err(|diagnostic| vec![diagnostic])?;
+                write_lock_atomic(&output, &lock)
+                    .map_err(|_| vec![lock_output_diagnostic(false)])?;
+            }
+            None => {
+                write_lock_atomic(&default_lock_path(&package), &lock)
+                    .map_err(|diagnostic| vec![diagnostic])?;
+            }
+        }
         Ok(lock)
     });
 
@@ -233,6 +240,23 @@ fn run_compile(args: CompileArgs) -> ExitCategory {
     }
 }
 
+fn validated_lock_output_path(
+    package: &AgentPackage,
+    catalog: &Path,
+    output: &Path,
+) -> Result<PathBuf, Diagnostic> {
+    let output = canonicalize_output_path(output).map_err(|_| lock_output_diagnostic(false))?;
+    let package_root =
+        fs::canonicalize(package.root().as_path()).map_err(|_| lock_output_diagnostic(false))?;
+    let catalog = fs::canonicalize(catalog).map_err(|_| lock_output_diagnostic(false))?;
+
+    if output.starts_with(&package_root) || output == catalog {
+        return Err(lock_output_diagnostic(true));
+    }
+
+    Ok(output)
+}
+
 fn validated_compile_output_path(
     args: &ResolutionArgs,
     output: &Path,
@@ -280,6 +304,19 @@ fn compile_output_diagnostic(overlap: bool) -> Diagnostic {
             "compiled IR output path overlaps protected input"
         } else {
             "compiled IR output cannot be written"
+        },
+    )
+}
+
+fn lock_output_diagnostic(overlap: bool) -> Diagnostic {
+    diagnostic(
+        DiagnosticCode::LockOutput,
+        DiagnosticCategory::Runtime,
+        DiagnosticStage::Lock,
+        if overlap {
+            "capability lock output path overlaps protected input"
+        } else {
+            "capability lock output cannot be written"
         },
     )
 }

@@ -35,6 +35,22 @@ fn compile_output_has_a_dedicated_stable_wire_code() {
 }
 
 #[test]
+fn lock_output_has_a_dedicated_stable_wire_code() {
+    let diagnostic = Diagnostic::error(
+        DiagnosticCode::LockOutput,
+        DiagnosticCategory::Runtime,
+        DiagnosticStage::Lock,
+        "capability lock output cannot be written",
+    );
+
+    assert_eq!(diagnostic.code.as_str(), "KF-CLI-002");
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap()["code"],
+        "KF-CLI-002"
+    );
+}
+
+#[test]
 fn diagnostics_sort_by_stage_path_range_then_code() {
     let mut diagnostics = [
         Diagnostic::error(

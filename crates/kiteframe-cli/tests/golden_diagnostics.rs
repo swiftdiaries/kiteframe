@@ -37,6 +37,11 @@ fn fixture_diagnostic(code: DiagnosticCode) -> Diagnostic {
             DiagnosticStage::Runtime,
             "compiled IR output failed",
         ),
+        DiagnosticCode::LockOutput => (
+            DiagnosticCategory::Runtime,
+            DiagnosticStage::Lock,
+            "capability lock output failed",
+        ),
         DiagnosticCode::AdmissionDenied => (
             DiagnosticCategory::Authorization,
             DiagnosticStage::Admit,

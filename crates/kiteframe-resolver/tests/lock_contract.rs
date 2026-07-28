@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeSet,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -7,8 +8,8 @@ use kiteframe_contract::{
     ApprovalRequirement, CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
     ConfirmationRequirement, ConsentRequirement, EffectClassification, EvidenceRequirement,
-    ExecutionMode, FreshnessRequirement, IdempotencyRequirement, LockSchemaVersion, NonEmptySet,
-    ResourceSelectorSchema, Sha256Digest,
+    ExecutionMode, FeatureId, FreshnessRequirement, IdempotencyRequirement, LockSchemaVersion,
+    NonEmptySet, ResourceSelectorSchema, Sha256Digest,
 };
 use kiteframe_core::{PackageLimits, load_package};
 use kiteframe_resolver::{
@@ -29,6 +30,29 @@ fn support_package() -> kiteframe_core::AgentPackage {
 
 fn ordered_package() -> kiteframe_core::AgentPackage {
     load_package(fixture("ordered-package").as_path(), PackageLimits::V1).unwrap()
+}
+
+fn feature_package() -> kiteframe_core::AgentPackage {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("prompts")).unwrap();
+    fs::write(
+        directory.path().join("agent.yaml"),
+        r#"
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: features, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  models:
+    primary: { capabilities: [text] }
+  features:
+    required: [kiteframe.capability.point-of-use-auth@1]
+    optional: [kiteframe.capability.deferred@1]
+"#,
+    )
+    .unwrap();
+    fs::write(directory.path().join("prompts/system.md"), "System").unwrap();
+    load_package(directory.path(), PackageLimits::V1).unwrap()
 }
 
 fn descriptor(name: &str, version: &str, approval: ApprovalRequirement) -> CapabilityDescriptor {
@@ -97,6 +121,47 @@ fn support_lock() -> kiteframe_contract::CapabilityLock {
         CandidatePolicy::AllowAll,
     )
     .unwrap()
+}
+
+#[test]
+fn lock_records_the_canonical_package_requested_feature_set() {
+    let package = feature_package();
+    let lock = lock_package(
+        &package,
+        &catalog_with(Vec::new()),
+        CandidatePolicy::AllowAll,
+    )
+    .unwrap();
+
+    assert_eq!(
+        lock.resolved_features,
+        BTreeSet::from([
+            FeatureId::new("kiteframe.capability.deferred@1").unwrap(),
+            FeatureId::new("kiteframe.capability.point-of-use-auth@1").unwrap(),
+        ])
+    );
+    verify_lock(&package, &lock, None).unwrap();
+}
+
+#[test]
+fn verification_rejects_a_digest_valid_lock_with_feature_declaration_drift() {
+    let package = feature_package();
+    let mut lock = lock_package(
+        &package,
+        &catalog_with(Vec::new()),
+        CandidatePolicy::AllowAll,
+    )
+    .unwrap();
+    lock.resolved_features
+        .remove(&FeatureId::new("kiteframe.capability.deferred@1").unwrap());
+    refresh_lock_digest(&mut lock);
+
+    let errors = verify_lock(&package, &lock, None).unwrap_err();
+
+    assert!(errors.iter().any(|error| {
+        error.code.as_str() == "KF-LOCK-001"
+            && error.message.as_str() == "package requested features do not match capability lock"
+    }));
 }
 
 fn ordered_lock() -> kiteframe_contract::CapabilityLock {

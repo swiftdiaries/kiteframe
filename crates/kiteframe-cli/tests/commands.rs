@@ -159,6 +159,135 @@ fn assert_compile_output_rejected(package: &Path, target: &Path, output: &Path) 
     );
 }
 
+fn assert_lock_output_rejected(package: &Path, catalog: &Path, output: &Path) {
+    let result = command()
+        .args([
+            "lock",
+            package.to_str().unwrap(),
+            "--catalog",
+            catalog.to_str().unwrap(),
+            "--output",
+            output.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert!(result.get_output().stderr.is_empty());
+    let body = parse_single_json(&result.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["code"], "KF-CLI-002");
+    assert_eq!(
+        body["diagnostics"][0]["message"],
+        "capability lock output path overlaps protected input"
+    );
+}
+
+#[test]
+fn lock_rejects_explicit_outputs_inside_the_package_and_consumed_catalog() {
+    for protected_relative in ["agent.yaml", "capability.lock"] {
+        let (_directory, package) = copy_package("support-agent");
+        let protected = package.join(protected_relative);
+        let before = fs::read(&protected).unwrap();
+
+        assert_lock_output_rejected(
+            &package,
+            Path::new(&workspace_fixture("catalogs/support-v1.json")),
+            &protected,
+        );
+
+        assert_eq!(fs::read(protected).unwrap(), before);
+    }
+
+    let (directory, package) = copy_package("support-agent");
+    let package_artifact = package.join("alternate.lock");
+    assert_lock_output_rejected(
+        &package,
+        Path::new(&workspace_fixture("catalogs/support-v1.json")),
+        &package_artifact,
+    );
+    assert!(!package_artifact.exists());
+
+    let catalog = directory.path().join("catalog.json");
+    fs::copy(workspace_fixture("catalogs/support-v1.json"), &catalog).unwrap();
+    let before = fs::read(&catalog).unwrap();
+    assert_lock_output_rejected(&package, &catalog, &catalog);
+    assert_eq!(fs::read(catalog).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn lock_rejects_symlink_aliases_to_package_and_catalog_inputs() {
+    use std::os::unix::fs::symlink;
+
+    let (directory, package) = copy_package("support-agent");
+    let catalog = directory.path().join("catalog.json");
+    fs::copy(workspace_fixture("catalogs/support-v1.json"), &catalog).unwrap();
+
+    let package_alias = directory.path().join("package-alias");
+    symlink(&package, &package_alias).unwrap();
+    let package_alias_output = package_alias.join("alternate.lock");
+    assert_lock_output_rejected(&package, &catalog, &package_alias_output);
+    assert!(!package.join("alternate.lock").exists());
+
+    let catalog_alias = directory.path().join("catalog-alias.json");
+    symlink(&catalog, &catalog_alias).unwrap();
+    let before = fs::read(&catalog).unwrap();
+    assert_lock_output_rejected(&package, &catalog, &catalog_alias);
+    assert_eq!(fs::read(catalog).unwrap(), before);
+}
+
+#[test]
+fn lock_output_write_failures_are_redacted_structured_diagnostics() {
+    let directory = tempfile::tempdir().unwrap();
+    let sentinels = ["credential-LEAK", "token-LEAK", "argument-LEAK"];
+    let sensitive = sentinels.join("_");
+    let output_path = directory.path().join("missing").join(sensitive);
+    let base_args = [
+        "lock",
+        &fixture("support-agent"),
+        "--catalog",
+        &workspace_fixture("catalogs/support-v1.json"),
+        "--output",
+        output_path.to_str().unwrap(),
+    ];
+
+    let json_output = command()
+        .args(base_args)
+        .arg("--json")
+        .assert()
+        .failure()
+        .code(5);
+    assert!(json_output.get_output().stderr.is_empty());
+    let body = parse_single_json(&json_output.get_output().stdout);
+    assert_eq!(body["diagnostics"][0]["code"], "KF-CLI-002");
+    assert_eq!(
+        body["diagnostics"][0]["message"],
+        "capability lock output cannot be written"
+    );
+    let json = String::from_utf8_lossy(&json_output.get_output().stdout);
+    for sentinel in sentinels {
+        assert!(
+            !json.contains(sentinel),
+            "JSON diagnostic leaked {sentinel}"
+        );
+    }
+
+    let human_output = command().args(base_args).assert().failure().code(5);
+    assert!(human_output.get_output().stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&human_output.get_output().stderr);
+    assert_eq!(
+        stderr,
+        "KF-CLI-002 Error: capability lock output cannot be written\n"
+    );
+    for sentinel in sentinels {
+        assert!(
+            !stderr.contains(sentinel),
+            "human diagnostic leaked {sentinel}"
+        );
+    }
+}
+
 #[test]
 fn compile_rejects_outputs_inside_the_package_and_preserves_consumed_inputs() {
     for protected_relative in ["agent.yaml", "capability.lock", "bindings/deepagents.yaml"] {

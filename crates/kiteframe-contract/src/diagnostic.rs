@@ -47,6 +47,7 @@ define_diagnostic_codes! {
     ComponentUnresolved => "KF-RUNTIME-001",
     RuntimeConstruction => "KF-RUNTIME-002",
     CompileOutput => "KF-CLI-001",
+    LockOutput => "KF-CLI-002",
 }
 
 #[derive(

@@ -343,6 +343,14 @@ impl CapabilityDescriptor {
         if parts.summary.trim().is_empty() {
             errors.push(invalid("capability summary is required"));
         }
+        let mut stable_error_codes = BTreeSet::new();
+        if parts
+            .stable_errors
+            .iter()
+            .any(|error| !stable_error_codes.insert(error.code()))
+        {
+            errors.push(invalid("stable error machine codes must be unique"));
+        }
         if parts.effect.effectful() && matches!(parts.idempotency, IdempotencyRequirement::None) {
             errors.push(invalid("effectful capability requires idempotency"));
         }

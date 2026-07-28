@@ -45,6 +45,30 @@ fn descriptor(name: &str, version: &str) -> CapabilityDescriptor {
     CapabilityDescriptor::try_new(descriptor_parts(name, version)).unwrap()
 }
 
+#[test]
+fn descriptor_rejects_duplicate_stable_error_machine_codes() {
+    let mut parts = descriptor_parts("cases.read", "1.0.0");
+    parts.stable_errors = vec![
+        CapabilityErrorDescriptor::try_new("CASE_MISSING", "not_found", "never", "case is missing")
+            .unwrap(),
+        CapabilityErrorDescriptor::try_new(
+            "CASE_MISSING",
+            "dependency",
+            "after_refresh",
+            "case backend is stale",
+        )
+        .unwrap(),
+    ];
+
+    let errors = CapabilityDescriptor::try_new(parts).unwrap_err();
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.message.as_str() == "stable error machine codes must be unique" })
+    );
+}
+
 fn catalog_with_descriptors(descriptors: Vec<CapabilityDescriptor>) -> Vec<u8> {
     serde_json::to_vec(
         &CapabilityCatalog::try_new(

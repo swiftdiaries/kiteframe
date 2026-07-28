@@ -97,7 +97,8 @@
         "KF-AUDIT-001",
         "KF-RUNTIME-001",
         "KF-RUNTIME-002",
-        "KF-CLI-001"
+        "KF-CLI-001",
+        "KF-CLI-002"
       ]
     },
     "DiagnosticSeverity": {

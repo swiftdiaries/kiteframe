@@ -14,7 +14,9 @@ drift in CI.
 ### Trust boundary
 
 - `kiteframe lock` is the only command that mutates package state. It validates
-  the complete selection before atomically replacing `capability.lock`.
+  the complete selection before atomically replacing `capability.lock`. The
+  default path remains package-local; an explicit `--output` must be outside
+  the canonical package root and cannot alias the consumed catalog.
 - `kiteframe check` and `kiteframe explain` are read-only. `kiteframe compile`
   emits canonical IR to stdout or an explicit output artifact; it does not
   rewrite the package, lock, or binding and does not construct runtime objects.
@@ -22,6 +24,13 @@ drift in CI.
   exact lock and explicit runtime metadata. Actor grants are not an input to
   resolution, and point-of-use authorization remains a runtime enforcement
   responsibility outside this compiler boundary.
+
+Feature handling has two distinct deterministic phases. For schema
+compatibility, `CapabilityLock.resolvedFeatures` stores the canonical
+package-requested set (`required ∪ optional`), not a target-negotiated result;
+lock verification exact-matches that set against the verified package.
+Resolution then negotiates the verified request against the explicit target,
+and only `ResolvedAgent` records the enabled and omitted target result.
 
 ## Design
 
