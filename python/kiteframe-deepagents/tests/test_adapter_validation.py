@@ -4,12 +4,10 @@ import builtins
 import hashlib
 import json
 import shutil
-from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
-from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from kiteframe import (
     ComponentKind,
@@ -21,13 +19,14 @@ from kiteframe import (
 )
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage
 from langgraph.store.memory import InMemoryStore
-from pydantic import Field
 
+import kiteframe_deepagents.compatibility as compatibility
 from kiteframe_deepagents.adapter import DeepAgentsAdapter
 from kiteframe_deepagents.compatibility import (
     AMBIENT_TOOL_NAMES,
+    DENY_ONLY_PROFILE,
     KiteframeHarnessProfileToken,
     bootstrap_deepagents_deployment,
 )
@@ -54,42 +53,6 @@ def canonical_bytes(value: object) -> bytes:
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
-
-
-class AdapterTestModel(FakeMessagesListChatModel):
-    model_name: str = MODEL_IDENTIFIER
-    tool_requests: list[tuple[str, ...]] = Field(default_factory=list)
-
-    def _get_ls_params(
-        self,
-        stop: list[str] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        del stop, kwargs
-        return {
-            "ls_provider": "kiteframe-test",
-            "ls_model_name": self.model_name,
-            "ls_model_type": "chat",
-        }
-
-    def bind_tools(
-        self,
-        tools: Sequence[Any],
-        **kwargs: Any,
-    ) -> AdapterTestModel:
-        del kwargs
-        self.tool_requests.append(tuple(tool.name for tool in tools))
-        return self
-
-
-class AmbiguousTestModel(AdapterTestModel):
-    def _get_ls_params(
-        self,
-        stop: list[str] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        del stop, kwargs
-        return {}
 
 
 class FirstMiddleware(AgentMiddleware):
@@ -307,7 +270,7 @@ def registry_for(
         registry.register(
             ComponentKind.MODEL,
             MODEL_SYMBOL,
-            model or AdapterTestModel(responses=[AIMessage(content="done")]),
+            model or MODEL_KEY,
         )
     registry.register(
         ComponentKind.CAPABILITY_PROVIDER,
@@ -595,7 +558,7 @@ spec:
     target.write_bytes(canonical_bytes(metadata))
     inputs = resolve_package(package, binding, target)
     registry = ComponentRegistry()
-    model = AdapterTestModel(responses=[AIMessage(content="done")])
+    model = MODEL_KEY
     first = FirstMiddleware()
     second = SecondMiddleware()
     backend = StateBackend()
@@ -654,44 +617,105 @@ def test_profile_token_must_attest_the_resolved_model_key(
     assert "harness profile" in str(error.value)
 
 
-def test_validated_bare_model_uses_attested_provider_qualified_profile(
+def test_provider_qualified_model_key_is_retained_for_public_construction(
     adapter: DeepAgentsAdapter,
     runtime_inputs: ResolvedRuntimeInputs,
 ) -> None:
-    bootstrap_deepagents_deployment(
-        ComponentRegistry(),
-        model_key=MODEL_KEY,
-        profile_symbol="profiles.bootstrap-only",
+    components = adapter.validate(
+        runtime_inputs,
+        registry_for(runtime_inputs, model=MODEL_KEY),
     )
-    components = adapter.validate(runtime_inputs, registry_for(runtime_inputs))
-    model = components.primary_model
-    assert isinstance(model, AdapterTestModel)
 
-    graph = create_deep_agent(model=model, subagents=[])
-    graph.invoke({"messages": [HumanMessage(content="hello")]})
-
-    assert AMBIENT_TOOL_NAMES.isdisjoint(model.tool_requests[0])
-    assert "task" not in model.tool_requests[0]
+    assert components.models == (("primary", MODEL_KEY),)
+    assert components.primary_model == MODEL_KEY
+    assert components.primary_model == components.harness_profile.model_key
 
 
-def test_bare_model_without_runtime_provider_is_rejected(
+def test_bootstrap_registration_key_matches_validated_constructor_model_string(
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registrations: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        compatibility,
+        "register_harness_profile",
+        lambda key, profile: registrations.append((key, profile)),
+    )
+    registry = ComponentRegistry()
+    registry.register(ComponentKind.MODEL, MODEL_SYMBOL, MODEL_KEY)
+    registry.register(
+        ComponentKind.CAPABILITY_PROVIDER,
+        runtime_inputs.runtime_binding.capability_provider,
+        TestCapabilityInvoker(),
+    )
+    registry.register(
+        ComponentKind.AUDIT_SINK,
+        runtime_inputs.runtime_binding.audit_sink,
+        TestAuditSink(),
+    )
+    profile_symbol = runtime_inputs.runtime_binding.harness_profile
+    assert profile_symbol is not None
+    token = bootstrap_deepagents_deployment(
+        registry,
+        model_key=MODEL_KEY,
+        profile_symbol=profile_symbol,
+    )
+
+    components = adapter.validate(runtime_inputs, registry.freeze())
+
+    assert registrations == [(MODEL_KEY, DENY_ONLY_PROFILE)]
+    assert components.primary_model == MODEL_KEY
+    assert components.primary_model == token.model_key
+
+
+def test_prebuilt_model_is_rejected_before_public_constructor(
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def forbidden_constructor(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        del args, kwargs
+        called = True
+
+    monkeypatch.setattr(
+        "kiteframe_deepagents.compatibility.create_deep_agent",
+        forbidden_constructor,
+    )
+    prebuilt_model = FakeMessagesListChatModel(
+        responses=[AIMessage(content="done")]
+    )
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        adapter.validate(
+            runtime_inputs,
+            registry_for(runtime_inputs, model=prebuilt_model),
+        )
+
+    assert error.value.code == "KF-RUNTIME-001"
+    assert "provider:model string" in str(error.value)
+    assert called is False
+
+
+def test_bare_model_string_is_rejected(
     adapter: DeepAgentsAdapter,
     runtime_inputs: ResolvedRuntimeInputs,
 ) -> None:
-    model = AmbiguousTestModel(responses=[AIMessage(content="done")])
-
     with pytest.raises(KiteframeDiagnosticError) as error:
         adapter.validate(
             runtime_inputs,
             registry_for(
                 runtime_inputs,
-                model=model,
+                model=MODEL_IDENTIFIER,
                 profile=profile_token(MODEL_IDENTIFIER),
             ),
         )
 
     assert error.value.code == "KF-RUNTIME-001"
-    assert "stable model provider" in str(error.value)
+    assert "provider:model" in str(error.value)
 
 
 def test_validation_is_resolution_only(
@@ -716,6 +740,5 @@ def test_validation_is_resolution_only(
 
     components = adapter.validate(runtime_inputs, registry)
 
-    assert isinstance(components.primary_model, AdapterTestModel)
-    assert components.primary_model.model_name == MODEL_IDENTIFIER
+    assert components.primary_model == MODEL_KEY
     assert isinstance(TestDurableCheckpointer(), DurableCheckpointer)

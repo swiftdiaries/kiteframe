@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
@@ -18,7 +17,6 @@ from kiteframe import (
 from kiteframe.provider import CapabilityInvoker
 from kiteframe.registry import ComponentUnresolvedError
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import CheckpointTuple
 from langgraph.store.base import BaseStore
@@ -60,7 +58,7 @@ class AuditSink(Protocol):
 class ValidatedComponents:
     """The exact registry objects resolved for one immutable input snapshot."""
 
-    models: tuple[tuple[str, BaseChatModel], ...]
+    models: tuple[tuple[str, str], ...]
     middleware: tuple[AgentMiddleware, ...]
     package_backend: BackendProtocol | None
     checkpointer: CheckpointerProtocol | None
@@ -71,7 +69,7 @@ class ValidatedComponents:
     compilation_report: CompilationReport
 
     @property
-    def primary_model(self) -> BaseChatModel:
+    def primary_model(self) -> str:
         for role, model in self.models:
             if role == "primary":
                 return model
@@ -136,40 +134,18 @@ def _resolve(
         raise _runtime_error(f"{kind.value} component is unresolved") from error
 
 
-def _model_key(model: BaseChatModel) -> str:
-    identifier = getattr(model, "model_name", None) or getattr(
-        model,
-        "model",
-        None,
-    )
-    if not isinstance(identifier, str) or not identifier:
-        raise _runtime_error("model component has no stable model key")
-    if ":" in identifier:
-        provider, separator, model_name = identifier.partition(":")
-        if (
-            separator != ":"
-            or not provider
-            or not model_name
-            or ":" in model_name
-        ):
-            raise _runtime_error("model component has an ambiguous model key")
-        return identifier
-
-    lookup = getattr(model, "_get_ls_params", None)
-    if not callable(lookup):
-        raise _runtime_error("model component has no stable model provider")
-    try:
-        parameters = lookup()
-    except (AttributeError, TypeError, NotImplementedError) as error:
+def _provider_qualified_model_key(value: str) -> str:
+    provider, separator, model_name = value.partition(":")
+    if (
+        separator != ":"
+        or not provider
+        or not model_name
+        or ":" in model_name
+    ):
         raise _runtime_error(
-            "model component has no stable model provider"
-        ) from error
-    if not isinstance(parameters, Mapping):
-        raise _runtime_error("model component has no stable model provider")
-    provider = parameters.get("ls_provider")
-    if not isinstance(provider, str) or not provider or ":" in provider:
-        raise _runtime_error("model component has no stable model provider")
-    return f"{provider}:{identifier}"
+            "model component must use the exact provider:model form"
+        )
+    return value
 
 
 def _requires_durable_checkpoint(inputs: ResolvedRuntimeInputs) -> bool:
@@ -188,12 +164,15 @@ def validate_components(
     descriptors = _target_descriptors(inputs)
     binding = inputs.runtime_binding
 
-    models: list[tuple[str, BaseChatModel]] = []
+    models: list[tuple[str, str]] = []
     for role, symbol in binding.model_symbols:
         _require_descriptor(descriptors, symbol, ComponentKind.MODEL)
         model = _resolve(registry, ComponentKind.MODEL, symbol)
-        if not isinstance(model, BaseChatModel):
-            raise _runtime_error("model component has an invalid public type")
+        if not isinstance(model, str):
+            raise _runtime_error(
+                "model component must be a provider:model string"
+            )
+        model = _provider_qualified_model_key(model)
         models.append((role, model))
 
     middleware: list[AgentMiddleware] = []
@@ -311,7 +290,7 @@ def validate_components(
     if primary is None:
         raise _runtime_error("primary model component is unresolved")
     expected_profile = KiteframeHarnessProfileToken(
-        model_key=_model_key(primary),
+        model_key=primary,
         deepagents_version=DEEPAGENTS_VERSION,
         excluded_tools=AMBIENT_TOOL_NAMES,
         general_purpose_subagent_disabled=True,
