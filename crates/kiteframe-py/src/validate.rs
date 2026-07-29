@@ -202,7 +202,7 @@ fn single_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::resolve_package_inner;
-    use kiteframe_contract::{ModelRole, RegistrySymbol};
+    use kiteframe_contract::{ComponentKind, ModelRole, RegistrySymbol};
     use std::path::PathBuf;
 
     #[test]
@@ -221,6 +221,29 @@ mod tests {
             "deepagents"
         );
         assert_eq!(inputs.runtime_target.as_str(), "deepagents");
+        assert_eq!(
+            inputs
+                .runtime_binding
+                .spec
+                .components
+                .harness_profile
+                .as_ref()
+                .expect("resolved binding retains harness profile")
+                .as_str(),
+            "profiles.deepagents"
+        );
+        assert_eq!(
+            inputs
+                .target_components
+                .get(&RegistrySymbol::new("profiles.deepagents").unwrap())
+                .expect("resolved target retains harness profile metadata")
+                .kind,
+            ComponentKind::HarnessProfile
+        );
+        assert_eq!(
+            inputs.resolved_agent.compilation_report().decisions.len(),
+            2
+        );
         assert_eq!(
             inputs
                 .runtime_binding

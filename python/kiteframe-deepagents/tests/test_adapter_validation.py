@@ -26,7 +26,6 @@ from kiteframe_deepagents.compatibility import (
     KiteframeHarnessProfileToken,
 )
 from kiteframe_deepagents.components import (
-    HARNESS_PROFILE_SYMBOL,
     DurableCheckpointer,
 )
 from kiteframe_deepagents.target import (
@@ -135,7 +134,9 @@ kind: RuntimeBinding
 metadata: { runtime: deepagents }
 spec:
   models: { primary: models.anthropic.sonnet }
-  components: { checkpointer: checkpointers.durable }
+  components:
+    checkpointer: checkpointers.durable
+    harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
 """
@@ -165,6 +166,8 @@ def registry_for(
     profile: KiteframeHarnessProfileToken | None = None,
 ) -> FrozenComponentRegistry:
     registry = ComponentRegistry()
+    profile_symbol = inputs.runtime_binding.harness_profile
+    assert profile_symbol is not None
     if include_model:
         registry.register(
             ComponentKind.MODEL,
@@ -190,7 +193,7 @@ def registry_for(
         )
     registry.register(
         ComponentKind.HARNESS_PROFILE,
-        HARNESS_PROFILE_SYMBOL,
+        profile_symbol,
         profile or profile_token(),
     )
     return registry.freeze()
@@ -282,6 +285,7 @@ spec:
   components:
     middleware: [middleware.tenant-context, middleware.second]
     backend: backends.workspace
+    harnessProfile: profiles.bound-deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
 """
@@ -293,6 +297,9 @@ spec:
         ).read_bytes()
     )
     metadata["components"]["middleware.second"] = {"kind": "middleware"}
+    metadata["components"]["profiles.bound-deepagents"] = {
+        "kind": "harness_profile"
+    }
     target.write_bytes(canonical_bytes(metadata))
     inputs = resolve_package(package, binding, target)
     registry = ComponentRegistry()
@@ -318,7 +325,7 @@ spec:
     registry.register(ComponentKind.AUDIT_SINK, "audit-sinks.ledger", audit_sink)
     registry.register(
         ComponentKind.HARNESS_PROFILE,
-        HARNESS_PROFILE_SYMBOL,
+        "profiles.bound-deepagents",
         profile_token(),
     )
 
@@ -332,6 +339,10 @@ spec:
     assert components.audit_sink is audit_sink
     assert components.checkpointer is None
     assert components.store is None
+    assert components.compilation_report.decisions == (
+        ("features", "0 required and 0 optional enabled"),
+        ("models", "1 roles resolved"),
+    )
 
 
 def test_profile_token_must_attest_the_resolved_model_key(

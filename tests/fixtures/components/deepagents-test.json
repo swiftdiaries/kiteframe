@@ -49,6 +49,9 @@
         "latencyClass": "interactive"
       }
     },
+    "profiles.deepagents": {
+      "kind": "harness_profile"
+    },
     "redaction-policies.default": {
       "kind": "redaction_policy"
     },

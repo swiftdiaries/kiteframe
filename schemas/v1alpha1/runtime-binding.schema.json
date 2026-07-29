@@ -108,6 +108,7 @@
           "default": {
             "backend": null,
             "checkpointer": null,
+            "harnessProfile": null,
             "middleware": []
           }
         },
@@ -158,6 +159,17 @@
           "default": null
         },
         "checkpointer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistrySymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "harnessProfile": {
           "anyOf": [
             {
               "$ref": "#/$defs/RegistrySymbol"

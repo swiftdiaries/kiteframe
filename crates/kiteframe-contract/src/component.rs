@@ -31,6 +31,7 @@ pub enum ComponentKind {
     RetentionPolicy,
     AccessPolicy,
     EncryptedContentStore,
+    HarnessProfile,
 }
 #[derive(
     Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize, JsonSchema,

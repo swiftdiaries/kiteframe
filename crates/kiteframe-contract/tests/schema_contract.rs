@@ -1,8 +1,8 @@
 use kiteframe_contract::{
     AdmissionRequest, AgentManifest, CapabilityCatalog, CapabilityGrantSet, CapabilityVersion,
-    CatalogRequest, ContentCaptureRequirement, EffectProposal, InvocationOutcome,
-    InvocationRequest, InvocationStatus, PackagePath, PackageVersion, ResolvedAgent,
-    ResourceSelector, RuntimeBinding, StatusRequest,
+    CatalogRequest, ComponentKind, ComponentMetadataCatalog, ContentCaptureRequirement,
+    EffectProposal, InvocationOutcome, InvocationRequest, InvocationStatus, PackagePath,
+    PackageVersion, ResolvedAgent, ResourceSelector, RuntimeBinding, StatusRequest,
 };
 use schemars::JsonSchema;
 
@@ -130,6 +130,50 @@ fn binding_contains_symbols_but_no_executable_or_secret_fields() {
     assert!(!text.contains("endpoint"));
     assert!(!text.contains("capturedContent"));
     assert!(!text.contains("portableGrant"));
+}
+
+#[test]
+fn binding_and_target_retain_the_exact_harness_profile_symbol_and_kind() {
+    let binding = serde_yaml_ng::from_str::<RuntimeBinding>(
+        r#"
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: deepagents }
+spec:
+  models: { primary: models.anthropic.sonnet }
+  components: { harnessProfile: profiles.deepagents }
+  capabilityProvider: capability-providers.primary
+  auditSink: audit-sinks.ledger
+"#,
+    )
+    .expect("harness profile binding validates");
+    assert_eq!(
+        binding
+            .spec
+            .components
+            .harness_profile
+            .as_ref()
+            .expect("harness profile remains selected")
+            .as_str(),
+        "profiles.deepagents"
+    );
+
+    let catalog = serde_json::from_value::<ComponentMetadataCatalog>(serde_json::json!({
+        "target": "deepagents",
+        "components": {
+            "profiles.deepagents": {"kind": "harness_profile"}
+        }
+    }))
+    .expect("harness profile metadata validates");
+    assert_eq!(
+        catalog
+            .components
+            .values()
+            .next()
+            .expect("profile descriptor remains present")
+            .kind,
+        ComponentKind::HarnessProfile
+    );
 }
 
 #[test]

@@ -8,6 +8,7 @@ from typing import Literal, Protocol, runtime_checkable
 
 from deepagents.backends import BackendProtocol
 from kiteframe import (
+    CompilationReport,
     ComponentKind,
     FrozenComponentRegistry,
     KiteframeDiagnosticError,
@@ -26,7 +27,6 @@ from .compatibility import (
     KiteframeHarnessProfileToken,
 )
 
-HARNESS_PROFILE_SYMBOL = "profiles.deepagents"
 RUNTIME_COMPONENT_UNRESOLVED = "KF-RUNTIME-001"
 
 
@@ -54,6 +54,7 @@ class ValidatedComponents:
     capability_provider: object
     audit_sink: object
     harness_profile: KiteframeHarnessProfileToken
+    compilation_report: CompilationReport
 
     @property
     def primary_model(self) -> BaseChatModel:
@@ -234,10 +235,18 @@ def validate_components(
         binding.audit_sink,
     )
 
+    profile_symbol = binding.harness_profile
+    if profile_symbol is None:
+        raise _runtime_error("harness profile component metadata is unresolved")
+    _require_descriptor(
+        descriptors,
+        profile_symbol,
+        ComponentKind.HARNESS_PROFILE,
+    )
     harness_profile = _resolve(
         registry,
         ComponentKind.HARNESS_PROFILE,
-        HARNESS_PROFILE_SYMBOL,
+        profile_symbol,
     )
     primary = next(
         (model for role, model in models if role == "primary"),
@@ -266,12 +275,12 @@ def validate_components(
         capability_provider=capability_provider,
         audit_sink=audit_sink,
         harness_profile=harness_profile,
+        compilation_report=inputs.compilation_report,
     )
 
 
 __all__ = [
     "DurableCheckpointer",
-    "HARNESS_PROFILE_SYMBOL",
     "ValidatedComponents",
     "validate_components",
 ]

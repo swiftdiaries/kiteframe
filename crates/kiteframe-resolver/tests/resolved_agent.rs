@@ -142,7 +142,8 @@ fn binding() -> kiteframe_contract::RuntimeBinding {
             "components": {
                 "middleware": ["middleware.tenant-context"],
                 "backend": "backends.workspace",
-                "checkpointer": "checkpointers.durable"
+                "checkpointer": "checkpointers.durable",
+                "harnessProfile": "profiles.deepagents"
             },
             "capabilityProvider": "capability-providers.primary",
             "auditSink": "audit-sinks.ledger"
@@ -436,6 +437,21 @@ fn component_symbols_are_checked_against_their_exact_kinds() {
         .components
         .components
         .get_mut(&RegistrySymbol::new("capability-providers.primary").unwrap())
+        .unwrap()
+        .kind = ComponentKind::AuditSink;
+
+    let errors = resolve_agent(input).unwrap_err();
+
+    assert_eq!(errors[0].code.as_str(), "KF-RUNTIME-001");
+}
+
+#[test]
+fn harness_profile_symbol_is_checked_against_its_exact_kind() {
+    let mut input = resolution_fixture();
+    input
+        .components
+        .components
+        .get_mut(&RegistrySymbol::new("profiles.deepagents").unwrap())
         .unwrap()
         .kind = ComponentKind::AuditSink;
 

@@ -7,7 +7,7 @@ mod validate;
 
 use error::KiteframeDiagnosticError;
 pub use ir::{
-    PyComponentDescriptor, PyResolvedAgent, PyResolvedCapabilityRequirement,
+    PyCompilationReport, PyComponentDescriptor, PyResolvedAgent, PyResolvedCapabilityRequirement,
     PyResolvedModelRequirement, PyResolvedRuntimeInputs, PyResolvedSubagent, PyResolvedTextAsset,
     PyRuntimeBinding, PyRuntimeBindingContentCapture,
 };
@@ -54,6 +54,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRuntimeBinding>()?;
     module.add_class::<PyRuntimeBindingContentCapture>()?;
     module.add_class::<PyComponentDescriptor>()?;
+    module.add_class::<PyCompilationReport>()?;
     module.add_class::<PyResolvedRuntimeInputs>()?;
     module.add(
         "KiteframeDiagnosticError",

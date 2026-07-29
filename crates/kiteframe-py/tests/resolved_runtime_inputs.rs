@@ -63,21 +63,75 @@ fn frozen_projection_retains_validated_binding_target_and_component_values() {
                 .unwrap(),
             "audit-sinks.ledger"
         );
+        assert_eq!(
+            binding
+                .getattr("harness_profile")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "profiles.deepagents"
+        );
         let components = projection.getattr("target_components").unwrap();
-        let symbols = components
+        let component_values = components
             .try_iter()
             .unwrap()
             .map(Result::unwrap)
             .map(|component| {
-                component
-                    .getattr("symbol")
-                    .expect("symbol property")
-                    .extract::<String>()
-                    .expect("symbol is text")
+                (
+                    component
+                        .getattr("symbol")
+                        .expect("symbol property")
+                        .extract::<String>()
+                        .expect("symbol is text"),
+                    component
+                        .getattr("kind")
+                        .expect("kind property")
+                        .extract::<String>()
+                        .expect("kind is text"),
+                )
             })
             .collect::<Vec<_>>();
-        assert!(symbols.contains(&"models.anthropic.sonnet".to_owned()));
-        assert!(symbols.contains(&"capability-providers.primary".to_owned()));
-        assert!(symbols.contains(&"audit-sinks.ledger".to_owned()));
+        assert!(
+            component_values.contains(&("models.anthropic.sonnet".to_owned(), "model".to_owned()))
+        );
+        assert!(component_values.contains(&(
+            "capability-providers.primary".to_owned(),
+            "capability_provider".to_owned()
+        )));
+        assert!(
+            component_values.contains(&("audit-sinks.ledger".to_owned(), "audit_sink".to_owned()))
+        );
+        assert!(component_values.contains(&(
+            "profiles.deepagents".to_owned(),
+            "harness_profile".to_owned()
+        )));
+
+        let report = projection.getattr("compilation_report").unwrap();
+        assert_eq!(
+            report.get_type().name().expect("report type has a name"),
+            "CompilationReport"
+        );
+        assert!(
+            report
+                .getattr("warnings")
+                .unwrap()
+                .extract::<Vec<(String, String)>>()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            report
+                .getattr("decisions")
+                .unwrap()
+                .extract::<Vec<(String, String)>>()
+                .unwrap(),
+            vec![
+                (
+                    "features".to_owned(),
+                    "0 required and 0 optional enabled".to_owned(),
+                ),
+                ("models".to_owned(), "1 roles resolved".to_owned()),
+            ]
+        );
     });
 }

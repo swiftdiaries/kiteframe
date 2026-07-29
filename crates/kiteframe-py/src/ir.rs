@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use kiteframe_contract::{
-    BindingContentCapturePolicy, ComponentKind, ComponentMetadata, DataClassification,
-    LatencyClass, ModelCapability, ModelLatencyClass, ModelModality, RegistrySymbol, ResolvedAgent,
-    ResolvedCapabilityRequirement, ResolvedModelRequirement, ResolvedSubagent, RuntimeBinding,
-    RuntimeTarget, ValidatedTextAsset,
+    BindingContentCapturePolicy, CompilationReport, ComponentKind, ComponentMetadata,
+    DataClassification, LatencyClass, ModelCapability, ModelLatencyClass, ModelModality,
+    RegistrySymbol, ResolvedAgent, ResolvedCapabilityRequirement, ResolvedModelRequirement,
+    ResolvedSubagent, RuntimeBinding, RuntimeTarget, ValidatedTextAsset,
 };
 use kiteframe_core::canonical_json;
 use pyo3::{prelude::*, types::PyTuple};
@@ -24,6 +24,7 @@ fn component_kind_name(kind: ComponentKind) -> &'static str {
         ComponentKind::RetentionPolicy => "retention_policy",
         ComponentKind::AccessPolicy => "access_policy",
         ComponentKind::EncryptedContentStore => "encrypted_content_store",
+        ComponentKind::HarnessProfile => "harness_profile",
     }
 }
 
@@ -307,6 +308,16 @@ impl PyRuntimeBinding {
     }
 
     #[getter]
+    fn harness_profile(&self) -> Option<&str> {
+        self.inner
+            .spec
+            .components
+            .harness_profile
+            .as_ref()
+            .map(RegistrySymbol::as_str)
+    }
+
+    #[getter]
     fn capability_provider(&self) -> &str {
         self.inner.spec.capability_provider.as_str()
     }
@@ -344,6 +355,59 @@ impl PyComponentDescriptor {
             symbol,
             inner: Arc::new(inner),
         }
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "CompilationReport"
+)]
+pub struct PyCompilationReport {
+    inner: Arc<CompilationReport>,
+}
+
+impl From<CompilationReport> for PyCompilationReport {
+    fn from(inner: CompilationReport) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCompilationReport {
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]",
+        imports = ("builtins",)
+    ))]
+    fn warnings<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .warnings
+                .iter()
+                .map(|warning| (warning.code.as_str(), warning.message.as_str())),
+        )
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]",
+        imports = ("builtins",)
+    ))]
+    fn decisions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .decisions
+                .iter()
+                .map(|decision| (decision.subject.as_str(), decision.outcome.as_str())),
+        )
     }
 }
 
@@ -828,6 +892,11 @@ impl PyResolvedRuntimeInputs {
     #[getter]
     fn runtime_target(&self) -> &str {
         self.runtime_target.as_str()
+    }
+
+    #[getter]
+    fn compilation_report(&self) -> PyCompilationReport {
+        self.resolved_agent.compilation_report().clone().into()
     }
 
     #[getter]

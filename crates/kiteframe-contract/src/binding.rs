@@ -106,6 +106,8 @@ pub struct TypedComponentSymbols {
     pub backend: Option<RegistrySymbol>,
     #[serde(default)]
     pub checkpointer: Option<RegistrySymbol>,
+    #[serde(default)]
+    pub harness_profile: Option<RegistrySymbol>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

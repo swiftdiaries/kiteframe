@@ -34,7 +34,8 @@
         "redaction_policy",
         "retention_policy",
         "access_policy",
-        "encrypted_content_store"
+        "encrypted_content_store",
+        "harness_profile"
       ]
     },
     "ComponentMetadata": {

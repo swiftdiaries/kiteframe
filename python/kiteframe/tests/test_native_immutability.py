@@ -5,6 +5,7 @@ import pytest
 
 from kiteframe import (
     CapabilityDescriptor,
+    CompilationReport,
     ComponentDescriptor,
     KiteframeDiagnosticError,
     ResolvedAgent,
@@ -95,11 +96,25 @@ def test_resolve_package_returns_all_compilation_inputs(
     assert len(inputs.resolved_agent.catalog_digest) == 64
     assert inputs.runtime_target == "deepagents"
     assert inputs.runtime_binding.runtime == "deepagents"
+    assert inputs.runtime_binding.harness_profile == "profiles.deepagents"
+    assert isinstance(inputs.compilation_report, CompilationReport)
+    assert inputs.compilation_report.warnings == ()
+    assert inputs.compilation_report.decisions == (
+        ("features", "0 required and 0 optional enabled"),
+        ("models", "1 roles resolved"),
+    )
     assert {component.symbol for component in inputs.target_components} >= {
         "models.anthropic.sonnet",
         "capability-providers.primary",
         "audit-sinks.ledger",
+        "profiles.deepagents",
     }
+    profile = next(
+        component
+        for component in inputs.target_components
+        if component.symbol == "profiles.deepagents"
+    )
+    assert profile.kind == "harness_profile"
 
 
 def test_runtime_inputs_are_not_constructible_or_mutable(workspace: Path) -> None:
@@ -127,6 +142,7 @@ def test_new_child_projections_are_nonconstructible_and_frozen(
     )
     resolved = inputs.resolved_agent
     children = (
+        (inputs.compilation_report, CompilationReport, "decisions"),
         (inputs.runtime_binding, RuntimeBinding, "runtime"),
         (inputs.target_components[0], ComponentDescriptor, "symbol"),
         (resolved.prompts[0], ResolvedTextAsset, "path"),
@@ -163,6 +179,8 @@ def test_new_projection_collections_are_immutable_tuples(workspace: Path) -> Non
     descriptor = resolved.capability_requirements[0].descriptor
     collections = (
         inputs.target_components,
+        inputs.compilation_report.warnings,
+        inputs.compilation_report.decisions,
         inputs.runtime_binding.model_symbols,
         inputs.runtime_binding.middleware_symbols,
         resolved.prompts,

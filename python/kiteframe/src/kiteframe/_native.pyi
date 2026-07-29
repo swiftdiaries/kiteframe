@@ -15,6 +15,7 @@ __all__ = [
     "CapabilityGrantSet",
     "CatalogFetchResult",
     "CatalogRequest",
+    "CompilationReport",
     "ComponentDescriptor",
     "Diagnostic",
     "EffectProposal",
@@ -210,6 +211,13 @@ class CatalogRequest:
     @staticmethod
     def default() -> CatalogRequest: ...
     def canonical_json(self) -> builtins.bytes: ...
+
+@typing.final
+class CompilationReport:
+    @property
+    def warnings(self) -> builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]: ...
+    @property
+    def decisions(self) -> builtins.tuple[builtins.tuple[builtins.str, builtins.str], ...]: ...
 
 @typing.final
 class ComponentDescriptor:
@@ -465,6 +473,8 @@ class ResolvedRuntimeInputs:
     @property
     def runtime_target(self) -> builtins.str: ...
     @property
+    def compilation_report(self) -> CompilationReport: ...
+    @property
     def target_components(self) -> builtins.tuple[ComponentDescriptor, ...]: ...
 
 @typing.final
@@ -497,6 +507,8 @@ class RuntimeBinding:
     def backend(self) -> typing.Optional[builtins.str]: ...
     @property
     def checkpointer(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def harness_profile(self) -> typing.Optional[builtins.str]: ...
     @property
     def capability_provider(self) -> builtins.str: ...
     @property

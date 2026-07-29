@@ -75,6 +75,7 @@ def test_rust_owned_stub_classes_are_read_only_and_nonconstructible() -> None:
         "CapabilityGrantSet",
         "CatalogFetchResult",
         "CatalogRequest",
+        "CompilationReport",
         "ComponentDescriptor",
         "Diagnostic",
         "EffectProposal",

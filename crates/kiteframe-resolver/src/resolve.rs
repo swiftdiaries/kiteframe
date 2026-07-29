@@ -219,6 +219,10 @@ fn validate_runtime_inputs(
             binding.spec.components.checkpointer.as_ref(),
             ComponentKind::Checkpointer,
         ),
+        (
+            binding.spec.components.harness_profile.as_ref(),
+            ComponentKind::HarnessProfile,
+        ),
     ] {
         if let Some(symbol) = symbol
             && let Err(error) = require_component_kind(components, symbol, expected)
