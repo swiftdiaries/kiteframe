@@ -18,7 +18,8 @@ pub use service::{
     PyCapabilityCatalog, PyCapabilityDenial, PyCapabilityDescriptor, PyCapabilityGrantSet,
     PyCatalogFetchResult, PyCatalogRequest, PyDiagnostic, PyEffectProposal,
     PyEffectiveCapabilityGrant, PyInvocationOutcome, PyInvocationRequest, PyInvocationStatus,
-    PyStableCapabilityError, PyStatusRequest, PySuspension, load_admission_request_inner,
+    PyStableCapabilityError, PyStatusRequest, PySuspension,
+    build_invocation_request_for_requirement, build_status_request, load_admission_request_inner,
     load_capability_catalog_inner, load_capability_grant_set_for_request_inner,
     load_capability_grant_set_inner, load_catalog_request_inner, load_effect_proposal_inner,
     load_invocation_outcome_for_request_inner, load_invocation_outcome_inner,
@@ -66,6 +67,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(service::load_admission_request, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_invocation_request, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_status_request, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        service::build_invocation_request_for_requirement,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(service::build_status_request, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_effect_proposal, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_capability_catalog, module)?)?;
     module.add_function(wrap_pyfunction!(

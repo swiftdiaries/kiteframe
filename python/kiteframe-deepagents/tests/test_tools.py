@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from kiteframe import (
@@ -22,6 +22,7 @@ from kiteframe import (
     load_invocation_status,
     load_resolved_agent,
 )
+from pydantic import ValidationError
 
 import kiteframe_deepagents.tools as tools_module
 from kiteframe_deepagents.context import (
@@ -379,26 +380,63 @@ def failed(request: InvocationRequest) -> InvocationOutcome:
 
 
 def denied(request: InvocationRequest) -> InvocationOutcome:
-    return load_invocation_outcome(
-        canonical_bytes(
-            {
-                "diagnostic": {
-                    "category": "authorization",
-                    "code": "KF-AUTH-003",
-                    "details": {},
-                    "help": None,
-                    "message": "invocation denied",
-                    "package_path": None,
-                    "retry": "never",
-                    "severity": "error",
-                    "source_range": None,
-                    "stage": "invoke",
-                },
-                "invocation_id": request.invocation_id,
-                "status": "denied",
-            }
+    return denied_with_message("invocation denied")(request)
+
+
+def denied_with_message(message: str) -> OutcomeFactory:
+    def factory(request: InvocationRequest) -> InvocationOutcome:
+        return load_invocation_outcome(
+            canonical_bytes(
+                {
+                    "diagnostic": {
+                        "category": "authorization",
+                        "code": "KF-AUTH-003",
+                        "details": {},
+                        "help": None,
+                        "message": message,
+                        "package_path": None,
+                        "retry": "never",
+                        "severity": "error",
+                        "source_range": None,
+                        "stage": "invoke",
+                    },
+                    "invocation_id": request.invocation_id,
+                    "status": "denied",
+                }
+            )
         )
-    )
+
+    return factory
+
+
+def outcome_unknown_status(message: str) -> StatusFactory:
+    def factory(
+        request: StatusRequest,
+        invocation: InvocationRequest,
+    ) -> InvocationStatus:
+        assert request.invocation_id == invocation.invocation_id
+        return load_invocation_status(
+            canonical_bytes(
+                {
+                    "diagnostic": {
+                        "category": "capability",
+                        "code": "KF-CAP-003",
+                        "details": {},
+                        "help": None,
+                        "message": message,
+                        "package_path": None,
+                        "retry": "status_first",
+                        "severity": "error",
+                        "source_range": None,
+                        "stage": "invoke",
+                    },
+                    "invocation_id": request.invocation_id,
+                    "status": "outcome_unknown",
+                }
+            )
+        )
+
+    return factory
 
 
 def effect_proposal_digest(request: InvocationRequest) -> str:
@@ -468,6 +506,10 @@ class FakeCheckpointStore(IdempotencyCheckpointStore):
         self.events.append(f"persist:{record.key}")
 
 
+class SuspensionInterruptForTest(Exception):
+    pass
+
+
 @dataclass
 class FakeSuspensionBridge(CapabilitySuspensionBridge):
     calls: list[tuple[InvocationRequest, InvocationOutcome]]
@@ -476,12 +518,23 @@ class FakeSuspensionBridge(CapabilitySuspensionBridge):
         self,
         request: InvocationRequest,
         outcome: InvocationOutcome,
-    ) -> object:
+    ) -> NoReturn:
         self.calls.append((request, outcome))
         suspension = outcome.suspension
         assert suspension is not None
-        return {
-            "checkpoint_ref": suspension.checkpoint_ref,
+        raise SuspensionInterruptForTest(suspension.checkpoint_ref)
+
+
+@dataclass
+class ReturningSuspensionBridge(CapabilitySuspensionBridge):
+    async def suspend(
+        self,
+        request: InvocationRequest,
+        outcome: InvocationOutcome,
+    ) -> NoReturn:
+        del request, outcome
+        return {  # type: ignore[reportReturnType]
+            "evidence_request_ref": "evidence-request:provider-secret",
             "status": "suspended",
         }
 
@@ -716,6 +769,50 @@ async def test_effectful_key_is_uuidv7_scoped_and_persisted_before_invoke(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_arguments",
+    [
+        {"case_id": "case-1"},
+        {"case_id": "case-1", "body": "hello", "extra": "forged"},
+        {"case_id": 7, "body": "hello"},
+    ],
+)
+async def test_locked_input_schema_rejects_invalid_arguments_before_effect(
+    comment_tool: CapabilityTool,
+    fake_invoker: FakeInvoker,
+    checkpoint_store: FakeCheckpointStore,
+    invalid_arguments: dict[str, object],
+) -> None:
+    result = await comment_tool.ainvoke(
+        {**invalid_arguments, "_resource": RESOURCE}
+    )
+
+    assert result == "KF-CAP-002: invalid capability invocation"
+    assert checkpoint_store.records == []
+    assert fake_invoker.requests == []
+
+
+@pytest.mark.asyncio
+async def test_native_factory_uses_rfc8785_numbers_and_unicode(
+    read_tool: CapabilityTool,
+    fake_invoker: FakeInvoker,
+) -> None:
+    result = await read_tool.ainvoke(
+        {
+            "amount": 1.0,
+            "label": "€ café",
+            "_resource": RESOURCE,
+        }
+    )
+
+    assert result == {"ok": True}
+    canonical = fake_invoker.requests[-1].canonical_json()
+    assert b'"amount":1,' in canonical
+    assert '"label":"€ café"'.encode() in canonical
+    assert b"\\u20ac" not in canonical.lower()
+
+
+@pytest.mark.asyncio
 async def test_read_only_capability_forbids_idempotency_key(
     read_tool: CapabilityTool,
     fake_invoker: FakeInvoker,
@@ -777,14 +874,11 @@ async def test_deferred_status_suspension_goes_to_bridge(
     fake_invoker.outcomes = [deferred]
     fake_invoker.statuses = [suspended_status]
 
-    result = await comment_tool.ainvoke(
-        {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
-    )
+    with pytest.raises(SuspensionInterruptForTest, match="checkpoint:opaque:1"):
+        await comment_tool.ainvoke(
+            {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
+        )
 
-    assert result == {
-        "checkpoint_ref": "checkpoint:opaque:1",
-        "status": "suspended",
-    }
     request, outcome = suspension_bridge.calls[-1]
     assert request is fake_invoker.requests[-1]
     assert outcome.suspension is not None
@@ -795,7 +889,7 @@ async def test_deferred_status_suspension_goes_to_bridge(
     ("factory", "safe_error"),
     [
         (failed, "COMMENT_REJECTED: comment rejected"),
-        (denied, "KF-AUTH-003: invocation denied"),
+        (denied, "KF-AUTH-003: capability invocation denied"),
     ],
 )
 async def test_native_failures_map_only_to_stable_safe_tool_errors(
@@ -811,6 +905,41 @@ async def test_native_failures_map_only_to_stable_safe_tool_errors(
     )
 
     assert result == safe_error
+
+
+@pytest.mark.asyncio
+async def test_provider_denial_diagnostic_message_is_never_tool_output(
+    comment_tool: CapabilityTool,
+    fake_invoker: FakeInvoker,
+) -> None:
+    fake_invoker.outcomes = [
+        denied_with_message("provider secret: internal policy row 42")
+    ]
+
+    result = await comment_tool.ainvoke(
+        {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
+    )
+
+    assert result == "KF-AUTH-003: capability invocation denied"
+    assert "secret" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_first_diagnostic_message_is_never_tool_output(
+    comment_tool: CapabilityTool,
+    fake_invoker: FakeInvoker,
+) -> None:
+    fake_invoker.outcomes = [outcome_unknown]
+    fake_invoker.statuses = [
+        outcome_unknown_status("provider secret: shard unavailable")
+    ]
+
+    result = await comment_tool.ainvoke(
+        {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
+    )
+
+    assert result == "KF-CAP-003: capability outcome requires reconciliation"
+    assert "secret" not in result
 
 
 @pytest.mark.asyncio
@@ -856,18 +985,67 @@ async def test_suspended_outcome_goes_to_bridge_with_native_values(
 ) -> None:
     fake_invoker.outcomes = [suspended]
 
-    result = await comment_tool.ainvoke(
-        {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
-    )
+    with pytest.raises(SuspensionInterruptForTest, match="checkpoint:opaque:1"):
+        await comment_tool.ainvoke(
+            {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
+        )
 
-    assert result == {
-        "checkpoint_ref": "checkpoint:opaque:1",
-        "status": "suspended",
-    }
     request, outcome = suspension_bridge.calls[-1]
     assert request is fake_invoker.requests[-1]
     assert outcome.suspension is not None
     assert outcome.suspension.proposal_digest == effect_proposal_digest(request)
+
+
+@pytest.mark.asyncio
+async def test_suspension_bridge_return_fails_closed_without_protected_output(
+    read_requirement: ResolvedCapabilityRequirement,
+    write_requirement: ResolvedCapabilityRequirement,
+    native_grants: tuple[EffectiveCapabilityGrant, ...],
+    session: KiteframeSessionContext,
+    fake_invoker: FakeInvoker,
+    checkpoint_store: FakeCheckpointStore,
+) -> None:
+    fake_invoker.outcomes = [suspended]
+    tool = next(
+        tool
+        for tool in build_capability_tools(
+            (read_requirement, write_requirement),
+            native_grants,
+            grant_digest=session.grant_digest,
+            invoker=fake_invoker,
+            session=session,
+            checkpoint_store=checkpoint_store,
+            suspension_bridge=ReturningSuspensionBridge(),
+        )
+        if tool.name == "cases.comment"
+    )
+
+    result = await tool.ainvoke(
+        {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
+    )
+
+    assert result == "KF-CAP-005: suspension bridge did not interrupt"
+    assert "evidence-request" not in result
+
+
+def test_tool_authority_and_schema_are_deeply_immutable(
+    comment_tool: CapabilityTool,
+) -> None:
+    with pytest.raises((TypeError, ValidationError)):
+        comment_tool.grant_digest = "ff" * 32  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises((TypeError, ValidationError)):
+        comment_tool.requirement = object()  # type: ignore[assignment]
+
+    schema = comment_tool.args_schema
+    assert isinstance(schema, dict)
+    with pytest.raises(TypeError):
+        schema["type"] = "array"
+    with pytest.raises(TypeError):
+        schema |= {"type": "array"}
+    properties = schema["properties"]
+    assert isinstance(properties, dict)
+    with pytest.raises(TypeError):
+        properties["case_id"]["type"] = "integer"
 
 
 def test_sync_invocation_is_rejected(

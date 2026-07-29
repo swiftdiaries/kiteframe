@@ -18,7 +18,7 @@ use kiteframe_core::canonical_json;
 use pyo3::{
     IntoPyObjectExt,
     prelude::*,
-    types::{PyDict, PyTuple},
+    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple},
 };
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
@@ -115,6 +115,63 @@ fn serialized_to_python<T: serde::Serialize + ?Sized>(
     let value = serde_json::to_value(value)
         .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("value cannot be projected"))?;
     json_value_to_python(py, &value)
+}
+
+fn python_to_json_value(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    if value.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if value.is_instance_of::<PyBool>() {
+        return value.extract::<bool>().map(serde_json::Value::Bool);
+    }
+    if value.is_instance_of::<PyInt>() {
+        let number = value
+            .extract::<i64>()
+            .map(serde_json::Number::from)
+            .or_else(|_| value.extract::<u64>().map(serde_json::Number::from))
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "integer is outside the supported JSON range",
+                )
+            })?;
+        return Ok(serde_json::Value::Number(number));
+    }
+    if value.is_instance_of::<PyFloat>() {
+        let number = serde_json::Number::from_f64(value.extract::<f64>()?).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("non-finite floats are not valid JSON")
+        })?;
+        return Ok(serde_json::Value::Number(number));
+    }
+    if value.is_instance_of::<PyString>() {
+        return value.extract::<String>().map(serde_json::Value::String);
+    }
+    if let Ok(values) = value.cast::<PyList>() {
+        return values
+            .iter()
+            .map(|item| python_to_json_value(&item))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(values) = value.cast::<PyTuple>() {
+        return values
+            .iter()
+            .map(|item| python_to_json_value(&item))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(values) = value.cast::<PyDict>() {
+        let mut object = serde_json::Map::new();
+        for (key, item) in values.iter() {
+            let key = key.extract::<String>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("JSON object keys must be strings")
+            })?;
+            object.insert(key, python_to_json_value(&item)?);
+        }
+        return Ok(serde_json::Value::Object(object));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "value is not representable as JSON",
+    ))
 }
 
 fn retry_name(retry: RetryClass) -> &'static str {
@@ -1849,6 +1906,94 @@ pub fn load_invocation_status(
 
 #[gen_stub_pyfunction]
 #[pyfunction]
+#[pyo3(signature = (
+    *,
+    invocation_id,
+    admission_id,
+    grant_digest,
+    requirement,
+    selected_resource,
+    arguments,
+    preconditions,
+    evidence_refs,
+    traceparent,
+    baggage,
+    idempotency_key=None,
+    tracestate=None,
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn build_invocation_request_for_requirement(
+    invocation_id: &str,
+    admission_id: &str,
+    grant_digest: &str,
+    requirement: &PyResolvedCapabilityRequirement,
+    selected_resource: &str,
+    arguments: &Bound<'_, PyAny>,
+    preconditions: &Bound<'_, PyAny>,
+    evidence_refs: &Bound<'_, PyAny>,
+    traceparent: &str,
+    baggage: &Bound<'_, PyAny>,
+    idempotency_key: Option<&str>,
+    tracestate: Option<&str>,
+) -> PyResult<PyInvocationRequest> {
+    let descriptor = requirement.descriptor_inner();
+    let wire = serde_json::json!({
+        "admissionId": admission_id,
+        "arguments": python_to_json_value(arguments)?,
+        "capability": {
+            "name": descriptor.identity().name().as_str(),
+            "version": descriptor.identity().version().as_str(),
+        },
+        "evidenceRefs": python_to_json_value(evidence_refs)?,
+        "grantDigest": grant_digest,
+        "idempotencyKey": idempotency_key,
+        "invocationId": invocation_id,
+        "preconditions": python_to_json_value(preconditions)?,
+        "selectedResource": selected_resource,
+        "traceContext": {
+            "baggage": python_to_json_value(baggage)?,
+            "traceparent": traceparent,
+            "tracestate": tracestate,
+        },
+    });
+    let request: ContractInvocationRequest =
+        serde_json::from_value(wire).map_err(|_| invocation_request_error())?;
+    request
+        .validate_against(descriptor)
+        .map_err(diagnostic_error)?;
+    Ok(PyInvocationRequest::from(request))
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (
+    *,
+    invocation_id,
+    traceparent,
+    baggage,
+    tracestate=None,
+))]
+pub fn build_status_request(
+    invocation_id: &str,
+    traceparent: &str,
+    baggage: &Bound<'_, PyAny>,
+    tracestate: Option<&str>,
+) -> PyResult<PyStatusRequest> {
+    let wire = serde_json::json!({
+        "invocationId": invocation_id,
+        "traceContext": {
+            "baggage": python_to_json_value(baggage)?,
+            "traceparent": traceparent,
+            "tracestate": tracestate,
+        },
+    });
+    serde_json::from_value::<ContractStatusRequest>(wire)
+        .map(PyStatusRequest::from)
+        .map_err(|_| invocation_request_error())
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
 pub fn load_capability_grant_set_for_request(
     #[gen_stub(override_type(
         type_repr = "builtins.bytes",
@@ -1902,6 +2047,15 @@ pub fn load_invocation_status_for_request(
     )
     .map(PyInvocationStatus::from)
     .map_err(provider_response_error)
+}
+
+fn invocation_request_error() -> PyErr {
+    diagnostic_error(vec![Diagnostic::error(
+        DiagnosticCode::ResultInvalid,
+        DiagnosticCategory::Capability,
+        DiagnosticStage::Invoke,
+        "invocation request is invalid",
+    )])
 }
 
 fn provider_response_error(error: ProviderResponseError) -> PyErr {

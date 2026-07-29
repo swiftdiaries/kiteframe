@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, NoReturn, Protocol, runtime_checkable
 
 from kiteframe import (
     EffectiveCapabilityGrant,
@@ -16,29 +15,28 @@ from kiteframe import (
     InvocationStatus,
     ResolvedCapabilityRequirement,
     StatusRequest,
+    build_invocation_request_for_requirement,
+    build_status_request,
     load_invocation_outcome,
     load_invocation_outcome_for_request,
-    load_invocation_request,
     load_invocation_status_for_request,
-    load_status_request,
 )
 from kiteframe.provider import CapabilityInvoker
 from langchain_core.tools import ArgsSchema, BaseTool, ToolException
+from pydantic import ConfigDict, Field
 
 from .context import KiteframeSessionContext
 
 INVALID_PROVIDER_RESULT = "KF-CAP-002: invalid capability provider result"
 PROVIDER_UNAVAILABLE = "KF-CAP-004: capability provider unavailable"
 RESOURCE_DENIED = "KF-AUTH-003: capability resource is not granted"
-
-
-def _canonical_bytes(value: object) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode()
+INVOCATION_DENIED = "KF-AUTH-003: capability invocation denied"
+OUTCOME_RECONCILIATION_REQUIRED = (
+    "KF-CAP-003: capability outcome requires reconciliation"
+)
+SUSPENSION_DID_NOT_INTERRUPT = (
+    "KF-CAP-005: suspension bridge did not interrupt"
+)
 
 
 def _uuid7() -> uuid.UUID:
@@ -92,7 +90,70 @@ class CapabilitySuspensionBridge(Protocol):
         self,
         request: InvocationRequest,
         outcome: InvocationOutcome,
-    ) -> object: ...
+    ) -> NoReturn: ...
+
+
+class _FrozenDict(dict[str, Any]):
+    def _immutable(self, *args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        raise TypeError("locked tool schema is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable  # pyright: ignore[reportAssignmentType]
+    update = _immutable  # pyright: ignore[reportAssignmentType]
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenDict:
+        del memo
+        return self
+
+
+class _FrozenList(list[Any]):
+    def _immutable(self, *args: object, **kwargs: object) -> NoReturn:
+        del args, kwargs
+        raise TypeError("locked tool schema is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable  # pyright: ignore[reportAssignmentType]
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _FrozenList:
+        del memo
+        return self
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _FrozenDict(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return _FrozenList(_freeze_json(item) for item in value)
+    return value
+
+
+def _comparable_json(value: Any) -> object:
+    if isinstance(value, dict):
+        return tuple(
+            (key, _comparable_json(item))
+            for key, item in sorted(value.items())
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_comparable_json(item) for item in value)
+    return value
 
 
 def _trace_context_wire(session: KiteframeSessionContext) -> dict[str, Any]:
@@ -147,23 +208,21 @@ def build_native_invocation_request(
     if grant_digest != session.grant_digest:
         raise ValueError("grant digest does not match the session")
 
-    request_wire = {
-        "admissionId": session.admission_id,
-        "arguments": arguments,
-        "capability": {
-            "name": requirement.name,
-            "version": requirement.version,
-        },
-        "evidenceRefs": {},
-        "grantDigest": grant_digest,
-        "invocationId": f"invocation:{_uuid7()}",
-        "preconditions": {},
-        "selectedResource": resource,
-        "traceContext": _trace_context_wire(session),
-    }
-    if idempotency_key is not None:
-        request_wire["idempotencyKey"] = idempotency_key
-    return load_invocation_request(_canonical_bytes(request_wire))
+    trace = _trace_context_wire(session)
+    return build_invocation_request_for_requirement(
+        invocation_id=f"invocation:{_uuid7()}",
+        admission_id=session.admission_id,
+        grant_digest=grant_digest,
+        requirement=requirement,
+        selected_resource=resource,
+        arguments=arguments,
+        preconditions={},
+        evidence_refs={},
+        traceparent=trace["traceparent"],
+        tracestate=trace.get("tracestate"),
+        baggage=trace.get("baggage", {}),
+        idempotency_key=idempotency_key,
+    )
 
 
 def _grant_projection(grant: EffectiveCapabilityGrant) -> tuple[object, ...]:
@@ -174,25 +233,57 @@ def _grant_projection(grant: EffectiveCapabilityGrant) -> tuple[object, ...]:
         grant.execution_modes,
         grant.maximum_effect,
         grant.expires_at,
-        _canonical_bytes(grant.required_evidence),
-        _canonical_bytes(grant.freshness),
-        _canonical_bytes(grant.preconditions),
+        _comparable_json(grant.required_evidence),
+        _comparable_json(grant.freshness),
+        _comparable_json(grant.preconditions),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _CapabilityAuthoritySnapshot:
+    requirement: ResolvedCapabilityRequirement
+    grant: EffectiveCapabilityGrant
+    grant_digest: str
+    session: KiteframeSessionContext
 
 
 class CapabilityTool(BaseTool):
     """Provider-backed tool derived only from one embedded locked descriptor."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
+
     name: str = ""
     description: str
     args_schema: ArgsSchema | None = None
-    requirement: ResolvedCapabilityRequirement
-    grant: EffectiveCapabilityGrant
-    grant_digest: str
     invoker: CapabilityInvoker
-    session: KiteframeSessionContext
     checkpoint_store: IdempotencyCheckpointStore
     suspension_bridge: CapabilitySuspensionBridge
+    authority_snapshot: _CapabilityAuthoritySnapshot = Field(
+        exclude=True,
+        repr=False,
+    )
+
+    def model_post_init(self, __context: Any) -> None:
+        del __context
+        schema = self.args_schema
+        if isinstance(schema, dict):
+            object.__setattr__(self, "args_schema", _freeze_json(schema))
+
+    @property
+    def requirement(self) -> ResolvedCapabilityRequirement:
+        return self.authority_snapshot.requirement
+
+    @property
+    def grant(self) -> EffectiveCapabilityGrant:
+        return self.authority_snapshot.grant
+
+    @property
+    def grant_digest(self) -> str:
+        return self.authority_snapshot.grant_digest
+
+    @property
+    def session(self) -> KiteframeSessionContext:
+        return self.authority_snapshot.session
 
     @property
     def descriptor_digest(self) -> str:
@@ -241,8 +332,10 @@ class CapabilityTool(BaseTool):
     def _stable_failure(outcome: InvocationOutcome | InvocationStatus) -> str:
         if outcome.error is not None:
             return f"{outcome.error.code}: {outcome.error.message}"
-        if outcome.diagnostic is not None:
-            return f"{outcome.diagnostic.code}: {outcome.diagnostic.message}"
+        if outcome.status == "denied":
+            return INVOCATION_DENIED
+        if outcome.status == "outcome_unknown":
+            return OUTCOME_RECONCILIATION_REQUIRED
         return INVALID_PROVIDER_RESULT
 
     def _validated_outcome(
@@ -283,13 +376,12 @@ class CapabilityTool(BaseTool):
         self,
         invocation: InvocationRequest,
     ) -> InvocationStatus:
-        status_request = load_status_request(
-            _canonical_bytes(
-                {
-                    "invocationId": invocation.invocation_id,
-                    "traceContext": _trace_context_wire(self.session),
-                }
-            )
+        trace = _trace_context_wire(self.session)
+        status_request = build_status_request(
+            invocation_id=invocation.invocation_id,
+            traceparent=trace["traceparent"],
+            tracestate=trace.get("tracestate"),
+            baggage=trace.get("baggage", {}),
         )
         try:
             status = await self.invoker.status(
@@ -300,6 +392,14 @@ class CapabilityTool(BaseTool):
         except Exception:
             raise ToolException(PROVIDER_UNAVAILABLE) from None
         return self._validated_status(status_request, invocation, status)
+
+    async def _suspend(
+        self,
+        invocation: InvocationRequest,
+        outcome: InvocationOutcome,
+    ) -> NoReturn:
+        await self.suspension_bridge.suspend(invocation, outcome)
+        raise ToolException(SUSPENSION_DID_NOT_INTERRUPT)
 
     async def _resolve_status(
         self,
@@ -317,7 +417,7 @@ class CapabilityTool(BaseTool):
             }
         if status.status == "suspended":
             outcome = load_invocation_outcome(status.canonical_json())
-            return await self.suspension_bridge.suspend(invocation, outcome)
+            await self._suspend(invocation, outcome)
         raise ToolException(INVALID_PROVIDER_RESULT)
 
     async def _resolve_outcome(
@@ -330,7 +430,7 @@ class CapabilityTool(BaseTool):
         if outcome.status in {"failed", "denied"}:
             raise ToolException(self._stable_failure(outcome))
         if outcome.status == "suspended":
-            return await self.suspension_bridge.suspend(request, outcome)
+            await self._suspend(request, outcome)
         if outcome.status in {"deferred", "outcome_unknown"}:
             status = await self._status(request)
             return await self._resolve_status(request, status)
@@ -439,14 +539,16 @@ def build_capability_tools(
             CapabilityTool(
                 name=requirement.name,
                 description=descriptor.summary,
-                args_schema=input_schema,
-                requirement=requirement,
-                grant=grant,
-                grant_digest=grant_digest,
+                args_schema=_freeze_json(input_schema),
                 invoker=invoker,
-                session=session,
                 checkpoint_store=checkpoint_store,
                 suspension_bridge=suspension_bridge,
+                authority_snapshot=_CapabilityAuthoritySnapshot(
+                    requirement=requirement,
+                    grant=grant,
+                    grant_digest=grant_digest,
+                    session=session,
+                ),
                 handle_tool_error=True,
             )
         )

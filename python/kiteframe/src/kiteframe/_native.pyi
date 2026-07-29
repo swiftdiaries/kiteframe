@@ -35,6 +35,8 @@ __all__ = [
     "StableCapabilityError",
     "StatusRequest",
     "Suspension",
+    "build_invocation_request_for_requirement",
+    "build_status_request",
     "load_admission_request",
     "load_capability_catalog",
     "load_capability_grant_set",
@@ -564,6 +566,10 @@ class Suspension:
     def evidence_request_ref(self) -> builtins.str: ...
     @property
     def proposal_digest(self) -> builtins.str: ...
+
+def build_invocation_request_for_requirement(*, invocation_id: builtins.str, admission_id: builtins.str, grant_digest: builtins.str, requirement: ResolvedCapabilityRequirement, selected_resource: builtins.str, arguments: typing.Any, preconditions: typing.Any, evidence_refs: typing.Any, traceparent: builtins.str, baggage: typing.Any, idempotency_key: typing.Optional[builtins.str] = None, tracestate: typing.Optional[builtins.str] = None) -> InvocationRequest: ...
+
+def build_status_request(*, invocation_id: builtins.str, traceparent: builtins.str, baggage: typing.Any, tracestate: typing.Optional[builtins.str] = None) -> StatusRequest: ...
 
 def load_admission_request(bytes: builtins.bytes) -> AdmissionRequest: ...
 
