@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence
+from typing import Any
 
 import deepagents
 import pytest
 from deepagents import create_deep_agent
 from kiteframe.registry import ComponentKind, ComponentRegistry
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage, HumanMessage
 
 import kiteframe_deepagents.compatibility as compatibility
 from kiteframe_deepagents.compatibility import (
@@ -39,6 +43,7 @@ EXPECTED_PARAMETERS = (
 )
 
 MODEL_KEY = "kiteframe-test:deny-only"
+CONSTRUCTION_MODEL_KEY = "anthropic:claude-3-5-haiku-latest"
 
 
 def test_pinned_distribution_and_public_signature() -> None:
@@ -156,3 +161,60 @@ def test_bootstrap_rejects_ambiguous_bare_profile_key(
         )
 
     assert registrations == []
+
+
+def test_bootstrapped_model_string_constructs_deny_only_public_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bound_tool_names: list[tuple[str, ...]] = []
+    constructor_model_keys: list[str] = []
+    original_bind_tools = ChatAnthropic.bind_tools
+
+    def recording_bind_tools(
+        model: ChatAnthropic,
+        tools: Sequence[Any],
+        **kwargs: Any,
+    ) -> Any:
+        bound_tool_names.append(tuple(tool.name for tool in tools))
+        return original_bind_tools(model, tools, **kwargs)
+
+    def public_constructor(*, model: str, **kwargs: Any) -> Any:
+        constructor_model_keys.append(model)
+        return create_deep_agent(model=model, **kwargs)
+
+    def local_invoke(*args: Any, **kwargs: Any) -> AIMessage:
+        del args, kwargs
+        return AIMessage(content="done")
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-only-not-a-secret")
+    monkeypatch.setattr(ChatAnthropic, "bind_tools", recording_bind_tools)
+    monkeypatch.setattr(ChatAnthropic, "invoke", local_invoke)
+    registry = ComponentRegistry()
+    registry.register(
+        ComponentKind.MODEL,
+        "models.anthropic.haiku",
+        CONSTRUCTION_MODEL_KEY,
+    )
+    token = bootstrap_deepagents_deployment(
+        registry,
+        model_key=CONSTRUCTION_MODEL_KEY,
+        profile_symbol="profiles.deepagents.construction",
+    )
+    frozen = registry.freeze()
+    model_key = frozen.resolve(
+        ComponentKind.MODEL,
+        "models.anthropic.haiku",
+    )
+    assert isinstance(model_key, str)
+
+    graph = public_constructor(model=model_key, subagents=[])
+    result = graph.invoke({"messages": [HumanMessage(content="hello")]})
+
+    assert graph is not None
+    assert result["messages"][-1].content == "done"
+    assert constructor_model_keys == [CONSTRUCTION_MODEL_KEY]
+    assert constructor_model_keys[0] == model_key == token.model_key
+    assert constructor_model_keys[0].encode() == token.model_key.encode()
+    assert len(bound_tool_names) == 1
+    assert AMBIENT_TOOL_NAMES.isdisjoint(bound_tool_names[0])
+    assert "task" not in bound_tool_names[0]
