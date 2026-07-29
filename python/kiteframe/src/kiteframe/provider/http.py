@@ -428,6 +428,9 @@ class ProviderHttpClient:
                 raise ProviderTransportError("provider not-modified digest mismatch")
             return CatalogFetchResult.not_modified(request)
 
+        if response.status_code != 200:
+            raise ProviderTransportError("provider catalog response must use HTTP 200")
+
         catalog = _load_native_response(load_capability_catalog, response.body)
         if response.etag != catalog.catalog_digest:
             raise ProviderTransportError("provider catalog digest mismatch")

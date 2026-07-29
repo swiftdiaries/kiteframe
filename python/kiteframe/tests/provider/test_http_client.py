@@ -587,13 +587,12 @@ async def test_catalog_rejects_unsolicited_304() -> None:
     )
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
-        with pytest.raises(
-            ProviderTransportError,
-            match="provider returned unsolicited not-modified",
-        ):
+        with pytest.raises(ProviderTransportError) as error:
             await client.catalog(CatalogRequest.default())
     finally:
         await client.aclose()
+
+    assert str(error.value) == "provider returned unsolicited not-modified"
 
 
 @pytest.mark.asyncio
@@ -603,13 +602,25 @@ async def test_catalog_rejects_not_modified_digest_mismatch() -> None:
     )
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
-        with pytest.raises(
-            ProviderTransportError,
-            match="provider not-modified digest mismatch",
-        ):
+        with pytest.raises(ProviderTransportError) as error:
             await client.catalog(catalog_request())
     finally:
         await client.aclose()
+
+    assert str(error.value) == "provider not-modified digest mismatch"
+
+
+@pytest.mark.asyncio
+async def test_catalog_rejects_not_modified_without_an_etag() -> None:
+    transport = httpx.MockTransport(lambda request: httpx.Response(304))
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(ProviderTransportError) as error:
+            await client.catalog(catalog_request())
+    finally:
+        await client.aclose()
+
+    assert str(error.value) == "provider not-modified digest mismatch"
 
 
 @pytest.mark.asyncio
@@ -644,6 +655,28 @@ async def test_catalog_requires_an_etag_matching_the_typed_catalog() -> None:
             await client.catalog(CatalogRequest.default())
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [201, 204, 206])
+async def test_catalog_rejects_success_statuses_other_than_200(
+    status_code: int,
+) -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            status_code,
+            content=capability_catalog_bytes(),
+            headers={"etag": json.loads(capability_catalog_bytes())["catalogDigest"]},
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(ProviderTransportError) as error:
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+    assert str(error.value) == "provider catalog response must use HTTP 200"
 
 
 @pytest.mark.asyncio

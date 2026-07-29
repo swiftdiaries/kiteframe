@@ -973,6 +973,10 @@ impl PyCatalogFetchResult {
     }
 
     #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Literal[\"modified\", \"not_modified\"]",
+        imports = ("typing",)
+    ))]
     pub fn status(&self) -> &'static str {
         match self.inner.as_ref() {
             ContractCatalogFetchResult::Modified { .. } => "modified",
