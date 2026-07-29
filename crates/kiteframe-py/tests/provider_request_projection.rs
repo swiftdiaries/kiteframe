@@ -11,13 +11,14 @@ use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
     AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog, CapabilityDescriptor,
     CapabilityDescriptorParts, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
-    CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CatalogRequest,
+    CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CatalogRequest, CheckpointRef,
     ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
-    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceReferences, ExecutionMode,
-    IdempotencyRequirement, InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus,
-    LockedCapability, NonEmptySet, NormalizedResourceSelector, PolicyRevision, RequestedCapability,
-    RequiredEvidence, ResolvedAgent, ResolvedCapabilityRequirement, ResourceSelectorSchema,
-    SessionRef, Sha256Digest, StatusRequest, TaskRef, Timestamp, TraceContext,
+    EffectProposal, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceKind,
+    EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId, InvocationOutcome,
+    InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet, NormalizedResourceSelector,
+    PolicyRevision, ProtectedEvidenceRequestRef, RequestedCapability, RequiredEvidence,
+    ResolvedAgent, ResolvedCapabilityRequirement, ResourceSelectorSchema, SessionRef, Sha256Digest,
+    StatusRequest, Suspension, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::prelude::*;
@@ -298,7 +299,77 @@ fn correlated_invocation_loaders_reject_another_invocation_id() {
         load_invocation_status_for_request_inner(
             &canonical_json(&status).unwrap(),
             &StatusRequest::new(request.invocation_id().clone(), trace_context()),
+            &request,
             &descriptor(),
+        )
+        .unwrap_err(),
+        ProviderResponseError::Correlation
+    );
+}
+
+#[test]
+fn correlated_invocation_loaders_reject_only_a_changed_proposal_digest() {
+    let request = invocation_request();
+    let descriptor = suspendable_descriptor();
+    let expected = EffectProposal::try_new(&request, &descriptor).unwrap();
+    let status_request = StatusRequest::new(request.invocation_id().clone(), trace_context());
+
+    let suspension = Suspension::try_new(
+        CheckpointRef::new("checkpoint:opaque:1").unwrap(),
+        EvidenceKind::Approval,
+        ProtectedEvidenceRequestRef::new("evidence-request:opaque:1").unwrap(),
+        *expected.proposal_digest(),
+    )
+    .unwrap();
+    let outcome = InvocationOutcome::Suspended {
+        invocation_id: request.invocation_id().clone(),
+        suspension: suspension.clone(),
+    };
+    let status = InvocationStatus::Suspended {
+        invocation_id: request.invocation_id().clone(),
+        suspension,
+    };
+
+    assert!(
+        load_invocation_outcome_for_request_inner(
+            &canonical_json(&outcome).unwrap(),
+            &request,
+            &descriptor,
+        )
+        .is_ok()
+    );
+    assert!(
+        load_invocation_status_for_request_inner(
+            &canonical_json(&status).unwrap(),
+            &status_request,
+            &request,
+            &descriptor,
+        )
+        .is_ok()
+    );
+
+    let mut outcome_wire = serde_json::to_value(outcome).unwrap();
+    outcome_wire["suspension"]["proposalDigest"] =
+        json!(Sha256Digest::from_bytes([99; Sha256Digest::BYTE_LENGTH]));
+    assert_eq!(
+        load_invocation_outcome_for_request_inner(
+            &canonical_json(&outcome_wire).unwrap(),
+            &request,
+            &descriptor,
+        )
+        .unwrap_err(),
+        ProviderResponseError::Correlation
+    );
+
+    let mut status_wire = serde_json::to_value(status).unwrap();
+    status_wire["suspension"]["proposalDigest"] =
+        json!(Sha256Digest::from_bytes([99; Sha256Digest::BYTE_LENGTH]));
+    assert_eq!(
+        load_invocation_status_for_request_inner(
+            &canonical_json(&status_wire).unwrap(),
+            &status_request,
+            &request,
+            &descriptor,
         )
         .unwrap_err(),
         ProviderResponseError::Correlation
@@ -450,6 +521,28 @@ fn grant_set_parts() -> CapabilityGrantSetParts {
 
 fn descriptor() -> CapabilityDescriptor {
     descriptor_with_name("cases.comment")
+}
+
+fn suspendable_descriptor() -> CapabilityDescriptor {
+    CapabilityDescriptor::try_new(CapabilityDescriptorParts {
+        identity: capability_identity(),
+        summary: String::from("Comment on a case"),
+        input_schema: json!({"type": "object"}),
+        output_schema: json!({"type": "object"}),
+        stable_errors: Vec::new(),
+        execution_modes: NonEmptySet::try_new(BTreeSet::from([ExecutionMode::Suspendable]))
+            .unwrap(),
+        resource_selector_schema: ResourceSelectorSchema::try_new(json!({"type": "string"}))
+            .unwrap(),
+        effect: EffectClassification::ReadOnly,
+        idempotency: IdempotencyRequirement::None,
+        freshness: Default::default(),
+        preconditions: Vec::new(),
+        confirmation: ConfirmationRequirement::None,
+        approval: ApprovalRequirement::None,
+        consent: ConsentRequirement::None,
+    })
+    .unwrap()
 }
 
 fn resolved_requirement() -> ResolvedCapabilityRequirement {

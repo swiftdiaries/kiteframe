@@ -1662,11 +1662,12 @@ pub fn load_invocation_outcome_for_request_inner(
 pub fn load_invocation_status_for_request_inner(
     bytes: &[u8],
     request: &ContractStatusRequest,
+    invocation: &ContractInvocationRequest,
     descriptor: &ContractCapabilityDescriptor,
 ) -> Result<ContractInvocationStatus, ProviderResponseError> {
     let response = load_invocation_status_inner(bytes)?;
     response
-        .validate_for_status_request(request, descriptor)
+        .validate_for_status_request(request, invocation, descriptor)
         .map_err(|_| ProviderResponseError::Correlation)?;
     Ok(response)
 }
@@ -1890,11 +1891,13 @@ pub fn load_invocation_status_for_request(
     ))]
     bytes: &[u8],
     request: &PyStatusRequest,
+    invocation: &PyInvocationRequest,
     requirement: &PyResolvedCapabilityRequirement,
 ) -> PyResult<PyInvocationStatus> {
     load_invocation_status_for_request_inner(
         bytes,
         request.inner.as_ref(),
+        invocation.inner.as_ref(),
         requirement.descriptor_inner(),
     )
     .map(PyInvocationStatus::from)

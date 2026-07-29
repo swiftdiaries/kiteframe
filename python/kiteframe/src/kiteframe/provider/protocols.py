@@ -38,6 +38,7 @@ class CapabilityInvoker(Protocol):
     async def status(
         self,
         request: StatusRequest,
+        invocation: InvocationRequest,
         requirement: ResolvedCapabilityRequirement,
     ) -> InvocationStatus: ...
 

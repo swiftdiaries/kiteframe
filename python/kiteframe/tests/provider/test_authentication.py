@@ -93,7 +93,9 @@ async def call_operation(
     elif operation == "invoke":
         await client.invoke(invocation_request())
     else:
-        await client.status(status_request(), runtime_requirement())
+        await client.status(
+            status_request(), invocation_request(), runtime_requirement()
+        )
 
 
 @pytest.mark.asyncio

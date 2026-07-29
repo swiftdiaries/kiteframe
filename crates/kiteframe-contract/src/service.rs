@@ -1807,6 +1807,27 @@ impl JsonSchema for StatusFirstDiagnostic {
     }
 }
 
+fn validate_suspension(
+    suspension: &Suspension,
+    request: &InvocationRequest,
+    descriptor: &CapabilityDescriptor,
+) -> Result<(), Diagnostic> {
+    descriptor.require_mode(crate::ExecutionMode::Suspendable)?;
+    let expected = EffectProposal::try_new(request, descriptor).map_err(|_| {
+        result_invalid(
+            DiagnosticStage::Invoke,
+            "invocation suspension proposal does not match its locked descriptor",
+        )
+    })?;
+    if suspension.proposal_digest() != expected.proposal_digest() {
+        return Err(result_invalid(
+            DiagnosticStage::Invoke,
+            "invocation suspension proposal digest does not match the invocation",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "status", deny_unknown_fields)]
 pub enum InvocationOutcome {
@@ -1881,7 +1902,9 @@ impl InvocationOutcome {
             Self::Succeeded { result, .. } => descriptor.validate_output(result),
             Self::Failed { error, .. } => descriptor.validate_stable_error(error),
             Self::Deferred { .. } => descriptor.require_mode(crate::ExecutionMode::Deferred),
-            Self::Suspended { .. } => descriptor.require_mode(crate::ExecutionMode::Suspendable),
+            Self::Suspended { suspension, .. } => {
+                validate_suspension(suspension, request, descriptor)
+            }
             Self::Denied { diagnostic, .. } => validate_denial_diagnostic(diagnostic),
             Self::OutcomeUnknown { diagnostic, .. } => {
                 validate_status_first(diagnostic.diagnostic()).map_err(|_| {
@@ -2037,7 +2060,9 @@ impl InvocationStatus {
         })?;
         match self {
             Self::Pending { .. } => descriptor.require_mode(crate::ExecutionMode::Deferred),
-            Self::Suspended { .. } => descriptor.require_mode(crate::ExecutionMode::Suspendable),
+            Self::Suspended { suspension, .. } => {
+                validate_suspension(suspension, request, descriptor)
+            }
             Self::Succeeded { result, .. } => descriptor.validate_output(result),
             Self::Failed { error, .. } => descriptor.validate_stable_error(error),
             Self::Denied { diagnostic, .. } => validate_denial_diagnostic(diagnostic),
@@ -2062,21 +2087,12 @@ impl InvocationStatus {
     pub fn validate_for_status_request(
         &self,
         request: &StatusRequest,
+        invocation: &InvocationRequest,
         descriptor: &CapabilityDescriptor,
     ) -> Result<(), Diagnostic> {
         validate_response_invocation_id(self.invocation_id(), request.invocation_id())?;
-        match self {
-            Self::Pending { .. } => descriptor.require_mode(crate::ExecutionMode::Deferred),
-            Self::Suspended { .. } => descriptor.require_mode(crate::ExecutionMode::Suspendable),
-            Self::Succeeded { result, .. } => descriptor.validate_output(result),
-            Self::Failed { error, .. } => descriptor.validate_stable_error(error),
-            Self::Denied { diagnostic, .. } => validate_denial_diagnostic(diagnostic),
-            Self::OutcomeUnknown { diagnostic, .. } => {
-                validate_status_first(diagnostic.diagnostic()).map_err(|_| {
-                    result_invalid(DiagnosticStage::Invoke, "invalid status-first error")
-                })
-            }
-        }
+        validate_response_invocation_id(request.invocation_id(), invocation.invocation_id())?;
+        self.validate_against(invocation, descriptor)
     }
 }
 

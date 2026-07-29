@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import shutil
 from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
@@ -13,7 +14,9 @@ from kiteframe import (
     KiteframeDiagnosticError,
     load_admission_request,
     load_catalog_request,
+    load_invocation_outcome_for_request,
     load_invocation_request,
+    load_invocation_status_for_request,
     load_resolved_agent,
     load_status_request,
     provider,
@@ -23,6 +26,7 @@ from kiteframe._native import (
     CapabilityGrantSet,
     CatalogFetchResult,
     InvocationOutcome,
+    InvocationRequest,
     InvocationStatus,
     ResolvedCapabilityRequirement,
     ResolvedRuntimeInputs,
@@ -444,6 +448,98 @@ def runtime_requirement() -> ResolvedCapabilityRequirement:
     return resolved_runtime_inputs().resolved_agent.capability_requirements[0]
 
 
+def suspendable_runtime_inputs(tmp_path: Path) -> ResolvedRuntimeInputs:
+    workspace = Path(__file__).resolve().parents[4]
+    source = workspace / "tests/fixtures/packages/support-agent"
+    package = tmp_path / "support-agent"
+    shutil.copytree(source, package)
+
+    lock_path = package / "capability.lock"
+    lock = json.loads(lock_path.read_bytes())
+    descriptor = lock["capabilities"][0]["descriptor"]
+    descriptor["executionModes"] = ["immediate", "suspendable"]
+    digest_input = {
+        key: value
+        for key, value in descriptor.items()
+        if key != "descriptorDigest"
+    }
+    descriptor_digest = hashlib.sha256(canonical_bytes(digest_input)).hexdigest()
+    descriptor["descriptorDigest"] = descriptor_digest
+    lock["capabilities"][0]["descriptorDigest"] = descriptor_digest
+    safety = {
+        key: descriptor[key]
+        for key in (
+            "executionModes",
+            "resourceSelectorSchema",
+            "effect",
+            "idempotency",
+            "freshness",
+            "preconditions",
+            "confirmation",
+            "approval",
+            "consent",
+        )
+    }
+    safety_hasher = hashlib.sha256()
+    safety_hasher.update(b"kiteframe.dev/capability-descriptor/safety-metadata\0")
+    safety_hasher.update(canonical_bytes(safety))
+    lock["capabilities"][0]["safetyMetadataDigest"] = safety_hasher.hexdigest()
+    lock_material = {key: value for key, value in lock.items() if key != "lockDigest"}
+    lock["lockDigest"] = hashlib.sha256(canonical_bytes(lock_material)).hexdigest()
+    lock_path.write_bytes(canonical_bytes(lock))
+
+    return resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        workspace / "tests/fixtures/components/deepagents-test.json",
+    )
+
+
+def expected_proposal_digest(
+    request: InvocationRequest,
+    effect: str = "read_only",
+) -> str:
+    arguments_hasher = hashlib.sha256()
+    arguments_hasher.update(b"kiteframe:effect-arguments:v1\0")
+    arguments_hasher.update(canonical_bytes(request.arguments))
+    preconditions_hasher = hashlib.sha256()
+    preconditions_hasher.update(b"kiteframe:effect-preconditions:v1\0")
+    preconditions_hasher.update(canonical_bytes(request.preconditions))
+    proposal = {
+        "admissionId": request.admission_id,
+        "argumentsDigest": arguments_hasher.hexdigest(),
+        "capability": {
+            "name": request.capability_name,
+            "version": request.capability_version,
+        },
+        "effect": effect,
+        "grantDigest": request.grant_digest,
+        "idempotencyKey": request.idempotency_key,
+        "invocationId": request.invocation_id,
+        "preconditionsDigest": preconditions_hasher.hexdigest(),
+        "selectedResource": request.selected_resource,
+    }
+    proposal_hasher = hashlib.sha256()
+    proposal_hasher.update(b"kiteframe:effect-proposal:v1\0")
+    proposal_hasher.update(canonical_bytes(proposal))
+    return proposal_hasher.hexdigest()
+
+
+def suspended_response(proposal_digest: str) -> bytes:
+    return canonical_bytes(
+        {
+            "invocation_id": "inv-1",
+            "status": "suspended",
+            "suspension": {
+                "checkpointRef": "checkpoint:opaque:1",
+                "evidenceKind": "approval",
+                "evidenceRequestRef": "evidence-request:opaque:1",
+                "proposalDigest": proposal_digest,
+            },
+        }
+    )
+
+
 def ProviderHttpClient(  # noqa: N802
     base_url: str,
     *,
@@ -530,7 +626,9 @@ async def test_invoke_and_status_validate_with_the_indexed_locked_descriptor() -
     )
     try:
         outcome = await client.invoke(invocation_request())
-        status = await client.status(status_request(), runtime_requirement())
+        status = await client.status(
+            status_request(), invocation_request(), runtime_requirement()
+        )
     finally:
         await client.aclose()
 
@@ -566,7 +664,7 @@ async def test_status_rejects_changed_retained_digest_before_transport() -> None
     )
     try:
         with pytest.raises(ValueError, match="resolved runtime inputs"):
-            await client.status(status_request(), changed)
+            await client.status(status_request(), invocation_request(), changed)
     finally:
         await client.aclose()
 
@@ -605,6 +703,94 @@ async def test_invoke_rejects_responses_outside_the_locked_descriptor(
         await client.aclose()
 
     assert error.value.code == "KF-CAP-002"
+
+
+def test_correlated_loaders_reject_only_a_changed_proposal_digest(
+    tmp_path: Path,
+) -> None:
+    inputs = suspendable_runtime_inputs(tmp_path)
+    requirement = inputs.resolved_agent.capability_requirements[0]
+    invocation = invocation_request()
+    expected = expected_proposal_digest(invocation)
+    status = status_request()
+
+    outcome = load_invocation_outcome_for_request(
+        suspended_response(expected),
+        invocation,
+        requirement,
+    )
+    outcome_suspension = outcome.suspension
+    assert outcome_suspension is not None
+    assert outcome_suspension.proposal_digest == expected
+    invocation_status = load_invocation_status_for_request(
+        suspended_response(expected),
+        status,
+        invocation,
+        requirement,
+    )
+    status_suspension = invocation_status.suspension
+    assert status_suspension is not None
+    assert status_suspension.proposal_digest == expected
+
+    changed = "ff" * 32
+    with pytest.raises(KiteframeDiagnosticError) as outcome_error:
+        load_invocation_outcome_for_request(
+            suspended_response(changed),
+            invocation,
+            requirement,
+        )
+    with pytest.raises(KiteframeDiagnosticError) as status_error:
+        load_invocation_status_for_request(
+            suspended_response(changed),
+            status,
+            invocation,
+            requirement,
+        )
+    assert outcome_error.value.code == "KF-CAP-002"
+    assert status_error.value.code == "KF-CAP-002"
+
+
+@pytest.mark.asyncio
+async def test_provider_rejects_changed_proposal_digest_before_delivery(
+    tmp_path: Path,
+) -> None:
+    inputs = suspendable_runtime_inputs(tmp_path)
+    requirement = inputs.resolved_agent.capability_requirements[0]
+    invocation = invocation_request()
+    status = status_request()
+    expected = expected_proposal_digest(invocation)
+
+    def valid_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=suspended_response(expected))
+
+    async with NativeProviderHttpClient(
+        "https://provider.test",
+        resolved_runtime_inputs=inputs,
+        transport=httpx.MockTransport(valid_handler),
+    ) as client:
+        outcome_suspension = (await client.invoke(invocation)).suspension
+        assert outcome_suspension is not None
+        assert outcome_suspension.proposal_digest == expected
+        status_suspension = (
+            await client.status(status, invocation, requirement)
+        ).suspension
+        assert status_suspension is not None
+        assert status_suspension.proposal_digest == expected
+
+    def changed_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=suspended_response("ff" * 32))
+
+    async with NativeProviderHttpClient(
+        "https://provider.test",
+        resolved_runtime_inputs=inputs,
+        transport=httpx.MockTransport(changed_handler),
+    ) as client:
+        with pytest.raises(KiteframeDiagnosticError) as outcome_error:
+            await client.invoke(invocation)
+        with pytest.raises(KiteframeDiagnosticError) as status_error:
+            await client.status(status, invocation, requirement)
+    assert outcome_error.value.code == "KF-CAP-002"
+    assert status_error.value.code == "KF-CAP-002"
 
 
 @pytest.mark.asyncio
@@ -650,7 +836,9 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
         catalog = await client.catalog(catalog_request())
         grant_set = await client.admit(admission_request())
         outcome = await client.invoke(invocation_request())
-        status = await client.status(status_request(), runtime_requirement())
+        status = await client.status(
+            status_request(), invocation_request(), runtime_requirement()
+        )
     finally:
         await client.aclose()
 
@@ -910,7 +1098,9 @@ async def test_status_rejects_a_valid_status_for_another_invocation() -> None:
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(KiteframeDiagnosticError) as error:
-            await client.status(status_request(), runtime_requirement())
+            await client.status(
+                status_request(), invocation_request(), runtime_requirement()
+            )
     finally:
         await client.aclose()
 
@@ -1298,7 +1488,7 @@ async def test_status_rejects_path_normalizing_dot_segments(
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(ValueError, match="invocation ID"):
-            await client.status(request, runtime_requirement())
+            await client.status(request, invocation_request(), runtime_requirement())
     finally:
         await client.aclose()
 
@@ -1314,7 +1504,11 @@ async def test_status_requires_a_native_status_request(
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(TypeError, match="native StatusRequest"):
-            await client.status(candidate, runtime_requirement())  # type: ignore[arg-type]
+            await client.status(
+                candidate,  # type: ignore[arg-type]
+                invocation_request(),
+                runtime_requirement(),
+            )
     finally:
         await client.aclose()
 

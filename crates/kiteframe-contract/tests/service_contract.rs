@@ -661,6 +661,52 @@ fn deferred_and_suspended_variants_require_their_locked_execution_modes() {
 }
 
 #[test]
+fn suspended_outcome_rejects_a_proposal_digest_from_another_invocation() {
+    let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Suspendable]));
+    let request = invocation_request(None);
+    let suspension = Suspension::try_new(
+        CheckpointRef::new("checkpoint:opaque:1").unwrap(),
+        EvidenceKind::Approval,
+        ProtectedEvidenceRequestRef::new("evidence-request:opaque:1").unwrap(),
+        digest(99),
+    )
+    .unwrap();
+    let outcome = InvocationOutcome::Suspended {
+        invocation_id: request.invocation_id().clone(),
+        suspension,
+    };
+
+    let diagnostic = outcome.validate_against(&request, &descriptor).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "KF-CAP-002");
+}
+
+#[test]
+fn suspended_status_rejects_a_proposal_digest_from_another_invocation() {
+    let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Suspendable]));
+    let request = invocation_request(None);
+    let suspension = Suspension::try_new(
+        CheckpointRef::new("checkpoint:opaque:1").unwrap(),
+        EvidenceKind::Approval,
+        ProtectedEvidenceRequestRef::new("evidence-request:opaque:1").unwrap(),
+        digest(99),
+    )
+    .unwrap();
+    let status = InvocationStatus::Suspended {
+        invocation_id: request.invocation_id().clone(),
+        suspension,
+    };
+
+    let diagnostic = status.validate_against(&request, &descriptor).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "KF-CAP-002");
+
+    let status_request = StatusRequest::new(request.invocation_id().clone(), trace_context());
+    let diagnostic = status
+        .validate_for_status_request(&status_request, &request, &descriptor)
+        .unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "KF-CAP-002");
+}
+
+#[test]
 fn terminal_status_is_validated_against_the_locked_descriptor() {
     let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Immediate]));
     let request = invocation_request(None);

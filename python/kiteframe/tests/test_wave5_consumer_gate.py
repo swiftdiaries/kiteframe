@@ -263,6 +263,7 @@ def test_invocation_outcome_must_match_the_embedded_lock(
                 }
             ),
             status_request,
+            request,
             requirement,
         )
 
@@ -299,7 +300,10 @@ class StaticAuthenticator:
 async def test_status_propagates_native_trace_and_credentials_only_in_allowed_header(
 ) -> None:
     profile = load_profile()
-    request = load_status_request(canonical_bytes(profile["statusRequest"]))
+    invocation = load_invocation_request(support_invocation_bytes())
+    status_wire = dict(profile["statusRequest"])
+    status_wire["invocationId"] = invocation.invocation_id
+    request = load_status_request(canonical_bytes(status_wire))
     inputs = support_runtime_inputs()
     requirement = inputs.resolved_agent.capability_requirements[0]
     captured: list[httpx.Request] = []
@@ -327,7 +331,7 @@ async def test_status_propagates_native_trace_and_credentials_only_in_allowed_he
             {"kiteframe.request_id", "kiteframe.session_id"}
         ),
     ) as client:
-        result = await client.status(request, requirement)
+        result = await client.status(request, invocation, requirement)
 
     assert result.status == "succeeded"
     sent = captured[0]

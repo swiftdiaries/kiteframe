@@ -4,11 +4,16 @@ from pathlib import Path
 import pytest
 
 from kiteframe import (
+    CapabilityDescriptor,
+    ComponentDescriptor,
     KiteframeDiagnosticError,
     ResolvedAgent,
     ResolvedCapabilityRequirement,
+    ResolvedModelRequirement,
     ResolvedRuntimeInputs,
     ResolvedSubagent,
+    ResolvedTextAsset,
+    RuntimeBinding,
     load_resolved_agent,
     resolve_package,
 )
@@ -109,6 +114,74 @@ def test_runtime_inputs_are_not_constructible_or_mutable(workspace: Path) -> Non
     )
     with pytest.raises(AttributeError):
         inputs.runtime_target = "forged"  # type: ignore[misc]
+
+
+def test_new_child_projections_are_nonconstructible_and_frozen(
+    workspace: Path,
+) -> None:
+    package = workspace / "tests/fixtures/packages/support-agent"
+    inputs = resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        workspace / "tests/fixtures/components/deepagents-test.json",
+    )
+    resolved = inputs.resolved_agent
+    children = (
+        (inputs.runtime_binding, RuntimeBinding, "runtime"),
+        (inputs.target_components[0], ComponentDescriptor, "symbol"),
+        (resolved.prompts[0], ResolvedTextAsset, "path"),
+        (resolved.model_requirements[0], ResolvedModelRequirement, "role"),
+        (
+            resolved.capability_requirements[0],
+            ResolvedCapabilityRequirement,
+            "required",
+        ),
+        (
+            resolved.capability_requirements[0].descriptor,
+            CapabilityDescriptor,
+            "summary",
+        ),
+    )
+
+    for value, projection, attribute in children:
+        assert isinstance(value, projection)
+        assert not hasattr(value, "__dict__")
+        with pytest.raises(TypeError):
+            projection()
+        with pytest.raises(AttributeError):
+            setattr(value, attribute, "forged")
+
+
+def test_new_projection_collections_are_immutable_tuples(workspace: Path) -> None:
+    package = workspace / "tests/fixtures/packages/support-agent"
+    inputs = resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        workspace / "tests/fixtures/components/deepagents-test.json",
+    )
+    resolved = inputs.resolved_agent
+    descriptor = resolved.capability_requirements[0].descriptor
+    collections = (
+        inputs.target_components,
+        inputs.runtime_binding.model_symbols,
+        inputs.runtime_binding.middleware_symbols,
+        resolved.prompts,
+        resolved.skills,
+        resolved.model_requirements,
+        resolved.capability_requirements,
+        resolved.subagents,
+        resolved.required_features,
+        resolved.optional_features,
+        resolved.capability_requirements[0].resources,
+        descriptor.stable_errors,
+        descriptor.execution_modes,
+        descriptor.preconditions,
+    )
+
+    for collection in collections:
+        assert isinstance(collection, tuple)
+        with pytest.raises(AttributeError):
+            collection.append("forged")  # type: ignore[attr-defined]
 
 
 def test_resolver_diagnostics_are_exposed_as_redacted_json(

@@ -518,15 +518,24 @@ class ProviderHttpClient:
     async def status(
         self,
         request: StatusRequest,
+        invocation: InvocationRequest,
         requirement: ResolvedCapabilityRequirement,
     ) -> InvocationStatus:
         if not isinstance(request, StatusRequest):
             raise TypeError("status request must be a native StatusRequest")
+        if not isinstance(invocation, InvocationRequest):
+            raise TypeError(
+                "status invocation must be the original native InvocationRequest"
+            )
         # Native validation owns the nonblank invariant. The adapter additionally
         # rejects RFC 3986 dot segments that HTTPX would normalize outside the
         # fixed invocation route.
         if request.invocation_id in {".", ".."}:
             raise ValueError("invocation ID cannot be an HTTP path dot segment")
+        if request.invocation_id != invocation.invocation_id:
+            raise ValueError(
+                "status request does not match the original invocation request"
+            )
         if not isinstance(requirement, ResolvedCapabilityRequirement):
             raise TypeError(
                 "status requirement must be a native ResolvedCapabilityRequirement"
@@ -552,6 +561,7 @@ class ProviderHttpClient:
             load_invocation_status_for_request,
             response.body,
             request,
+            invocation,
             indexed,
         )
 

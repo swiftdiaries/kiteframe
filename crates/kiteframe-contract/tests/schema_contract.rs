@@ -165,6 +165,27 @@ fn wave3r_portable_schemas_have_no_platform_or_deployment_specific_fields() {
 }
 
 #[test]
+fn resolved_requirement_schema_keeps_nonempty_resources_and_typed_lock_digests() {
+    let schema = serde_json::to_value(schemars::schema_for!(ResolvedAgent)).unwrap();
+    let requirement = &schema["$defs"]["ResolvedCapabilityRequirement"]["properties"];
+    assert_eq!(requirement["resources"]["minItems"], 1);
+
+    let locked = &schema["$defs"]["LockedCapability"]["properties"];
+    for property in [
+        "descriptorDigest",
+        "inputSchemaDigest",
+        "outputSchemaDigest",
+        "stableErrorSetDigest",
+        "safetyMetadataDigest",
+    ] {
+        assert_eq!(
+            locked[property]["$ref"], "#/$defs/Sha256Digest",
+            "{property} must retain the shared SHA-256 digest schema"
+        );
+    }
+}
+
+#[test]
 fn typed_binding_structurally_rejects_capability_and_delegation_injection() {
     let binding = r#"
 apiVersion: kiteframe.dev/binding/v1alpha1
