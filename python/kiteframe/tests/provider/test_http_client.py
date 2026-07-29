@@ -18,8 +18,8 @@ from kiteframe import (
     resolve_package,
 )
 from kiteframe._native import (
-    CatalogFetchResult,
     CapabilityGrantSet,
+    CatalogFetchResult,
     InvocationOutcome,
     InvocationStatus,
     ResolvedCapabilityRequirement,
@@ -351,7 +351,7 @@ def ProviderHttpClient(  # noqa: N802
 ) -> NativeProviderHttpClient:
     return NativeProviderHttpClient(
         base_url,
-        resolved_runtime_inputs(),
+        resolved_runtime_inputs=resolved_runtime_inputs(),
         transport=transport,
         baggage_allowlist=baggage_allowlist,
     )
@@ -364,7 +364,7 @@ def test_client_requires_frozen_resolved_runtime_inputs() -> None:
     with pytest.raises(TypeError, match="ResolvedRuntimeInputs"):
         NativeProviderHttpClient(
             "https://provider.test",
-            object(),  # type: ignore[arg-type]
+            resolved_runtime_inputs=object(),  # type: ignore[arg-type]
         )
 
 
@@ -1130,7 +1130,9 @@ async def test_mock_transport_may_use_plaintext_without_network_io() -> None:
             lambda request: httpx.Response(
                 200,
                 content=capability_catalog_bytes(),
-                headers={"etag": json.loads(capability_catalog_bytes())["catalogDigest"]},
+                headers={
+                    "etag": json.loads(capability_catalog_bytes())["catalogDigest"]
+                },
             )
         ),
     )

@@ -1,5 +1,10 @@
 """Adapter-facing provider protocols and strict HTTP transport."""
 
+from .auth import (
+    ProviderAuthenticator,
+    ProviderAuthRequest,
+    ProviderOperation,
+)
 from .http import (
     PROVIDER_RESPONSE_LIMIT_BYTES,
     ProviderHttpClient,
@@ -19,6 +24,9 @@ __all__ = [
     "CapabilityInvoker",
     "CatalogProvider",
     "ProviderHttpClient",
+    "ProviderAuthRequest",
+    "ProviderAuthenticator",
+    "ProviderOperation",
     "ProviderTransportError",
     "require_https",
     "trace_headers",

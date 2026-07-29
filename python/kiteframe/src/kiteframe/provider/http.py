@@ -1,10 +1,11 @@
 """Strict async client for the Kiteframe V1 capability provider profile."""
 
 import json
+import ssl
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Concatenate, ParamSpec, Self, TypeVar
+from typing import Any, Concatenate, Literal, ParamSpec, Self, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -27,6 +28,13 @@ from kiteframe._native import (
     load_invocation_status_for_request,
 )
 
+from .auth import (
+    ProviderAuthenticator,
+    ProviderAuthRequest,
+    ProviderOperation,
+    normalize_credential_header_allowlist,
+    normalize_credential_headers,
+)
 from .trace import trace_headers
 
 PROVIDER_RESPONSE_LIMIT_BYTES = 1_048_576
@@ -346,8 +354,11 @@ class ProviderHttpClient:
     def __init__(
         self,
         base_url: str,
-        resolved_runtime_inputs: ResolvedRuntimeInputs,
         *,
+        resolved_runtime_inputs: ResolvedRuntimeInputs,
+        authenticator: ProviderAuthenticator | None = None,
+        credential_header_allowlist: frozenset[str] = frozenset(),
+        tls_context: ssl.SSLContext | None = None,
         transport: httpx.MockTransport | None = None,
         baggage_allowlist: frozenset[str] = frozenset(),
     ) -> None:
@@ -355,6 +366,8 @@ class ProviderHttpClient:
             raise TypeError(
                 "resolved_runtime_inputs must be native ResolvedRuntimeInputs"
             )
+        if tls_context is not None and not isinstance(tls_context, ssl.SSLContext):
+            raise TypeError("tls_context must be an ssl.SSLContext")
         if transport is not None and not isinstance(
             transport,
             httpx.MockTransport,
@@ -364,14 +377,25 @@ class ProviderHttpClient:
             base_url,
             allow_mock=transport is not None,
         )
+        if authenticator is not None and not credential_header_allowlist:
+            raise ValueError(
+                "an authenticator requires an explicit credential header allowlist"
+            )
+        normalized_credential_allowlist = normalize_credential_header_allowlist(
+            credential_header_allowlist
+        )
         self._client = httpx.AsyncClient(
             base_url=base_url,
             follow_redirects=False,
-            verify=True,
+            verify=tls_context if tls_context is not None else True,
             transport=transport,
             timeout=httpx.Timeout(10.0),
             trust_env=False,
         )
+        parsed_url = httpx.URL(base_url)
+        self._origin = f"{parsed_url.scheme}://{parsed_url.netloc.decode('ascii')}"
+        self._authenticator = authenticator
+        self._credential_header_allowlist = normalized_credential_allowlist
         self._baggage_allowlist = frozenset(baggage_allowlist)
         requirements: dict[
             tuple[str, str],
@@ -412,6 +436,7 @@ class ProviderHttpClient:
         if request.known_catalog_digest is not None:
             headers["if-none-match"] = f'"{request.known_catalog_digest}"'
         response = await self._request(
+            "catalog",
             "GET",
             "/v1/capability-catalog",
             headers=headers,
@@ -419,7 +444,9 @@ class ProviderHttpClient:
         )
         if response.status_code == 304:
             if request.known_catalog_digest is None:
-                raise ProviderTransportError("provider returned unsolicited not-modified")
+                raise ProviderTransportError(
+                    "provider returned unsolicited not-modified"
+                )
             if response.body:
                 raise ProviderTransportError(
                     "provider returned a non-empty not-modified response"
@@ -443,6 +470,7 @@ class ProviderHttpClient:
         if not isinstance(request, AdmissionRequest):
             raise TypeError("admission request must be a native AdmissionRequest")
         response = await self._request(
+            "admit",
             "POST",
             "/v1/capability-admissions",
             headers=_request_headers(
@@ -471,6 +499,7 @@ class ProviderHttpClient:
             )
         name = quote(request.capability_name, safe=".")
         response = await self._request(
+            "invoke",
             "POST",
             f"/v1/capability-invocations/{name}",
             headers=_request_headers(
@@ -511,6 +540,7 @@ class ProviderHttpClient:
             )
         encoded_invocation_id = quote(request.invocation_id, safe="")
         response = await self._request(
+            "status",
             "GET",
             f"/v1/capability-invocations/{encoded_invocation_id}",
             headers=_request_headers(
@@ -527,7 +557,8 @@ class ProviderHttpClient:
 
     async def _request(
         self,
-        method: str,
+        operation: ProviderOperation,
+        method: Literal["GET", "POST"],
         route: str,
         *,
         headers: Mapping[str, str] | None = None,
@@ -545,24 +576,65 @@ class ProviderHttpClient:
         status_code: int | None = None
         etag: str | None = None
         failure_message: str | None = None
+        authentication_failed = False
+        invalid_credential_headers = False
+        returned_credential_headers: Mapping[str, str] = {}
+        credential_headers: Mapping[str, str] = {}
         response: httpx.Response | None = None
         try:
-            async with self._client.stream(
-                method,
-                route,
-                headers=request_headers,
-                content=content,
-            ) as response:
-                status_code = response.status_code
-                etag = response.headers.get("etag")
-                if not 300 <= status_code < 400 or status_code == 304:
-                    body = await _bounded_body(response)
-        except httpx.HTTPError:
-            failure_message = "provider request failed"
-        except ProviderTransportError as error:
-            failure_message = str(error)
+            if self._authenticator is not None:
+                auth_request = ProviderAuthRequest(
+                    operation=operation,
+                    method=method,
+                    origin=self._origin,
+                    route=route,
+                )
+                try:
+                    returned_credential_headers = (
+                        await self._authenticator.credential_headers(auth_request)
+                    )
+                except Exception:
+                    authentication_failed = True
+                if not authentication_failed:
+                    try:
+                        credential_headers = normalize_credential_headers(
+                            returned_credential_headers,
+                            allowlist=self._credential_header_allowlist,
+                        )
+                    except Exception:
+                        invalid_credential_headers = True
+                request_headers.update(credential_headers)
+            if not authentication_failed and not invalid_credential_headers:
+                try:
+                    async with self._client.stream(
+                        method,
+                        route,
+                        headers=request_headers,
+                        content=content,
+                    ) as response:
+                        status_code = response.status_code
+                        etag = response.headers.get("etag")
+                        if not 300 <= status_code < 400 or status_code == 304:
+                            body = await _bounded_body(response)
+                except httpx.HTTPError:
+                    failure_message = "provider request failed"
+                except ProviderTransportError as error:
+                    failure_message = str(error)
+        finally:
+            for credential_header_name in credential_headers:
+                request_headers.pop(credential_header_name, None)
+            returned_credential_headers = {}
+            credential_headers = {}
         response = None
 
+        if authentication_failed:
+            body = b""
+            content = None
+            raise ProviderTransportError("provider authentication failed")
+        if invalid_credential_headers:
+            body = b""
+            content = None
+            raise ValueError("credential header value or name is invalid")
         if failure_message is not None:
             body = b""
             content = None

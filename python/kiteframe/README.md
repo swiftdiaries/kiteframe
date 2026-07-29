@@ -62,7 +62,10 @@ catalog_request = CatalogRequest.default()
 admission_request = load_admission_request(canonical_admission_json)
 invocation_request = load_invocation_request(canonical_invocation_json)
 
-async with ProviderHttpClient("https://provider.example") as client:
+async with ProviderHttpClient(
+    "https://provider.example",
+    resolved_runtime_inputs=resolved_runtime_inputs,
+) as client:
     catalog = await client.catalog(catalog_request)
     grants = await client.admit(admission_request)
     outcome = await client.invoke(invocation_request)
@@ -75,6 +78,35 @@ response bodies, filters baggage, and parses every successful response
 through its native locked-schema loader. The V1 status lookup accepts only an
 invocation ID and therefore does not infer or reuse ambient caller trace
 state.
+
+Provider credentials remain deployment-owned Python values. Configure an
+authenticator with an explicit credential-header allowlist; it is called
+immediately before every catalog, admission, invocation, and status request.
+Credential headers cannot control request framing, trace context, baggage,
+cookies, or proxy headers, and they never enter canonical request bodies or
+provider diagnostics.
+
+Deployment code may also construct an `ssl.SSLContext` with its client
+certificate and key, then pass only that context to the provider client:
+
+```python
+import ssl
+
+tls_context = ssl.create_default_context()
+tls_context.load_cert_chain(
+    certfile=deployment_client_certificate_path,
+    keyfile=deployment_client_key_path,
+)
+client = ProviderHttpClient(
+    provider_origin,
+    resolved_runtime_inputs=resolved_runtime_inputs,
+    tls_context=tls_context,
+)
+```
+
+Kiteframe does not serialize, inspect, or log certificate paths, key paths,
+passwords, or credentials. Mock transports are test-only and do not prove
+mutual TLS.
 
 ## Resolve an agent package
 
