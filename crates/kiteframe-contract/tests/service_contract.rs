@@ -357,25 +357,95 @@ fn grant_set_validation_rejects_unrequested_or_broader_grants() {
 #[test]
 fn invocation_outcome_validation_rejects_a_different_invocation() {
     let request = invocation_request(None);
+    let descriptor = read_only_descriptor();
     let outcome = InvocationOutcome::Succeeded {
         invocation_id: InvocationId::new("inv-other").unwrap(),
         result: json!({"ok": true}),
     };
 
-    let error = outcome.validate_against(&request).unwrap_err();
+    let error = outcome.validate_against(&request, &descriptor).unwrap_err();
     assert_eq!(error.code.as_str(), "KF-CAP-002");
 }
 
 #[test]
 fn invocation_status_validation_rejects_a_different_invocation() {
+    let request = invocation_request(None);
+    let descriptor = read_only_descriptor();
     let status = InvocationStatus::Pending {
         invocation_id: InvocationId::new("inv-other").unwrap(),
     };
 
-    let error = status
-        .validate_invocation_id(&InvocationId::new("inv-1").unwrap())
-        .unwrap_err();
+    let error = status.validate_against(&request, &descriptor).unwrap_err();
     assert_eq!(error.code.as_str(), "KF-CAP-002");
+}
+
+#[test]
+fn succeeded_result_must_match_the_locked_output_schema() {
+    let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Immediate]));
+    let request = invocation_request(None);
+    let outcome = InvocationOutcome::Succeeded {
+        invocation_id: request.invocation_id().clone(),
+        result: json!({"unexpected": true}),
+    };
+
+    let diagnostic = outcome.validate_against(&request, &descriptor).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "KF-CAP-002");
+}
+
+#[test]
+fn failed_error_must_be_declared_by_the_locked_descriptor() {
+    let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Immediate]));
+    let request = invocation_request(None);
+    let outcome = InvocationOutcome::Failed {
+        invocation_id: request.invocation_id().clone(),
+        error: stable_error("PROVIDER_NATIVE_500"),
+    };
+
+    let diagnostic = outcome.validate_against(&request, &descriptor).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "KF-CAP-002");
+}
+
+#[test]
+fn deferred_and_suspended_variants_require_their_locked_execution_modes() {
+    let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Immediate]));
+    let request = invocation_request(None);
+    let deferred = InvocationOutcome::Deferred {
+        invocation_id: request.invocation_id().clone(),
+    };
+    let suspended = InvocationOutcome::Suspended {
+        invocation_id: request.invocation_id().clone(),
+        suspension: Suspension::try_new("checkpoint://case-1").unwrap(),
+    };
+
+    assert_eq!(
+        deferred
+            .validate_against(&request, &descriptor)
+            .unwrap_err()
+            .code
+            .as_str(),
+        "KF-CAP-002"
+    );
+    assert_eq!(
+        suspended
+            .validate_against(&request, &descriptor)
+            .unwrap_err()
+            .code
+            .as_str(),
+        "KF-CAP-002"
+    );
+}
+
+#[test]
+fn terminal_status_is_validated_against_the_locked_descriptor() {
+    let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Immediate]));
+    let request = invocation_request(None);
+    let status = InvocationStatus::Succeeded {
+        invocation_id: request.invocation_id().clone(),
+        result: json!({"unexpected": true}),
+    };
+
+    let diagnostic = status.validate_against(&request, &descriptor).unwrap_err();
+    assert_eq!(diagnostic.code.as_str(), "KF-CAP-002");
 }
 
 #[test]
@@ -511,6 +581,53 @@ fn descriptor(
         consent: ConsentRequirement::None,
     })
     .unwrap()
+}
+
+fn response_descriptor(execution_modes: BTreeSet<ExecutionMode>) -> CapabilityDescriptor {
+    CapabilityDescriptor::try_new(CapabilityDescriptorParts {
+        identity: capability_identity(),
+        summary: String::from("Operate on a case"),
+        input_schema: json!({
+            "type": "object",
+            "required": ["caseId"],
+            "properties": {"caseId": {"type": "string"}},
+            "additionalProperties": false
+        }),
+        output_schema: json!({
+            "type": "object",
+            "required": ["accepted", "caseId"],
+            "properties": {
+                "accepted": {"type": "boolean"},
+                "caseId": {"type": "string"}
+            },
+            "additionalProperties": false
+        }),
+        stable_errors: vec![
+            kiteframe_contract::CapabilityErrorDescriptor::try_new(
+                "CASE_CONFLICT",
+                "conflict",
+                "after_refresh",
+                "case changed",
+            )
+            .unwrap(),
+        ],
+        execution_modes: NonEmptySet::try_new(execution_modes).unwrap(),
+        resource_selector_schema: ResourceSelectorSchema::try_new(json!({"type": "string"}))
+            .unwrap(),
+        effect: EffectClassification::ReadOnly,
+        idempotency: IdempotencyRequirement::None,
+        freshness: Default::default(),
+        preconditions: Vec::new(),
+        confirmation: ConfirmationRequirement::None,
+        approval: ApprovalRequirement::None,
+        consent: ConsentRequirement::None,
+    })
+    .unwrap()
+}
+
+fn stable_error(code: &str) -> StableCapabilityError {
+    StableCapabilityError::try_new(code, "conflict", RetryClass::AfterRefresh, "case changed")
+        .unwrap()
 }
 
 fn capability_identity() -> CapabilityIdentity {

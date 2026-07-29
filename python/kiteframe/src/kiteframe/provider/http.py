@@ -16,6 +16,8 @@ from kiteframe._native import (
     InvocationRequest,
     InvocationStatus,
     KiteframeDiagnosticError,
+    ResolvedCapabilityRequirement,
+    ResolvedRuntimeInputs,
     load_capability_catalog,
     load_capability_grant_set_for_request,
     load_invocation_outcome_for_request,
@@ -157,12 +159,10 @@ def _request_headers(
     *,
     baggage_allowlist: frozenset[str],
 ) -> dict[str, str]:
-    wire = json.loads(request.canonical_json())
-    context = wire["traceContext"]
     return trace_headers(
         traceparent=request.traceparent,
         tracestate=request.tracestate,
-        baggage=context.get("baggage", {}),
+        baggage=request.baggage,
         baggage_allowlist=baggage_allowlist,
     )
 
@@ -318,16 +318,33 @@ def _diagnostic_error(
         body = b""
 
 
+def _requirement_digests(
+    requirement: ResolvedCapabilityRequirement,
+) -> tuple[str, str, str, str, str]:
+    return (
+        requirement.descriptor_digest,
+        requirement.input_schema_digest,
+        requirement.output_schema_digest,
+        requirement.stable_error_set_digest,
+        requirement.safety_metadata_digest,
+    )
+
+
 class ProviderHttpClient:
     """Strict client for the four standardized V1 provider routes."""
 
     def __init__(
         self,
         base_url: str,
+        resolved_runtime_inputs: ResolvedRuntimeInputs,
         *,
         transport: httpx.MockTransport | None = None,
         baggage_allowlist: frozenset[str] = frozenset(),
     ) -> None:
+        if not isinstance(resolved_runtime_inputs, ResolvedRuntimeInputs):
+            raise TypeError(
+                "resolved_runtime_inputs must be native ResolvedRuntimeInputs"
+            )
         if transport is not None and not isinstance(
             transport,
             httpx.MockTransport,
@@ -346,6 +363,20 @@ class ProviderHttpClient:
             trust_env=False,
         )
         self._baggage_allowlist = frozenset(baggage_allowlist)
+        requirements: dict[
+            tuple[str, str],
+            ResolvedCapabilityRequirement,
+        ] = {}
+        for requirement in (
+            resolved_runtime_inputs.resolved_agent.capability_requirements
+        ):
+            identity = (requirement.name, requirement.version)
+            if identity in requirements:
+                raise ValueError(
+                    "resolved runtime inputs contain a duplicate capability identity"
+                )
+            requirements[identity] = requirement
+        self._requirements = requirements
 
     async def __aenter__(self) -> Self:
         return self
@@ -405,6 +436,12 @@ class ProviderHttpClient:
     ) -> InvocationOutcome:
         if not isinstance(request, InvocationRequest):
             raise TypeError("invocation request must be a native InvocationRequest")
+        identity = (request.capability_name, request.capability_version)
+        requirement = self._requirements.get(identity)
+        if requirement is None:
+            raise ValueError(
+                "invocation capability is not present in resolved runtime inputs"
+            )
         name = quote(request.capability_name, safe=".")
         return _load_native_response(
             load_invocation_outcome_for_request,
@@ -418,9 +455,14 @@ class ProviderHttpClient:
                 content=request.canonical_json(),
             ),
             request,
+            requirement,
         )
 
-    async def status(self, invocation_id: str) -> InvocationStatus:
+    async def status(
+        self,
+        invocation_id: str,
+        requirement: ResolvedCapabilityRequirement,
+    ) -> InvocationStatus:
         # Mirrors InvocationId::new's nonblank rule, then excludes RFC 3986
         # dot segments that HTTPX would normalize outside the fixed route.
         if (
@@ -432,6 +474,17 @@ class ProviderHttpClient:
             or "\0" in invocation_id
         ):
             raise ValueError("invocation ID must be a non-empty string")
+        if not isinstance(requirement, ResolvedCapabilityRequirement):
+            raise TypeError(
+                "status requirement must be a native ResolvedCapabilityRequirement"
+            )
+        indexed = self._requirements.get((requirement.name, requirement.version))
+        if indexed is None or _requirement_digests(indexed) != _requirement_digests(
+            requirement
+        ):
+            raise ValueError(
+                "status requirement is not present in resolved runtime inputs"
+            )
         encoded_invocation_id = quote(invocation_id, safe="")
         return _load_native_response(
             load_invocation_status_for_invocation_id,
@@ -440,6 +493,7 @@ class ProviderHttpClient:
                 f"/v1/capability-invocations/{encoded_invocation_id}",
             ),
             invocation_id,
+            indexed,
         )
 
     async def _request(

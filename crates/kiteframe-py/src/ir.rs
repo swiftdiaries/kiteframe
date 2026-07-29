@@ -440,7 +440,7 @@ impl PyComponentDescriptor {
     name = "ResolvedCapabilityRequirement"
 )]
 pub struct PyResolvedCapabilityRequirement {
-    inner: Arc<ResolvedCapabilityRequirement>,
+    pub(crate) inner: Arc<ResolvedCapabilityRequirement>,
 }
 
 impl From<ResolvedCapabilityRequirement> for PyResolvedCapabilityRequirement {
@@ -448,6 +448,12 @@ impl From<ResolvedCapabilityRequirement> for PyResolvedCapabilityRequirement {
         Self {
             inner: Arc::new(inner),
         }
+    }
+}
+
+impl PyResolvedCapabilityRequirement {
+    pub(crate) fn descriptor_inner(&self) -> &kiteframe_contract::CapabilityDescriptor {
+        self.inner.descriptor()
     }
 }
 
@@ -497,6 +503,11 @@ impl PyResolvedCapabilityRequirement {
     #[getter]
     fn safety_metadata_digest(&self) -> String {
         self.inner.safety_metadata_digest().to_string()
+    }
+
+    #[getter]
+    fn descriptor(&self) -> crate::service::PyCapabilityDescriptor {
+        crate::service::PyCapabilityDescriptor::from(self.inner.descriptor().clone())
     }
 }
 

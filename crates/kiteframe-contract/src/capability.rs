@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CapabilityName, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage, RetryClass,
-    SafeMessage, Sha256Digest,
+    SafeMessage, Sha256Digest, StableCapabilityError,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, JsonSchema)]
@@ -298,6 +298,15 @@ impl CapabilityErrorDescriptor {
     pub fn code(&self) -> &str {
         &self.code
     }
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+    pub fn retry(&self) -> RetryClass {
+        self.retry
+    }
+    pub fn message(&self) -> &SafeMessage {
+        &self.message
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -457,6 +466,46 @@ impl CapabilityDescriptor {
     pub fn consent(&self) -> &ConsentRequirement {
         &self.consent
     }
+    pub fn validate_input(&self, input: &Value) -> Result<(), Diagnostic> {
+        validate_instance(
+            self.input_schema.as_value(),
+            input,
+            "capability input does not match its locked schema",
+        )
+    }
+    pub fn validate_output(&self, output: &Value) -> Result<(), Diagnostic> {
+        validate_instance(
+            self.output_schema.as_value(),
+            output,
+            "capability output does not match its locked schema",
+        )
+    }
+    pub fn validate_stable_error(&self, error: &StableCapabilityError) -> Result<(), Diagnostic> {
+        if self.stable_errors.iter().any(|descriptor| {
+            descriptor.code() == error.code()
+                && descriptor.category() == error.category()
+                && descriptor.retry() == error.retry()
+                && descriptor.message() == error.message()
+        }) {
+            Ok(())
+        } else {
+            Err(capability_result_invalid(
+                "provider error does not match a locked stable error",
+            ))
+        }
+    }
+    pub fn supports_execution_mode(&self, mode: ExecutionMode) -> bool {
+        self.execution_modes.as_set().contains(&mode)
+    }
+    pub fn require_mode(&self, mode: ExecutionMode) -> Result<(), Diagnostic> {
+        if self.supports_execution_mode(mode) {
+            Ok(())
+        } else {
+            Err(capability_result_invalid(
+                "provider response requires an unsupported execution mode",
+            ))
+        }
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -528,6 +577,30 @@ fn invalid(message: impl Into<SafeMessage>) -> Diagnostic {
         DiagnosticCode::PackageInvalid,
         DiagnosticCategory::Package,
         DiagnosticStage::Validate,
+        message,
+    )
+}
+
+fn validate_instance(
+    schema: &Value,
+    instance: &Value,
+    message: &'static str,
+) -> Result<(), Diagnostic> {
+    let compiled = jsonschema::draft202012::options()
+        .build(schema)
+        .map_err(|_| capability_result_invalid("locked capability schema is invalid"))?;
+    if compiled.is_valid(instance) {
+        Ok(())
+    } else {
+        Err(capability_result_invalid(message))
+    }
+}
+
+fn capability_result_invalid(message: impl Into<SafeMessage>) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::ResultInvalid,
+        DiagnosticCategory::Capability,
+        DiagnosticStage::Invoke,
         message,
     )
 }

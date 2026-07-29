@@ -2,17 +2,24 @@ use std::sync::{Arc, LazyLock};
 
 use kiteframe_contract::{
     AdmissionRequest as ContractAdmissionRequest, CapabilityCatalog as ContractCapabilityCatalog,
+    CapabilityDescriptor as ContractCapabilityDescriptor, CapabilityErrorDescriptor,
     CapabilityGrant as ContractCapabilityGrant, CapabilityGrantSet as ContractCapabilityGrantSet,
     CatalogRequest as ContractCatalogRequest, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, InvocationId as ContractInvocationId,
+    DiagnosticSeverity, DiagnosticStage, ExecutionMode, InvocationId as ContractInvocationId,
     InvocationOutcome as ContractInvocationOutcome, InvocationRequest as ContractInvocationRequest,
-    InvocationStatus as ContractInvocationStatus, TraceContext,
+    InvocationStatus as ContractInvocationStatus, RetryClass, StableCapabilityError, Suspension,
+    TraceContext,
 };
 use kiteframe_core::canonical_json;
-use pyo3::{prelude::*, types::PyTuple};
+use pyo3::{
+    IntoPyObjectExt,
+    prelude::*,
+    types::{PyDict, PyTuple},
+};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
 use crate::error::diagnostic_error;
+use crate::ir::PyResolvedCapabilityRequirement;
 
 static CATALOG_REQUEST_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     locked_response_validator(include_bytes!(
@@ -49,6 +56,365 @@ static INVOCATION_STATUS_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new
         "../../../schemas/v1alpha1/invocation-status.schema.json"
     ))
 });
+
+pub(crate) fn json_value_to_python(
+    py: Python<'_>,
+    value: &serde_json::Value,
+) -> PyResult<Py<PyAny>> {
+    match value {
+        serde_json::Value::Null => Ok(py.None()),
+        serde_json::Value::Bool(value) => value.into_py_any(py),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                value.into_py_any(py)
+            } else if let Some(value) = value.as_u64() {
+                value.into_py_any(py)
+            } else {
+                value
+                    .as_f64()
+                    .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("invalid JSON number"))?
+                    .into_py_any(py)
+            }
+        }
+        serde_json::Value::String(value) => value.into_py_any(py),
+        serde_json::Value::Array(values) => {
+            let values = values
+                .iter()
+                .map(|value| json_value_to_python(py, value))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyTuple::new(py, values)?.into_any().unbind())
+        }
+        serde_json::Value::Object(values) => {
+            let object = PyDict::new(py);
+            for (key, value) in values {
+                object.set_item(key, json_value_to_python(py, value)?)?;
+            }
+            Ok(object.into_any().unbind())
+        }
+    }
+}
+
+fn serialized_to_python<T: serde::Serialize + ?Sized>(
+    py: Python<'_>,
+    value: &T,
+) -> PyResult<Py<PyAny>> {
+    let value = serde_json::to_value(value)
+        .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("value cannot be projected"))?;
+    json_value_to_python(py, &value)
+}
+
+fn retry_name(retry: RetryClass) -> &'static str {
+    match retry {
+        RetryClass::Never => "never",
+        RetryClass::AfterRefresh => "after_refresh",
+        RetryClass::AfterUserAction => "after_user_action",
+        RetryClass::StatusFirst => "status_first",
+    }
+}
+
+fn execution_mode_name(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Immediate => "immediate",
+        ExecutionMode::Deferred => "deferred",
+        ExecutionMode::Suspendable => "suspendable",
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    skip_from_py_object,
+    module = "kiteframe._native",
+    name = "StableCapabilityError"
+)]
+#[derive(Clone)]
+pub struct PyStableCapabilityError {
+    inner: StableCapabilityError,
+}
+
+impl From<StableCapabilityError> for PyStableCapabilityError {
+    fn from(inner: StableCapabilityError) -> Self {
+        Self { inner }
+    }
+}
+
+impl From<CapabilityErrorDescriptor> for PyStableCapabilityError {
+    fn from(inner: CapabilityErrorDescriptor) -> Self {
+        Self {
+            inner: StableCapabilityError::try_new(
+                inner.code(),
+                inner.category(),
+                inner.retry(),
+                inner.message().clone(),
+            )
+            .expect("validated descriptor errors are valid stable capability errors"),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyStableCapabilityError {
+    #[getter]
+    pub fn code(&self) -> &str {
+        self.inner.code()
+    }
+    #[getter]
+    pub fn category(&self) -> &str {
+        self.inner.category()
+    }
+    #[getter]
+    pub fn retry(&self) -> &'static str {
+        retry_name(self.inner.retry())
+    }
+    #[getter]
+    pub fn message(&self) -> &str {
+        self.inner.message().as_str()
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    skip_from_py_object,
+    module = "kiteframe._native",
+    name = "Diagnostic"
+)]
+#[derive(Clone)]
+pub struct PyDiagnostic {
+    inner: Diagnostic,
+}
+
+impl From<Diagnostic> for PyDiagnostic {
+    fn from(inner: Diagnostic) -> Self {
+        Self { inner }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyDiagnostic {
+    #[getter]
+    pub fn code(&self) -> &'static str {
+        self.inner.code.as_str()
+    }
+    #[getter]
+    pub fn category(&self) -> PyResult<String> {
+        serde_json::to_value(self.inner.category)
+            .and_then(serde_json::from_value)
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("invalid diagnostic category"))
+    }
+    #[getter]
+    pub fn severity(&self) -> &'static str {
+        match self.inner.severity {
+            DiagnosticSeverity::Error => "error",
+            DiagnosticSeverity::Warning => "warning",
+        }
+    }
+    #[getter]
+    pub fn stage(&self) -> PyResult<String> {
+        serde_json::to_value(self.inner.stage)
+            .and_then(serde_json::from_value)
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("invalid diagnostic stage"))
+    }
+    #[getter]
+    pub fn package_path(&self) -> Option<&str> {
+        self.inner.package_path.as_deref()
+    }
+    #[getter]
+    pub fn source_range(&self) -> Option<(u32, u32)> {
+        self.inner
+            .source_range
+            .map(|range| (range.start, range.end))
+    }
+    #[getter]
+    pub fn message(&self) -> &str {
+        self.inner.message.as_str()
+    }
+    #[getter]
+    pub fn help(&self) -> Option<&str> {
+        self.inner
+            .help
+            .as_ref()
+            .map(kiteframe_contract::SafeMessage::as_str)
+    }
+    #[getter]
+    pub fn retry(&self) -> &'static str {
+        retry_name(self.inner.retry)
+    }
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.tuple[builtins.str, typing.Any], ...]",
+        imports = ("builtins", "typing")
+    ))]
+    pub fn details<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let details = self
+            .inner
+            .details
+            .iter()
+            .map(|(key, value)| {
+                PyTuple::new(py, [key.into_py_any(py)?, json_value_to_python(py, value)?])
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, details)
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    skip_from_py_object,
+    module = "kiteframe._native",
+    name = "Suspension"
+)]
+#[derive(Clone)]
+pub struct PySuspension {
+    inner: Suspension,
+}
+
+impl From<Suspension> for PySuspension {
+    fn from(inner: Suspension) -> Self {
+        Self { inner }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PySuspension {
+    #[getter]
+    pub fn checkpoint_ref(&self) -> &str {
+        self.inner.checkpoint_ref()
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "CapabilityDescriptor"
+)]
+pub struct PyCapabilityDescriptor {
+    inner: Arc<ContractCapabilityDescriptor>,
+}
+
+impl From<ContractCapabilityDescriptor> for PyCapabilityDescriptor {
+    fn from(inner: ContractCapabilityDescriptor) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCapabilityDescriptor {
+    #[getter]
+    pub fn name(&self) -> &str {
+        self.inner.identity().name().as_str()
+    }
+    #[getter]
+    pub fn version(&self) -> &str {
+        self.inner.identity().version().as_str()
+    }
+    #[getter]
+    pub fn summary(&self) -> &str {
+        self.inner.summary()
+    }
+    #[getter]
+    pub fn descriptor_digest(&self) -> String {
+        self.inner.descriptor_digest().to_string()
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn input_schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_value_to_python(py, self.inner.input_schema().as_value())
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn output_schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_value_to_python(py, self.inner.output_schema().as_value())
+    }
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[StableCapabilityError, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn stable_errors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let errors = self
+            .inner
+            .stable_errors()
+            .iter()
+            .cloned()
+            .map(PyStableCapabilityError::from)
+            .map(|error| Py::new(py, error))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, errors)
+    }
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.str, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn execution_modes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .execution_modes()
+                .as_set()
+                .iter()
+                .copied()
+                .map(execution_mode_name),
+        )
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn resource_selector_schema(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_value_to_python(
+            py,
+            self.inner.resource_selector_schema().as_schema().as_value(),
+        )
+    }
+    #[getter]
+    pub fn effect(&self) -> PyResult<String> {
+        serde_json::to_value(self.inner.effect())
+            .and_then(serde_json::from_value)
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("invalid capability effect"))
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn idempotency(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.idempotency())
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn freshness(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.freshness())
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn preconditions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.preconditions())
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn confirmation(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.confirmation())
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn approval(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.approval())
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn consent(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.consent())
+    }
+}
 
 #[gen_stub_pyclass]
 #[pyclass(
@@ -99,6 +465,12 @@ impl PyCatalogRequest {
         self.inner.trace_context().tracestate()
     }
 
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn baggage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.trace_context().baggage())
+    }
+
     #[gen_stub(override_return_type(
         type_repr = "builtins.bytes",
         imports = ("builtins",)
@@ -138,6 +510,12 @@ impl PyAdmissionRequest {
     #[getter]
     pub fn tracestate(&self) -> Option<&str> {
         self.inner.trace_context().tracestate()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn baggage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.trace_context().baggage())
     }
 
     #[getter]
@@ -234,6 +612,24 @@ impl PyInvocationRequest {
     }
 
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn arguments(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_value_to_python(py, self.inner.arguments())
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn preconditions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.preconditions())
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn evidence_refs(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.evidence_refs().as_map())
+    }
+
+    #[getter]
     pub fn idempotency_key(&self) -> Option<&str> {
         self.inner
             .idempotency_key()
@@ -248,6 +644,12 @@ impl PyInvocationRequest {
     #[getter]
     pub fn tracestate(&self) -> Option<&str> {
         self.inner.trace_context().tracestate()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn baggage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.trace_context().baggage())
     }
 
     #[gen_stub(override_return_type(
@@ -517,6 +919,45 @@ impl PyInvocationOutcome {
         invocation_id.as_str()
     }
 
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Optional[typing.Any]",
+        imports = ("typing",)
+    ))]
+    pub fn result(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.inner.as_ref() {
+            ContractInvocationOutcome::Succeeded { result, .. } => {
+                json_value_to_python(py, result).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[getter]
+    pub fn error(&self) -> Option<PyStableCapabilityError> {
+        match self.inner.as_ref() {
+            ContractInvocationOutcome::Failed { error, .. } => {
+                Some(PyStableCapabilityError::from(error.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    #[getter]
+    pub fn diagnostic(&self) -> Option<PyDiagnostic> {
+        self.inner.diagnostic().cloned().map(PyDiagnostic::from)
+    }
+
+    #[getter]
+    pub fn suspension(&self) -> Option<PySuspension> {
+        match self.inner.as_ref() {
+            ContractInvocationOutcome::Suspended { suspension, .. } => {
+                Some(PySuspension::from(suspension.clone()))
+            }
+            _ => None,
+        }
+    }
+
     #[gen_stub(override_return_type(
         type_repr = "builtins.bytes",
         imports = ("builtins",)
@@ -575,6 +1016,53 @@ impl PyInvocationStatus {
             | ContractInvocationStatus::OutcomeUnknown { invocation_id, .. } => invocation_id,
         };
         invocation_id.as_str()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "typing.Optional[typing.Any]",
+        imports = ("typing",)
+    ))]
+    pub fn result(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.inner.as_ref() {
+            ContractInvocationStatus::Succeeded { result, .. } => {
+                json_value_to_python(py, result).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[getter]
+    pub fn error(&self) -> Option<PyStableCapabilityError> {
+        match self.inner.as_ref() {
+            ContractInvocationStatus::Failed { error, .. } => {
+                Some(PyStableCapabilityError::from(error.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    #[getter]
+    pub fn diagnostic(&self) -> Option<PyDiagnostic> {
+        match self.inner.as_ref() {
+            ContractInvocationStatus::Denied { diagnostic, .. } => {
+                Some(PyDiagnostic::from(diagnostic.clone()))
+            }
+            ContractInvocationStatus::OutcomeUnknown { diagnostic, .. } => {
+                Some(PyDiagnostic::from(diagnostic.diagnostic().clone()))
+            }
+            _ => None,
+        }
+    }
+
+    #[getter]
+    pub fn suspension(&self) -> Option<PySuspension> {
+        match self.inner.as_ref() {
+            ContractInvocationStatus::Suspended { suspension, .. } => {
+                Some(PySuspension::from(suspension.clone()))
+            }
+            _ => None,
+        }
     }
 
     #[gen_stub(override_return_type(
@@ -651,10 +1139,11 @@ pub fn load_capability_grant_set_for_request_inner(
 pub fn load_invocation_outcome_for_request_inner(
     bytes: &[u8],
     request: &ContractInvocationRequest,
+    descriptor: &ContractCapabilityDescriptor,
 ) -> Result<ContractInvocationOutcome, ProviderResponseError> {
     let response = load_invocation_outcome_inner(bytes)?;
     response
-        .validate_against(request)
+        .validate_against(request, descriptor)
         .map_err(|_| ProviderResponseError::Correlation)?;
     Ok(response)
 }
@@ -662,10 +1151,11 @@ pub fn load_invocation_outcome_for_request_inner(
 pub fn load_invocation_status_for_invocation_id_inner(
     bytes: &[u8],
     invocation_id: &ContractInvocationId,
+    descriptor: &ContractCapabilityDescriptor,
 ) -> Result<ContractInvocationStatus, ProviderResponseError> {
     let response = load_invocation_status_inner(bytes)?;
     response
-        .validate_invocation_id(invocation_id)
+        .validate_for_invocation_id(invocation_id, descriptor)
         .map_err(|_| ProviderResponseError::Correlation)?;
     Ok(response)
 }
@@ -841,10 +1331,15 @@ pub fn load_invocation_outcome_for_request(
     ))]
     bytes: &[u8],
     request: &PyInvocationRequest,
+    requirement: &PyResolvedCapabilityRequirement,
 ) -> PyResult<PyInvocationOutcome> {
-    load_invocation_outcome_for_request_inner(bytes, request.inner.as_ref())
-        .map(PyInvocationOutcome::from)
-        .map_err(provider_response_error)
+    load_invocation_outcome_for_request_inner(
+        bytes,
+        request.inner.as_ref(),
+        requirement.descriptor_inner(),
+    )
+    .map(PyInvocationOutcome::from)
+    .map_err(provider_response_error)
 }
 
 #[gen_stub_pyfunction]
@@ -856,12 +1351,17 @@ pub fn load_invocation_status_for_invocation_id(
     ))]
     bytes: &[u8],
     invocation_id: &str,
+    requirement: &PyResolvedCapabilityRequirement,
 ) -> PyResult<PyInvocationStatus> {
     let invocation_id = ContractInvocationId::new(invocation_id)
         .map_err(|_| provider_response_error(ProviderResponseError::Correlation))?;
-    load_invocation_status_for_invocation_id_inner(bytes, &invocation_id)
-        .map(PyInvocationStatus::from)
-        .map_err(provider_response_error)
+    load_invocation_status_for_invocation_id_inner(
+        bytes,
+        &invocation_id,
+        requirement.descriptor_inner(),
+    )
+    .map(PyInvocationStatus::from)
+    .map_err(provider_response_error)
 }
 
 fn provider_response_error(error: ProviderResponseError) -> PyErr {

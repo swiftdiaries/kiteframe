@@ -5,9 +5,11 @@ use _native::{
 use kiteframe_contract::{
     ActorRef, AdmissionId, AgentRef, CapabilityGrant, CapabilityGrantParts, CapabilityGrantSet,
     CapabilityGrantSetParts, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    InvocationOutcome, InvocationStatus, NormalizedResourceSelector, PolicyRevision, SessionRef,
-    Sha256Digest, TaskRef, Timestamp,
+    Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage, InvocationId,
+    InvocationOutcome, InvocationStatus, NormalizedResourceSelector, PolicyRevision, RetryClass,
+    SessionRef, Sha256Digest, StableCapabilityError, Suspension, TaskRef, Timestamp,
 };
+use pyo3::Python;
 
 #[test]
 fn grant_set_projection_exposes_only_stable_scalar_and_tuple_values() {
@@ -79,6 +81,58 @@ fn invocation_status_response_boundary_rejects_locked_schema_violation() {
         load_invocation_status_inner(response).unwrap_err(),
         ProviderResponseError::LockedSchema
     );
+}
+
+#[test]
+fn outcome_and_status_expose_detached_structured_values() {
+    Python::attach(|py| {
+        let outcome = PyInvocationOutcome::from(InvocationOutcome::Succeeded {
+            invocation_id: InvocationId::new("inv-1").unwrap(),
+            result: serde_json::json!({"accepted": true, "caseId": "case-1"}),
+        });
+        let result = outcome.result(py).unwrap().unwrap();
+        assert!(
+            result
+                .bind(py)
+                .get_item("accepted")
+                .unwrap()
+                .extract::<bool>()
+                .unwrap()
+        );
+
+        let failed = PyInvocationOutcome::from(InvocationOutcome::Failed {
+            invocation_id: InvocationId::new("inv-1").unwrap(),
+            error: StableCapabilityError::try_new(
+                "CASE_CONFLICT",
+                "conflict",
+                RetryClass::AfterRefresh,
+                "case changed",
+            )
+            .unwrap(),
+        });
+        assert_eq!(failed.error().unwrap().code(), "CASE_CONFLICT");
+        assert_eq!(failed.error().unwrap().retry(), "after_refresh");
+
+        let denied = PyInvocationStatus::from(InvocationStatus::Denied {
+            invocation_id: InvocationId::new("inv-1").unwrap(),
+            diagnostic: Diagnostic::error(
+                DiagnosticCode::InvocationDenied,
+                DiagnosticCategory::Authorization,
+                DiagnosticStage::Invoke,
+                "invocation denied",
+            ),
+        });
+        assert_eq!(denied.diagnostic().unwrap().code(), "KF-AUTH-003");
+
+        let suspended = PyInvocationStatus::from(InvocationStatus::Suspended {
+            invocation_id: InvocationId::new("inv-1").unwrap(),
+            suspension: Suspension::try_new("checkpoint://case-1").unwrap(),
+        });
+        assert_eq!(
+            suspended.suspension().unwrap().checkpoint_ref(),
+            "checkpoint://case-1"
+        );
+    });
 }
 
 fn grant_set() -> CapabilityGrantSet {

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import pickle
+from pathlib import Path
 
 import pytest
 
@@ -8,12 +9,16 @@ from kiteframe import (
     AdmissionRequest,
     CapabilityCatalog,
     CatalogRequest,
+    InvocationOutcome,
     InvocationRequest,
     KiteframeDiagnosticError,
     load_admission_request,
     load_capability_catalog,
     load_catalog_request,
+    load_invocation_outcome,
     load_invocation_request,
+    load_invocation_status,
+    resolve_package,
 )
 
 VALID_TRACEPARENT = (
@@ -42,9 +47,13 @@ def valid_catalog_request() -> bytes:
 
 @pytest.fixture
 def valid_admission_request() -> bytes:
+    workspace = Path(__file__).resolve().parents[3]
+    resolved = json.loads(
+        (workspace / "tests/fixtures/resolved/support-agent.json").read_bytes()
+    )
     capability = {
-        "name": "cases.comment",
-        "version": "1.0.0",
+        "name": "cases.read",
+        "version": "1.2.0",
     }
     return canonical_bytes(
         {
@@ -58,17 +67,11 @@ def valid_admission_request() -> bytes:
             "requiredCapabilities": [
                 {
                     "capability": capability,
-                    "resources": ["tenant:t1/case:case-1"],
+                    "resources": ["tenant:support"],
                 }
             ],
             "resolvedDigest": "03" * 32,
-            "resolvedRequirements": [
-                {
-                    "identity": capability,
-                    "required": True,
-                    "resources": ["tenant:t1/case:case-1"],
-                }
-            ],
+            "resolvedRequirements": resolved["capabilityRequirements"],
             "session": "session:1",
             "task": "task:triage",
             "traceContext": {"traceparent": VALID_TRACEPARENT},
@@ -189,17 +192,142 @@ def test_provider_request_properties_are_stable_native_values(
     assert catalog_request.known_catalog_digest == "09" * 32
     assert catalog_request.traceparent == VALID_TRACEPARENT
     assert admission.traceparent == VALID_TRACEPARENT
-    assert admission.required_capabilities == (("cases.comment", "1.0.0"),)
+    assert admission.required_capabilities == (("cases.read", "1.2.0"),)
     assert invocation.invocation_id == "inv-1"
     assert invocation.admission_id == "adm-1"
     assert invocation.capability_name == "cases.comment"
     assert invocation.capability_version == "1.0.0"
     assert invocation.selected_resource == "tenant:t1/case:case-1"
+    assert invocation.arguments == {"caseId": "case-1"}
+    assert invocation.preconditions == {}
+    assert invocation.evidence_refs == {
+        "approval": "evidence://approval/1",
+    }
     assert invocation.traceparent == VALID_TRACEPARENT
+    assert invocation.baggage == {}
     assert catalog.name == "provider.test"
     assert catalog.revision == "revision-1"
     assert len(catalog.catalog_digest) == 64
     assert catalog.descriptor_digests == ()
+
+
+def test_outcome_exposes_result_without_json_reparse() -> None:
+    outcome = load_invocation_outcome(
+        canonical_bytes(
+            {
+                "invocation_id": "inv-1",
+                "result": {"caseId": "case-1", "accepted": True},
+                "status": "succeeded",
+            }
+        )
+    )
+
+    assert isinstance(outcome, InvocationOutcome)
+    result = outcome.result
+    assert result == {"caseId": "case-1", "accepted": True}
+    assert result is not None
+    assert outcome.error is None
+    assert outcome.diagnostic is None
+    assert outcome.suspension is None
+    result["accepted"] = False
+    assert outcome.result == {"caseId": "case-1", "accepted": True}
+
+
+def test_failure_and_denial_are_structured() -> None:
+    failure = load_invocation_outcome(
+        canonical_bytes(
+            {
+                "error": {
+                    "category": "conflict",
+                    "code": "CASE_CONFLICT",
+                    "message": "case changed",
+                    "retry": "after_refresh",
+                },
+                "invocation_id": "inv-1",
+                "status": "failed",
+            }
+        )
+    )
+    denial = load_invocation_status(
+        canonical_bytes(
+            {
+                "diagnostic": {
+                    "category": "authorization",
+                    "code": "KF-AUTH-003",
+                    "details": {},
+                    "help": None,
+                    "message": "invocation denied",
+                    "package_path": None,
+                    "retry": "never",
+                    "severity": "error",
+                    "source_range": None,
+                    "stage": "invoke",
+                },
+                "invocation_id": "inv-1",
+                "status": "denied",
+            }
+        )
+    )
+
+    error = failure.error
+    diagnostic = denial.diagnostic
+    assert error is not None
+    assert diagnostic is not None
+    assert error.code == "CASE_CONFLICT"
+    assert error.category == "conflict"
+    assert error.retry == "after_refresh"
+    assert error.message == "case changed"
+    assert diagnostic.code == "KF-AUTH-003"
+    assert diagnostic.details == ()
+
+
+def test_suspension_is_a_frozen_structured_projection() -> None:
+    status = load_invocation_status(
+        canonical_bytes(
+            {
+                "invocation_id": "inv-1",
+                "status": "suspended",
+                "suspension": {"checkpointRef": "checkpoint://case-1"},
+            }
+        )
+    )
+
+    suspension = status.suspension
+    assert suspension is not None
+    assert suspension.checkpoint_ref == "checkpoint://case-1"
+    with pytest.raises(AttributeError):
+        suspension.checkpoint_ref = "forged"  # type: ignore[reportAttributeAccessIssue]
+
+
+def test_resolved_requirement_exposes_its_frozen_locked_descriptor() -> None:
+    workspace = Path(__file__).resolve().parents[3]
+    package = workspace / "tests/fixtures/packages/support-agent"
+    inputs = resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        workspace / "tests/fixtures/components/deepagents-test.json",
+    )
+    requirement = inputs.resolved_agent.capability_requirements[0]
+    descriptor = requirement.descriptor
+
+    assert descriptor.name == "cases.read"
+    assert descriptor.version == "1.2.0"
+    assert descriptor.summary == "Read a case"
+    assert descriptor.input_schema["type"] == "object"
+    assert descriptor.output_schema["type"] == "object"
+    assert descriptor.stable_errors == ()
+    assert descriptor.execution_modes == ("immediate",)
+    assert descriptor.resource_selector_schema == {"type": "string"}
+    assert descriptor.effect == "read_only"
+    assert descriptor.idempotency == {"kind": "none"}
+    assert descriptor.freshness["policyRevisionRequired"] is False
+    assert descriptor.preconditions == ()
+    assert descriptor.confirmation == {"kind": "none"}
+    assert descriptor.approval == {"kind": "none"}
+    assert descriptor.consent == {"kind": "none"}
+    assert descriptor.descriptor_digest == requirement.descriptor_digest
+    with pytest.raises(AttributeError):
+        requirement.descriptor = None  # type: ignore[reportAttributeAccessIssue]
 
 
 def test_provider_requests_reject_noncanonical_bytes(

@@ -14,9 +14,10 @@ pub use ir::{
 use pyo3::prelude::*;
 use pyo3_stub_gen::{StubGenConfig, StubInfo};
 pub use service::{
-    ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCapabilityGrant,
-    PyCapabilityGrantSet, PyCatalogRequest, PyInvocationOutcome, PyInvocationRequest,
-    PyInvocationStatus, load_admission_request_inner, load_capability_catalog_inner,
+    ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCapabilityDescriptor,
+    PyCapabilityGrant, PyCapabilityGrantSet, PyCatalogRequest, PyDiagnostic, PyInvocationOutcome,
+    PyInvocationRequest, PyInvocationStatus, PyStableCapabilityError, PySuspension,
+    load_admission_request_inner, load_capability_catalog_inner,
     load_capability_grant_set_for_request_inner, load_capability_grant_set_inner,
     load_catalog_request_inner, load_invocation_outcome_for_request_inner,
     load_invocation_outcome_inner, load_invocation_request_inner,
@@ -29,10 +30,14 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAdmissionRequest>()?;
     module.add_class::<PyInvocationRequest>()?;
     module.add_class::<PyCapabilityCatalog>()?;
+    module.add_class::<PyCapabilityDescriptor>()?;
     module.add_class::<PyCapabilityGrant>()?;
     module.add_class::<PyCapabilityGrantSet>()?;
     module.add_class::<PyInvocationOutcome>()?;
     module.add_class::<PyInvocationStatus>()?;
+    module.add_class::<PyStableCapabilityError>()?;
+    module.add_class::<PyDiagnostic>()?;
+    module.add_class::<PySuspension>()?;
     module.add_class::<PyResolvedAgent>()?;
     module.add_class::<PyResolvedCapabilityRequirement>()?;
     module.add_class::<PyResolvedSubagent>()?;

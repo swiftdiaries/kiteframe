@@ -1,6 +1,8 @@
 import gzip
 import hashlib
 import json
+from functools import lru_cache
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,18 +14,23 @@ from kiteframe import (
     load_catalog_request,
     load_invocation_request,
     provider,
+    resolve_package,
 )
 from kiteframe._native import (
     CapabilityCatalog,
     CapabilityGrantSet,
     InvocationOutcome,
     InvocationStatus,
+    ResolvedCapabilityRequirement,
+    ResolvedRuntimeInputs,
 )
 from kiteframe.provider import (
     PROVIDER_RESPONSE_LIMIT_BYTES,
-    ProviderHttpClient,
     ProviderTransportError,
     trace_headers,
+)
+from kiteframe.provider import (
+    ProviderHttpClient as NativeProviderHttpClient,
 )
 
 VALID_TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -103,14 +110,13 @@ def invocation_request():
                 "admissionId": "adm-1",
                 "arguments": {"caseId": "case-1"},
                 "capability": {
-                    "name": "cases.comment",
-                    "version": "1.0.0",
+                    "name": "cases.read",
+                    "version": "1.2.0",
                 },
                 "evidenceRefs": {"approval": "evidence://approval/1"},
-                "idempotencyKey": "idem-1",
                 "invocationId": "inv-1",
                 "preconditions": {},
-                "selectedResource": "tenant:t1/case:case-1",
+                "selectedResource": "tenant:support",
                 "traceContext": {
                     "traceparent": VALID_TRACEPARENT,
                     "tracestate": "vendor=value",
@@ -230,6 +236,146 @@ class UnsafeTransport(httpx.AsyncBaseTransport):
         return httpx.Response(200, content=capability_catalog_bytes())
 
 
+@lru_cache
+def resolved_runtime_inputs() -> ResolvedRuntimeInputs:
+    workspace = Path(__file__).resolve().parents[4]
+    package = workspace / "tests/fixtures/packages/support-agent"
+    return resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        workspace / "tests/fixtures/components/deepagents-test.json",
+    )
+
+
+def runtime_requirement() -> ResolvedCapabilityRequirement:
+    return resolved_runtime_inputs().resolved_agent.capability_requirements[0]
+
+
+def ProviderHttpClient(  # noqa: N802
+    base_url: str,
+    *,
+    transport: httpx.MockTransport | None = None,
+    baggage_allowlist: frozenset[str] = frozenset(),
+) -> NativeProviderHttpClient:
+    return NativeProviderHttpClient(
+        base_url,
+        resolved_runtime_inputs(),
+        transport=transport,
+        baggage_allowlist=baggage_allowlist,
+    )
+
+
+def test_client_requires_frozen_resolved_runtime_inputs() -> None:
+    with pytest.raises(TypeError):
+        NativeProviderHttpClient("https://provider.test")  # type: ignore[call-arg]
+
+    with pytest.raises(TypeError, match="ResolvedRuntimeInputs"):
+        NativeProviderHttpClient(
+            "https://provider.test",
+            object(),  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_invocation_identity_fails_before_transport() -> None:
+    request = load_invocation_request(
+        canonical_bytes(
+            {
+                "admissionId": "adm-1",
+                "arguments": {},
+                "capability": {
+                    "name": "cases.comment",
+                    "version": "1.0.0",
+                },
+                "evidenceRefs": {},
+                "invocationId": "inv-1",
+                "preconditions": {},
+                "selectedResource": "tenant:support",
+                "traceContext": {"traceparent": VALID_TRACEPARENT},
+            }
+        )
+    )
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(
+            lambda request: pytest.fail("unknown capability reached transport")
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="resolved runtime inputs"):
+            await client.invoke(request)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invoke_and_status_validate_with_the_indexed_locked_descriptor() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path in {
+            "/v1/capability-invocations/cases.read",
+            "/v1/capability-invocations/inv-1",
+        }
+        return httpx.Response(
+            200,
+            content=canonical_bytes(
+                {
+                    "invocation_id": "inv-1",
+                    "result": {"caseId": "case-1"},
+                    "status": "succeeded",
+                }
+            ),
+        )
+
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        outcome = await client.invoke(invocation_request())
+        status = await client.status("inv-1", runtime_requirement())
+    finally:
+        await client.aclose()
+
+    assert outcome.result == {"caseId": "case-1"}
+    assert status.result == {"caseId": "case-1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"invocation_id": "inv-1", "result": [], "status": "succeeded"},
+        {"invocation_id": "inv-1", "status": "deferred"},
+        {
+            "error": {
+                "category": "provider",
+                "code": "PROVIDER_NATIVE_500",
+                "message": "provider failed",
+                "retry": "never",
+            },
+            "invocation_id": "inv-1",
+            "status": "failed",
+        },
+    ],
+)
+async def test_invoke_rejects_responses_outside_the_locked_descriptor(
+    response: dict[str, object],
+) -> None:
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=canonical_bytes(response))
+        ),
+    )
+    try:
+        with pytest.raises(KiteframeDiagnosticError) as error:
+            await client.invoke(invocation_request())
+    finally:
+        await client.aclose()
+
+    assert error.value.code == "KF-CAP-002"
+
+
 @pytest.mark.asyncio
 async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None:
     seen: list[httpx.Request] = []
@@ -240,18 +386,26 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
             return httpx.Response(200, content=capability_catalog_bytes())
         if request.url.path == "/v1/capability-admissions":
             return httpx.Response(200, content=grant_set_bytes())
-        if request.url.path == "/v1/capability-invocations/cases.comment":
+        if request.url.path == "/v1/capability-invocations/cases.read":
             return httpx.Response(
                 200,
                 content=canonical_bytes(
-                    {"invocation_id": "inv-1", "status": "deferred"}
+                    {
+                        "invocation_id": "inv-1",
+                        "result": {"caseId": "case-1"},
+                        "status": "succeeded",
+                    }
                 ),
             )
         if request.url.path == "/v1/capability-invocations/inv-1":
             return httpx.Response(
                 200,
                 content=canonical_bytes(
-                    {"invocation_id": "inv-1", "status": "pending"}
+                    {
+                        "invocation_id": "inv-1",
+                        "result": {"caseId": "case-1"},
+                        "status": "succeeded",
+                    }
                 ),
             )
         return httpx.Response(404, content=diagnostic_envelope())
@@ -265,7 +419,7 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
         catalog = await client.catalog(catalog_request())
         grant_set = await client.admit(admission_request())
         outcome = await client.invoke(invocation_request())
-        status = await client.status("inv-1")
+        status = await client.status("inv-1", runtime_requirement())
     finally:
         await client.aclose()
 
@@ -276,7 +430,7 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
     assert [(request.method, request.url.path) for request in seen] == [
         ("GET", "/v1/capability-catalog"),
         ("POST", "/v1/capability-admissions"),
-        ("POST", "/v1/capability-invocations/cases.comment"),
+        ("POST", "/v1/capability-invocations/cases.read"),
         ("GET", "/v1/capability-invocations/inv-1"),
     ]
     assert seen[0].content == b""
@@ -418,7 +572,7 @@ async def test_status_rejects_a_valid_status_for_another_invocation() -> None:
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(KiteframeDiagnosticError) as error:
-            await client.status("inv-1")
+            await client.status("inv-1", runtime_requirement())
     finally:
         await client.aclose()
 
@@ -794,7 +948,7 @@ async def test_status_rejects_path_normalizing_dot_segments(
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(ValueError, match="invocation ID"):
-            await client.status(invocation_id)
+            await client.status(invocation_id, runtime_requirement())
     finally:
         await client.aclose()
 
@@ -810,7 +964,7 @@ async def test_status_enforces_native_nonblank_invocation_id(
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(ValueError, match="invocation ID"):
-            await client.status(invocation_id)
+            await client.status(invocation_id, runtime_requirement())
     finally:
         await client.aclose()
 

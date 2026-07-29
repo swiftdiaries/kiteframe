@@ -971,6 +971,18 @@ impl StableCapabilityError {
             message: message.into(),
         })
     }
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+    pub fn retry(&self) -> RetryClass {
+        self.retry
+    }
+    pub fn message(&self) -> &SafeMessage {
+        &self.message
+    }
 }
 
 impl<'de> Deserialize<'de> for StableCapabilityError {
@@ -1127,8 +1139,30 @@ impl InvocationOutcome {
         }
     }
 
-    pub fn validate_against(&self, request: &InvocationRequest) -> Result<(), Diagnostic> {
-        validate_response_invocation_id(self.invocation_id(), request.invocation_id())
+    pub fn validate_against(
+        &self,
+        request: &InvocationRequest,
+        descriptor: &CapabilityDescriptor,
+    ) -> Result<(), Diagnostic> {
+        validate_response_invocation_id(self.invocation_id(), request.invocation_id())?;
+        request.validate_against(descriptor).map_err(|_| {
+            result_invalid(
+                DiagnosticStage::Invoke,
+                "invocation request no longer matches its locked descriptor",
+            )
+        })?;
+        match self {
+            Self::Succeeded { result, .. } => descriptor.validate_output(result),
+            Self::Failed { error, .. } => descriptor.validate_stable_error(error),
+            Self::Deferred { .. } => descriptor.require_mode(crate::ExecutionMode::Deferred),
+            Self::Suspended { .. } => descriptor.require_mode(crate::ExecutionMode::Suspendable),
+            Self::Denied { diagnostic, .. } => validate_denial_diagnostic(diagnostic),
+            Self::OutcomeUnknown { diagnostic, .. } => {
+                validate_status_first(diagnostic.diagnostic()).map_err(|_| {
+                    result_invalid(DiagnosticStage::Invoke, "invalid status-first error")
+                })
+            }
+        }
     }
 }
 
@@ -1252,6 +1286,52 @@ impl InvocationStatus {
     pub fn validate_invocation_id(&self, invocation_id: &InvocationId) -> Result<(), Diagnostic> {
         validate_response_invocation_id(self.invocation_id(), invocation_id)
     }
+
+    pub fn validate_against(
+        &self,
+        request: &InvocationRequest,
+        descriptor: &CapabilityDescriptor,
+    ) -> Result<(), Diagnostic> {
+        validate_response_invocation_id(self.invocation_id(), request.invocation_id())?;
+        request.validate_against(descriptor).map_err(|_| {
+            result_invalid(
+                DiagnosticStage::Invoke,
+                "invocation request no longer matches its locked descriptor",
+            )
+        })?;
+        match self {
+            Self::Pending { .. } => descriptor.require_mode(crate::ExecutionMode::Deferred),
+            Self::Suspended { .. } => descriptor.require_mode(crate::ExecutionMode::Suspendable),
+            Self::Succeeded { result, .. } => descriptor.validate_output(result),
+            Self::Failed { error, .. } => descriptor.validate_stable_error(error),
+            Self::Denied { diagnostic, .. } => validate_denial_diagnostic(diagnostic),
+            Self::OutcomeUnknown { diagnostic, .. } => {
+                validate_status_first(diagnostic.diagnostic()).map_err(|_| {
+                    result_invalid(DiagnosticStage::Invoke, "invalid status-first error")
+                })
+            }
+        }
+    }
+
+    pub fn validate_for_invocation_id(
+        &self,
+        invocation_id: &InvocationId,
+        descriptor: &CapabilityDescriptor,
+    ) -> Result<(), Diagnostic> {
+        validate_response_invocation_id(self.invocation_id(), invocation_id)?;
+        match self {
+            Self::Pending { .. } => descriptor.require_mode(crate::ExecutionMode::Deferred),
+            Self::Suspended { .. } => descriptor.require_mode(crate::ExecutionMode::Suspendable),
+            Self::Succeeded { result, .. } => descriptor.validate_output(result),
+            Self::Failed { error, .. } => descriptor.validate_stable_error(error),
+            Self::Denied { diagnostic, .. } => validate_denial_diagnostic(diagnostic),
+            Self::OutcomeUnknown { diagnostic, .. } => {
+                validate_status_first(diagnostic.diagnostic()).map_err(|_| {
+                    result_invalid(DiagnosticStage::Invoke, "invalid status-first error")
+                })
+            }
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for InvocationStatus {
@@ -1326,6 +1406,20 @@ fn validate_status_first(diagnostic: &Diagnostic) -> Result<(), String> {
         return Err("outcome_unknown diagnostics must require a status-first retry".to_owned());
     }
     Ok(())
+}
+
+fn validate_denial_diagnostic(diagnostic: &Diagnostic) -> Result<(), Diagnostic> {
+    if diagnostic.code == DiagnosticCode::InvocationDenied
+        && diagnostic.category == DiagnosticCategory::Authorization
+        && diagnostic.stage == DiagnosticStage::Invoke
+    {
+        Ok(())
+    } else {
+        Err(result_invalid(
+            DiagnosticStage::Invoke,
+            "provider denial does not contain an invocation-denied diagnostic",
+        ))
+    }
 }
 
 fn validate_response_invocation_id(
