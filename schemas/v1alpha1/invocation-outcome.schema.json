@@ -245,6 +245,14 @@
         "runtime"
       ]
     },
+    "EvidenceKind": {
+      "type": "string",
+      "enum": [
+        "confirmation",
+        "approval",
+        "consent"
+      ]
+    },
     "RetryClass": {
       "type": "string",
       "enum": [
@@ -257,6 +265,10 @@
     "SafeMessage": {
       "description": "A caller-supplied message that is safe to render to users.",
       "type": "string"
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "SourceRange": {
       "description": "A half-open byte range within a package source file.",
@@ -320,11 +332,24 @@
         "checkpointRef": {
           "type": "string",
           "minLength": 1
+        },
+        "evidenceKind": {
+          "$ref": "#/$defs/EvidenceKind"
+        },
+        "evidenceRequestRef": {
+          "type": "string",
+          "minLength": 1
+        },
+        "proposalDigest": {
+          "$ref": "#/$defs/Sha256Digest"
         }
       },
       "additionalProperties": false,
       "required": [
-        "checkpointRef"
+        "checkpointRef",
+        "evidenceKind",
+        "evidenceRequestRef",
+        "proposalDigest"
       ]
     }
   }

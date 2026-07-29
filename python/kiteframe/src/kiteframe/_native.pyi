@@ -16,6 +16,7 @@ __all__ = [
     "CatalogRequest",
     "ComponentDescriptor",
     "Diagnostic",
+    "EffectProposal",
     "EffectiveCapabilityGrant",
     "InvocationOutcome",
     "InvocationRequest",
@@ -30,17 +31,20 @@ __all__ = [
     "RuntimeBinding",
     "RuntimeBindingContentCapture",
     "StableCapabilityError",
+    "StatusRequest",
     "Suspension",
     "load_admission_request",
     "load_capability_catalog",
     "load_capability_grant_set",
     "load_capability_grant_set_for_request",
     "load_catalog_request",
+    "load_effect_proposal",
     "load_invocation_outcome",
     "load_invocation_outcome_for_request",
     "load_invocation_request",
     "load_invocation_status",
-    "load_invocation_status_for_invocation_id",
+    "load_invocation_status_for_request",
+    "load_status_request",
     "load_resolved_agent",
     "resolve_package",
 ]
@@ -255,6 +259,44 @@ class InvocationRequest:
     def canonical_json(self) -> builtins.bytes: ...
 
 @typing.final
+class StatusRequest:
+    @property
+    def invocation_id(self) -> builtins.str: ...
+    @property
+    def traceparent(self) -> builtins.str: ...
+    @property
+    def tracestate(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def baggage(self) -> typing.Any: ...
+    def canonical_json(self) -> builtins.bytes: ...
+
+@typing.final
+class EffectProposal:
+    @property
+    def invocation_id(self) -> builtins.str: ...
+    @property
+    def admission_id(self) -> builtins.str: ...
+    @property
+    def grant_digest(self) -> builtins.str: ...
+    @property
+    def capability_name(self) -> builtins.str: ...
+    @property
+    def capability_version(self) -> builtins.str: ...
+    @property
+    def selected_resource(self) -> builtins.str: ...
+    @property
+    def arguments_digest(self) -> builtins.str: ...
+    @property
+    def preconditions_digest(self) -> builtins.str: ...
+    @property
+    def idempotency_key(self) -> typing.Optional[builtins.str]: ...
+    @property
+    def effect(self) -> builtins.str: ...
+    @property
+    def proposal_digest(self) -> builtins.str: ...
+    def canonical_json(self) -> builtins.bytes: ...
+
+@typing.final
 class InvocationStatus:
     @property
     def status(self) -> typing.Literal["pending", "suspended", "succeeded", "failed", "denied", "outcome_unknown"]: ...
@@ -308,6 +350,12 @@ class Diagnostic:
 class Suspension:
     @property
     def checkpoint_ref(self) -> builtins.str: ...
+    @property
+    def evidence_kind(self) -> builtins.str: ...
+    @property
+    def evidence_request_ref(self) -> builtins.str: ...
+    @property
+    def proposal_digest(self) -> builtins.str: ...
 
 class KiteframeDiagnosticError(builtins.Exception):
     @property
@@ -495,6 +543,8 @@ def load_capability_grant_set_for_request(bytes: builtins.bytes, request: Admiss
 
 def load_catalog_request(bytes: builtins.bytes) -> CatalogRequest: ...
 
+def load_effect_proposal(bytes: builtins.bytes) -> EffectProposal: ...
+
 def load_invocation_outcome(bytes: builtins.bytes) -> InvocationOutcome: ...
 
 def load_invocation_outcome_for_request(bytes: builtins.bytes, request: InvocationRequest, requirement: ResolvedCapabilityRequirement) -> InvocationOutcome: ...
@@ -503,7 +553,9 @@ def load_invocation_request(bytes: builtins.bytes) -> InvocationRequest: ...
 
 def load_invocation_status(bytes: builtins.bytes) -> InvocationStatus: ...
 
-def load_invocation_status_for_invocation_id(bytes: builtins.bytes, invocation_id: builtins.str, requirement: ResolvedCapabilityRequirement) -> InvocationStatus: ...
+def load_invocation_status_for_request(bytes: builtins.bytes, request: StatusRequest, requirement: ResolvedCapabilityRequirement) -> InvocationStatus: ...
+
+def load_status_request(bytes: builtins.bytes) -> StatusRequest: ...
 
 def load_resolved_agent(bytes: builtins.bytes) -> ResolvedAgent:
     r"""

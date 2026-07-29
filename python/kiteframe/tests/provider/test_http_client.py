@@ -13,6 +13,7 @@ from kiteframe import (
     load_admission_request,
     load_catalog_request,
     load_invocation_request,
+    load_status_request,
     provider,
     resolve_package,
 )
@@ -23,6 +24,7 @@ from kiteframe._native import (
     InvocationStatus,
     ResolvedCapabilityRequirement,
     ResolvedRuntimeInputs,
+    StatusRequest,
 )
 from kiteframe.provider import (
     PROVIDER_RESPONSE_LIMIT_BYTES,
@@ -118,10 +120,29 @@ def invocation_request():
                     "version": "1.2.0",
                 },
                 "evidenceRefs": {"approval": "evidence://approval/1"},
+                "grantDigest": "0a" * 32,
                 "invocationId": "inv-1",
                 "preconditions": {},
                 "selectedResource": "tenant:support",
                 "traceContext": {
+                    "traceparent": VALID_TRACEPARENT,
+                    "tracestate": "vendor=value",
+                },
+            }
+        )
+    )
+
+
+def status_request() -> StatusRequest:
+    return load_status_request(
+        canonical_bytes(
+            {
+                "invocationId": "inv-1",
+                "traceContext": {
+                    "baggage": {
+                        "kiteframe.request_id": "10" * 16,
+                        "kiteframe.session_id": "11" * 16,
+                    },
                     "traceparent": VALID_TRACEPARENT,
                     "tracestate": "vendor=value",
                 },
@@ -340,7 +361,7 @@ async def test_invoke_and_status_validate_with_the_indexed_locked_descriptor() -
     )
     try:
         outcome = await client.invoke(invocation_request())
-        status = await client.status("inv-1", runtime_requirement())
+        status = await client.status(status_request(), runtime_requirement())
     finally:
         await client.aclose()
 
@@ -427,7 +448,7 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
         catalog = await client.catalog(catalog_request())
         grant_set = await client.admit(admission_request())
         outcome = await client.invoke(invocation_request())
-        status = await client.status("inv-1", runtime_requirement())
+        status = await client.status(status_request(), runtime_requirement())
     finally:
         await client.aclose()
 
@@ -445,10 +466,16 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
     assert seen[0].headers["if-none-match"] == f'"{"09" * 32}"'
     assert seen[1].content == admission_request().canonical_json()
     assert seen[2].content == invocation_request().canonical_json()
+    assert seen[3].content == b""
     assert seen[0].headers["traceparent"] == VALID_TRACEPARENT
     assert seen[0].headers["tracestate"] == "vendor=value"
     assert seen[0].headers["baggage"] == (f"kiteframe.session_id={'11' * 16}")
     assert "baggage" not in seen[1].headers
+    assert seen[3].headers["traceparent"] == VALID_TRACEPARENT
+    assert seen[3].headers["tracestate"] == "vendor=value"
+    assert seen[3].headers["baggage"] == (
+        f"kiteframe.session_id={'11' * 16}"
+    )
 
 
 @pytest.mark.asyncio
@@ -580,7 +607,7 @@ async def test_status_rejects_a_valid_status_for_another_invocation() -> None:
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(KiteframeDiagnosticError) as error:
-            await client.status("inv-1", runtime_requirement())
+            await client.status(status_request(), runtime_requirement())
     finally:
         await client.aclose()
 
@@ -950,29 +977,37 @@ async def test_mock_transport_may_use_plaintext_without_network_io() -> None:
 async def test_status_rejects_path_normalizing_dot_segments(
     invocation_id: str,
 ) -> None:
+    request = load_status_request(
+        canonical_bytes(
+            {
+                "invocationId": invocation_id,
+                "traceContext": {"traceparent": VALID_TRACEPARENT},
+            }
+        )
+    )
     transport = httpx.MockTransport(
         lambda request: pytest.fail("invalid status ID reached transport")
     )
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(ValueError, match="invocation ID"):
-            await client.status(invocation_id, runtime_requirement())
+            await client.status(request, runtime_requirement())
     finally:
         await client.aclose()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invocation_id", [" ", "\t"])
-async def test_status_enforces_native_nonblank_invocation_id(
-    invocation_id: str,
+@pytest.mark.parametrize("candidate", ["inv-1", object()])
+async def test_status_requires_a_native_status_request(
+    candidate: object,
 ) -> None:
     transport = httpx.MockTransport(
-        lambda request: pytest.fail("invalid status ID reached transport")
+        lambda request: pytest.fail("status reached transport")
     )
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
-        with pytest.raises(ValueError, match="invocation ID"):
-            await client.status(invocation_id, runtime_requirement())
+        with pytest.raises(TypeError, match="native StatusRequest"):
+            await client.status(candidate, runtime_requirement())  # type: ignore[arg-type]
     finally:
         await client.aclose()
 

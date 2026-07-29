@@ -2,10 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use _native::{
     ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCatalogRequest,
-    PyInvocationRequest, PyResolvedAgent, load_capability_catalog_inner,
+    PyInvocationRequest, PyResolvedAgent, PyStatusRequest, load_capability_catalog_inner,
     load_capability_grant_set_for_request_inner, load_catalog_request_inner,
     load_invocation_outcome_for_request_inner, load_invocation_request_inner,
-    load_invocation_status_for_invocation_id_inner,
+    load_invocation_status_for_request_inner, load_status_request_inner,
 };
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
@@ -17,7 +17,7 @@ use kiteframe_contract::{
     IdempotencyRequirement, InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus,
     LockedCapability, NonEmptySet, NormalizedResourceSelector, PolicyRevision, RequestedCapability,
     RequiredEvidence, ResolvedAgent, ResolvedCapabilityRequirement, ResourceSelectorSchema,
-    SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+    SessionRef, Sha256Digest, StatusRequest, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::prelude::*;
@@ -65,6 +65,28 @@ fn request_and_catalog_projections_expose_only_stable_values() {
 }
 
 #[test]
+fn status_request_loader_and_projection_preserve_native_trace_context() {
+    let request = StatusRequest::new(InvocationId::new("inv-1").unwrap(), trace_context());
+    let bytes = canonical_json(&request).unwrap();
+    let loaded = load_status_request_inner(&bytes).unwrap();
+    let projected = PyStatusRequest::from(loaded);
+
+    assert_eq!(projected.invocation_id(), "inv-1");
+    assert_eq!(projected.traceparent(), valid_traceparent());
+    assert_eq!(projected.tracestate(), None);
+    Python::attach(|py| {
+        assert_eq!(
+            projected
+                .baggage(py)
+                .unwrap()
+                .extract::<BTreeMap<String, String>>(py)
+                .unwrap(),
+            BTreeMap::new()
+        );
+    });
+}
+
+#[test]
 fn resolved_requirement_projection_exposes_exact_locked_semantics() {
     let descriptor = descriptor();
     let requirement = ResolvedCapabilityRequirement::try_new(
@@ -84,14 +106,32 @@ fn resolved_requirement_projection_exposes_exact_locked_semantics() {
     .unwrap();
     let projected = _native::PyResolvedCapabilityRequirement::from(requirement);
 
-    assert_eq!(
-        projected.descriptor_digest(),
-        descriptor.descriptor_digest().to_string()
-    );
-    assert_eq!(projected.input_schema_digest(), "04".repeat(32));
-    assert_eq!(projected.output_schema_digest(), "05".repeat(32));
-    assert_eq!(projected.stable_error_set_digest(), "06".repeat(32));
-    assert_eq!(projected.safety_metadata_digest(), "07".repeat(32));
+    Python::attach(|py| {
+        let projected = Py::new(py, projected).unwrap();
+        assert_eq!(
+            projected
+                .getattr(py, "descriptor_digest")
+                .unwrap()
+                .extract::<String>(py)
+                .unwrap(),
+            descriptor.descriptor_digest().to_string()
+        );
+        for (property, expected) in [
+            ("input_schema_digest", "04".repeat(32)),
+            ("output_schema_digest", "05".repeat(32)),
+            ("stable_error_set_digest", "06".repeat(32)),
+            ("safety_metadata_digest", "07".repeat(32)),
+        ] {
+            assert_eq!(
+                projected
+                    .getattr(py, property)
+                    .unwrap()
+                    .extract::<String>(py)
+                    .unwrap(),
+                expected
+            );
+        }
+    });
 }
 
 #[test]
@@ -102,12 +142,26 @@ fn resolved_agent_projection_exposes_verified_catalog_correlation() {
     .unwrap();
     let projected = PyResolvedAgent::from(resolved);
 
-    assert_eq!(projected.catalog_name(), "support");
-    assert_eq!(projected.catalog_revision(), "v1");
-    assert_eq!(
-        projected.catalog_digest(),
-        "6710f3261083b4b1a2c202e185b234bb1d58ed479962995fa3613422b503894b"
-    );
+    Python::attach(|py| {
+        let projected = Py::new(py, projected).unwrap();
+        for (property, expected) in [
+            ("catalog_name", "support"),
+            ("catalog_revision", "v1"),
+            (
+                "catalog_digest",
+                "6710f3261083b4b1a2c202e185b234bb1d58ed479962995fa3613422b503894b",
+            ),
+        ] {
+            assert_eq!(
+                projected
+                    .getattr(py, property)
+                    .unwrap()
+                    .extract::<String>(py)
+                    .unwrap(),
+                expected
+            );
+        }
+    });
 }
 
 #[test]
@@ -122,7 +176,7 @@ fn provider_request_boundary_rejects_noncanonical_bytes() {
 }
 
 #[test]
-fn canonical_admission_loader_rejects_normalizable_resource_order() {
+fn canonical_admission_loader_rejects_resource_order_tampering() {
     let mut wire = serde_json::to_value(admission_request()).unwrap();
     wire["requiredCapabilities"][0]["resources"] =
         json!(["tenant:t1/case:case-2", "tenant:t1/case:case-1"]);
@@ -132,7 +186,7 @@ fn canonical_admission_loader_rejects_normalizable_resource_order() {
 
     assert_eq!(
         _native::load_admission_request_inner(&bytes).unwrap_err(),
-        ProviderResponseError::NonCanonical
+        ProviderResponseError::Contract
     );
 }
 
@@ -200,8 +254,12 @@ fn correlated_invocation_loaders_reject_another_invocation_id() {
         result: json!({"ok": true}),
     };
     assert_eq!(
-        load_invocation_outcome_for_request_inner(&canonical_json(&outcome).unwrap(), &request,)
-            .unwrap_err(),
+        load_invocation_outcome_for_request_inner(
+            &canonical_json(&outcome).unwrap(),
+            &request,
+            &descriptor(),
+        )
+        .unwrap_err(),
         ProviderResponseError::Correlation
     );
 
@@ -209,9 +267,10 @@ fn correlated_invocation_loaders_reject_another_invocation_id() {
         invocation_id: InvocationId::new("inv-other").unwrap(),
     };
     assert_eq!(
-        load_invocation_status_for_invocation_id_inner(
+        load_invocation_status_for_request_inner(
             &canonical_json(&status).unwrap(),
-            request.invocation_id(),
+            &StatusRequest::new(request.invocation_id().clone(), trace_context()),
+            &descriptor(),
         )
         .unwrap_err(),
         ProviderResponseError::Correlation

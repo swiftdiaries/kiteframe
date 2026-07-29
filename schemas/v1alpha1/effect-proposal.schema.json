@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EffectProposal",
+  "type": "object",
+  "properties": {
+    "admissionId": {
+      "type": "string"
+    },
+    "argumentsDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "capability": {
+      "$ref": "#/$defs/CapabilityIdentity"
+    },
+    "effect": {
+      "$ref": "#/$defs/EffectClassification"
+    },
+    "grantDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "idempotencyKey": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "invocationId": {
+      "type": "string"
+    },
+    "preconditionsDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "proposalDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "selectedResource": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "invocationId",
+    "admissionId",
+    "grantDigest",
+    "capability",
+    "selectedResource",
+    "argumentsDigest",
+    "preconditionsDigest",
+    "effect",
+    "proposalDigest"
+  ],
+  "$defs": {
+    "CapabilityIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/CapabilityName"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version"
+      ]
+    },
+    "CapabilityName": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "EffectClassification": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "reversible_write",
+        "irreversible_write",
+        "external_side_effect"
+      ]
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

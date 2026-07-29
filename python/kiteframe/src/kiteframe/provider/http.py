@@ -19,10 +19,11 @@ from kiteframe._native import (
     KiteframeDiagnosticError,
     ResolvedCapabilityRequirement,
     ResolvedRuntimeInputs,
+    StatusRequest,
     load_capability_catalog,
     load_capability_grant_set_for_request,
     load_invocation_outcome_for_request,
-    load_invocation_status_for_invocation_id,
+    load_invocation_status_for_request,
 )
 
 from .trace import trace_headers
@@ -156,7 +157,7 @@ def _canonical_json(value: object) -> bytes:
 
 
 def _request_headers(
-    request: CatalogRequest | AdmissionRequest | InvocationRequest,
+    request: CatalogRequest | AdmissionRequest | InvocationRequest | StatusRequest,
     *,
     baggage_allowlist: frozenset[str],
 ) -> dict[str, str]:
@@ -461,20 +462,16 @@ class ProviderHttpClient:
 
     async def status(
         self,
-        invocation_id: str,
+        request: StatusRequest,
         requirement: ResolvedCapabilityRequirement,
     ) -> InvocationStatus:
-        # Mirrors InvocationId::new's nonblank rule, then excludes RFC 3986
-        # dot segments that HTTPX would normalize outside the fixed route.
-        if (
-            not isinstance(invocation_id, str)
-            or not invocation_id.strip()
-            or invocation_id in {".", ".."}
-            or "\r" in invocation_id
-            or "\n" in invocation_id
-            or "\0" in invocation_id
-        ):
-            raise ValueError("invocation ID must be a non-empty string")
+        if not isinstance(request, StatusRequest):
+            raise TypeError("status request must be a native StatusRequest")
+        # Native validation owns the nonblank invariant. The adapter additionally
+        # rejects RFC 3986 dot segments that HTTPX would normalize outside the
+        # fixed invocation route.
+        if request.invocation_id in {".", ".."}:
+            raise ValueError("invocation ID cannot be an HTTP path dot segment")
         if not isinstance(requirement, ResolvedCapabilityRequirement):
             raise TypeError(
                 "status requirement must be a native ResolvedCapabilityRequirement"
@@ -486,14 +483,18 @@ class ProviderHttpClient:
             raise ValueError(
                 "status requirement is not present in resolved runtime inputs"
             )
-        encoded_invocation_id = quote(invocation_id, safe="")
+        encoded_invocation_id = quote(request.invocation_id, safe="")
         return _load_native_response(
-            load_invocation_status_for_invocation_id,
+            load_invocation_status_for_request,
             await self._request(
                 "GET",
                 f"/v1/capability-invocations/{encoded_invocation_id}",
+                headers=_request_headers(
+                    request,
+                    baggage_allowlist=self._baggage_allowlist,
+                ),
             ),
-            invocation_id,
+            request,
             indexed,
         )
 

@@ -7,10 +7,11 @@ use kiteframe_contract::{
     CapabilityDescriptor as ContractCapabilityDescriptor, CapabilityErrorDescriptor,
     CapabilityGrantSet as ContractCapabilityGrantSet, CatalogRequest as ContractCatalogRequest,
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity, DiagnosticStage,
-    EffectiveCapabilityGrant as ContractEffectiveCapabilityGrant, ExecutionMode,
-    InvocationId as ContractInvocationId, InvocationOutcome as ContractInvocationOutcome,
-    InvocationRequest as ContractInvocationRequest, InvocationStatus as ContractInvocationStatus,
-    RetryClass, StableCapabilityError, Suspension, TraceContext,
+    EffectClassification, EffectProposal as ContractEffectProposal,
+    EffectiveCapabilityGrant as ContractEffectiveCapabilityGrant, EvidenceKind, ExecutionMode,
+    InvocationOutcome as ContractInvocationOutcome, InvocationRequest as ContractInvocationRequest,
+    InvocationStatus as ContractInvocationStatus, RetryClass, StableCapabilityError,
+    StatusRequest as ContractStatusRequest, Suspension, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::{
@@ -36,6 +37,16 @@ static ADMISSION_REQUEST_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new
 static INVOCATION_REQUEST_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     locked_response_validator(include_bytes!(
         "../../../schemas/v1alpha1/invocation-request.schema.json"
+    ))
+});
+static EFFECT_PROPOSAL_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/effect-proposal.schema.json"
+    ))
+});
+static STATUS_REQUEST_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
+    locked_response_validator(include_bytes!(
+        "../../../schemas/v1alpha1/status-request.schema.json"
     ))
 });
 static CAPABILITY_CATALOG_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
@@ -119,6 +130,23 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
         ExecutionMode::Immediate => "immediate",
         ExecutionMode::Deferred => "deferred",
         ExecutionMode::Suspendable => "suspendable",
+    }
+}
+
+fn effect_name(effect: EffectClassification) -> &'static str {
+    match effect {
+        EffectClassification::ReadOnly => "read_only",
+        EffectClassification::ReversibleWrite => "reversible_write",
+        EffectClassification::IrreversibleWrite => "irreversible_write",
+        EffectClassification::ExternalSideEffect => "external_side_effect",
+    }
+}
+
+fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Confirmation => "confirmation",
+        EvidenceKind::Approval => "approval",
+        EvidenceKind::Consent => "consent",
     }
 }
 
@@ -288,7 +316,147 @@ impl From<Suspension> for PySuspension {
 impl PySuspension {
     #[getter]
     pub fn checkpoint_ref(&self) -> &str {
-        self.inner.checkpoint_ref()
+        self.inner.checkpoint_ref().as_str()
+    }
+
+    #[getter]
+    pub fn evidence_kind(&self) -> &'static str {
+        evidence_kind_name(self.inner.evidence_kind())
+    }
+
+    #[getter]
+    pub fn evidence_request_ref(&self) -> &str {
+        self.inner.evidence_request_ref().as_str()
+    }
+
+    #[getter]
+    pub fn proposal_digest(&self) -> String {
+        self.inner.proposal_digest().to_string()
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "EffectProposal"
+)]
+pub struct PyEffectProposal {
+    inner: Arc<ContractEffectProposal>,
+}
+
+impl From<ContractEffectProposal> for PyEffectProposal {
+    fn from(inner: ContractEffectProposal) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyEffectProposal {
+    #[getter]
+    pub fn invocation_id(&self) -> &str {
+        self.inner.invocation_id().as_str()
+    }
+    #[getter]
+    pub fn admission_id(&self) -> &str {
+        self.inner.admission_id().as_str()
+    }
+    #[getter]
+    pub fn grant_digest(&self) -> String {
+        self.inner.grant_digest().to_string()
+    }
+    #[getter]
+    pub fn capability_name(&self) -> &str {
+        self.inner.capability().name().as_str()
+    }
+    #[getter]
+    pub fn capability_version(&self) -> &str {
+        self.inner.capability().version().as_str()
+    }
+    #[getter]
+    pub fn selected_resource(&self) -> &str {
+        self.inner.selected_resource().as_str()
+    }
+    #[getter]
+    pub fn arguments_digest(&self) -> String {
+        self.inner.arguments_digest().to_string()
+    }
+    #[getter]
+    pub fn preconditions_digest(&self) -> String {
+        self.inner.preconditions_digest().to_string()
+    }
+    #[getter]
+    pub fn idempotency_key(&self) -> Option<&str> {
+        self.inner
+            .idempotency_key()
+            .map(kiteframe_contract::IdempotencyKey::as_str)
+    }
+    #[getter]
+    pub fn effect(&self) -> &'static str {
+        effect_name(self.inner.effect())
+    }
+    #[getter]
+    pub fn proposal_digest(&self) -> String {
+        self.inner.proposal_digest().to_string()
+    }
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "StatusRequest"
+)]
+pub struct PyStatusRequest {
+    inner: Arc<ContractStatusRequest>,
+}
+
+impl From<ContractStatusRequest> for PyStatusRequest {
+    fn from(inner: ContractStatusRequest) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyStatusRequest {
+    #[getter]
+    pub fn invocation_id(&self) -> &str {
+        self.inner.invocation_id().as_str()
+    }
+    #[getter]
+    pub fn traceparent(&self) -> &str {
+        self.inner.trace_context().traceparent()
+    }
+    #[getter]
+    pub fn tracestate(&self) -> Option<&str> {
+        self.inner.trace_context().tracestate()
+    }
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn baggage(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.trace_context().baggage())
+    }
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
     }
 }
 
@@ -1326,6 +1494,18 @@ pub fn load_invocation_request_inner(
     validate_canonical_locked_response(bytes, &INVOCATION_REQUEST_SCHEMA)
 }
 
+pub fn load_effect_proposal_inner(
+    bytes: &[u8],
+) -> Result<ContractEffectProposal, ProviderResponseError> {
+    validate_canonical_locked_response(bytes, &EFFECT_PROPOSAL_SCHEMA)
+}
+
+pub fn load_status_request_inner(
+    bytes: &[u8],
+) -> Result<ContractStatusRequest, ProviderResponseError> {
+    validate_canonical_locked_response(bytes, &STATUS_REQUEST_SCHEMA)
+}
+
 pub fn load_capability_catalog_inner(
     bytes: &[u8],
 ) -> Result<ContractCapabilityCatalog, ProviderResponseError> {
@@ -1373,14 +1553,14 @@ pub fn load_invocation_outcome_for_request_inner(
     Ok(response)
 }
 
-pub fn load_invocation_status_for_invocation_id_inner(
+pub fn load_invocation_status_for_request_inner(
     bytes: &[u8],
-    invocation_id: &ContractInvocationId,
+    request: &ContractStatusRequest,
     descriptor: &ContractCapabilityDescriptor,
 ) -> Result<ContractInvocationStatus, ProviderResponseError> {
     let response = load_invocation_status_inner(bytes)?;
     response
-        .validate_for_invocation_id(invocation_id, descriptor)
+        .validate_for_status_request(request, descriptor)
         .map_err(|_| ProviderResponseError::Correlation)?;
     Ok(response)
 }
@@ -1478,6 +1658,34 @@ pub fn load_invocation_request(
 
 #[gen_stub_pyfunction]
 #[pyfunction]
+pub fn load_effect_proposal(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+) -> PyResult<PyEffectProposal> {
+    load_effect_proposal_inner(bytes)
+        .map(PyEffectProposal::from)
+        .map_err(provider_response_error)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn load_status_request(
+    #[gen_stub(override_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    bytes: &[u8],
+) -> PyResult<PyStatusRequest> {
+    load_status_request_inner(bytes)
+        .map(PyStatusRequest::from)
+        .map_err(provider_response_error)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
 pub fn load_capability_catalog(
     #[gen_stub(override_type(
         type_repr = "builtins.bytes",
@@ -1569,20 +1777,18 @@ pub fn load_invocation_outcome_for_request(
 
 #[gen_stub_pyfunction]
 #[pyfunction]
-pub fn load_invocation_status_for_invocation_id(
+pub fn load_invocation_status_for_request(
     #[gen_stub(override_type(
         type_repr = "builtins.bytes",
         imports = ("builtins",)
     ))]
     bytes: &[u8],
-    invocation_id: &str,
+    request: &PyStatusRequest,
     requirement: &PyResolvedCapabilityRequirement,
 ) -> PyResult<PyInvocationStatus> {
-    let invocation_id = ContractInvocationId::new(invocation_id)
-        .map_err(|_| provider_response_error(ProviderResponseError::Correlation))?;
-    load_invocation_status_for_invocation_id_inner(
+    load_invocation_status_for_request_inner(
         bytes,
-        &invocation_id,
+        request.inner.as_ref(),
         requirement.descriptor_inner(),
     )
     .map(PyInvocationStatus::from)

@@ -5,12 +5,13 @@ use _native::{
 use kiteframe_contract::{
     ActorRef, AdmissionId, AgentRef, ApprovalRequirement, AuthorityRevision, AuthorityRevisionSet,
     CapabilityDenial, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
-    CapabilityName, CapabilityReleaseVersion, CatalogIdentity, ConfirmationRequirement,
-    ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity,
-    DiagnosticStage, EffectClassification, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts,
-    ExecutionMode, InvocationId, InvocationOutcome, InvocationStatus, NonEmptySet,
-    NormalizedResourceSelector, PolicyRevision, RequiredEvidence, RetryClass, SessionRef,
-    Sha256Digest, StableCapabilityError, Suspension, TaskRef, Timestamp,
+    CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CheckpointRef,
+    ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticSeverity, DiagnosticStage, EffectClassification, EffectiveCapabilityGrant,
+    EffectiveCapabilityGrantParts, EvidenceKind, ExecutionMode, InvocationId, InvocationOutcome,
+    InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
+    ProtectedEvidenceRequestRef, RequiredEvidence, RetryClass, SessionRef, Sha256Digest,
+    StableCapabilityError, Suspension, TaskRef, Timestamp,
 };
 use pyo3::Python;
 
@@ -180,11 +181,17 @@ fn outcome_and_status_expose_detached_structured_values() {
 
         let suspended = PyInvocationStatus::from(InvocationStatus::Suspended {
             invocation_id: InvocationId::new("inv-1").unwrap(),
-            suspension: Suspension::try_new("checkpoint://case-1").unwrap(),
+            suspension: Suspension::try_new(
+                CheckpointRef::new("checkpoint:opaque:1").unwrap(),
+                EvidenceKind::Approval,
+                ProtectedEvidenceRequestRef::new("evidence-request:opaque:1").unwrap(),
+                Sha256Digest::from_bytes([11; 32]),
+            )
+            .unwrap(),
         });
         assert_eq!(
             suspended.suspension().unwrap().checkpoint_ref(),
-            "checkpoint://case-1"
+            "checkpoint:opaque:1"
         );
     });
 }

@@ -7,15 +7,16 @@ use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
     AuthorityRevision, AuthorityRevisionSet, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, CapabilityName,
-    CapabilityReleaseVersion, CatalogIdentity, CatalogRequest, ConfirmationRequirement,
-    ConsentRequirement, DelegationAncestry, Diagnostic, EffectClassification,
-    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceReferences,
-    EvidenceRequirement, ExecutionMode, IdempotencyRequirement, IdempotencyScope, InvocationId,
-    InvocationOutcome, InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet,
-    NormalizedResourceSelector, PolicyRevision, PreconditionDescriptor, RequestedCapability,
-    RequiredEvidence, ResolvedCapabilityRequirement, ResourceSelectorSchema, RetryClass,
-    SessionRef, Sha256Digest, StableCapabilityError, StatusFirstDiagnostic, Suspension, TaskRef,
-    Timestamp, TraceContext,
+    CapabilityReleaseVersion, CatalogIdentity, CatalogRequest, CheckpointRef,
+    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, Diagnostic,
+    EffectClassification, EffectProposal, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts,
+    EvidenceKind, EvidenceReferences, EvidenceRequirement, ExecutionMode, IdempotencyRequirement,
+    IdempotencyScope, InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus,
+    LockedCapability, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
+    PreconditionDescriptor, ProtectedEvidenceRequestRef, RequestedCapability, RequiredEvidence,
+    ResolvedCapabilityRequirement, ResourceSelectorSchema, RetryClass, SessionRef, Sha256Digest,
+    StableCapabilityError, StatusFirstDiagnostic, StatusRequest, Suspension, TaskRef, Timestamp,
+    TraceContext,
 };
 use serde_json::json;
 
@@ -38,6 +39,191 @@ fn effectful_invocation_requires_an_idempotency_key() {
     let request = invocation_request(None);
     let errors = request.validate_against(&descriptor).unwrap_err();
     assert_eq!(errors[0].code.as_str(), "KF-PKG-001");
+}
+
+#[test]
+fn proposal_digest_changes_for_every_effect_semantic() {
+    let baseline_request = invocation_request_for(
+        capability_identity(),
+        AdmissionId::new("adm-1").unwrap(),
+        digest(42),
+        "tenant:t1/case:case-1",
+        json!({"caseId": "case-1"}),
+        BTreeMap::from([(String::from("caseVersion"), String::from("7"))]),
+        Some("idem-1"),
+    );
+    let baseline = EffectProposal::try_new(&baseline_request, &effectful_descriptor()).unwrap();
+
+    let changed = [
+        EffectProposal::try_new(
+            &invocation_request_for(
+                capability_identity_with_name("cases.close"),
+                AdmissionId::new("adm-1").unwrap(),
+                digest(42),
+                "tenant:t1/case:case-1",
+                json!({"caseId": "case-1"}),
+                BTreeMap::from([(String::from("caseVersion"), String::from("7"))]),
+                Some("idem-1"),
+            ),
+            &descriptor_with_identity(
+                capability_identity_with_name("cases.close"),
+                EffectClassification::ExternalSideEffect,
+                required_idempotency(),
+            ),
+        )
+        .unwrap(),
+        EffectProposal::try_new(
+            &invocation_request_for(
+                capability_identity(),
+                AdmissionId::new("adm-2").unwrap(),
+                digest(42),
+                "tenant:t1/case:case-1",
+                json!({"caseId": "case-1"}),
+                BTreeMap::from([(String::from("caseVersion"), String::from("7"))]),
+                Some("idem-1"),
+            ),
+            &effectful_descriptor(),
+        )
+        .unwrap(),
+        EffectProposal::try_new(
+            &invocation_request_for(
+                capability_identity(),
+                AdmissionId::new("adm-1").unwrap(),
+                digest(43),
+                "tenant:t1/case:case-1",
+                json!({"caseId": "case-1"}),
+                BTreeMap::from([(String::from("caseVersion"), String::from("7"))]),
+                Some("idem-1"),
+            ),
+            &effectful_descriptor(),
+        )
+        .unwrap(),
+        EffectProposal::try_new(
+            &invocation_request_for(
+                capability_identity(),
+                AdmissionId::new("adm-1").unwrap(),
+                digest(42),
+                "tenant:t1/case:case-2",
+                json!({"caseId": "case-1"}),
+                BTreeMap::from([(String::from("caseVersion"), String::from("7"))]),
+                Some("idem-1"),
+            ),
+            &effectful_descriptor(),
+        )
+        .unwrap(),
+        EffectProposal::try_new(
+            &invocation_request_for(
+                capability_identity(),
+                AdmissionId::new("adm-1").unwrap(),
+                digest(42),
+                "tenant:t1/case:case-1",
+                json!({"caseId": "case-2"}),
+                BTreeMap::from([(String::from("caseVersion"), String::from("7"))]),
+                Some("idem-1"),
+            ),
+            &effectful_descriptor(),
+        )
+        .unwrap(),
+        EffectProposal::try_new(
+            &invocation_request_for(
+                capability_identity(),
+                AdmissionId::new("adm-1").unwrap(),
+                digest(42),
+                "tenant:t1/case:case-1",
+                json!({"caseId": "case-1"}),
+                BTreeMap::from([(String::from("caseVersion"), String::from("8"))]),
+                Some("idem-1"),
+            ),
+            &effectful_descriptor(),
+        )
+        .unwrap(),
+        EffectProposal::try_new(
+            &invocation_request_for(
+                capability_identity(),
+                AdmissionId::new("adm-1").unwrap(),
+                digest(42),
+                "tenant:t1/case:case-1",
+                json!({"caseId": "case-1"}),
+                BTreeMap::from([(String::from("caseVersion"), String::from("7"))]),
+                Some("idem-2"),
+            ),
+            &effectful_descriptor(),
+        )
+        .unwrap(),
+        EffectProposal::try_new(
+            &baseline_request,
+            &descriptor(
+                EffectClassification::ReversibleWrite,
+                required_idempotency(),
+            ),
+        )
+        .unwrap(),
+    ];
+
+    for proposal in changed {
+        assert_ne!(baseline.proposal_digest(), proposal.proposal_digest());
+    }
+}
+
+#[test]
+fn proposal_digest_changes_for_another_invocation_and_rejects_tampering() {
+    let baseline =
+        EffectProposal::try_new(&invocation_request(None), &read_only_descriptor()).unwrap();
+    let changed_request = InvocationRequest::try_new(
+        InvocationId::new("inv-2").unwrap(),
+        baseline.admission_id().clone(),
+        *baseline.grant_digest(),
+        baseline.capability().clone(),
+        baseline.selected_resource().as_str(),
+        json!({"caseId": "case-1"}),
+        BTreeMap::new(),
+        None,
+        EvidenceReferences::try_new(BTreeMap::new()).unwrap(),
+        trace_context(),
+    )
+    .unwrap();
+    let changed = EffectProposal::try_new(&changed_request, &read_only_descriptor()).unwrap();
+    assert_ne!(baseline.proposal_digest(), changed.proposal_digest());
+
+    let mut wire = serde_json::to_value(baseline).unwrap();
+    wire["argumentsDigest"] = json!(digest(99));
+    assert!(serde_json::from_value::<EffectProposal>(wire).is_err());
+}
+
+#[test]
+fn suspension_contains_only_protected_refs_and_proposal_binding() {
+    let proposal =
+        EffectProposal::try_new(&invocation_request(None), &read_only_descriptor()).unwrap();
+    let suspension = Suspension::try_new(
+        CheckpointRef::new("checkpoint:opaque:1").unwrap(),
+        EvidenceKind::Approval,
+        ProtectedEvidenceRequestRef::new("evidence-request:opaque:1").unwrap(),
+        *proposal.proposal_digest(),
+    )
+    .unwrap();
+    let wire = serde_json::to_value(suspension).unwrap();
+
+    assert_eq!(
+        wire.as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            String::from("checkpointRef"),
+            String::from("evidenceKind"),
+            String::from("evidenceRequestRef"),
+            String::from("proposalDigest"),
+        ])
+    );
+    assert!(wire.get("approvalText").is_none());
+    assert!(wire.get("evidence").is_none());
+}
+
+#[test]
+fn status_request_requires_native_trace_context() {
+    let request = StatusRequest::new(InvocationId::new("inv-1").unwrap(), trace_context());
+    assert_eq!(request.trace_context().traceparent(), valid_traceparent());
 }
 
 #[test]
@@ -445,7 +631,15 @@ fn deferred_and_suspended_variants_require_their_locked_execution_modes() {
     };
     let suspended = InvocationOutcome::Suspended {
         invocation_id: request.invocation_id().clone(),
-        suspension: Suspension::try_new("checkpoint://case-1").unwrap(),
+        suspension: Suspension::try_new(
+            CheckpointRef::new("checkpoint:opaque:1").unwrap(),
+            EvidenceKind::Approval,
+            ProtectedEvidenceRequestRef::new("evidence-request:opaque:1").unwrap(),
+            *EffectProposal::try_new(&request, &read_only_descriptor())
+                .unwrap()
+                .proposal_digest(),
+        )
+        .unwrap(),
     };
 
     assert_eq!(
@@ -630,14 +824,35 @@ fn status_unknown_deserialization_rejects_non_status_first_retry() {
 }
 
 fn invocation_request(idempotency_key: Option<&str>) -> InvocationRequest {
-    InvocationRequest::try_new(
-        InvocationId::new("inv-1").unwrap(),
+    invocation_request_for(
+        capability_identity(),
         AdmissionId::new("adm-1").unwrap(),
         digest(42),
-        capability_identity(),
         "tenant:t1/case:case-1",
         json!({"caseId": "case-1"}),
         BTreeMap::new(),
+        idempotency_key,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invocation_request_for(
+    capability: CapabilityIdentity,
+    admission_id: AdmissionId,
+    grant_digest: Sha256Digest,
+    selected_resource: &str,
+    arguments: serde_json::Value,
+    preconditions: BTreeMap<String, String>,
+    idempotency_key: Option<&str>,
+) -> InvocationRequest {
+    InvocationRequest::try_new(
+        InvocationId::new("inv-1").unwrap(),
+        admission_id,
+        grant_digest,
+        capability,
+        selected_resource,
+        arguments,
+        preconditions,
         idempotency_key.map(ToOwned::to_owned),
         EvidenceReferences::try_new(BTreeMap::from([(
             String::from("approval"),
@@ -652,11 +867,15 @@ fn invocation_request(idempotency_key: Option<&str>) -> InvocationRequest {
 fn effectful_descriptor() -> CapabilityDescriptor {
     descriptor(
         EffectClassification::ExternalSideEffect,
-        IdempotencyRequirement::Required {
-            scope: IdempotencyScope::ActorCapabilityResourceOperation,
-            retention_seconds: std::num::NonZeroU64::new(60).unwrap(),
-        },
+        required_idempotency(),
     )
+}
+
+fn required_idempotency() -> IdempotencyRequirement {
+    IdempotencyRequirement::Required {
+        scope: IdempotencyScope::ActorCapabilityResourceOperation,
+        retention_seconds: std::num::NonZeroU64::new(60).unwrap(),
+    }
 }
 
 fn read_only_descriptor() -> CapabilityDescriptor {
@@ -667,8 +886,16 @@ fn descriptor(
     effect: EffectClassification,
     idempotency: IdempotencyRequirement,
 ) -> CapabilityDescriptor {
+    descriptor_with_identity(capability_identity(), effect, idempotency)
+}
+
+fn descriptor_with_identity(
+    identity: CapabilityIdentity,
+    effect: EffectClassification,
+    idempotency: IdempotencyRequirement,
+) -> CapabilityDescriptor {
     CapabilityDescriptor::try_new(CapabilityDescriptorParts {
-        identity: capability_identity(),
+        identity,
         summary: String::from("Operate on a case"),
         input_schema: json!({"type": "object"}),
         output_schema: json!({"type": "object"}),
@@ -690,6 +917,10 @@ fn descriptor(
         consent: ConsentRequirement::None,
     })
     .unwrap()
+}
+
+fn trace_context() -> TraceContext {
+    TraceContext::try_new(valid_traceparent(), None, BTreeMap::new()).unwrap()
 }
 
 fn response_descriptor(execution_modes: BTreeSet<ExecutionMode>) -> CapabilityDescriptor {

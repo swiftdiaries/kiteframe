@@ -50,6 +50,11 @@ string_ref!(PolicyRevision, "policy revision is required");
 string_ref!(InvocationId, "invocation ID is required");
 string_ref!(IdempotencyKey, "idempotency key is required");
 string_ref!(NormalizedResourceSelector, "resource selector is required");
+string_ref!(CheckpointRef, "suspension checkpoint reference is required");
+string_ref!(
+    ProtectedEvidenceRequestRef,
+    "protected evidence request reference is required"
+);
 
 /// A fixed-width, non-secret correlation identifier permitted in W3C baggage.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1315,6 +1320,10 @@ fn canonical_digest<T: Serialize>(domain: &[u8], value: &T) -> Result<Sha256Dige
     Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
 }
 
+const EFFECT_ARGUMENTS_DIGEST_DOMAIN: &[u8] = b"kiteframe:effect-arguments:v1\0";
+const EFFECT_PRECONDITIONS_DIGEST_DOMAIN: &[u8] = b"kiteframe:effect-preconditions:v1\0";
+const EFFECT_PROPOSAL_DIGEST_DOMAIN: &[u8] = b"kiteframe:effect-proposal:v1\0";
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InvocationRequest {
@@ -1451,6 +1460,198 @@ impl InvocationRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EffectProposal {
+    invocation_id: InvocationId,
+    admission_id: AdmissionId,
+    grant_digest: Sha256Digest,
+    capability: CapabilityIdentity,
+    selected_resource: NormalizedResourceSelector,
+    arguments_digest: Sha256Digest,
+    preconditions_digest: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    idempotency_key: Option<IdempotencyKey>,
+    effect: EffectClassification,
+    proposal_digest: Sha256Digest,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EffectProposalDigestInput<'a> {
+    invocation_id: &'a InvocationId,
+    admission_id: &'a AdmissionId,
+    grant_digest: &'a Sha256Digest,
+    capability: &'a CapabilityIdentity,
+    selected_resource: &'a NormalizedResourceSelector,
+    arguments_digest: &'a Sha256Digest,
+    preconditions_digest: &'a Sha256Digest,
+    idempotency_key: &'a Option<IdempotencyKey>,
+    effect: EffectClassification,
+}
+
+impl EffectProposal {
+    pub fn try_new(
+        request: &InvocationRequest,
+        descriptor: &CapabilityDescriptor,
+    ) -> Result<Self, Vec<Diagnostic>> {
+        request.validate_against(descriptor)?;
+        let arguments_digest =
+            canonical_digest(EFFECT_ARGUMENTS_DIGEST_DOMAIN, request.arguments())
+                .map_err(|message| vec![invalid(message)])?;
+        let preconditions_digest =
+            canonical_digest(EFFECT_PRECONDITIONS_DIGEST_DOMAIN, request.preconditions())
+                .map_err(|message| vec![invalid(message)])?;
+        Self::from_digests(
+            request.invocation_id.clone(),
+            request.admission_id.clone(),
+            request.grant_digest,
+            request.capability.clone(),
+            request.selected_resource.clone(),
+            arguments_digest,
+            preconditions_digest,
+            request.idempotency_key.clone(),
+            descriptor.effect(),
+            None,
+        )
+        .map_err(|message| vec![invalid(message)])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_digests(
+        invocation_id: InvocationId,
+        admission_id: AdmissionId,
+        grant_digest: Sha256Digest,
+        capability: CapabilityIdentity,
+        selected_resource: NormalizedResourceSelector,
+        arguments_digest: Sha256Digest,
+        preconditions_digest: Sha256Digest,
+        idempotency_key: Option<IdempotencyKey>,
+        effect: EffectClassification,
+        claimed_digest: Option<Sha256Digest>,
+    ) -> Result<Self, String> {
+        let proposal_digest = canonical_digest(
+            EFFECT_PROPOSAL_DIGEST_DOMAIN,
+            &EffectProposalDigestInput {
+                invocation_id: &invocation_id,
+                admission_id: &admission_id,
+                grant_digest: &grant_digest,
+                capability: &capability,
+                selected_resource: &selected_resource,
+                arguments_digest: &arguments_digest,
+                preconditions_digest: &preconditions_digest,
+                idempotency_key: &idempotency_key,
+                effect,
+            },
+        )?;
+        if claimed_digest.is_some_and(|claimed| claimed != proposal_digest) {
+            return Err("effect proposal digest does not match its canonical semantics".to_owned());
+        }
+        Ok(Self {
+            invocation_id,
+            admission_id,
+            grant_digest,
+            capability,
+            selected_resource,
+            arguments_digest,
+            preconditions_digest,
+            idempotency_key,
+            effect,
+            proposal_digest,
+        })
+    }
+
+    pub fn invocation_id(&self) -> &InvocationId {
+        &self.invocation_id
+    }
+    pub fn admission_id(&self) -> &AdmissionId {
+        &self.admission_id
+    }
+    pub fn grant_digest(&self) -> &Sha256Digest {
+        &self.grant_digest
+    }
+    pub fn capability(&self) -> &CapabilityIdentity {
+        &self.capability
+    }
+    pub fn selected_resource(&self) -> &NormalizedResourceSelector {
+        &self.selected_resource
+    }
+    pub fn arguments_digest(&self) -> &Sha256Digest {
+        &self.arguments_digest
+    }
+    pub fn preconditions_digest(&self) -> &Sha256Digest {
+        &self.preconditions_digest
+    }
+    pub fn idempotency_key(&self) -> Option<&IdempotencyKey> {
+        self.idempotency_key.as_ref()
+    }
+    pub fn effect(&self) -> EffectClassification {
+        self.effect
+    }
+    pub fn proposal_digest(&self) -> &Sha256Digest {
+        &self.proposal_digest
+    }
+}
+
+impl<'de> Deserialize<'de> for EffectProposal {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            invocation_id: InvocationId,
+            admission_id: AdmissionId,
+            grant_digest: Sha256Digest,
+            capability: CapabilityIdentity,
+            selected_resource: NormalizedResourceSelector,
+            arguments_digest: Sha256Digest,
+            preconditions_digest: Sha256Digest,
+            #[serde(default)]
+            idempotency_key: Option<IdempotencyKey>,
+            effect: EffectClassification,
+            proposal_digest: Sha256Digest,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::from_digests(
+            raw.invocation_id,
+            raw.admission_id,
+            raw.grant_digest,
+            raw.capability,
+            raw.selected_resource,
+            raw.arguments_digest,
+            raw.preconditions_digest,
+            raw.idempotency_key,
+            raw.effect,
+            Some(raw.proposal_digest),
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StatusRequest {
+    invocation_id: InvocationId,
+    trace_context: TraceContext,
+}
+
+impl StatusRequest {
+    pub fn new(invocation_id: InvocationId, trace_context: TraceContext) -> Self {
+        Self {
+            invocation_id,
+            trace_context,
+        }
+    }
+
+    pub fn invocation_id(&self) -> &InvocationId {
+        &self.invocation_id
+    }
+
+    pub fn trace_context(&self) -> &TraceContext {
+        &self.trace_context
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StableCapabilityError {
     #[schemars(length(min = 1))]
     code: String,
@@ -1509,37 +1710,54 @@ impl<'de> Deserialize<'de> for StableCapabilityError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Confirmation,
+    Approval,
+    Consent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Suspension {
     #[schemars(length(min = 1))]
-    checkpoint_ref: String,
-}
-
-impl<'de> Deserialize<'de> for Suspension {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase", deny_unknown_fields)]
-        struct Raw {
-            checkpoint_ref: String,
-        }
-
-        let raw = Raw::deserialize(deserializer)?;
-        Self::try_new(raw.checkpoint_ref).map_err(D::Error::custom)
-    }
+    checkpoint_ref: CheckpointRef,
+    evidence_kind: EvidenceKind,
+    #[schemars(length(min = 1))]
+    evidence_request_ref: ProtectedEvidenceRequestRef,
+    proposal_digest: Sha256Digest,
 }
 
 impl Suspension {
-    pub fn try_new(checkpoint_ref: impl Into<String>) -> Result<Self, String> {
-        let checkpoint_ref = checkpoint_ref.into();
-        if checkpoint_ref.trim().is_empty() {
-            return Err("suspension checkpoint reference is required".to_owned());
-        }
-        Ok(Self { checkpoint_ref })
+    pub fn try_new(
+        checkpoint_ref: CheckpointRef,
+        evidence_kind: EvidenceKind,
+        evidence_request_ref: ProtectedEvidenceRequestRef,
+        proposal_digest: Sha256Digest,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            checkpoint_ref,
+            evidence_kind,
+            evidence_request_ref,
+            proposal_digest,
+        })
     }
 
-    pub fn checkpoint_ref(&self) -> &str {
+    pub fn checkpoint_ref(&self) -> &CheckpointRef {
         &self.checkpoint_ref
+    }
+
+    pub fn evidence_kind(&self) -> EvidenceKind {
+        self.evidence_kind
+    }
+
+    pub fn evidence_request_ref(&self) -> &ProtectedEvidenceRequestRef {
+        &self.evidence_request_ref
+    }
+
+    pub fn proposal_digest(&self) -> &Sha256Digest {
+        &self.proposal_digest
     }
 }
 
@@ -1841,12 +2059,12 @@ impl InvocationStatus {
         self.validate_against(request, descriptor)
     }
 
-    pub fn validate_for_invocation_id(
+    pub fn validate_for_status_request(
         &self,
-        invocation_id: &InvocationId,
+        request: &StatusRequest,
         descriptor: &CapabilityDescriptor,
     ) -> Result<(), Diagnostic> {
-        validate_response_invocation_id(self.invocation_id(), invocation_id)?;
+        validate_response_invocation_id(self.invocation_id(), request.invocation_id())?;
         match self {
             Self::Pending { .. } => descriptor.require_mode(crate::ExecutionMode::Deferred),
             Self::Suspended { .. } => descriptor.require_mode(crate::ExecutionMode::Suspendable),

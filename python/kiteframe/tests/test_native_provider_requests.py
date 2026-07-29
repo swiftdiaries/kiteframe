@@ -12,12 +12,14 @@ from kiteframe import (
     InvocationOutcome,
     InvocationRequest,
     KiteframeDiagnosticError,
+    StatusRequest,
     load_admission_request,
     load_capability_catalog,
     load_catalog_request,
     load_invocation_outcome,
     load_invocation_request,
     load_invocation_status,
+    load_status_request,
     resolve_package,
 )
 
@@ -92,10 +94,25 @@ def valid_invocation_request() -> bytes:
             "evidenceRefs": {
                 "approval": "evidence://approval/1",
             },
+            "grantDigest": "0a" * 32,
             "invocationId": "inv-1",
             "preconditions": {},
             "selectedResource": "tenant:t1/case:case-1",
             "traceContext": {"traceparent": VALID_TRACEPARENT},
+        }
+    )
+
+
+@pytest.fixture
+def valid_status_request() -> bytes:
+    return canonical_bytes(
+        {
+            "invocationId": "inv-1",
+            "traceContext": {
+                "baggage": {"kiteframe.request_id": "10" * 16},
+                "traceparent": VALID_TRACEPARENT,
+                "tracestate": "vendor=value",
+            },
         }
     )
 
@@ -150,6 +167,12 @@ def test_catalog_request_is_factory_only_and_canonical() -> None:
             "invocation_id",
         ),
         (
+            StatusRequest,
+            load_status_request,
+            "valid_status_request",
+            "invocation_id",
+        ),
+        (
             CapabilityCatalog,
             load_capability_catalog,
             "valid_capability_catalog",
@@ -182,11 +205,13 @@ def test_provider_request_properties_are_stable_native_values(
     valid_catalog_request: bytes,
     valid_admission_request: bytes,
     valid_invocation_request: bytes,
+    valid_status_request: bytes,
     valid_capability_catalog: bytes,
 ) -> None:
     catalog_request = load_catalog_request(valid_catalog_request)
     admission = load_admission_request(valid_admission_request)
     invocation = load_invocation_request(valid_invocation_request)
+    status_request = load_status_request(valid_status_request)
     catalog = load_capability_catalog(valid_capability_catalog)
 
     assert catalog_request.known_catalog_digest == "09" * 32
@@ -205,6 +230,10 @@ def test_provider_request_properties_are_stable_native_values(
     }
     assert invocation.traceparent == VALID_TRACEPARENT
     assert invocation.baggage == {}
+    assert status_request.invocation_id == "inv-1"
+    assert status_request.traceparent == VALID_TRACEPARENT
+    assert status_request.tracestate == "vendor=value"
+    assert status_request.baggage == {"kiteframe.request_id": "10" * 16}
     assert catalog.name == "provider.test"
     assert catalog.revision == "revision-1"
     assert len(catalog.catalog_digest) == 64
@@ -287,14 +316,22 @@ def test_suspension_is_a_frozen_structured_projection() -> None:
             {
                 "invocation_id": "inv-1",
                 "status": "suspended",
-                "suspension": {"checkpointRef": "checkpoint://case-1"},
+                "suspension": {
+                    "checkpointRef": "checkpoint:opaque:1",
+                    "evidenceKind": "approval",
+                    "evidenceRequestRef": "evidence-request:opaque:1",
+                    "proposalDigest": "0b" * 32,
+                },
             }
         )
     )
 
     suspension = status.suspension
     assert suspension is not None
-    assert suspension.checkpoint_ref == "checkpoint://case-1"
+    assert suspension.checkpoint_ref == "checkpoint:opaque:1"
+    assert suspension.evidence_kind == "approval"
+    assert suspension.evidence_request_ref == "evidence-request:opaque:1"
+    assert suspension.proposal_digest == "0b" * 32
     with pytest.raises(AttributeError):
         suspension.checkpoint_ref = "forged"  # type: ignore[reportAttributeAccessIssue]
 

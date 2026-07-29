@@ -16,13 +16,14 @@ use pyo3_stub_gen::{StubGenConfig, StubInfo};
 pub use service::{
     ProviderResponseError, PyAdmissionRequest, PyAuthorityRevision, PyAuthorityRevisionSet,
     PyCapabilityCatalog, PyCapabilityDenial, PyCapabilityDescriptor, PyCapabilityGrantSet,
-    PyCatalogRequest, PyDiagnostic, PyEffectiveCapabilityGrant, PyInvocationOutcome,
-    PyInvocationRequest, PyInvocationStatus, PyStableCapabilityError, PySuspension,
-    load_admission_request_inner, load_capability_catalog_inner,
+    PyCatalogRequest, PyDiagnostic, PyEffectProposal, PyEffectiveCapabilityGrant,
+    PyInvocationOutcome, PyInvocationRequest, PyInvocationStatus, PyStableCapabilityError,
+    PyStatusRequest, PySuspension, load_admission_request_inner, load_capability_catalog_inner,
     load_capability_grant_set_for_request_inner, load_capability_grant_set_inner,
-    load_catalog_request_inner, load_invocation_outcome_for_request_inner,
-    load_invocation_outcome_inner, load_invocation_request_inner,
-    load_invocation_status_for_invocation_id_inner, load_invocation_status_inner,
+    load_catalog_request_inner, load_effect_proposal_inner,
+    load_invocation_outcome_for_request_inner, load_invocation_outcome_inner,
+    load_invocation_request_inner, load_invocation_status_for_request_inner,
+    load_invocation_status_inner, load_status_request_inner,
 };
 
 #[pymodule]
@@ -30,6 +31,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCatalogRequest>()?;
     module.add_class::<PyAdmissionRequest>()?;
     module.add_class::<PyInvocationRequest>()?;
+    module.add_class::<PyStatusRequest>()?;
+    module.add_class::<PyEffectProposal>()?;
     module.add_class::<PyCapabilityCatalog>()?;
     module.add_class::<PyCapabilityDescriptor>()?;
     module.add_class::<PyEffectiveCapabilityGrant>()?;
@@ -60,6 +63,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(service::load_catalog_request, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_admission_request, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_invocation_request, module)?)?;
+    module.add_function(wrap_pyfunction!(service::load_status_request, module)?)?;
+    module.add_function(wrap_pyfunction!(service::load_effect_proposal, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_capability_catalog, module)?)?;
     module.add_function(wrap_pyfunction!(
         service::load_capability_grant_set,
@@ -76,7 +81,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(service::load_invocation_status, module)?)?;
     module.add_function(wrap_pyfunction!(
-        service::load_invocation_status_for_invocation_id,
+        service::load_invocation_status_for_request,
         module
     )?)?;
     Ok(())

@@ -10,6 +10,8 @@ from kiteframe._native import (
     InvocationOutcome,
     InvocationRequest,
     InvocationStatus,
+    ResolvedCapabilityRequirement,
+    StatusRequest,
 )
 
 
@@ -33,7 +35,11 @@ class CapabilityInvoker(Protocol):
         request: InvocationRequest,
     ) -> InvocationOutcome: ...
 
-    async def status(self, invocation_id: str) -> InvocationStatus: ...
+    async def status(
+        self,
+        request: StatusRequest,
+        requirement: ResolvedCapabilityRequirement,
+    ) -> InvocationStatus: ...
 
 
 __all__ = [
