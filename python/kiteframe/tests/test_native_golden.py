@@ -1,4 +1,3 @@
-import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -7,8 +6,8 @@ import pytest
 
 from kiteframe import load_resolved_agent, resolve_package
 from kiteframe._native import (
-    CapabilityGrant,
     CapabilityGrantSet,
+    EffectiveCapabilityGrant,
     InvocationOutcome,
     InvocationStatus,
     KiteframeDiagnosticError,
@@ -33,36 +32,77 @@ def canonical_bytes(value: object) -> bytes:
 
 
 def valid_grant_set_bytes() -> bytes:
-    grant_set = {
-        "actor": "actor:alice",
-        "admissionId": "adm-1",
-        "agent": "agent:case-worker",
-        "catalogDigest": "01" * 32,
-        "expiresAt": 200,
-        "grants": [
-            {
-                "capability": {
-                    "name": "cases.comment",
-                    "version": "1.0.0",
-                },
-                "resources": ["tenant:t1/case:case-1"],
-            }
-        ],
-        "issuedAt": 100,
-        "policyRevision": "policy:7",
-        "session": "session:1",
-        "task": "task:triage",
-    }
-    digest = hashlib.sha256(
-        b"kiteframe:capability-grant-set:v1\0" + canonical_bytes(grant_set)
-    ).hexdigest()
-    return canonical_bytes({**grant_set, "grantDigest": digest})
+    return canonical_bytes(
+        {
+            "actor": "actor:alice",
+            "admissionId": "adm-1",
+            "admissionRequestDigest": "09" * 32,
+            "agent": "agent:case-worker",
+            "catalogDigest": "01" * 32,
+            "catalogIdentity": {
+                "name": "provider.test",
+                "revision": "revision-1",
+            },
+            "authorityRevisions": {
+                "authorityRevisionDigest": (
+                    "bb4b094d4e6b440e6babaf51624f70d185297df32b5508d36ff03046dd77cbaa"
+                ),
+                "entries": [{"revision": "7", "source": "policy"}],
+            },
+            "expiresAt": 200,
+            "grants": [
+                {
+                    "capability": {
+                        "name": "cases.comment",
+                        "version": "1.0.0",
+                    },
+                    "executionModes": ["immediate"],
+                    "expiresAt": 180,
+                    "freshness": {
+                        "maxAdmissionAgeSeconds": None,
+                        "maxInputAgeSeconds": None,
+                        "policyRevisionRequired": False,
+                    },
+                    "maximumEffect": "read_only",
+                    "preconditions": [],
+                    "requiredEvidence": {
+                        "approval": {"kind": "none"},
+                        "confirmation": {"kind": "none"},
+                        "consent": {"kind": "none"},
+                    },
+                    "resources": ["tenant:t1/case:case-1"],
+                }
+            ],
+            "grantDigest": (
+                "fa8573bd34fa3793fd71ff96692c3df5781a424a372af319486b7b9883451eed"
+            ),
+            "issuedAt": 100,
+            "optionalDenials": [
+                {
+                    "capability": {"name": "notes.read", "version": "1.0.0"},
+                    "diagnostic": {
+                        "category": "authorization",
+                        "code": "KF-AUTH-001",
+                        "details": {},
+                        "help": None,
+                        "message": "optional capability denied",
+                        "package_path": None,
+                        "retry": "never",
+                        "severity": "warning",
+                        "source_range": None,
+                        "stage": "admit",
+                    },
+                }
+            ],
+            "policyRevision": "policy:7",
+            "session": "session:1",
+            "task": "task:triage",
+        }
+    )
 
 
 def test_python_round_trip_preserves_exact_golden_bytes(workspace: Path) -> None:
-    expected = (
-        workspace / "tests/fixtures/resolved/support-agent.json"
-    ).read_bytes()
+    expected = (workspace / "tests/fixtures/resolved/support-agent.json").read_bytes()
     resolved = load_resolved_agent(expected)
     assert resolved.canonical_json() == expected
 
@@ -73,11 +113,12 @@ def test_digest_tuple_matches_rust_fixture(workspace: Path) -> None:
         (fixture_root / "resolved/support-agent.digests.json").read_bytes()
     )
     package = fixture_root / "packages/support-agent"
-    resolved = resolve_package(
+    inputs = resolve_package(
         package,
         package / "bindings/deepagents.yaml",
         fixture_root / "components/deepagents-test.json",
     )
+    resolved = inputs.resolved_agent
 
     assert resolved.portable_digest == expected["portableDigest"]
     assert resolved.lock_digest == expected["lockDigest"]
@@ -101,7 +142,7 @@ def test_capability_grant_set_is_frozen_and_round_trips_canonically() -> None:
     assert grant_set.expires_at == 200
     assert len(grant_set.grant_digest) == 64
     assert isinstance(grant_set.grants, tuple)
-    assert isinstance(grant_set.grants[0], CapabilityGrant)
+    assert isinstance(grant_set.grants[0], EffectiveCapabilityGrant)
     assert grant_set.grants[0].name == "cases.comment"
     assert grant_set.grants[0].version == "1.0.0"
     assert grant_set.grants[0].resources == ("tenant:t1/case:case-1",)
@@ -128,9 +169,7 @@ def test_invocation_variants_are_stable_frozen_projections(
     projection: type,
     status: str,
 ) -> None:
-    expected = canonical_bytes(
-        {"invocation_id": "inv-1", "status": status}
-    )
+    expected = canonical_bytes({"invocation_id": "inv-1", "status": status})
     value = loader(expected)  # type: ignore[operator]
 
     assert isinstance(value, projection)
@@ -149,9 +188,7 @@ def test_invocation_variants_are_stable_frozen_projections(
 
 def test_invalid_provider_output_never_becomes_a_projection() -> None:
     with pytest.raises(KiteframeDiagnosticError) as caught:
-        load_invocation_outcome(
-            b'{"invocation_id":"inv-1","status":"not-a-status"}'
-        )
+        load_invocation_outcome(b'{"invocation_id":"inv-1","status":"not-a-status"}')
 
     diagnostics = json.loads(caught.value.diagnostics_json)
     assert diagnostics[0]["code"] == "KF-CAP-002"

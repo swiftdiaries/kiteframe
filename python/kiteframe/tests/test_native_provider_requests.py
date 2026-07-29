@@ -23,9 +23,7 @@ from kiteframe import (
     resolve_package,
 )
 
-VALID_TRACEPARENT = (
-    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-)
+VALID_TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -61,11 +59,19 @@ def valid_admission_request() -> bytes:
         {
             "actor": "actor:alice",
             "agent": "agent:case-worker",
+            "catalogDigest": "04" * 32,
+            "catalogIdentity": {
+                "name": "provider.test",
+                "revision": "revision-1",
+            },
             "contextualFacts": {},
             "delegationAncestry": [],
             "lockDigest": "02" * 32,
             "optionalCapabilities": [],
             "portableDigest": "01" * 32,
+            "requestDigest": (
+                "a6f8a332833d30e14a05e70e719adf8c3156593a588151f2a4b96b0ca3ede119"
+            ),
             "requiredCapabilities": [
                 {
                     "capability": capability,
@@ -217,6 +223,12 @@ def test_provider_request_properties_are_stable_native_values(
     assert catalog_request.known_catalog_digest == "09" * 32
     assert catalog_request.traceparent == VALID_TRACEPARENT
     assert admission.traceparent == VALID_TRACEPARENT
+    assert admission.catalog_name == "provider.test"
+    assert admission.catalog_revision == "revision-1"
+    assert admission.catalog_digest == "04" * 32
+    assert admission.request_digest == (
+        "a6f8a332833d30e14a05e70e719adf8c3156593a588151f2a4b96b0ca3ede119"
+    )
     assert admission.required_capabilities == (("cases.read", "1.2.0"),)
     assert invocation.invocation_id == "inv-1"
     assert invocation.admission_id == "adm-1"

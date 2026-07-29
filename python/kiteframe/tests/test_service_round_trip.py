@@ -16,9 +16,7 @@ from kiteframe._native import (
     load_invocation_status,
 )
 
-VALID_TRACEPARENT = (
-    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-)
+VALID_TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -31,78 +29,76 @@ def canonical_bytes(value: object) -> bytes:
 
 
 def valid_grant_json() -> bytes:
-    authority_entries = [{"revision": "7", "source": "policy"}]
-    authority_digest = hashlib.sha256(
-        b"kiteframe:authority-revision-set:v1\0"
-        + canonical_bytes(authority_entries)
-    ).hexdigest()
-    grant_set = {
-        "actor": "actor:alice",
-        "admissionId": "adm-1",
-        "admissionRequestDigest": "09" * 32,
-        "agent": "agent:case-worker",
-        "catalogDigest": "01" * 32,
-        "catalogIdentity": {
-            "name": "provider.test",
-            "revision": "revision-1",
-        },
-        "authorityRevisions": {
-            "authorityRevisionDigest": authority_digest,
-            "entries": authority_entries,
-        },
-        "expiresAt": 200,
-        "grants": [
-            {
-                "capability": {
-                    "name": "cases.comment",
-                    "version": "1.0.0",
-                },
-                "executionModes": ["immediate"],
-                "expiresAt": 180,
-                "freshness": {
-                    "maxAdmissionAgeSeconds": None,
-                    "maxInputAgeSeconds": None,
-                    "policyRevisionRequired": False,
-                },
-                "maximumEffect": "read_only",
-                "preconditions": [],
-                "requiredEvidence": {
-                    "approval": {"kind": "none"},
-                    "confirmation": {"kind": "none"},
-                    "consent": {"kind": "none"},
-                },
-                "resources": ["tenant:t1/case:case-1"],
-            }
-        ],
-        "issuedAt": 100,
-        "optionalDenials": [
-            {
-                "capability": {
-                    "name": "notes.read",
-                    "version": "1.0.0",
-                },
-                "diagnostic": {
-                    "category": "authorization",
-                    "code": "KF-AUTH-001",
-                    "details": {},
-                    "help": None,
-                    "message": "optional capability denied",
-                    "package_path": None,
-                    "retry": "never",
-                    "severity": "warning",
-                    "source_range": None,
-                    "stage": "admit",
-                },
-            }
-        ],
-        "policyRevision": "policy:7",
-        "session": "session:1",
-        "task": "task:triage",
-    }
-    digest = hashlib.sha256(
-        b"kiteframe:capability-grant-set:v1\0" + canonical_bytes(grant_set)
-    ).hexdigest()
-    return canonical_bytes({**grant_set, "grantDigest": digest})
+    return canonical_bytes(
+        {
+            "actor": "actor:alice",
+            "admissionId": "adm-1",
+            "admissionRequestDigest": "09" * 32,
+            "agent": "agent:case-worker",
+            "catalogDigest": "01" * 32,
+            "catalogIdentity": {
+                "name": "provider.test",
+                "revision": "revision-1",
+            },
+            "authorityRevisions": {
+                "authorityRevisionDigest": (
+                    "bb4b094d4e6b440e6babaf51624f70d185297df32b5508d36ff03046dd77cbaa"
+                ),
+                "entries": [{"revision": "7", "source": "policy"}],
+            },
+            "expiresAt": 200,
+            "grants": [
+                {
+                    "capability": {
+                        "name": "cases.comment",
+                        "version": "1.0.0",
+                    },
+                    "executionModes": ["immediate"],
+                    "expiresAt": 180,
+                    "freshness": {
+                        "maxAdmissionAgeSeconds": None,
+                        "maxInputAgeSeconds": None,
+                        "policyRevisionRequired": False,
+                    },
+                    "maximumEffect": "read_only",
+                    "preconditions": [],
+                    "requiredEvidence": {
+                        "approval": {"kind": "none"},
+                        "confirmation": {"kind": "none"},
+                        "consent": {"kind": "none"},
+                    },
+                    "resources": ["tenant:t1/case:case-1"],
+                }
+            ],
+            "issuedAt": 100,
+            "grantDigest": (
+                "fa8573bd34fa3793fd71ff96692c3df5781a424a372af319486b7b9883451eed"
+            ),
+            "optionalDenials": [
+                {
+                    "capability": {
+                        "name": "notes.read",
+                        "version": "1.0.0",
+                    },
+                    "diagnostic": {
+                        "category": "authorization",
+                        "code": "KF-AUTH-001",
+                        "details": {},
+                        "help": None,
+                        "message": "optional capability denied",
+                        "package_path": None,
+                        "retry": "never",
+                        "severity": "warning",
+                        "source_range": None,
+                        "stage": "admit",
+                    },
+                }
+            ],
+            "policyRevision": "policy:7",
+            "session": "session:1",
+            "task": "task:triage",
+        }
+    )
 
 
 def valid_catalog_json() -> bytes:
@@ -124,38 +120,34 @@ def valid_admission_json() -> bytes:
     )
     requirement = resolved["capabilityRequirements"][0]
     capability = requirement["lockedCapability"]["identity"]
-    request = {
-        "actor": "actor:alice",
-        "agent": "agent:case-worker",
-        "catalogDigest": "04" * 32,
-        "catalogIdentity": {
-            "name": "provider.test",
-            "revision": "revision-1",
-        },
-        "contextualFacts": {},
-        "delegationAncestry": [],
-        "lockDigest": "02" * 32,
-        "optionalCapabilities": [],
-        "portableDigest": "01" * 32,
-        "requiredCapabilities": [
-            {
-                "capability": capability,
-                "resources": requirement["resources"],
-            }
-        ],
-        "resolvedDigest": "03" * 32,
-        "resolvedRequirements": [requirement],
-        "session": "session:1",
-        "task": "task:triage",
-        "traceContext": {"traceparent": VALID_TRACEPARENT},
-    }
-    digest = hashlib.sha256(
-        b"kiteframe:admission-request:v1\0" + canonical_bytes(request)
-    ).hexdigest()
     return canonical_bytes(
         {
-            **request,
-            "requestDigest": digest,
+            "actor": "actor:alice",
+            "agent": "agent:case-worker",
+            "catalogDigest": "04" * 32,
+            "catalogIdentity": {
+                "name": "provider.test",
+                "revision": "revision-1",
+            },
+            "contextualFacts": {},
+            "delegationAncestry": [],
+            "lockDigest": "02" * 32,
+            "optionalCapabilities": [],
+            "portableDigest": "01" * 32,
+            "requestDigest": (
+                "a6f8a332833d30e14a05e70e719adf8c3156593a588151f2a4b96b0ca3ede119"
+            ),
+            "requiredCapabilities": [
+                {
+                    "capability": capability,
+                    "resources": requirement["resources"],
+                }
+            ],
+            "resolvedDigest": "03" * 32,
+            "resolvedRequirements": [requirement],
+            "session": "session:1",
+            "task": "task:triage",
+            "traceContext": {"traceparent": VALID_TRACEPARENT},
         }
     )
 

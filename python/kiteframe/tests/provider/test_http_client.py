@@ -74,11 +74,19 @@ def admission_request():
             {
                 "actor": "actor:alice",
                 "agent": "agent:case-worker",
+                "catalogDigest": "04" * 32,
+                "catalogIdentity": {
+                    "name": "provider.test",
+                    "revision": "revision-1",
+                },
                 "contextualFacts": {},
                 "delegationAncestry": [],
                 "lockDigest": "02" * 32,
                 "optionalCapabilities": [],
                 "portableDigest": "01" * 32,
+                "requestDigest": (
+                    "9681f9098ff800dbf70fcb37505eca5edf0be98772e2f2c1ee395b31d3063251"
+                ),
                 "requiredCapabilities": [
                     {
                         "capability": capability,
@@ -86,9 +94,7 @@ def admission_request():
                     }
                 ],
                 "resolvedDigest": "03" * 32,
-                "resolvedRequirements": [
-                    requirement
-                ],
+                "resolvedRequirements": [requirement],
                 "session": "session:1",
                 "task": "task:triage",
                 "traceContext": {
@@ -163,32 +169,82 @@ def capability_catalog_bytes() -> bytes:
     return canonical_bytes({**wire, "catalogDigest": digest})
 
 
-def grant_set_bytes(**overrides: object) -> bytes:
+def grant_set_bytes(variant: str = "valid") -> bytes:
+    grant_digests = {
+        "valid": "426fa5aeb72b6b14549a1396a01991b6"
+        + "31a4572c33b6e962189344960ac5e1f1",
+        "actor": "0b773c8d152cc2cd1186bcc3ac9b4965"
+        + "f9b813169827fe7957a2b028dcfb1e20",
+        "agent": "f1fadb560891c52eb71ca3ccf233e343"
+        + "16625394a21b608cad2b7e3883afd649",
+        "task": "8ffff06f5f7eb206e31fe511ab488ac8" + "b3484d5cac9ddd299e9e7da0dcc77ace",
+        "session": "27734b9b2d0977d5ab202e22b1860e2"
+        + "4e7f0b191fe0d8fd33d62af6bc615d57d",
+        "unrequested": "c873291f8270f66f91986cae3f441142"
+        + "7ca19563866ad9a3a3437b211ed34e11",
+        "broader": "feeea71dd3d24b1fbaba3c9a23b9d3a8"
+        + "dc7d1ae2f1a2c0afd9aa269dd9db0064",
+    }
+    grant = {
+        "capability": {"name": "cases.read", "version": "1.2.0"},
+        "executionModes": ["immediate"],
+        "expiresAt": 180,
+        "freshness": {
+            "maxAdmissionAgeSeconds": None,
+            "maxInputAgeSeconds": None,
+            "policyRevisionRequired": False,
+        },
+        "maximumEffect": "read_only",
+        "preconditions": [],
+        "requiredEvidence": {
+            "approval": {"kind": "none"},
+            "confirmation": {"kind": "none"},
+            "consent": {"kind": "none"},
+        },
+        "resources": ["tenant:support"],
+    }
     grant_set = {
         "actor": "actor:alice",
         "admissionId": "adm-1",
+        "admissionRequestDigest": (
+            "9681f9098ff800dbf70fcb37505eca5edf0be98772e2f2c1ee395b31d3063251"
+        ),
         "agent": "agent:case-worker",
-        "catalogDigest": "01" * 32,
+        "authorityRevisions": {
+            "authorityRevisionDigest": (
+                "bb4b094d4e6b440e6babaf51624f70d185297df32b5508d36ff03046dd77cbaa"
+            ),
+            "entries": [{"revision": "7", "source": "policy"}],
+        },
+        "catalogDigest": "04" * 32,
+        "catalogIdentity": {"name": "provider.test", "revision": "revision-1"},
         "expiresAt": 200,
-        "grants": [
-            {
-                "capability": {
-                    "name": "cases.read",
-                    "version": "1.2.0",
-                },
-                "resources": ["tenant:support"],
-            }
-        ],
+        "grants": [grant],
         "issuedAt": 100,
+        "optionalDenials": [],
         "policyRevision": "policy:7",
         "session": "session:1",
         "task": "task:triage",
     }
-    grant_set.update(overrides)
-    digest = hashlib.sha256(
-        b"kiteframe:capability-grant-set:v1\0" + canonical_bytes(grant_set)
-    ).hexdigest()
-    return canonical_bytes({**grant_set, "grantDigest": digest})
+    if variant in {"actor", "agent", "task", "session"}:
+        grant_set[variant] = {
+            "actor": "actor:bob",
+            "agent": "agent:other",
+            "task": "task:other",
+            "session": "session:other",
+        }[variant]
+    elif variant == "unrequested":
+        grant_set["grants"] = [
+            {
+                **grant,
+                "capability": {"name": "cases.close", "version": "1.0.0"},
+                "resources": ["tenant:t1/case:case-1"],
+            }
+        ]
+    elif variant == "broader":
+        grant_set["grants"] = [{**grant, "resources": ["tenant:support/*"]}]
+
+    return canonical_bytes({**grant_set, "grantDigest": grant_digests[variant]})
 
 
 def traceback_retains(error: BaseException, secret: str) -> bool:
@@ -313,6 +369,7 @@ async def test_unknown_invocation_identity_fails_before_transport() -> None:
                     "version": "1.0.0",
                 },
                 "evidenceRefs": {},
+                "grantDigest": "0a" * 32,
                 "invocationId": "inv-1",
                 "preconditions": {},
                 "selectedResource": "tenant:support",
@@ -473,9 +530,7 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
     assert "baggage" not in seen[1].headers
     assert seen[3].headers["traceparent"] == VALID_TRACEPARENT
     assert seen[3].headers["tracestate"] == "vendor=value"
-    assert seen[3].headers["baggage"] == (
-        f"kiteframe.session_id={'11' * 16}"
-    )
+    assert seen[3].headers["baggage"] == (f"kiteframe.session_id={'11' * 16}")
 
 
 @pytest.mark.asyncio
@@ -511,7 +566,7 @@ async def test_admit_rejects_a_valid_grant_for_another_admission_identity(
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
             200,
-            content=grant_set_bytes(**{field: mismatch}),
+            content=grant_set_bytes(field),
         )
     )
     client = ProviderHttpClient("https://provider.test", transport=transport)
@@ -526,35 +581,19 @@ async def test_admit_rejects_a_valid_grant_for_another_admission_identity(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "grants",
+    "variant",
     [
-        [
-            {
-                "capability": {
-                    "name": "cases.close",
-                    "version": "1.0.0",
-                },
-                "resources": ["tenant:t1/case:case-1"],
-            }
-        ],
-        [
-            {
-                "capability": {
-                    "name": "cases.comment",
-                    "version": "1.0.0",
-                },
-                "resources": ["tenant:t1/case:*"],
-            }
-        ],
+        "unrequested",
+        "broader",
     ],
 )
 async def test_admit_rejects_unrequested_or_broader_grants(
-    grants: list[dict[str, object]],
+    variant: str,
 ) -> None:
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
             200,
-            content=grant_set_bytes(grants=grants),
+            content=grant_set_bytes(variant),
         )
     )
     client = ProviderHttpClient("https://provider.test", transport=transport)
