@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Concatenate, ParamSpec, Self, TypeVar
 from urllib.parse import quote
@@ -10,8 +11,8 @@ import httpx
 
 from kiteframe._native import (
     AdmissionRequest,
-    CapabilityCatalog,
     CapabilityGrantSet,
+    CatalogFetchResult,
     CatalogRequest,
     InvocationOutcome,
     InvocationRequest,
@@ -121,6 +122,13 @@ _DIAGNOSTIC_RETRIES = frozenset(
 )
 _LoaderParameters = ParamSpec("_LoaderParameters")
 _Response = TypeVar("_Response")
+
+
+@dataclass(frozen=True)
+class _ProviderResponse:
+    body: bytes
+    status_code: int
+    etag: str | None
 
 
 class ProviderTransportError(RuntimeError):
@@ -394,7 +402,7 @@ class ProviderHttpClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def catalog(self, request: CatalogRequest) -> CapabilityCatalog:
+    async def catalog(self, request: CatalogRequest) -> CatalogFetchResult:
         if not isinstance(request, CatalogRequest):
             raise TypeError("catalog request must be a native CatalogRequest")
         headers = _request_headers(
@@ -403,14 +411,27 @@ class ProviderHttpClient:
         )
         if request.known_catalog_digest is not None:
             headers["if-none-match"] = f'"{request.known_catalog_digest}"'
-        return _load_native_response(
-            load_capability_catalog,
-            await self._request(
-                "GET",
-                "/v1/capability-catalog",
-                headers=headers,
-            ),
+        response = await self._request(
+            "GET",
+            "/v1/capability-catalog",
+            headers=headers,
+            allow_not_modified=True,
         )
+        if response.status_code == 304:
+            if request.known_catalog_digest is None:
+                raise ProviderTransportError("provider returned unsolicited not-modified")
+            if response.body:
+                raise ProviderTransportError(
+                    "provider returned a non-empty not-modified response"
+                )
+            if response.etag != request.known_catalog_digest:
+                raise ProviderTransportError("provider not-modified digest mismatch")
+            return CatalogFetchResult.not_modified(request)
+
+        catalog = _load_native_response(load_capability_catalog, response.body)
+        if response.etag != catalog.catalog_digest:
+            raise ProviderTransportError("provider catalog digest mismatch")
+        return CatalogFetchResult.modified(catalog)
 
     async def admit(
         self,
@@ -418,17 +439,18 @@ class ProviderHttpClient:
     ) -> CapabilityGrantSet:
         if not isinstance(request, AdmissionRequest):
             raise TypeError("admission request must be a native AdmissionRequest")
+        response = await self._request(
+            "POST",
+            "/v1/capability-admissions",
+            headers=_request_headers(
+                request,
+                baggage_allowlist=self._baggage_allowlist,
+            ),
+            content=request.canonical_json(),
+        )
         return _load_native_response(
             load_capability_grant_set_for_request,
-            await self._request(
-                "POST",
-                "/v1/capability-admissions",
-                headers=_request_headers(
-                    request,
-                    baggage_allowlist=self._baggage_allowlist,
-                ),
-                content=request.canonical_json(),
-            ),
+            response.body,
             request,
         )
 
@@ -445,17 +467,18 @@ class ProviderHttpClient:
                 "invocation capability is not present in resolved runtime inputs"
             )
         name = quote(request.capability_name, safe=".")
+        response = await self._request(
+            "POST",
+            f"/v1/capability-invocations/{name}",
+            headers=_request_headers(
+                request,
+                baggage_allowlist=self._baggage_allowlist,
+            ),
+            content=request.canonical_json(),
+        )
         return _load_native_response(
             load_invocation_outcome_for_request,
-            await self._request(
-                "POST",
-                f"/v1/capability-invocations/{name}",
-                headers=_request_headers(
-                    request,
-                    baggage_allowlist=self._baggage_allowlist,
-                ),
-                content=request.canonical_json(),
-            ),
+            response.body,
             request,
             requirement,
         )
@@ -484,16 +507,17 @@ class ProviderHttpClient:
                 "status requirement is not present in resolved runtime inputs"
             )
         encoded_invocation_id = quote(request.invocation_id, safe="")
+        response = await self._request(
+            "GET",
+            f"/v1/capability-invocations/{encoded_invocation_id}",
+            headers=_request_headers(
+                request,
+                baggage_allowlist=self._baggage_allowlist,
+            ),
+        )
         return _load_native_response(
             load_invocation_status_for_request,
-            await self._request(
-                "GET",
-                f"/v1/capability-invocations/{encoded_invocation_id}",
-                headers=_request_headers(
-                    request,
-                    baggage_allowlist=self._baggage_allowlist,
-                ),
-            ),
+            response.body,
             request,
             indexed,
         )
@@ -505,7 +529,8 @@ class ProviderHttpClient:
         *,
         headers: Mapping[str, str] | None = None,
         content: bytes | None = None,
-    ) -> bytes:
+        allow_not_modified: bool = False,
+    ) -> _ProviderResponse:
         request_headers = {
             "accept": "application/json",
             "accept-encoding": "identity",
@@ -515,6 +540,7 @@ class ProviderHttpClient:
             request_headers["content-type"] = "application/json"
         body = b""
         status_code: int | None = None
+        etag: str | None = None
         failure_message: str | None = None
         response: httpx.Response | None = None
         try:
@@ -525,7 +551,8 @@ class ProviderHttpClient:
                 content=content,
             ) as response:
                 status_code = response.status_code
-                if not 300 <= status_code < 400:
+                etag = response.headers.get("etag")
+                if not 300 <= status_code < 400 or status_code == 304:
                     body = await _bounded_body(response)
         except httpx.HTTPError:
             failure_message = "provider request failed"
@@ -541,17 +568,19 @@ class ProviderHttpClient:
             body = b""
             content = None
             raise ProviderTransportError("provider request failed")
-        if 300 <= status_code < 400:
+        if 300 <= status_code < 400 and not (
+            allow_not_modified and status_code == 304
+        ):
             content = None
             raise ProviderTransportError(
                 "provider redirect-class response is forbidden"
             )
-        if not 200 <= status_code < 300:
+        if status_code != 304 and not 200 <= status_code < 300:
             diagnostic_error = _diagnostic_error(body)
             body = b""
             content = None
             raise diagnostic_error
-        return body
+        return _ProviderResponse(body=body, status_code=status_code, etag=etag)
 
 
 __all__ = [

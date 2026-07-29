@@ -197,6 +197,8 @@ fn canonical_catalog_loader_rejects_normalizable_descriptor_order() {
             name: String::from("provider.test"),
             revision: String::from("revision-1"),
         },
+        Timestamp::new(100),
+        Some(Timestamp::new(200)),
         vec![
             descriptor_with_name("cases.close"),
             descriptor_with_name("cases.comment"),
@@ -371,7 +373,13 @@ fn invocation_request() -> InvocationRequest {
 }
 
 fn capability_catalog() -> CapabilityCatalog {
-    CapabilityCatalog::try_new(catalog_identity(), vec![descriptor()]).unwrap()
+    CapabilityCatalog::try_new(
+        catalog_identity(),
+        Timestamp::new(100),
+        Some(Timestamp::new(200)),
+        vec![descriptor()],
+    )
+    .unwrap()
 }
 
 fn grant_set_parts() -> CapabilityGrantSetParts {

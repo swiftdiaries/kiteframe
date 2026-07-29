@@ -4,7 +4,7 @@ from typing import Protocol, runtime_checkable
 
 from kiteframe._native import (
     AdmissionRequest,
-    CapabilityCatalog,
+    CatalogFetchResult,
     CapabilityGrantSet,
     CatalogRequest,
     InvocationOutcome,
@@ -17,7 +17,7 @@ from kiteframe._native import (
 
 @runtime_checkable
 class CatalogProvider(Protocol):
-    async def catalog(self, request: CatalogRequest) -> CapabilityCatalog: ...
+    async def catalog(self, request: CatalogRequest) -> CatalogFetchResult: ...
 
 
 @runtime_checkable

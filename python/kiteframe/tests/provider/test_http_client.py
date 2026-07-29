@@ -18,7 +18,7 @@ from kiteframe import (
     resolve_package,
 )
 from kiteframe._native import (
-    CapabilityCatalog,
+    CatalogFetchResult,
     CapabilityGrantSet,
     InvocationOutcome,
     InvocationStatus,
@@ -160,13 +160,24 @@ def status_request() -> StatusRequest:
 def capability_catalog_bytes() -> bytes:
     wire = {
         "descriptors": [],
+        "expiresAt": 200,
         "identity": {
             "name": "provider.test",
             "revision": "revision-1",
         },
+        "issuedAt": 100,
     }
     digest = hashlib.sha256(canonical_bytes(wire)).hexdigest()
     return canonical_bytes({**wire, "catalogDigest": digest})
+
+
+def catalog_response() -> httpx.Response:
+    body = capability_catalog_bytes()
+    return httpx.Response(
+        200,
+        content=body,
+        headers={"etag": json.loads(body)["catalogDigest"]},
+    )
 
 
 def grant_set_bytes(variant: str = "valid") -> bytes:
@@ -314,7 +325,7 @@ class UnsafeTransport(httpx.AsyncBaseTransport):
         self,
         request: httpx.Request,
     ) -> httpx.Response:
-        return httpx.Response(200, content=capability_catalog_bytes())
+        return catalog_response()
 
 
 @lru_cache
@@ -469,7 +480,7 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         if request.url.path == "/v1/capability-catalog":
-            return httpx.Response(200, content=capability_catalog_bytes())
+            return catalog_response()
         if request.url.path == "/v1/capability-admissions":
             return httpx.Response(200, content=grant_set_bytes())
         if request.url.path == "/v1/capability-invocations/cases.read":
@@ -509,7 +520,9 @@ async def test_client_calls_only_the_four_v1_routes_with_native_values() -> None
     finally:
         await client.aclose()
 
-    assert isinstance(catalog, CapabilityCatalog)
+    assert isinstance(catalog, CatalogFetchResult)
+    assert catalog.status == "modified"
+    assert catalog.catalog is not None
     assert isinstance(grant_set, CapabilityGrantSet)
     assert isinstance(outcome, InvocationOutcome)
     assert isinstance(status, InvocationStatus)
@@ -544,6 +557,90 @@ async def test_client_does_not_follow_redirects() -> None:
     client = ProviderHttpClient("https://provider.test", transport=transport)
     try:
         with pytest.raises(ProviderTransportError, match="redirect"):
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_304_returns_a_native_not_modified_result() -> None:
+    known_digest = "09" * 32
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(304, headers={"etag": known_digest})
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        result = await client.catalog(catalog_request())
+    finally:
+        await client.aclose()
+
+    assert isinstance(result, CatalogFetchResult)
+    assert result.status == "not_modified"
+    assert result.catalog is None
+    assert result.catalog_digest == known_digest
+
+
+@pytest.mark.asyncio
+async def test_catalog_rejects_unsolicited_304() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(304, headers={"etag": "09" * 32})
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(
+            ProviderTransportError,
+            match="provider returned unsolicited not-modified",
+        ):
+            await client.catalog(CatalogRequest.default())
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_rejects_not_modified_digest_mismatch() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(304, headers={"etag": "08" * 32})
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(
+            ProviderTransportError,
+            match="provider not-modified digest mismatch",
+        ):
+            await client.catalog(catalog_request())
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_rejects_nonempty_not_modified_body() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            304,
+            content=b"unexpected",
+            headers={"etag": "09" * 32},
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(ProviderTransportError, match="not-modified response"):
+            await client.catalog(catalog_request())
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_catalog_requires_an_etag_matching_the_typed_catalog() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            content=capability_catalog_bytes(),
+            headers={"etag": "00" * 32},
+        )
+    )
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    try:
+        with pytest.raises(ProviderTransportError, match="catalog digest mismatch"):
             await client.catalog(CatalogRequest.default())
     finally:
         await client.aclose()
@@ -1000,6 +1097,7 @@ async def test_mock_transport_may_use_plaintext_without_network_io() -> None:
             lambda request: httpx.Response(
                 200,
                 content=capability_catalog_bytes(),
+                headers={"etag": json.loads(capability_catalog_bytes())["catalogDigest"]},
             )
         ),
     )
@@ -1008,7 +1106,8 @@ async def test_mock_transport_may_use_plaintext_without_network_io() -> None:
     finally:
         await client.aclose()
 
-    assert isinstance(catalog, CapabilityCatalog)
+    assert isinstance(catalog, CatalogFetchResult)
+    assert catalog.status == "modified"
 
 
 @pytest.mark.asyncio

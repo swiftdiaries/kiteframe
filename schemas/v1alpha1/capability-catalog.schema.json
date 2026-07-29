@@ -12,13 +12,20 @@
         "$ref": "#/$defs/CapabilityDescriptor"
       }
     },
+    "expiresAt": {
+      "$ref": "#/$defs/Timestamp"
+    },
     "identity": {
       "$ref": "#/$defs/CatalogIdentity"
+    },
+    "issuedAt": {
+      "$ref": "#/$defs/Timestamp"
     }
   },
   "additionalProperties": false,
   "required": [
     "identity",
+    "issuedAt",
     "descriptors",
     "catalogDigest"
   ],
@@ -423,6 +430,12 @@
     "Sha256Digest": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "Timestamp": {
+      "description": "Unix seconds. Provider adapters obtain time from their deployment rather than from packages.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
     }
   }
 }

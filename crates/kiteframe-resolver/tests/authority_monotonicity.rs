@@ -10,7 +10,7 @@ use kiteframe_contract::{
     CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
     ComponentMetadataCatalog, ConfirmationRequirement, ConsentRequirement, EffectClassification,
     ExecutionMode, FreshnessRequirement, IdempotencyRequirement, NonEmptySet, PackageIdentity,
-    ResourceSelectorSchema, RuntimeTargetDescriptor, Sha256Digest,
+    ResourceSelectorSchema, RuntimeTargetDescriptor, Sha256Digest, Timestamp,
 };
 use kiteframe_core::{AgentPackage, PackageLimits, load_package};
 use kiteframe_resolver::{
@@ -177,6 +177,8 @@ fn catalog(descriptors: Vec<CapabilityDescriptor>) -> kiteframe_resolver::Valida
             name: "support".to_owned(),
             revision: "v1".to_owned(),
         },
+        Timestamp::new(100),
+        Some(Timestamp::new(200)),
         descriptors,
     )
     .unwrap();

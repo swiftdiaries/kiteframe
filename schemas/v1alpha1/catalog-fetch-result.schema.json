@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CatalogFetchResult",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "catalog": {
+          "$ref": "capability-catalog.schema.json"
+        },
+        "status": {
+          "type": "string",
+          "const": "modified"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "catalog"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "catalog_digest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "status": {
+          "type": "string",
+          "const": "not_modified"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "catalog_digest"
+      ]
+    }
+  ],
+  "$defs": {
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

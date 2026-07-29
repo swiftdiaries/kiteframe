@@ -26,7 +26,7 @@ pub use capability::{
     JsonSchema2020_12, NonEmptySet, PreconditionDescriptor, PreconditionKind,
     ResourceSelectorSchema,
 };
-pub use catalog::{CapabilityCatalog, CatalogIdentity};
+pub use catalog::{CapabilityCatalog, CatalogFetchResult, CatalogIdentity};
 pub use component::{
     ComponentKind, ComponentMetadata, ComponentMetadataCatalog, ModelLatencyClass, ModelMetadata,
     ModelModality, ResidencyClass, RuntimeTargetDescriptor,

@@ -5,7 +5,8 @@ use kiteframe_contract::{
     AuthorityRevisionSet as ContractAuthorityRevisionSet,
     CapabilityCatalog as ContractCapabilityCatalog, CapabilityDenial as ContractCapabilityDenial,
     CapabilityDescriptor as ContractCapabilityDescriptor, CapabilityErrorDescriptor,
-    CapabilityGrantSet as ContractCapabilityGrantSet, CatalogRequest as ContractCatalogRequest,
+    CapabilityGrantSet as ContractCapabilityGrantSet,
+    CatalogFetchResult as ContractCatalogFetchResult, CatalogRequest as ContractCatalogRequest,
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity, DiagnosticStage,
     EffectClassification, EffectProposal as ContractEffectProposal,
     EffectiveCapabilityGrant as ContractEffectiveCapabilityGrant, EvidenceKind, ExecutionMode,
@@ -889,6 +890,16 @@ impl PyCapabilityCatalog {
     }
 
     #[getter]
+    pub fn issued_at(&self) -> u64 {
+        self.inner.issued_at().unix_seconds()
+    }
+
+    #[getter]
+    pub fn expires_at(&self) -> Option<u64> {
+        self.inner.expires_at().map(|value| value.unix_seconds())
+    }
+
+    #[getter]
     pub fn catalog_digest(&self) -> String {
         self.inner.catalog_digest().to_string()
     }
@@ -906,6 +917,89 @@ impl PyCapabilityCatalog {
                 .iter()
                 .map(|descriptor| descriptor.descriptor_digest().to_string()),
         )
+    }
+
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "CatalogFetchResult"
+)]
+pub struct PyCatalogFetchResult {
+    inner: Arc<ContractCatalogFetchResult>,
+}
+
+impl From<ContractCatalogFetchResult> for PyCatalogFetchResult {
+    fn from(inner: ContractCatalogFetchResult) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCatalogFetchResult {
+    #[staticmethod]
+    pub fn modified(catalog: &PyCapabilityCatalog) -> Self {
+        ContractCatalogFetchResult::Modified {
+            catalog: catalog.inner.as_ref().clone(),
+        }
+        .into()
+    }
+
+    #[staticmethod]
+    pub fn not_modified(request: &PyCatalogRequest) -> PyResult<Self> {
+        let digest = request
+            .inner
+            .known_catalog_digest()
+            .copied()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "catalog request does not contain a known catalog digest",
+                )
+            })?;
+        Ok(ContractCatalogFetchResult::not_modified(digest).into())
+    }
+
+    #[getter]
+    pub fn status(&self) -> &'static str {
+        match self.inner.as_ref() {
+            ContractCatalogFetchResult::Modified { .. } => "modified",
+            ContractCatalogFetchResult::NotModified { .. } => "not_modified",
+        }
+    }
+
+    #[getter]
+    pub fn catalog(&self) -> Option<PyCapabilityCatalog> {
+        match self.inner.as_ref() {
+            ContractCatalogFetchResult::Modified { catalog } => {
+                Some(PyCapabilityCatalog::from(catalog.clone()))
+            }
+            ContractCatalogFetchResult::NotModified { .. } => None,
+        }
+    }
+
+    #[getter]
+    pub fn catalog_digest(&self) -> String {
+        match self.inner.as_ref() {
+            ContractCatalogFetchResult::Modified { catalog } => {
+                catalog.catalog_digest().to_string()
+            }
+            ContractCatalogFetchResult::NotModified { catalog_digest } => {
+                catalog_digest.to_string()
+            }
+        }
     }
 
     #[gen_stub(override_return_type(

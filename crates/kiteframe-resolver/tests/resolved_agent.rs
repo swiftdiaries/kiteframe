@@ -7,7 +7,7 @@ use std::{
 use kiteframe_contract::{
     BindingContentCapturePolicy, CapabilityCatalog, CatalogIdentity, ComponentKind,
     ComponentMetadataCatalog, DataClassification, FeatureId, FeatureSet, ModelLatencyClass,
-    RegistrySymbol, ResidencyClass, RuntimeTargetDescriptor, Sha256Digest,
+    RegistrySymbol, ResidencyClass, RuntimeTargetDescriptor, Sha256Digest, Timestamp,
 };
 use kiteframe_core::{PackageLimits, load_package};
 use kiteframe_resolver::{
@@ -42,6 +42,8 @@ fn empty_catalog() -> kiteframe_resolver::ValidatedCatalog {
             name: "empty".to_owned(),
             revision: "v1".to_owned(),
         },
+        Timestamp::new(100),
+        Some(Timestamp::new(200)),
         Vec::new(),
     )
     .unwrap();

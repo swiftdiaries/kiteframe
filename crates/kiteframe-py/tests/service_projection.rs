@@ -1,17 +1,18 @@
 use _native::{
-    ProviderResponseError, PyCapabilityGrantSet, PyInvocationOutcome, PyInvocationStatus,
-    load_capability_grant_set_inner, load_invocation_outcome_inner, load_invocation_status_inner,
+    ProviderResponseError, PyCapabilityCatalog, PyCapabilityGrantSet, PyCatalogFetchResult,
+    PyCatalogRequest, PyInvocationOutcome, PyInvocationStatus, load_capability_grant_set_inner,
+    load_invocation_outcome_inner, load_invocation_status_inner,
 };
 use kiteframe_contract::{
     ActorRef, AdmissionId, AgentRef, ApprovalRequirement, AuthorityRevision, AuthorityRevisionSet,
-    CapabilityDenial, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
-    CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CheckpointRef,
-    ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticSeverity, DiagnosticStage, EffectClassification, EffectiveCapabilityGrant,
-    EffectiveCapabilityGrantParts, EvidenceKind, ExecutionMode, InvocationId, InvocationOutcome,
-    InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
-    ProtectedEvidenceRequestRef, RequiredEvidence, RetryClass, SessionRef, Sha256Digest,
-    StableCapabilityError, Suspension, TaskRef, Timestamp,
+    CapabilityCatalog, CapabilityDenial, CapabilityGrantSet, CapabilityGrantSetParts,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogFetchResult,
+    CatalogIdentity, CheckpointRef, ConfirmationRequirement, ConsentRequirement, Diagnostic,
+    DiagnosticCategory, DiagnosticCode, DiagnosticSeverity, DiagnosticStage, EffectClassification,
+    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceKind, ExecutionMode,
+    InvocationId, InvocationOutcome, InvocationStatus, NonEmptySet, NormalizedResourceSelector,
+    PolicyRevision, ProtectedEvidenceRequestRef, RequiredEvidence, RetryClass, SessionRef,
+    Sha256Digest, StableCapabilityError, Suspension, TaskRef, Timestamp, TraceContext,
 };
 use pyo3::Python;
 
@@ -94,6 +95,46 @@ fn invocation_loaders_validate_and_preserve_stable_variants() {
     assert!(matches!(status, InvocationStatus::Pending { .. }));
     assert_eq!(PyInvocationOutcome::from(outcome).status(), "deferred");
     assert_eq!(PyInvocationStatus::from(status).status(), "pending");
+}
+
+#[test]
+fn catalog_fetch_result_projection_preserves_disjoint_variants_and_time_bounds() {
+    let catalog = CapabilityCatalog::try_new(
+        CatalogIdentity {
+            name: "provider.test".to_owned(),
+            revision: "revision-1".to_owned(),
+        },
+        Timestamp::new(100),
+        Some(Timestamp::new(200)),
+        vec![],
+    )
+    .unwrap();
+    let modified = PyCatalogFetchResult::from(CatalogFetchResult::Modified {
+        catalog: catalog.clone(),
+    });
+
+    assert_eq!(modified.status(), "modified");
+    assert_eq!(modified.catalog().unwrap().issued_at(), 100);
+    assert_eq!(modified.catalog().unwrap().expires_at(), Some(200));
+    assert_eq!(
+        modified.catalog_digest(),
+        catalog.catalog_digest().to_string()
+    );
+
+    let request = PyCatalogRequest::from(kiteframe_contract::CatalogRequest::new(
+        Some(Sha256Digest::from_bytes([9; 32])),
+        TraceContext::try_new(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            None,
+            Default::default(),
+        )
+        .unwrap(),
+    ));
+    let not_modified = PyCatalogFetchResult::not_modified(&request).unwrap();
+
+    assert_eq!(not_modified.status(), "not_modified");
+    assert!(not_modified.catalog().is_none());
+    assert_eq!(not_modified.catalog_digest(), "09".repeat(32));
 }
 
 #[test]

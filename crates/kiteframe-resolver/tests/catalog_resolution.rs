@@ -5,7 +5,7 @@ use kiteframe_contract::{
     CapabilityErrorDescriptor, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
     CapabilityRequirement, CapabilityVersion, CatalogIdentity, ConfirmationRequirement,
     ConsentRequirement, EffectClassification, EvidenceRequirement, ExecutionMode,
-    FreshnessRequirement, IdempotencyRequirement, NonEmptySet, ResourceSelectorSchema,
+    FreshnessRequirement, IdempotencyRequirement, NonEmptySet, ResourceSelectorSchema, Timestamp,
 };
 use kiteframe_resolver::{CandidatePolicy, select_capabilities_with_warnings, validate_catalog};
 use proptest::prelude::*;
@@ -76,6 +76,8 @@ fn catalog_with_descriptors(descriptors: Vec<CapabilityDescriptor>) -> Vec<u8> {
                 name: "support".to_owned(),
                 revision: "v1".to_owned(),
             },
+            Timestamp::new(100),
+            Some(Timestamp::new(200)),
             descriptors,
         )
         .unwrap(),

@@ -9,7 +9,7 @@ use kiteframe_contract::{
     CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
     ConfirmationRequirement, ConsentRequirement, EffectClassification, EvidenceRequirement,
     ExecutionMode, FeatureId, FreshnessRequirement, IdempotencyRequirement, LockSchemaVersion,
-    NonEmptySet, ResourceSelectorSchema, Sha256Digest,
+    NonEmptySet, ResourceSelectorSchema, Sha256Digest, Timestamp,
 };
 use kiteframe_core::{PackageLimits, load_package};
 use kiteframe_resolver::{
@@ -96,6 +96,8 @@ fn catalog_with_identity(
             name: name.to_owned(),
             revision: revision.to_owned(),
         },
+        Timestamp::new(100),
+        Some(Timestamp::new(200)),
         descriptors,
     )
     .unwrap();

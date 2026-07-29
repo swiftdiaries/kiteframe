@@ -7,9 +7,9 @@ use std::{
 
 use kiteframe_contract::{
     AdmissionRequest, AgentManifest, AuthorityRevisionSet, CapabilityCatalog, CapabilityDescriptor,
-    CapabilityGrantSet, CapabilityLock, CatalogRequest, ComponentMetadataCatalog, Diagnostic,
-    EffectProposal, InvocationOutcome, InvocationRequest, InvocationStatus, ResolvedAgent,
-    RuntimeBinding, StatusRequest,
+    CapabilityGrantSet, CapabilityLock, CatalogFetchResult, CatalogRequest,
+    ComponentMetadataCatalog, Diagnostic, EffectProposal, InvocationOutcome, InvocationRequest,
+    InvocationStatus, ResolvedAgent, RuntimeBinding, StatusRequest,
 };
 use schemars::JsonSchema;
 
@@ -42,6 +42,7 @@ fn generate(destination: &Path) -> Result<()> {
     write_schema::<RuntimeBinding>(&destination.join("runtime-binding.schema.json"))?;
     write_schema::<CapabilityDescriptor>(&destination.join("capability-descriptor.schema.json"))?;
     write_schema::<CapabilityCatalog>(&destination.join("capability-catalog.schema.json"))?;
+    write_schema::<CatalogFetchResult>(&destination.join("catalog-fetch-result.schema.json"))?;
     write_schema::<CapabilityLock>(&destination.join("capability-lock.schema.json"))?;
     write_schema::<ComponentMetadataCatalog>(
         &destination.join("component-metadata-catalog.schema.json"),
@@ -65,6 +66,7 @@ fn check(destination: &Path) -> Result<()> {
     check_schema::<RuntimeBinding>(&destination.join("runtime-binding.schema.json"))?;
     check_schema::<CapabilityDescriptor>(&destination.join("capability-descriptor.schema.json"))?;
     check_schema::<CapabilityCatalog>(&destination.join("capability-catalog.schema.json"))?;
+    check_schema::<CatalogFetchResult>(&destination.join("catalog-fetch-result.schema.json"))?;
     check_schema::<CapabilityLock>(&destination.join("capability-lock.schema.json"))?;
     check_schema::<ComponentMetadataCatalog>(
         &destination.join("component-metadata-catalog.schema.json"),
