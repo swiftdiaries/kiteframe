@@ -159,9 +159,23 @@ def test_authority_revision_digest_is_persisted_but_not_copied_to_invocation(
     profile, request = native_admission
     tampered = copy.deepcopy(profile["grantSet"])
     tampered["authorityRevisions"]["entries"][0]["revision"] = "policy-43"
+    tampered.pop("grantDigest")
+    tampered["grantDigest"] = canonical_digest(
+        b"kiteframe:capability-grant-set:v1\0",
+        tampered,
+    )
 
-    with pytest.raises(KiteframeDiagnosticError):
+    assert tampered["grantDigest"] != profile["grantSet"]["grantDigest"]
+    assert tampered["authorityRevisions"]["authorityRevisionDigest"] != (
+        canonical_digest(
+            b"kiteframe:authority-revision-set:v1\0",
+            tampered["authorityRevisions"]["entries"],
+        )
+    )
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
         load_capability_grant_set_for_request(canonical_bytes(tampered), request)
+    assert error.value.code == "KF-CAP-002"
 
     invocation = load_invocation_request(canonical_bytes(profile["invocationRequest"]))
     wire = json.loads(invocation.canonical_json())

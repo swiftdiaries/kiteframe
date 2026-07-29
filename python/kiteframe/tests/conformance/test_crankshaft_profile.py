@@ -59,7 +59,4 @@ def test_crankshaft_profile_uses_only_portable_kiteframe_contracts() -> None:
     assert suspended.suspension is not None
     assert proposal.proposal_digest == suspended.suspension.proposal_digest
     assert "crankshaft" not in resolved_agent_schema_property_names()
-
-    portable_values = dict(profile)
-    portable_values.pop("profile")
-    assert "crankshaft" not in canonical_bytes(portable_values).decode().lower()
+    assert "crankshaft" not in canonical_bytes(profile).decode().lower()

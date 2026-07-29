@@ -90,3 +90,70 @@ Passed:
 Local Rust/PyO3 commands selected the supported CPython 3.13 interpreter
 explicitly; `PYTHONHOME` was also supplied for embedded-Python Rust tests in
 the uv-managed local installation.
+
+## Merge-Blocker Fix Round 1
+
+### Checked-in local PyO3 verification
+
+Added and documented the repository-root command:
+
+```console
+uv run --project python/kiteframe python scripts/verify_wave3r.py
+```
+
+The checked-in script rejects Python below the package's declared 3.11 floor,
+sets `PYO3_PYTHON` to its own `sys.executable`, derives `PYTHONHOME` from
+`sys.base_prefix`, and runs formatting, warning-denied workspace Clippy, the
+all-feature workspace test suite, schema drift, and native-stub drift.
+
+Reproduction used a fresh Cargo target with the unwrapped host environment.
+It selected macOS Python 3.9.6 and failed compiling `pyo3-stub-gen` with
+`E0425: cannot find type PyEncodingWarning`. The documented command reported
+the uv-managed CPython 3.13.2 interpreter and completed the entire matrix
+successfully. No Cargo manifest or lockfile changed.
+
+### Strengthened promoted gates
+
+- The authority-revision tamper now mutates one revision, recomputes the outer
+  grant digest over the mutated grant set, independently proves the retained
+  authority-revision digest is stale, and then asserts native rejection. The
+  rejection therefore cannot be attributed to the outer grant digest.
+- Removed the top-level `profile` metadata from the WFM fixture and removed
+  the conformance test's exemption. The complete fixture now has no
+  `crankshaft` field name or value.
+- Added a status requirement with the same capability identity and exactly one
+  changed retained digest. The client rejects it against frozen runtime inputs
+  before the mock transport can run.
+- Strengthened traceback-local inspection to traverse local mappings and
+  collections. Authenticator and HTTP transport failures now prove credentials
+  are absent from provider traceback locals in addition to public text,
+  representation, cause, context, canonical body, and baggage.
+
+### TDD and mutation evidence
+
+- RED: a fresh raw Cargo target reproduced the unsupported host-Python
+  `PyEncodingWarning` compile failure.
+- RED mutation: reducing status retention to identity-only caused the promoted
+  status test to fail because the mismatched requirement reached transport.
+- RED mutation: omitting credential-local cleanup caused the transport
+  traceback regression to recover the secret from provider locals.
+- RED mutation: retaining an authenticator exception message in a provider
+  local caused the authenticator traceback regression to recover the secret.
+- GREEN: production safety branches were restored unchanged; the four focused
+  Python files passed 107 tests.
+
+### Fresh verification
+
+Passed:
+
+- documented `uv run --project python/kiteframe python
+  scripts/verify_wave3r.py`;
+- `cargo fmt --all --check`;
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
+- `cargo test --workspace --all-features`;
+- schema and native-stub drift checks;
+- full Python suite: 172 passed;
+- Ruff over `src`, `tests`, and `scripts/verify_wave3r.py`;
+- Pyright for the Python project and the verification script: 0 errors,
+  0 warnings;
+- `git diff --check`.

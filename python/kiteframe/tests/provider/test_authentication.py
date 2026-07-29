@@ -16,6 +16,7 @@ from test_http_client import (
     resolved_runtime_inputs,
     runtime_requirement,
     status_request,
+    traceback_retains,
 )
 
 from kiteframe.provider import (
@@ -195,6 +196,9 @@ async def test_credentials_never_enter_body_baggage_or_failure_text() -> None:
     assert secret not in captured[0].headers.get("baggage", "")
     assert secret not in str(error.value)
     assert secret not in repr(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert not traceback_retains(error.value, secret)
 
 
 def test_authenticator_requires_an_explicit_nonempty_allowlist() -> None:
@@ -324,6 +328,7 @@ async def test_unsafe_credential_values_are_rejected(value: str) -> None:
 
 @pytest.mark.asyncio
 async def test_authenticator_failure_text_is_redacted() -> None:
+    secret = "credential-that-must-not-escape"
     client = ProviderHttpClient(
         "https://provider.test",
         resolved_runtime_inputs=resolved_runtime_inputs(),
@@ -338,8 +343,45 @@ async def test_authenticator_failure_text_is_redacted() -> None:
         await client.aclose()
 
     assert str(error.value) == "provider authentication failed"
+    assert secret not in str(error.value)
+    assert secret not in repr(error.value)
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
+    assert not traceback_retains(error.value, secret)
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_clears_credentials_from_traceback_locals() -> None:
+    secret = "credential-that-must-not-escape"
+    captured: list[httpx.Request] = []
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        raise httpx.ConnectError(secret, request=request)
+
+    client = ProviderHttpClient(
+        "https://provider.test",
+        resolved_runtime_inputs=resolved_runtime_inputs(),
+        authenticator=RecordingAuthenticator(
+            {"authorization": f"Bearer {secret}"}
+        ),
+        credential_header_allowlist=frozenset({"authorization"}),
+        transport=httpx.MockTransport(fail),
+    )
+    try:
+        with pytest.raises(ProviderTransportError) as error:
+            await client.invoke(invocation_request())
+    finally:
+        await client.aclose()
+
+    assert len(captured) == 1
+    assert secret.encode() not in captured[0].content
+    assert secret not in captured[0].headers.get("baggage", "")
+    assert secret not in str(error.value)
+    assert secret not in repr(error.value)
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert not traceback_retains(error.value, secret)
 
 
 @pytest.mark.asyncio

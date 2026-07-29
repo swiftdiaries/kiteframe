@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from kiteframe import (
     load_admission_request,
     load_catalog_request,
     load_invocation_request,
+    load_resolved_agent,
     load_status_request,
     provider,
     resolve_package,
@@ -259,17 +261,116 @@ def grant_set_bytes(variant: str = "valid") -> bytes:
 
 
 def traceback_retains(error: BaseException, secret: str) -> bool:
+    def value_retains(value: object, seen: set[int]) -> bool:
+        if isinstance(value, str):
+            return secret in value
+        if isinstance(value, (bytes, bytearray)):
+            return secret.encode() in value
+        identity = id(value)
+        if identity in seen:
+            return False
+        seen.add(identity)
+        if isinstance(value, Mapping):
+            return any(
+                value_retains(key, seen) or value_retains(item, seen)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(value_retains(item, seen) for item in value)
+        return False
+
     traceback = error.__traceback__
     while traceback is not None:
         filename = traceback.tb_frame.f_code.co_filename.replace("\\", "/")
         if "/kiteframe/provider/http.py" in filename:
             for value in traceback.tb_frame.f_locals.values():
-                if isinstance(value, str) and secret in value:
-                    return True
-                if isinstance(value, (bytes, bytearray)) and secret.encode() in value:
+                if value_retains(value, set()):
                     return True
         traceback = traceback.tb_next
     return False
+
+
+def domain_digest(domain: bytes, chunks: tuple[bytes, ...]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"kiteframe:v1\0")
+    digest.update(len(domain).to_bytes(8, "big"))
+    digest.update(domain)
+    for chunk in chunks:
+        digest.update(len(chunk).to_bytes(8, "big"))
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def canonical_component(domain: bytes, value: object) -> bytes:
+    return bytes.fromhex(domain_digest(domain, (canonical_bytes(value),)))
+
+
+def resolved_digest(wire: dict[str, object]) -> str:
+    components = (
+        canonical_component(
+            b"resolved/identity",
+            [wire["schemaVersion"], wire["packageIdentity"]],
+        ),
+        bytes.fromhex(
+            domain_digest(
+                b"resolved/portable",
+                (bytes.fromhex(str(wire["portableDigest"])),),
+            )
+        ),
+        bytes.fromhex(
+            domain_digest(
+                b"resolved/lock",
+                (bytes.fromhex(str(wire["lockDigest"])),),
+            )
+        ),
+        canonical_component(
+            b"resolved/catalog",
+            [wire["catalogIdentity"], wire["catalogDigest"]],
+        ),
+        bytes.fromhex(
+            domain_digest(
+                b"resolved/binding",
+                (bytes.fromhex(str(wire["bindingDigest"])),),
+            )
+        ),
+        canonical_component(b"resolved/prompts", wire["prompts"]),
+        canonical_component(b"resolved/skills", wire["skills"]),
+        canonical_component(
+            b"resolved/features",
+            [wire["requiredFeatures"], wire["optionalFeatures"]],
+        ),
+        canonical_component(b"resolved/models", wire["models"]),
+        canonical_component(
+            b"resolved/capabilities",
+            wire["capabilityRequirements"],
+        ),
+        canonical_component(b"resolved/children", wire["subagents"]),
+        canonical_component(
+            b"resolved/content-capture",
+            wire["contentCapture"],
+        ),
+        canonical_component(
+            b"resolved/report",
+            wire["compilationReport"],
+        ),
+    )
+    return domain_digest(b"resolved-agent", components)
+
+
+def changed_descriptor_requirement() -> ResolvedCapabilityRequirement:
+    workspace = Path(__file__).resolve().parents[4]
+    resolved_wire = json.loads(
+        (workspace / "tests/fixtures/resolved/support-agent.json").read_bytes()
+    )
+    alternate_lock = json.loads(
+        (workspace / "tests/fixtures/locks/support-agent.lock").read_bytes()
+    )
+    resolved_wire["capabilityRequirements"][0]["lockedCapability"] = alternate_lock[
+        "capabilities"
+    ][0]
+    resolved_wire["resolvedDigest"] = resolved_digest(resolved_wire)
+    changed = load_resolved_agent(canonical_bytes(resolved_wire))
+    return changed.capability_requirements[0]
 
 
 def diagnostic_envelope() -> bytes:
@@ -435,6 +536,39 @@ async def test_invoke_and_status_validate_with_the_indexed_locked_descriptor() -
 
     assert outcome.result == {"caseId": "case-1"}
     assert status.result == {"caseId": "case-1"}
+
+
+@pytest.mark.asyncio
+async def test_status_rejects_changed_retained_digest_before_transport() -> None:
+    indexed = runtime_requirement()
+    changed = changed_descriptor_requirement()
+    retained_without_descriptor = (
+        "input_schema_digest",
+        "output_schema_digest",
+        "stable_error_set_digest",
+        "safety_metadata_digest",
+    )
+
+    assert (changed.name, changed.version) == (indexed.name, indexed.version)
+    assert changed.descriptor_digest != indexed.descriptor_digest
+    assert all(
+        getattr(changed, name) == getattr(indexed, name)
+        for name in retained_without_descriptor
+    )
+
+    client = ProviderHttpClient(
+        "https://provider.test",
+        transport=httpx.MockTransport(
+            lambda request: pytest.fail(
+                "mismatched retained requirement reached transport"
+            )
+        ),
+    )
+    try:
+        with pytest.raises(ValueError, match="resolved runtime inputs"):
+            await client.status(status_request(), changed)
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

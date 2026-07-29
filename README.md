@@ -36,6 +36,20 @@ and only `ResolvedAgent` records the enabled and omitted target result.
 
 - [Kiteframe declarative agent harness design](docs/superpowers/specs/2026-07-25-kiteframe-declarative-agent-harness-design.md)
 
+## Development verification
+
+Run the complete Wave 3R Rust, PyO3, schema, and stub matrix from the
+repository root:
+
+```console
+uv run --project python/kiteframe python scripts/verify_wave3r.py
+```
+
+The checked-in command runs through the Python project managed by `uv`, rejects
+Python versions below the package's 3.11 floor, and supplies that exact
+interpreter and its base installation to PyO3. This avoids macOS system Python
+selection for embedded-Python tests and stub generation.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
