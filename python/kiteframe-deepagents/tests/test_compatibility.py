@@ -5,14 +5,19 @@ from collections.abc import Sequence
 from typing import Any
 
 import deepagents
-from deepagents import create_deep_agent, register_harness_profile
+import pytest
+from deepagents import create_deep_agent
+from kiteframe.registry import ComponentKind, ComponentRegistry
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import Field
 
+import kiteframe_deepagents.compatibility as compatibility
 from kiteframe_deepagents.compatibility import (
     AMBIENT_TOOL_NAMES,
+    DENY_ONLY_PROFILE,
     KiteframeHarnessProfileToken,
+    bootstrap_deepagents_deployment,
     deny_only_profile,
     verify_compatibility,
 )
@@ -56,7 +61,11 @@ class RecordingFakeChatModel(FakeMessagesListChatModel):
 
 
 def registered_model() -> RecordingFakeChatModel:
-    register_harness_profile(MODEL_KEY, deny_only_profile())
+    bootstrap_deepagents_deployment(
+        ComponentRegistry(),
+        model_key=MODEL_KEY,
+        profile_symbol="profiles.deepagents",
+    )
     return RecordingFakeChatModel(responses=[AIMessage(content="done")])
 
 
@@ -92,6 +101,69 @@ def test_profile_token_attests_the_deployment_profile() -> None:
 
     assert token.model_key == MODEL_KEY
     assert token.excluded_tools == AMBIENT_TOOL_NAMES
+
+
+def test_bootstrap_installs_static_profile_and_registers_the_matching_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registrations: list[tuple[str, object]] = []
+    model_key = "kiteframe-test:bootstrap"
+    registry = ComponentRegistry()
+
+    monkeypatch.setattr(
+        compatibility,
+        "register_harness_profile",
+        lambda key, profile: registrations.append((key, profile)),
+    )
+
+    token = bootstrap_deepagents_deployment(
+        registry,
+        model_key=model_key,
+        profile_symbol="profiles.deepagents",
+    )
+
+    assert registrations == [(model_key, DENY_ONLY_PROFILE)]
+    assert token == KiteframeHarnessProfileToken(
+        model_key=model_key,
+        deepagents_version="0.6.12",
+        excluded_tools=AMBIENT_TOOL_NAMES,
+        general_purpose_subagent_disabled=True,
+    )
+    assert (
+        registry.freeze().resolve(
+            ComponentKind.HARNESS_PROFILE,
+            "profiles.deepagents",
+        )
+        is token
+    )
+
+
+def test_bootstrap_is_idempotent_without_replacing_the_static_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registrations: list[tuple[str, object]] = []
+    model_key = "kiteframe-test:idempotent"
+    registry = ComponentRegistry()
+
+    monkeypatch.setattr(
+        compatibility,
+        "register_harness_profile",
+        lambda key, profile: registrations.append((key, profile)),
+    )
+
+    first = bootstrap_deepagents_deployment(
+        registry,
+        model_key=model_key,
+        profile_symbol="profiles.deepagents",
+    )
+    second = bootstrap_deepagents_deployment(
+        registry,
+        model_key=model_key,
+        profile_symbol="profiles.deepagents",
+    )
+
+    assert first is second
+    assert registrations == [(model_key, DENY_ONLY_PROFILE)]
 
 
 def test_registered_deny_only_profile_exposes_no_ambient_or_task_tools() -> None:

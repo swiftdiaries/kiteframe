@@ -9,7 +9,11 @@ description = "Kiteframe adapter for the pinned Deep Agents public API"
 requires-python = ">=3.11,<4"
 dependencies = [
     "deepagents==0.6.12",
+    "kiteframe",
 ]
+
+[tool.uv.sources]
+kiteframe = { path = "../kiteframe", editable = true }
 
 [tool.uv]
 dev-dependencies = [

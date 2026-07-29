@@ -56,6 +56,40 @@ def test_registration_rejects_non_component_kind() -> None:
         registry.register("model", "models.primary", object())  # type: ignore[arg-type]
 
 
+def test_harness_profile_component_is_resolved_after_freeze() -> None:
+    registry = ComponentRegistry()
+    profile_token = object()
+
+    registry.register(
+        ComponentKind.HARNESS_PROFILE,
+        "profiles.deepagents",
+        profile_token,
+    )
+
+    assert (
+        registry.freeze().resolve(
+            ComponentKind.HARNESS_PROFILE,
+            "profiles.deepagents",
+        )
+        is profile_token
+    )
+
+
+def test_mutable_registry_resolves_an_already_registered_harness_profile() -> None:
+    registry = ComponentRegistry()
+    profile_token = object()
+    registry.register(
+        ComponentKind.HARNESS_PROFILE,
+        "profiles.deepagents",
+        profile_token,
+    )
+
+    assert (
+        registry.resolve(ComponentKind.HARNESS_PROFILE, "profiles.deepagents")
+        is profile_token
+    )
+
+
 def test_frozen_registry_cannot_be_mutated() -> None:
     registry = ComponentRegistry()
     registry.freeze()

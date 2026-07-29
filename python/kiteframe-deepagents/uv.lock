@@ -539,11 +539,32 @@ wheels = [
 ]
 
 [[package]]
+name = "kiteframe"
+version = "0.1.0"
+source = { editable = "../kiteframe" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "httpx", specifier = ">=0.28,<1" }]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "maturin", specifier = ">=1.0,<2.0" },
+    { name = "pyright", specifier = ">=1.1.411,<2" },
+    { name = "pytest", specifier = ">=8" },
+    { name = "pytest-asyncio", specifier = ">=0.24" },
+    { name = "ruff", specifier = ">=0.14,<1" },
+]
+
+[[package]]
 name = "kiteframe-deepagents"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "deepagents" },
+    { name = "kiteframe" },
 ]
 
 [package.dev-dependencies]
@@ -555,7 +576,10 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "deepagents", specifier = "==0.6.12" }]
+requires-dist = [
+    { name = "deepagents", specifier = "==0.6.12" },
+    { name = "kiteframe", editable = "../kiteframe" },
+]
 
 [package.metadata.requires-dev]
 dev = [

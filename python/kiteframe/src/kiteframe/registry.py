@@ -21,6 +21,7 @@ class ComponentKind(str, Enum):
     RETENTION_POLICY = "retention_policy"
     ACCESS_POLICY = "access_policy"
     ENCRYPTED_CONTENT_STORE = "encrypted_content_store"
+    HARNESS_PROFILE = "harness_profile"
 
 
 class ComponentUnresolvedError(RuntimeError):
@@ -100,6 +101,17 @@ class ComponentRegistry:
         key = RegistryKey(kind, symbol)
         self._entries[key] = value
         self._symbols[symbol] = kind
+
+    def resolve(self, kind: ComponentKind, symbol: str) -> object:
+        """Resolve an already-registered deployment component before freeze."""
+        try:
+            symbol = validate_registry_symbol(symbol)
+        except ValueError as error:
+            raise ComponentUnresolvedError() from error
+
+        if self._symbols.get(symbol) is not kind:
+            raise ComponentUnresolvedError()
+        return self._entries[RegistryKey(kind, symbol)]
 
     def freeze(self) -> "FrozenComponentRegistry":
         self._frozen = True
