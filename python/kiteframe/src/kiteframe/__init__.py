@@ -2,12 +2,16 @@
 
 from ._native import (
     AdmissionRequest,
+    AuthorityRevision,
+    AuthorityRevisionSet,
     CapabilityCatalog,
+    CapabilityDenial,
     CapabilityDescriptor,
     CapabilityGrantSet,
     CatalogRequest,
     ComponentDescriptor,
     Diagnostic,
+    EffectiveCapabilityGrant,
     InvocationOutcome,
     InvocationRequest,
     InvocationStatus,
@@ -41,7 +45,10 @@ from .registry import (
 
 __all__ = [
     "AdmissionRequest",
+    "AuthorityRevision",
+    "AuthorityRevisionSet",
     "CapabilityCatalog",
+    "CapabilityDenial",
     "CapabilityDescriptor",
     "CapabilityGrantSet",
     "CatalogRequest",
@@ -51,6 +58,7 @@ __all__ = [
     "KiteframeDiagnosticError",
     "ComponentDescriptor",
     "Diagnostic",
+    "EffectiveCapabilityGrant",
     "ComponentKind",
     "ComponentRegistry",
     "ComponentUnresolvedError",

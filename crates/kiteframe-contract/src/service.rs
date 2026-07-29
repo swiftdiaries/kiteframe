@@ -6,8 +6,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    CapabilityDescriptor, CapabilityIdentity, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticSeverity, DiagnosticStage, IdempotencyRequirement, ResolvedCapabilityRequirement,
+    ApprovalRequirement, CapabilityDescriptor, CapabilityIdentity, CatalogIdentity,
+    ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticSeverity, DiagnosticStage, EffectClassification, ExecutionMode, FreshnessRequirement,
+    IdempotencyRequirement, NonEmptySet, PreconditionDescriptor, ResolvedCapabilityRequirement,
     RetryClass, SafeMessage, Sha256Digest,
 };
 
@@ -423,6 +425,8 @@ pub struct AdmissionRequestParts {
     pub portable_digest: Sha256Digest,
     pub lock_digest: Sha256Digest,
     pub resolved_digest: Sha256Digest,
+    pub catalog_identity: CatalogIdentity,
+    pub catalog_digest: Sha256Digest,
     pub required_capabilities: Vec<RequestedCapability>,
     pub optional_capabilities: Vec<RequestedCapability>,
     pub resolved_requirements: Vec<ResolvedCapabilityRequirement>,
@@ -441,12 +445,15 @@ pub struct AdmissionRequest {
     portable_digest: Sha256Digest,
     lock_digest: Sha256Digest,
     resolved_digest: Sha256Digest,
+    catalog_identity: CatalogIdentity,
+    catalog_digest: Sha256Digest,
     required_capabilities: Vec<RequestedCapability>,
     optional_capabilities: Vec<RequestedCapability>,
     resolved_requirements: Vec<ResolvedCapabilityRequirement>,
     delegation_ancestry: DelegationAncestry,
     contextual_facts: BTreeMap<String, String>,
     trace_context: TraceContext,
+    request_digest: Sha256Digest,
 }
 
 impl AdmissionRequest {
@@ -490,6 +497,8 @@ impl AdmissionRequest {
                 )]);
             }
         }
+        let request_digest =
+            admission_request_digest(&parts).map_err(|message| vec![invalid(message)])?;
         Ok(Self {
             actor: parts.actor,
             agent: parts.agent,
@@ -498,12 +507,15 @@ impl AdmissionRequest {
             portable_digest: parts.portable_digest,
             lock_digest: parts.lock_digest,
             resolved_digest: parts.resolved_digest,
+            catalog_identity: parts.catalog_identity,
+            catalog_digest: parts.catalog_digest,
             required_capabilities: parts.required_capabilities,
             optional_capabilities: parts.optional_capabilities,
             resolved_requirements: parts.resolved_requirements,
             delegation_ancestry: parts.delegation_ancestry,
             contextual_facts: parts.contextual_facts,
             trace_context: parts.trace_context,
+            request_digest,
         })
     }
 
@@ -517,6 +529,15 @@ impl AdmissionRequest {
 
     pub fn trace_context(&self) -> &TraceContext {
         &self.trace_context
+    }
+    pub fn catalog_identity(&self) -> &CatalogIdentity {
+        &self.catalog_identity
+    }
+    pub fn catalog_digest(&self) -> &Sha256Digest {
+        &self.catalog_digest
+    }
+    pub fn request_digest(&self) -> &Sha256Digest {
+        &self.request_digest
     }
 }
 
@@ -532,15 +553,18 @@ impl<'de> Deserialize<'de> for AdmissionRequest {
             portable_digest: Sha256Digest,
             lock_digest: Sha256Digest,
             resolved_digest: Sha256Digest,
+            catalog_identity: CatalogIdentity,
+            catalog_digest: Sha256Digest,
             required_capabilities: Vec<RequestedCapability>,
             optional_capabilities: Vec<RequestedCapability>,
             resolved_requirements: Vec<ResolvedCapabilityRequirement>,
             delegation_ancestry: DelegationAncestry,
             contextual_facts: BTreeMap<String, String>,
             trace_context: TraceContext,
+            request_digest: Sha256Digest,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Self::try_new(AdmissionRequestParts {
+        let value = Self::try_new(AdmissionRequestParts {
             actor: raw.actor,
             agent: raw.agent,
             task: raw.task,
@@ -548,6 +572,8 @@ impl<'de> Deserialize<'de> for AdmissionRequest {
             portable_digest: raw.portable_digest,
             lock_digest: raw.lock_digest,
             resolved_digest: raw.resolved_digest,
+            catalog_identity: raw.catalog_identity,
+            catalog_digest: raw.catalog_digest,
             required_capabilities: raw.required_capabilities,
             optional_capabilities: raw.optional_capabilities,
             resolved_requirements: raw.resolved_requirements,
@@ -555,8 +581,56 @@ impl<'de> Deserialize<'de> for AdmissionRequest {
             contextual_facts: raw.contextual_facts,
             trace_context: raw.trace_context,
         })
-        .map_err(|errors| D::Error::custom(errors[0].message.as_str()))
+        .map_err(|errors| D::Error::custom(errors[0].message.as_str()))?;
+        if value.request_digest != raw.request_digest {
+            return Err(D::Error::custom(
+                "request digest does not match canonical admission request",
+            ));
+        }
+        Ok(value)
     }
+}
+
+fn admission_request_digest(parts: &AdmissionRequestParts) -> Result<Sha256Digest, String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Wire<'a> {
+        actor: &'a ActorRef,
+        agent: &'a AgentRef,
+        task: &'a TaskRef,
+        session: &'a SessionRef,
+        portable_digest: &'a Sha256Digest,
+        lock_digest: &'a Sha256Digest,
+        resolved_digest: &'a Sha256Digest,
+        catalog_identity: &'a CatalogIdentity,
+        catalog_digest: &'a Sha256Digest,
+        required_capabilities: &'a [RequestedCapability],
+        optional_capabilities: &'a [RequestedCapability],
+        resolved_requirements: &'a [ResolvedCapabilityRequirement],
+        delegation_ancestry: &'a DelegationAncestry,
+        contextual_facts: &'a BTreeMap<String, String>,
+        trace_context: &'a TraceContext,
+    }
+    canonical_digest(
+        b"kiteframe:admission-request:v1\0",
+        &Wire {
+            actor: &parts.actor,
+            agent: &parts.agent,
+            task: &parts.task,
+            session: &parts.session,
+            portable_digest: &parts.portable_digest,
+            lock_digest: &parts.lock_digest,
+            resolved_digest: &parts.resolved_digest,
+            catalog_identity: &parts.catalog_identity,
+            catalog_digest: &parts.catalog_digest,
+            required_capabilities: &parts.required_capabilities,
+            optional_capabilities: &parts.optional_capabilities,
+            resolved_requirements: &parts.resolved_requirements,
+            delegation_ancestry: &parts.delegation_ancestry,
+            contextual_facts: &parts.contextual_facts,
+            trace_context: &parts.trace_context,
+        },
+    )
 }
 
 fn normalize_requests(requests: &mut [RequestedCapability]) {
@@ -570,85 +644,314 @@ fn selector_is_subset_of(requested: &str, allowed: &str) -> bool {
             .is_some_and(|prefix| requested.starts_with(&format!("{prefix}:")))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequiredEvidence {
+    confirmation: ConfirmationRequirement,
+    approval: ApprovalRequirement,
+    consent: ConsentRequirement,
+}
+
+impl RequiredEvidence {
+    pub fn new(
+        confirmation: ConfirmationRequirement,
+        approval: ApprovalRequirement,
+        consent: ConsentRequirement,
+    ) -> Self {
+        Self {
+            confirmation,
+            approval,
+            consent,
+        }
+    }
+
+    pub fn confirmation(&self) -> &ConfirmationRequirement {
+        &self.confirmation
+    }
+    pub fn approval(&self) -> &ApprovalRequirement {
+        &self.approval
+    }
+    pub fn consent(&self) -> &ConsentRequirement {
+        &self.consent
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct CapabilityGrantParts {
+pub struct EffectiveCapabilityGrantParts {
     pub capability: CapabilityIdentity,
     pub resources: Vec<NormalizedResourceSelector>,
+    pub execution_modes: NonEmptySet<ExecutionMode>,
+    pub maximum_effect: EffectClassification,
+    pub expires_at: Timestamp,
+    pub required_evidence: RequiredEvidence,
+    pub freshness: FreshnessRequirement,
+    pub preconditions: Vec<PreconditionDescriptor>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CapabilityGrant {
+pub struct EffectiveCapabilityGrant {
     capability: CapabilityIdentity,
     resources: Vec<NormalizedResourceSelector>,
+    execution_modes: NonEmptySet<ExecutionMode>,
+    maximum_effect: EffectClassification,
+    expires_at: Timestamp,
+    required_evidence: RequiredEvidence,
+    freshness: FreshnessRequirement,
+    preconditions: Vec<PreconditionDescriptor>,
 }
 
-impl CapabilityGrant {
-    pub fn try_new(mut parts: CapabilityGrantParts) -> Result<Self, String> {
+impl EffectiveCapabilityGrant {
+    pub fn try_new(mut parts: EffectiveCapabilityGrantParts) -> Result<Self, String> {
         parts.resources.sort();
         parts.resources.dedup();
         if parts.resources.is_empty() {
-            return Err("capability grant must have at least one resource selector".to_owned());
+            return Err(
+                "effective capability grant must have at least one resource selector".to_owned(),
+            );
         }
+        parts.preconditions.sort();
+        parts.preconditions.dedup();
         Ok(Self {
             capability: parts.capability,
             resources: parts.resources,
+            execution_modes: parts.execution_modes,
+            maximum_effect: parts.maximum_effect,
+            expires_at: parts.expires_at,
+            required_evidence: parts.required_evidence,
+            freshness: parts.freshness,
+            preconditions: parts.preconditions,
         })
     }
 
     pub fn capability(&self) -> &CapabilityIdentity {
         &self.capability
     }
-
     pub fn resources(&self) -> &[NormalizedResourceSelector] {
         &self.resources
     }
+    pub fn execution_modes(&self) -> &NonEmptySet<ExecutionMode> {
+        &self.execution_modes
+    }
+    pub fn maximum_effect(&self) -> EffectClassification {
+        self.maximum_effect
+    }
+    pub fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
+    pub fn required_evidence(&self) -> &RequiredEvidence {
+        &self.required_evidence
+    }
+    pub fn freshness(&self) -> &FreshnessRequirement {
+        &self.freshness
+    }
+    pub fn preconditions(&self) -> &[PreconditionDescriptor] {
+        &self.preconditions
+    }
 }
 
-impl<'de> Deserialize<'de> for CapabilityGrant {
+impl<'de> Deserialize<'de> for EffectiveCapabilityGrant {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Raw {
             capability: CapabilityIdentity,
             resources: Vec<NormalizedResourceSelector>,
+            execution_modes: NonEmptySet<ExecutionMode>,
+            maximum_effect: EffectClassification,
+            expires_at: Timestamp,
+            required_evidence: RequiredEvidence,
+            freshness: FreshnessRequirement,
+            preconditions: Vec<PreconditionDescriptor>,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Self::try_new(CapabilityGrantParts {
+        Self::try_new(EffectiveCapabilityGrantParts {
             capability: raw.capability,
             resources: raw.resources,
+            execution_modes: raw.execution_modes,
+            maximum_effect: raw.maximum_effect,
+            expires_at: raw.expires_at,
+            required_evidence: raw.required_evidence,
+            freshness: raw.freshness,
+            preconditions: raw.preconditions,
         })
         .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityRevision {
+    source: String,
+    revision: String,
+}
+
+impl AuthorityRevision {
+    pub fn try_new(source: impl Into<String>, revision: impl Into<String>) -> Result<Self, String> {
+        let source = source.into();
+        let revision = revision.into();
+        if source.trim().is_empty() || revision.trim().is_empty() {
+            return Err("authority revision source and revision are required".to_owned());
+        }
+        Ok(Self { source, revision })
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    pub fn revision(&self) -> &str {
+        &self.revision
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthorityRevision {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            source: String,
+            revision: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(raw.source, raw.revision).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthorityRevisionSet {
+    entries: Vec<AuthorityRevision>,
+    authority_revision_digest: Sha256Digest,
+}
+
+impl AuthorityRevisionSet {
+    pub fn try_new(mut entries: Vec<AuthorityRevision>) -> Result<Self, String> {
+        entries.sort();
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].source == pair[1].source)
+        {
+            return Err("authority revision sources must be unique".to_owned());
+        }
+        let authority_revision_digest =
+            canonical_digest(b"kiteframe:authority-revision-set:v1\0", &entries)?;
+        Ok(Self {
+            entries,
+            authority_revision_digest,
+        })
+    }
+
+    pub fn entries(&self) -> &[AuthorityRevision] {
+        &self.entries
+    }
+    pub fn authority_revision_digest(&self) -> &Sha256Digest {
+        &self.authority_revision_digest
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthorityRevisionSet {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            entries: Vec<AuthorityRevision>,
+            authority_revision_digest: Sha256Digest,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let value = Self::try_new(raw.entries).map_err(D::Error::custom)?;
+        if value.authority_revision_digest != raw.authority_revision_digest {
+            return Err(D::Error::custom(
+                "authority revision digest does not match canonical entries",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityDenial {
+    capability: CapabilityIdentity,
+    diagnostic: Diagnostic,
+}
+
+impl CapabilityDenial {
+    pub fn try_new(capability: CapabilityIdentity, diagnostic: Diagnostic) -> Result<Self, String> {
+        if diagnostic.code != DiagnosticCode::AdmissionDenied
+            || diagnostic.category != DiagnosticCategory::Authorization
+            || !matches!(
+                diagnostic.severity,
+                DiagnosticSeverity::Warning | DiagnosticSeverity::Error
+            )
+            || diagnostic.stage != DiagnosticStage::Admit
+            || diagnostic.retry != RetryClass::Never
+        {
+            return Err(
+                "capability denial diagnostic must use the admission denial contract".into(),
+            );
+        }
+        Ok(Self {
+            capability,
+            diagnostic,
+        })
+    }
+
+    pub fn capability(&self) -> &CapabilityIdentity {
+        &self.capability
+    }
+    pub fn diagnostic(&self) -> &Diagnostic {
+        &self.diagnostic
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityDenial {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            capability: CapabilityIdentity,
+            diagnostic: Diagnostic,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(raw.capability, raw.diagnostic).map_err(D::Error::custom)
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct CapabilityGrantSetParts {
     pub admission_id: AdmissionId,
+    pub admission_request_digest: Sha256Digest,
     pub actor: ActorRef,
     pub agent: AgentRef,
     pub task: TaskRef,
     pub session: SessionRef,
     pub policy_revision: PolicyRevision,
+    pub catalog_identity: CatalogIdentity,
     pub catalog_digest: Sha256Digest,
+    pub authority_revisions: AuthorityRevisionSet,
     pub issued_at: Timestamp,
     pub expires_at: Timestamp,
-    pub grants: Vec<CapabilityGrant>,
+    pub grants: Vec<EffectiveCapabilityGrant>,
+    pub optional_denials: Vec<CapabilityDenial>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CapabilityGrantSet {
     admission_id: AdmissionId,
+    admission_request_digest: Sha256Digest,
     actor: ActorRef,
     agent: AgentRef,
     task: TaskRef,
     session: SessionRef,
     policy_revision: PolicyRevision,
+    catalog_identity: CatalogIdentity,
     catalog_digest: Sha256Digest,
+    authority_revisions: AuthorityRevisionSet,
     issued_at: Timestamp,
     expires_at: Timestamp,
-    grants: Vec<CapabilityGrant>,
+    grants: Vec<EffectiveCapabilityGrant>,
+    optional_denials: Vec<CapabilityDenial>,
     grant_digest: Sha256Digest,
 }
 
@@ -667,18 +970,34 @@ impl CapabilityGrantSet {
         {
             return Err(vec![invalid("capability grant versions must be unique")]);
         }
+        parts
+            .optional_denials
+            .sort_by(|left, right| left.capability.cmp(&right.capability));
+        if parts
+            .optional_denials
+            .windows(2)
+            .any(|pair| pair[0].capability == pair[1].capability)
+        {
+            return Err(vec![invalid(
+                "optional capability denial versions must be unique",
+            )]);
+        }
         let digest = grant_digest(&parts).map_err(|message| vec![invalid(message)])?;
         Ok(Self {
             admission_id: parts.admission_id,
+            admission_request_digest: parts.admission_request_digest,
             actor: parts.actor,
             agent: parts.agent,
             task: parts.task,
             session: parts.session,
             policy_revision: parts.policy_revision,
+            catalog_identity: parts.catalog_identity,
             catalog_digest: parts.catalog_digest,
+            authority_revisions: parts.authority_revisions,
             issued_at: parts.issued_at,
             expires_at: parts.expires_at,
             grants: parts.grants,
+            optional_denials: parts.optional_denials,
             grant_digest: digest,
         })
     }
@@ -688,10 +1007,54 @@ impl CapabilityGrantSet {
             || self.agent != request.agent
             || self.task != request.task
             || self.session != request.session
+            || self.admission_request_digest != request.request_digest
+            || self.catalog_identity != request.catalog_identity
+            || self.catalog_digest != request.catalog_digest
         {
             return Err(result_invalid(
                 DiagnosticStage::Admit,
                 "capability grant identity does not match its admission request",
+            ));
+        }
+
+        for requested in &request.required_capabilities {
+            if self
+                .grants
+                .iter()
+                .filter(|grant| grant.capability == requested.capability)
+                .count()
+                != 1
+            {
+                return Err(grant_invalid(
+                    "required capability must have exactly one grant",
+                ));
+            }
+        }
+        for requested in &request.optional_capabilities {
+            let grants = self
+                .grants
+                .iter()
+                .filter(|grant| grant.capability == requested.capability)
+                .count();
+            let denials = self
+                .optional_denials
+                .iter()
+                .filter(|denial| denial.capability == requested.capability)
+                .count();
+            if grants + denials != 1 {
+                return Err(grant_invalid(
+                    "optional capability must have exactly one grant or denial",
+                ));
+            }
+        }
+        if self.optional_denials.iter().any(|denial| {
+            !request
+                .optional_capabilities
+                .iter()
+                .any(|requested| requested.capability == denial.capability)
+        }) {
+            return Err(grant_invalid(
+                "capability denial does not match an optional request",
             ));
         }
 
@@ -718,12 +1081,27 @@ impl CapabilityGrantSet {
                     "capability grant resources exceed the admission request",
                 ));
             }
+            let Some(resolved) = request
+                .resolved_requirements
+                .iter()
+                .find(|resolved| resolved.identity() == &grant.capability)
+            else {
+                return Err(grant_invalid("capability grant has no locked descriptor"));
+            };
+            if !effective_grant_narrows(grant, resolved.descriptor(), self.expires_at) {
+                return Err(grant_invalid(
+                    "effective capability grant exceeds its locked descriptor",
+                ));
+            }
         }
         Ok(())
     }
 
     pub fn admission_id(&self) -> &AdmissionId {
         &self.admission_id
+    }
+    pub fn admission_request_digest(&self) -> &Sha256Digest {
+        &self.admission_request_digest
     }
     pub fn actor(&self) -> &ActorRef {
         &self.actor
@@ -740,8 +1118,14 @@ impl CapabilityGrantSet {
     pub fn policy_revision(&self) -> &PolicyRevision {
         &self.policy_revision
     }
+    pub fn catalog_identity(&self) -> &CatalogIdentity {
+        &self.catalog_identity
+    }
     pub fn catalog_digest(&self) -> &Sha256Digest {
         &self.catalog_digest
+    }
+    pub fn authority_revisions(&self) -> &AuthorityRevisionSet {
+        &self.authority_revisions
     }
     pub fn issued_at(&self) -> Timestamp {
         self.issued_at
@@ -749,8 +1133,11 @@ impl CapabilityGrantSet {
     pub fn expires_at(&self) -> Timestamp {
         self.expires_at
     }
-    pub fn grants(&self) -> &[CapabilityGrant] {
+    pub fn grants(&self) -> &[EffectiveCapabilityGrant] {
         &self.grants
+    }
+    pub fn optional_denials(&self) -> &[CapabilityDenial] {
+        &self.optional_denials
     }
     pub fn grant_digest(&self) -> &Sha256Digest {
         &self.grant_digest
@@ -763,29 +1150,37 @@ impl<'de> Deserialize<'de> for CapabilityGrantSet {
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Raw {
             admission_id: AdmissionId,
+            admission_request_digest: Sha256Digest,
             actor: ActorRef,
             agent: AgentRef,
             task: TaskRef,
             session: SessionRef,
             policy_revision: PolicyRevision,
+            catalog_identity: CatalogIdentity,
             catalog_digest: Sha256Digest,
+            authority_revisions: AuthorityRevisionSet,
             issued_at: Timestamp,
             expires_at: Timestamp,
-            grants: Vec<CapabilityGrant>,
+            grants: Vec<EffectiveCapabilityGrant>,
+            optional_denials: Vec<CapabilityDenial>,
             grant_digest: Sha256Digest,
         }
         let raw = Raw::deserialize(deserializer)?;
         let value = Self::try_new(CapabilityGrantSetParts {
             admission_id: raw.admission_id,
+            admission_request_digest: raw.admission_request_digest,
             actor: raw.actor,
             agent: raw.agent,
             task: raw.task,
             session: raw.session,
             policy_revision: raw.policy_revision,
+            catalog_identity: raw.catalog_identity,
             catalog_digest: raw.catalog_digest,
+            authority_revisions: raw.authority_revisions,
             issued_at: raw.issued_at,
             expires_at: raw.expires_at,
             grants: raw.grants,
+            optional_denials: raw.optional_denials,
         })
         .map_err(|errors| D::Error::custom(errors[0].message.as_str()))?;
         if value.grant_digest != raw.grant_digest {
@@ -802,31 +1197,113 @@ fn grant_digest(parts: &CapabilityGrantSetParts) -> Result<Sha256Digest, String>
     #[serde(rename_all = "camelCase")]
     struct Wire<'a> {
         admission_id: &'a AdmissionId,
+        admission_request_digest: &'a Sha256Digest,
         actor: &'a ActorRef,
         agent: &'a AgentRef,
         task: &'a TaskRef,
         session: &'a SessionRef,
         policy_revision: &'a PolicyRevision,
+        catalog_identity: &'a CatalogIdentity,
         catalog_digest: &'a Sha256Digest,
+        authority_revisions: &'a AuthorityRevisionSet,
         issued_at: Timestamp,
         expires_at: Timestamp,
-        grants: &'a [CapabilityGrant],
+        grants: &'a [EffectiveCapabilityGrant],
+        optional_denials: &'a [CapabilityDenial],
     }
     canonical_digest(
         b"kiteframe:capability-grant-set:v1\0",
         &Wire {
             admission_id: &parts.admission_id,
+            admission_request_digest: &parts.admission_request_digest,
             actor: &parts.actor,
             agent: &parts.agent,
             task: &parts.task,
             session: &parts.session,
             policy_revision: &parts.policy_revision,
+            catalog_identity: &parts.catalog_identity,
             catalog_digest: &parts.catalog_digest,
+            authority_revisions: &parts.authority_revisions,
             issued_at: parts.issued_at,
             expires_at: parts.expires_at,
             grants: &parts.grants,
+            optional_denials: &parts.optional_denials,
         },
     )
+}
+
+fn grant_invalid(message: impl Into<SafeMessage>) -> Diagnostic {
+    result_invalid(DiagnosticStage::Admit, message)
+}
+
+fn effective_grant_narrows(
+    grant: &EffectiveCapabilityGrant,
+    descriptor: &CapabilityDescriptor,
+    grant_set_expiry: Timestamp,
+) -> bool {
+    grant
+        .execution_modes
+        .as_set()
+        .is_subset(descriptor.execution_modes().as_set())
+        && grant.maximum_effect <= descriptor.effect()
+        && grant.expires_at <= grant_set_expiry
+        && evidence_not_weaker(
+            grant.required_evidence.confirmation(),
+            descriptor.confirmation(),
+        )
+        && approval_not_weaker(grant.required_evidence.approval(), descriptor.approval())
+        && consent_not_weaker(grant.required_evidence.consent(), descriptor.consent())
+        && freshness_not_weaker(&grant.freshness, descriptor.freshness())
+        && descriptor
+            .preconditions()
+            .iter()
+            .filter(|precondition| precondition.required)
+            .all(|required| grant.preconditions.contains(required))
+}
+
+fn evidence_not_weaker(
+    effective: &ConfirmationRequirement,
+    locked: &ConfirmationRequirement,
+) -> bool {
+    match locked {
+        ConfirmationRequirement::None => true,
+        ConfirmationRequirement::Required { .. } => effective == locked,
+    }
+}
+
+fn approval_not_weaker(effective: &ApprovalRequirement, locked: &ApprovalRequirement) -> bool {
+    match locked {
+        ApprovalRequirement::None => true,
+        ApprovalRequirement::Required { .. } => effective == locked,
+    }
+}
+
+fn consent_not_weaker(effective: &ConsentRequirement, locked: &ConsentRequirement) -> bool {
+    match locked {
+        ConsentRequirement::None => true,
+        ConsentRequirement::Required { .. } => effective == locked,
+    }
+}
+
+fn freshness_not_weaker(effective: &FreshnessRequirement, locked: &FreshnessRequirement) -> bool {
+    maximum_not_larger(
+        effective.max_admission_age_seconds,
+        locked.max_admission_age_seconds,
+    ) && maximum_not_larger(
+        effective.max_input_age_seconds,
+        locked.max_input_age_seconds,
+    ) && (!locked.policy_revision_required || effective.policy_revision_required)
+}
+
+fn maximum_not_larger(
+    effective: Option<std::num::NonZeroU64>,
+    locked: Option<std::num::NonZeroU64>,
+) -> bool {
+    match (effective, locked) {
+        (_, None) => true,
+        (Some(effective), Some(locked)) => effective <= locked,
+        (None, Some(_)) => false,
+    }
 }
 
 fn canonical_digest<T: Serialize>(domain: &[u8], value: &T) -> Result<Sha256Digest, String> {
@@ -843,6 +1320,7 @@ fn canonical_digest<T: Serialize>(domain: &[u8], value: &T) -> Result<Sha256Dige
 pub struct InvocationRequest {
     invocation_id: InvocationId,
     admission_id: AdmissionId,
+    grant_digest: Sha256Digest,
     capability: CapabilityIdentity,
     selected_resource: NormalizedResourceSelector,
     arguments: Value,
@@ -858,6 +1336,7 @@ impl InvocationRequest {
     pub fn try_new(
         invocation_id: InvocationId,
         admission_id: AdmissionId,
+        grant_digest: Sha256Digest,
         capability: CapabilityIdentity,
         selected_resource: impl Into<String>,
         arguments: Value,
@@ -869,6 +1348,7 @@ impl InvocationRequest {
         Ok(Self {
             invocation_id,
             admission_id,
+            grant_digest,
             capability,
             selected_resource: NormalizedResourceSelector::new(selected_resource)?,
             arguments,
@@ -917,6 +1397,9 @@ impl InvocationRequest {
     }
     pub fn admission_id(&self) -> &AdmissionId {
         &self.admission_id
+    }
+    pub fn grant_digest(&self) -> &Sha256Digest {
+        &self.grant_digest
     }
     pub fn capability(&self) -> &CapabilityIdentity {
         &self.capability

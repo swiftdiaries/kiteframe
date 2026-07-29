@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthorityRevisionSet",
+  "type": "object",
+  "properties": {
+    "authorityRevisionDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthorityRevision"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "entries",
+    "authorityRevisionDigest"
+  ],
+  "$defs": {
+    "AuthorityRevision": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "revision"
+      ]
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

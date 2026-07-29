@@ -5,15 +5,17 @@ use std::{
 
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
-    CapabilityDescriptor, CapabilityDescriptorParts, CapabilityGrant, CapabilityGrantParts,
+    AuthorityRevision, AuthorityRevisionSet, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, CapabilityName,
-    CapabilityReleaseVersion, CatalogRequest, ConfirmationRequirement, ConsentRequirement,
-    DelegationAncestry, Diagnostic, EffectClassification, EvidenceReferences, EvidenceRequirement,
-    ExecutionMode, IdempotencyRequirement, IdempotencyScope, InvocationId, InvocationOutcome,
-    InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet, NormalizedResourceSelector,
-    PolicyRevision, PreconditionDescriptor, RequestedCapability, ResolvedCapabilityRequirement,
-    ResourceSelectorSchema, RetryClass, SessionRef, Sha256Digest, StableCapabilityError,
-    StatusFirstDiagnostic, Suspension, TaskRef, Timestamp, TraceContext,
+    CapabilityReleaseVersion, CatalogIdentity, CatalogRequest, ConfirmationRequirement,
+    ConsentRequirement, DelegationAncestry, Diagnostic, EffectClassification,
+    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceReferences,
+    EvidenceRequirement, ExecutionMode, IdempotencyRequirement, IdempotencyScope, InvocationId,
+    InvocationOutcome, InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet,
+    NormalizedResourceSelector, PolicyRevision, PreconditionDescriptor, RequestedCapability,
+    RequiredEvidence, ResolvedCapabilityRequirement, ResourceSelectorSchema, RetryClass,
+    SessionRef, Sha256Digest, StableCapabilityError, StatusFirstDiagnostic, Suspension, TaskRef,
+    Timestamp, TraceContext,
 };
 use serde_json::json;
 
@@ -368,25 +370,16 @@ fn grant_set_validation_rejects_unrequested_or_broader_grants() {
     let request = valid_admission_request();
 
     let mut unrequested = grant_set_parts();
-    unrequested.grants = vec![
-        CapabilityGrant::try_new(CapabilityGrantParts {
-            capability: capability_identity_with_name("cases.close"),
-            resources: vec![NormalizedResourceSelector::new("tenant:t1/case:case-1").unwrap()],
-        })
-        .unwrap(),
-    ];
+    unrequested.grants = vec![effective_grant(
+        capability_identity_with_name("cases.close"),
+        "tenant:t1/case:case-1",
+    )];
     let response = CapabilityGrantSet::try_new(unrequested).unwrap();
     let error = response.validate_against(&request).unwrap_err();
     assert_eq!(error.code.as_str(), "KF-CAP-002");
 
     let mut broader = grant_set_parts();
-    broader.grants = vec![
-        CapabilityGrant::try_new(CapabilityGrantParts {
-            capability: capability_identity(),
-            resources: vec![NormalizedResourceSelector::new("tenant:t1/case:*").unwrap()],
-        })
-        .unwrap(),
-    ];
+    broader.grants = vec![effective_grant(capability_identity(), "tenant:t1/case:*")];
     let response = CapabilityGrantSet::try_new(broader).unwrap();
     let error = response.validate_against(&request).unwrap_err();
     assert_eq!(error.code.as_str(), "KF-CAP-002");
@@ -576,6 +569,8 @@ fn admission_rejects_resource_selector_broader_than_resolved_requirement() {
         portable_digest: digest(1),
         lock_digest: digest(2),
         resolved_digest: digest(3),
+        catalog_identity: catalog_identity(),
+        catalog_digest: digest(4),
         required_capabilities: vec![request],
         optional_capabilities: Vec::new(),
         resolved_requirements: vec![resolved_requirement()],
@@ -608,10 +603,10 @@ fn admission_deserialization_rejects_a_selector_broader_than_its_resolved_requir
 }
 
 #[test]
-fn capability_grant_deserialization_rejects_empty_resources() {
+fn effective_capability_grant_deserialization_rejects_empty_resources() {
     let mut wire = serde_json::to_value(grant_set_parts().grants.remove(0)).unwrap();
     wire["resources"] = json!([]);
-    assert!(serde_json::from_value::<CapabilityGrant>(wire).is_err());
+    assert!(serde_json::from_value::<EffectiveCapabilityGrant>(wire).is_err());
 }
 
 #[test]
@@ -638,6 +633,7 @@ fn invocation_request(idempotency_key: Option<&str>) -> InvocationRequest {
     InvocationRequest::try_new(
         InvocationId::new("inv-1").unwrap(),
         AdmissionId::new("adm-1").unwrap(),
+        digest(42),
         capability_identity(),
         "tenant:t1/case:case-1",
         json!({"caseId": "case-1"}),
@@ -831,6 +827,8 @@ fn valid_admission_request() -> AdmissionRequest {
         portable_digest: digest(1),
         lock_digest: digest(2),
         resolved_digest: digest(3),
+        catalog_identity: catalog_identity(),
+        catalog_digest: digest(4),
         required_capabilities: vec![
             RequestedCapability::try_new(
                 capability_identity(),
@@ -863,23 +861,58 @@ fn diagnostic_with_retry(retry: &str) -> serde_json::Value {
 }
 
 fn grant_set_parts() -> CapabilityGrantSetParts {
+    let request = valid_admission_request();
     CapabilityGrantSetParts {
         admission_id: AdmissionId::new("adm-1").unwrap(),
+        admission_request_digest: *request.request_digest(),
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
         task: TaskRef::new("task:triage").unwrap(),
         session: SessionRef::new("session:1").unwrap(),
         policy_revision: PolicyRevision::new("policy:7").unwrap(),
-        catalog_digest: digest(1),
+        catalog_identity: catalog_identity(),
+        catalog_digest: digest(4),
+        authority_revisions: AuthorityRevisionSet::try_new(vec![
+            AuthorityRevision::try_new("policy", "7").unwrap(),
+        ])
+        .unwrap(),
         issued_at: Timestamp::new(100),
         expires_at: Timestamp::new(200),
-        grants: vec![
-            CapabilityGrant::try_new(CapabilityGrantParts {
-                capability: capability_identity(),
-                resources: vec![NormalizedResourceSelector::new("tenant:t1/case:case-1").unwrap()],
-            })
-            .unwrap(),
-        ],
+        grants: vec![effective_grant(
+            capability_identity(),
+            "tenant:t1/case:case-1",
+        )],
+        optional_denials: Vec::new(),
+    }
+}
+
+fn effective_grant(capability: CapabilityIdentity, resource: &str) -> EffectiveCapabilityGrant {
+    EffectiveCapabilityGrant::try_new(EffectiveCapabilityGrantParts {
+        capability,
+        resources: vec![NormalizedResourceSelector::new(resource).unwrap()],
+        execution_modes: NonEmptySet::try_new(BTreeSet::from([ExecutionMode::Immediate])).unwrap(),
+        maximum_effect: EffectClassification::ReadOnly,
+        expires_at: Timestamp::new(150),
+        required_evidence: RequiredEvidence::new(
+            ConfirmationRequirement::None,
+            ApprovalRequirement::Required {
+                evidence: EvidenceRequirement {
+                    kind: String::from("approval"),
+                    issuer: None,
+                },
+            },
+            ConsentRequirement::None,
+        ),
+        freshness: Default::default(),
+        preconditions: Vec::new(),
+    })
+    .unwrap()
+}
+
+fn catalog_identity() -> CatalogIdentity {
+    CatalogIdentity {
+        name: String::from("test-catalog"),
+        revision: String::from("r1"),
     }
 }
 

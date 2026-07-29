@@ -9,6 +9,12 @@
     "agent": {
       "type": "string"
     },
+    "catalogDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "catalogIdentity": {
+      "$ref": "#/$defs/CatalogIdentity"
+    },
     "contextualFacts": {
       "type": "object",
       "additionalProperties": {
@@ -28,6 +34,9 @@
       }
     },
     "portableDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
+    "requestDigest": {
       "$ref": "#/$defs/Sha256Digest"
     },
     "requiredCapabilities": {
@@ -64,12 +73,15 @@
     "portableDigest",
     "lockDigest",
     "resolvedDigest",
+    "catalogIdentity",
+    "catalogDigest",
     "requiredCapabilities",
     "optionalCapabilities",
     "resolvedRequirements",
     "delegationAncestry",
     "contextualFacts",
-    "traceContext"
+    "traceContext",
+    "requestDigest"
   ],
   "$defs": {
     "ApprovalRequirement": {
@@ -227,6 +239,22 @@
     "CapabilityName": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "CatalogIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "revision"
+      ]
     },
     "ConfirmationRequirement": {
       "oneOf": [

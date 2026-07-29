@@ -16,6 +16,9 @@
         "type": "string"
       }
     },
+    "grantDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
     "idempotencyKey": {
       "type": [
         "string",
@@ -42,6 +45,7 @@
   "required": [
     "invocationId",
     "admissionId",
+    "grantDigest",
     "capability",
     "selectedResource",
     "arguments",
@@ -73,6 +77,10 @@
     "CapabilityName": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
     },
     "TraceContext": {
       "type": "object",

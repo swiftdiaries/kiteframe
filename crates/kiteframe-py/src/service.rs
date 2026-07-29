@@ -1,14 +1,16 @@
 use std::sync::{Arc, LazyLock};
 
 use kiteframe_contract::{
-    AdmissionRequest as ContractAdmissionRequest, CapabilityCatalog as ContractCapabilityCatalog,
+    AdmissionRequest as ContractAdmissionRequest, AuthorityRevision as ContractAuthorityRevision,
+    AuthorityRevisionSet as ContractAuthorityRevisionSet,
+    CapabilityCatalog as ContractCapabilityCatalog, CapabilityDenial as ContractCapabilityDenial,
     CapabilityDescriptor as ContractCapabilityDescriptor, CapabilityErrorDescriptor,
-    CapabilityGrant as ContractCapabilityGrant, CapabilityGrantSet as ContractCapabilityGrantSet,
-    CatalogRequest as ContractCatalogRequest, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticSeverity, DiagnosticStage, ExecutionMode, InvocationId as ContractInvocationId,
-    InvocationOutcome as ContractInvocationOutcome, InvocationRequest as ContractInvocationRequest,
-    InvocationStatus as ContractInvocationStatus, RetryClass, StableCapabilityError, Suspension,
-    TraceContext,
+    CapabilityGrantSet as ContractCapabilityGrantSet, CatalogRequest as ContractCatalogRequest,
+    Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity, DiagnosticStage,
+    EffectiveCapabilityGrant as ContractEffectiveCapabilityGrant, ExecutionMode,
+    InvocationId as ContractInvocationId, InvocationOutcome as ContractInvocationOutcome,
+    InvocationRequest as ContractInvocationRequest, InvocationStatus as ContractInvocationStatus,
+    RetryClass, StableCapabilityError, Suspension, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::{
@@ -503,6 +505,26 @@ impl From<ContractAdmissionRequest> for PyAdmissionRequest {
 #[pymethods]
 impl PyAdmissionRequest {
     #[getter]
+    pub fn catalog_name(&self) -> &str {
+        &self.inner.catalog_identity().name
+    }
+
+    #[getter]
+    pub fn catalog_revision(&self) -> &str {
+        &self.inner.catalog_identity().revision
+    }
+
+    #[getter]
+    pub fn catalog_digest(&self) -> String {
+        self.inner.catalog_digest().to_string()
+    }
+
+    #[getter]
+    pub fn request_digest(&self) -> String {
+        self.inner.request_digest().to_string()
+    }
+
+    #[getter]
     pub fn traceparent(&self) -> &str {
         self.inner.trace_context().traceparent()
     }
@@ -594,6 +616,11 @@ impl PyInvocationRequest {
     #[getter]
     pub fn admission_id(&self) -> &str {
         self.inner.admission_id().as_str()
+    }
+
+    #[getter]
+    pub fn grant_digest(&self) -> String {
+        self.inner.grant_digest().to_string()
     }
 
     #[getter]
@@ -727,14 +754,14 @@ impl PyCapabilityCatalog {
     frozen,
     immutable_type,
     module = "kiteframe._native",
-    name = "CapabilityGrant"
+    name = "EffectiveCapabilityGrant"
 )]
-pub struct PyCapabilityGrant {
-    inner: Arc<ContractCapabilityGrant>,
+pub struct PyEffectiveCapabilityGrant {
+    inner: Arc<ContractEffectiveCapabilityGrant>,
 }
 
-impl From<ContractCapabilityGrant> for PyCapabilityGrant {
-    fn from(inner: ContractCapabilityGrant) -> Self {
+impl From<ContractEffectiveCapabilityGrant> for PyEffectiveCapabilityGrant {
+    fn from(inner: ContractEffectiveCapabilityGrant) -> Self {
         Self {
             inner: Arc::new(inner),
         }
@@ -743,7 +770,7 @@ impl From<ContractCapabilityGrant> for PyCapabilityGrant {
 
 #[gen_stub_pymethods]
 #[pymethods]
-impl PyCapabilityGrant {
+impl PyEffectiveCapabilityGrant {
     #[getter]
     pub fn name(&self) -> &str {
         self.inner.capability().name().as_str()
@@ -767,6 +794,167 @@ impl PyCapabilityGrant {
                 .iter()
                 .map(|resource| resource.as_str()),
         )
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.str, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn execution_modes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .execution_modes()
+                .as_set()
+                .iter()
+                .copied()
+                .map(execution_mode_name),
+        )
+    }
+
+    #[getter]
+    pub fn maximum_effect(&self) -> PyResult<String> {
+        serde_json::to_value(self.inner.maximum_effect())
+            .and_then(serde_json::from_value)
+            .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("invalid effect"))
+    }
+
+    #[getter]
+    pub fn expires_at(&self) -> u64 {
+        self.inner.expires_at().unix_seconds()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn required_evidence(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.required_evidence())
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn freshness(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.freshness())
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Any", imports = ("typing",)))]
+    pub fn preconditions(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        serialized_to_python(py, self.inner.preconditions())
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    skip_from_py_object,
+    module = "kiteframe._native",
+    name = "AuthorityRevision"
+)]
+#[derive(Clone)]
+pub struct PyAuthorityRevision {
+    inner: ContractAuthorityRevision,
+}
+
+impl From<ContractAuthorityRevision> for PyAuthorityRevision {
+    fn from(inner: ContractAuthorityRevision) -> Self {
+        Self { inner }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAuthorityRevision {
+    #[getter]
+    pub fn source(&self) -> &str {
+        self.inner.source()
+    }
+
+    #[getter]
+    pub fn revision(&self) -> &str {
+        self.inner.revision()
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "AuthorityRevisionSet"
+)]
+pub struct PyAuthorityRevisionSet {
+    inner: Arc<ContractAuthorityRevisionSet>,
+}
+
+impl From<ContractAuthorityRevisionSet> for PyAuthorityRevisionSet {
+    fn from(inner: ContractAuthorityRevisionSet) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyAuthorityRevisionSet {
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[AuthorityRevision, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn entries<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let entries = self
+            .inner
+            .entries()
+            .iter()
+            .cloned()
+            .map(PyAuthorityRevision::from)
+            .map(|entry| Py::new(py, entry))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, entries)
+    }
+
+    #[getter]
+    pub fn authority_revision_digest(&self) -> String {
+        self.inner.authority_revision_digest().to_string()
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    skip_from_py_object,
+    module = "kiteframe._native",
+    name = "CapabilityDenial"
+)]
+#[derive(Clone)]
+pub struct PyCapabilityDenial {
+    inner: ContractCapabilityDenial,
+}
+
+impl From<ContractCapabilityDenial> for PyCapabilityDenial {
+    fn from(inner: ContractCapabilityDenial) -> Self {
+        Self { inner }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyCapabilityDenial {
+    #[getter]
+    pub fn name(&self) -> &str {
+        self.inner.capability().name().as_str()
+    }
+    #[getter]
+    pub fn version(&self) -> &str {
+        self.inner.capability().version().as_str()
+    }
+    #[getter]
+    pub fn diagnostic(&self) -> PyDiagnostic {
+        PyDiagnostic::from(self.inner.diagnostic().clone())
     }
 }
 
@@ -798,6 +986,11 @@ impl PyCapabilityGrantSet {
     }
 
     #[getter]
+    pub fn admission_request_digest(&self) -> String {
+        self.inner.admission_request_digest().to_string()
+    }
+
+    #[getter]
     pub fn actor(&self) -> &str {
         self.inner.actor().as_str()
     }
@@ -823,8 +1016,23 @@ impl PyCapabilityGrantSet {
     }
 
     #[getter]
+    pub fn catalog_name(&self) -> &str {
+        &self.inner.catalog_identity().name
+    }
+
+    #[getter]
+    pub fn catalog_revision(&self) -> &str {
+        &self.inner.catalog_identity().revision
+    }
+
+    #[getter]
     pub fn catalog_digest(&self) -> String {
         self.inner.catalog_digest().to_string()
+    }
+
+    #[getter]
+    pub fn authority_revisions(&self) -> PyAuthorityRevisionSet {
+        PyAuthorityRevisionSet::from(self.inner.authority_revisions().clone())
     }
 
     #[getter]
@@ -839,7 +1047,7 @@ impl PyCapabilityGrantSet {
 
     #[getter]
     #[gen_stub(override_return_type(
-        type_repr = "builtins.tuple[CapabilityGrant, ...]",
+        type_repr = "builtins.tuple[EffectiveCapabilityGrant, ...]",
         imports = ("builtins",)
     ))]
     pub fn grants<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
@@ -848,10 +1056,27 @@ impl PyCapabilityGrantSet {
             .grants()
             .iter()
             .cloned()
-            .map(PyCapabilityGrant::from)
+            .map(PyEffectiveCapabilityGrant::from)
             .map(|grant| Py::new(py, grant))
             .collect::<PyResult<Vec<_>>>()?;
         PyTuple::new(py, grants)
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[CapabilityDenial, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn optional_denials<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        let denials = self
+            .inner
+            .optional_denials()
+            .iter()
+            .cloned()
+            .map(PyCapabilityDenial::from)
+            .map(|denial| Py::new(py, denial))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyTuple::new(py, denials)
     }
 
     #[getter]

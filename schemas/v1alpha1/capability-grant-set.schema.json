@@ -9,11 +9,20 @@
     "admissionId": {
       "type": "string"
     },
+    "admissionRequestDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
     "agent": {
       "type": "string"
     },
+    "authorityRevisions": {
+      "$ref": "#/$defs/AuthorityRevisionSet"
+    },
     "catalogDigest": {
       "$ref": "#/$defs/Sha256Digest"
+    },
+    "catalogIdentity": {
+      "$ref": "#/$defs/CatalogIdentity"
     },
     "expiresAt": {
       "$ref": "#/$defs/Timestamp"
@@ -24,11 +33,17 @@
     "grants": {
       "type": "array",
       "items": {
-        "$ref": "#/$defs/CapabilityGrant"
+        "$ref": "#/$defs/EffectiveCapabilityGrant"
       }
     },
     "issuedAt": {
       "$ref": "#/$defs/Timestamp"
+    },
+    "optionalDenials": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapabilityDenial"
+      }
     },
     "policyRevision": {
       "type": "string"
@@ -43,35 +58,105 @@
   "additionalProperties": false,
   "required": [
     "admissionId",
+    "admissionRequestDigest",
     "actor",
     "agent",
     "task",
     "session",
     "policyRevision",
+    "catalogIdentity",
     "catalogDigest",
+    "authorityRevisions",
     "issuedAt",
     "expiresAt",
     "grants",
+    "optionalDenials",
     "grantDigest"
   ],
   "$defs": {
-    "CapabilityGrant": {
+    "ApprovalRequirement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/EvidenceRequirement"
+            },
+            "kind": {
+              "type": "string",
+              "const": "required"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence"
+          ]
+        }
+      ]
+    },
+    "AuthorityRevision": {
       "type": "object",
       "properties": {
-        "capability": {
-          "$ref": "#/$defs/CapabilityIdentity"
+        "revision": {
+          "type": "string"
         },
-        "resources": {
+        "source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "revision"
+      ]
+    },
+    "AuthorityRevisionSet": {
+      "type": "object",
+      "properties": {
+        "authorityRevisionDigest": {
+          "$ref": "#/$defs/Sha256Digest"
+        },
+        "entries": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/AuthorityRevision"
           }
         }
       },
       "additionalProperties": false,
       "required": [
+        "entries",
+        "authorityRevisionDigest"
+      ]
+    },
+    "CapabilityDenial": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "diagnostic": {
+          "$ref": "#/$defs/Diagnostic"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
         "capability",
-        "resources"
+        "diagnostic"
       ]
     },
     "CapabilityIdentity": {
@@ -94,9 +179,413 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"
     },
+    "CatalogIdentity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "revision"
+      ]
+    },
+    "ConfirmationRequirement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/EvidenceRequirement"
+            },
+            "kind": {
+              "type": "string",
+              "const": "required"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence"
+          ]
+        }
+      ]
+    },
+    "ConsentRequirement": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "none"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "evidence": {
+              "$ref": "#/$defs/EvidenceRequirement"
+            },
+            "kind": {
+              "type": "string",
+              "const": "required"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "evidence"
+          ]
+        }
+      ]
+    },
+    "Diagnostic": {
+      "description": "A portable, redacted diagnostic. Details must be populated only with values safe for callers.",
+      "type": "object",
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/DiagnosticCategory"
+        },
+        "code": {
+          "$ref": "#/$defs/DiagnosticCode"
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "help": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeMessage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message": {
+          "$ref": "#/$defs/SafeMessage"
+        },
+        "package_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryClass"
+        },
+        "severity": {
+          "$ref": "#/$defs/DiagnosticSeverity"
+        },
+        "source_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceRange"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stage": {
+          "$ref": "#/$defs/DiagnosticStage"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "category",
+        "severity",
+        "stage",
+        "message",
+        "retry",
+        "details"
+      ]
+    },
+    "DiagnosticCategory": {
+      "type": "string",
+      "enum": [
+        "package",
+        "lock",
+        "catalog",
+        "feature",
+        "authorization",
+        "capability",
+        "audit",
+        "runtime"
+      ]
+    },
+    "DiagnosticCode": {
+      "description": "Stable V1 machine-readable diagnostic code.",
+      "type": "string",
+      "enum": [
+        "KF-PKG-001",
+        "KF-PKG-002",
+        "KF-LOCK-001",
+        "KF-LOCK-002",
+        "KF-CAT-001",
+        "KF-FEAT-001",
+        "KF-AUTH-001",
+        "KF-AUTH-002",
+        "KF-AUTH-003",
+        "KF-AUTH-004",
+        "KF-CAP-001",
+        "KF-CAP-002",
+        "KF-CAP-003",
+        "KF-AUDIT-001",
+        "KF-RUNTIME-001",
+        "KF-RUNTIME-002",
+        "KF-CLI-001",
+        "KF-CLI-002"
+      ]
+    },
+    "DiagnosticSeverity": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warning"
+      ]
+    },
+    "DiagnosticStage": {
+      "type": "string",
+      "enum": [
+        "parse",
+        "validate",
+        "lock",
+        "resolve",
+        "admit",
+        "invoke",
+        "audit",
+        "runtime"
+      ]
+    },
+    "EffectClassification": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "reversible_write",
+        "irreversible_write",
+        "external_side_effect"
+      ]
+    },
+    "EffectiveCapabilityGrant": {
+      "type": "object",
+      "properties": {
+        "capability": {
+          "$ref": "#/$defs/CapabilityIdentity"
+        },
+        "executionModes": {
+          "$ref": "#/$defs/NonEmptySet"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "freshness": {
+          "$ref": "#/$defs/FreshnessRequirement"
+        },
+        "maximumEffect": {
+          "$ref": "#/$defs/EffectClassification"
+        },
+        "preconditions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PreconditionDescriptor"
+          }
+        },
+        "requiredEvidence": {
+          "$ref": "#/$defs/RequiredEvidence"
+        },
+        "resources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "resources",
+        "executionModes",
+        "maximumEffect",
+        "expiresAt",
+        "requiredEvidence",
+        "freshness",
+        "preconditions"
+      ]
+    },
+    "EvidenceRequirement": {
+      "type": "object",
+      "properties": {
+        "issuer": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ]
+    },
+    "ExecutionMode": {
+      "type": "string",
+      "enum": [
+        "immediate",
+        "deferred",
+        "suspendable"
+      ]
+    },
+    "FreshnessRequirement": {
+      "type": "object",
+      "properties": {
+        "maxAdmissionAgeSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "maxInputAgeSeconds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        },
+        "policyRevisionRequired": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "NonEmptySet": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExecutionMode"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "PreconditionDescriptor": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PreconditionKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "kind"
+      ]
+    },
+    "PreconditionKind": {
+      "type": "string",
+      "enum": [
+        "entity_version",
+        "etag"
+      ]
+    },
+    "RequiredEvidence": {
+      "type": "object",
+      "properties": {
+        "approval": {
+          "$ref": "#/$defs/ApprovalRequirement"
+        },
+        "confirmation": {
+          "$ref": "#/$defs/ConfirmationRequirement"
+        },
+        "consent": {
+          "$ref": "#/$defs/ConsentRequirement"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "confirmation",
+        "approval",
+        "consent"
+      ]
+    },
+    "RetryClass": {
+      "type": "string",
+      "enum": [
+        "never",
+        "after_refresh",
+        "after_user_action",
+        "status_first"
+      ]
+    },
+    "SafeMessage": {
+      "description": "A caller-supplied message that is safe to render to users.",
+      "type": "string"
+    },
     "Sha256Digest": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "SourceRange": {
+      "description": "A half-open byte range within a package source file.",
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "start",
+        "end"
+      ]
     },
     "Timestamp": {
       "description": "Unix seconds. Provider adapters obtain time from their deployment rather than from packages.",

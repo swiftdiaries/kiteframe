@@ -31,11 +31,25 @@ def canonical_bytes(value: object) -> bytes:
 
 
 def valid_grant_json() -> bytes:
+    authority_entries = [{"revision": "7", "source": "policy"}]
+    authority_digest = hashlib.sha256(
+        b"kiteframe:authority-revision-set:v1\0"
+        + canonical_bytes(authority_entries)
+    ).hexdigest()
     grant_set = {
         "actor": "actor:alice",
         "admissionId": "adm-1",
+        "admissionRequestDigest": "09" * 32,
         "agent": "agent:case-worker",
         "catalogDigest": "01" * 32,
+        "catalogIdentity": {
+            "name": "provider.test",
+            "revision": "revision-1",
+        },
+        "authorityRevisions": {
+            "authorityRevisionDigest": authority_digest,
+            "entries": authority_entries,
+        },
         "expiresAt": 200,
         "grants": [
             {
@@ -43,10 +57,25 @@ def valid_grant_json() -> bytes:
                     "name": "cases.comment",
                     "version": "1.0.0",
                 },
+                "executionModes": ["immediate"],
+                "expiresAt": 180,
+                "freshness": {
+                    "maxAdmissionAgeSeconds": None,
+                    "maxInputAgeSeconds": None,
+                    "policyRevisionRequired": False,
+                },
+                "maximumEffect": "read_only",
+                "preconditions": [],
+                "requiredEvidence": {
+                    "approval": {"kind": "none"},
+                    "confirmation": {"kind": "none"},
+                    "consent": {"kind": "none"},
+                },
                 "resources": ["tenant:t1/case:case-1"],
             }
         ],
         "issuedAt": 100,
+        "optionalDenials": [],
         "policyRevision": "policy:7",
         "session": "session:1",
         "task": "task:triage",
@@ -76,26 +105,38 @@ def valid_admission_json() -> bytes:
     )
     requirement = resolved["capabilityRequirements"][0]
     capability = requirement["lockedCapability"]["identity"]
+    request = {
+        "actor": "actor:alice",
+        "agent": "agent:case-worker",
+        "catalogDigest": "04" * 32,
+        "catalogIdentity": {
+            "name": "provider.test",
+            "revision": "revision-1",
+        },
+        "contextualFacts": {},
+        "delegationAncestry": [],
+        "lockDigest": "02" * 32,
+        "optionalCapabilities": [],
+        "portableDigest": "01" * 32,
+        "requiredCapabilities": [
+            {
+                "capability": capability,
+                "resources": requirement["resources"],
+            }
+        ],
+        "resolvedDigest": "03" * 32,
+        "resolvedRequirements": [requirement],
+        "session": "session:1",
+        "task": "task:triage",
+        "traceContext": {"traceparent": VALID_TRACEPARENT},
+    }
+    digest = hashlib.sha256(
+        b"kiteframe:admission-request:v1\0" + canonical_bytes(request)
+    ).hexdigest()
     return canonical_bytes(
         {
-            "actor": "actor:alice",
-            "agent": "agent:case-worker",
-            "contextualFacts": {},
-            "delegationAncestry": [],
-            "lockDigest": "02" * 32,
-            "optionalCapabilities": [],
-            "portableDigest": "01" * 32,
-            "requiredCapabilities": [
-                {
-                    "capability": capability,
-                    "resources": requirement["resources"],
-                }
-            ],
-            "resolvedDigest": "03" * 32,
-            "resolvedRequirements": [requirement],
-            "session": "session:1",
-            "task": "task:triage",
-            "traceContext": {"traceparent": VALID_TRACEPARENT},
+            **request,
+            "requestDigest": digest,
         }
     )
 
@@ -110,6 +151,7 @@ def valid_invocation_json() -> bytes:
                 "version": "1.0.0",
             },
             "evidenceRefs": {"approval": "evidence://approval/1"},
+            "grantDigest": "09" * 32,
             "invocationId": "inv-1",
             "preconditions": {},
             "selectedResource": "tenant:t1/case:case-1",
@@ -158,6 +200,21 @@ def test_python_cannot_mutate_grant_then_reserialize() -> None:
         grant.grants += ()  # type: ignore[misc]
 
     assert grant.canonical_json() == valid_grant_json()
+
+    effective = grant.grants[0]
+    assert effective.execution_modes == ("immediate",)
+    assert effective.maximum_effect == "read_only"
+    assert effective.expires_at == 180
+    assert effective.required_evidence["confirmation"]["kind"] == "none"
+    assert effective.freshness["policyRevisionRequired"] is False
+    assert effective.preconditions == ()
+
+    revisions = grant.authority_revisions
+    assert revisions.entries[0].source == "policy"
+    assert revisions.entries[0].revision == "7"
+    assert len(revisions.authority_revision_digest) == 64
+    with pytest.raises(AttributeError):
+        revisions.entries += ()  # type: ignore[misc]
 
 
 @pytest.mark.parametrize(

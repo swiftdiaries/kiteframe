@@ -58,10 +58,11 @@ pub use schema::{
     RuntimeBindingKind,
 };
 pub use service::{
-    ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, BaggageCorrelationId,
-    CapabilityGrant, CapabilityGrantParts, CapabilityGrantSet, CapabilityGrantSetParts,
-    CatalogRequest, DelegationAncestry, EvidenceReferences, IdempotencyKey, InvocationId,
+    ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, AuthorityRevision,
+    AuthorityRevisionSet, BaggageCorrelationId, CapabilityDenial, CapabilityGrantSet,
+    CapabilityGrantSetParts, CatalogRequest, DelegationAncestry, EffectiveCapabilityGrant,
+    EffectiveCapabilityGrantParts, EvidenceReferences, IdempotencyKey, InvocationId,
     InvocationOutcome, InvocationRequest, InvocationStatus, NormalizedResourceSelector,
-    PolicyRevision, RequestedCapability, SessionRef, StableCapabilityError, StatusFirstDiagnostic,
-    Suspension, TaskRef, Timestamp, TraceContext,
+    PolicyRevision, RequestedCapability, RequiredEvidence, SessionRef, StableCapabilityError,
+    StatusFirstDiagnostic, Suspension, TaskRef, Timestamp, TraceContext,
 };

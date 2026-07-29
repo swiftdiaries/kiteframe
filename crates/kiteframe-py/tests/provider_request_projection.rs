@@ -9,14 +9,15 @@ use _native::{
 };
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
-    CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts, CapabilityGrant,
-    CapabilityGrantParts, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
+    AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog, CapabilityDescriptor,
+    CapabilityDescriptorParts, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
     CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CatalogRequest,
     ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
-    EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId, InvocationOutcome,
-    InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet, NormalizedResourceSelector,
-    PolicyRevision, RequestedCapability, ResolvedAgent, ResolvedCapabilityRequirement,
-    ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceReferences, ExecutionMode,
+    IdempotencyRequirement, InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus,
+    LockedCapability, NonEmptySet, NormalizedResourceSelector, PolicyRevision, RequestedCapability,
+    RequiredEvidence, ResolvedAgent, ResolvedCapabilityRequirement, ResourceSelectorSchema,
+    SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::prelude::*;
@@ -272,6 +273,8 @@ fn admission_request() -> AdmissionRequest {
         portable_digest: Sha256Digest::from_bytes([1; Sha256Digest::BYTE_LENGTH]),
         lock_digest: Sha256Digest::from_bytes([2; Sha256Digest::BYTE_LENGTH]),
         resolved_digest: Sha256Digest::from_bytes([3; Sha256Digest::BYTE_LENGTH]),
+        catalog_identity: catalog_identity(),
+        catalog_digest: Sha256Digest::from_bytes([8; Sha256Digest::BYTE_LENGTH]),
         required_capabilities: vec![
             RequestedCapability::try_new(
                 capability_identity(),
@@ -292,6 +295,7 @@ fn invocation_request() -> InvocationRequest {
     InvocationRequest::try_new(
         InvocationId::new("inv-1").unwrap(),
         AdmissionId::new("adm-1").unwrap(),
+        Sha256Digest::from_bytes([10; Sha256Digest::BYTE_LENGTH]),
         capability_identity(),
         "tenant:t1/case:case-1",
         json!({"caseId": "case-1"}),
@@ -308,34 +312,46 @@ fn invocation_request() -> InvocationRequest {
 }
 
 fn capability_catalog() -> CapabilityCatalog {
-    CapabilityCatalog::try_new(
-        CatalogIdentity {
-            name: String::from("provider.test"),
-            revision: String::from("revision-1"),
-        },
-        vec![descriptor()],
-    )
-    .unwrap()
+    CapabilityCatalog::try_new(catalog_identity(), vec![descriptor()]).unwrap()
 }
 
 fn grant_set_parts() -> CapabilityGrantSetParts {
+    let request = admission_request();
     CapabilityGrantSetParts {
         admission_id: AdmissionId::new("adm-1").unwrap(),
+        admission_request_digest: *request.request_digest(),
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
         task: TaskRef::new("task:triage").unwrap(),
         session: SessionRef::new("session:1").unwrap(),
         policy_revision: PolicyRevision::new("policy:7").unwrap(),
+        catalog_identity: catalog_identity(),
         catalog_digest: Sha256Digest::from_bytes([8; Sha256Digest::BYTE_LENGTH]),
+        authority_revisions: AuthorityRevisionSet::try_new(vec![
+            AuthorityRevision::try_new("policy", "7").unwrap(),
+        ])
+        .unwrap(),
         issued_at: Timestamp::new(100),
         expires_at: Timestamp::new(200),
         grants: vec![
-            CapabilityGrant::try_new(CapabilityGrantParts {
+            EffectiveCapabilityGrant::try_new(EffectiveCapabilityGrantParts {
                 capability: capability_identity(),
                 resources: vec![NormalizedResourceSelector::new("tenant:t1/case:case-1").unwrap()],
+                execution_modes: NonEmptySet::try_new(BTreeSet::from([ExecutionMode::Immediate]))
+                    .unwrap(),
+                maximum_effect: EffectClassification::ReadOnly,
+                expires_at: Timestamp::new(180),
+                required_evidence: RequiredEvidence::new(
+                    ConfirmationRequirement::None,
+                    ApprovalRequirement::None,
+                    ConsentRequirement::None,
+                ),
+                freshness: Default::default(),
+                preconditions: Vec::new(),
             })
             .unwrap(),
         ],
+        optional_denials: Vec::new(),
     }
 }
 
@@ -393,6 +409,13 @@ fn capability_identity_with_name(name: &str) -> CapabilityIdentity {
         CapabilityReleaseVersion::new("1.0.0").unwrap(),
     )
     .unwrap()
+}
+
+fn catalog_identity() -> CatalogIdentity {
+    CatalogIdentity {
+        name: String::from("provider.test"),
+        revision: String::from("revision-1"),
+    }
 }
 
 fn trace_context() -> TraceContext {

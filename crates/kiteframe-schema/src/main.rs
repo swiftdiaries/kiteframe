@@ -6,9 +6,9 @@ use std::{
 };
 
 use kiteframe_contract::{
-    AdmissionRequest, AgentManifest, CapabilityCatalog, CapabilityDescriptor, CapabilityGrantSet,
-    CapabilityLock, CatalogRequest, ComponentMetadataCatalog, Diagnostic, InvocationOutcome,
-    InvocationRequest, InvocationStatus, ResolvedAgent, RuntimeBinding,
+    AdmissionRequest, AgentManifest, AuthorityRevisionSet, CapabilityCatalog, CapabilityDescriptor,
+    CapabilityGrantSet, CapabilityLock, CatalogRequest, ComponentMetadataCatalog, Diagnostic,
+    InvocationOutcome, InvocationRequest, InvocationStatus, ResolvedAgent, RuntimeBinding,
 };
 use schemars::JsonSchema;
 
@@ -50,6 +50,7 @@ fn generate(destination: &Path) -> Result<()> {
     write_schema::<CatalogRequest>(&destination.join("catalog-request.schema.json"))?;
     write_schema::<AdmissionRequest>(&destination.join("admission-request.schema.json"))?;
     write_schema::<CapabilityGrantSet>(&destination.join("capability-grant-set.schema.json"))?;
+    write_schema::<AuthorityRevisionSet>(&destination.join("authority-revision-set.schema.json"))?;
     write_schema::<InvocationRequest>(&destination.join("invocation-request.schema.json"))?;
     write_schema::<InvocationOutcome>(&destination.join("invocation-outcome.schema.json"))?;
     write_schema::<InvocationStatus>(&destination.join("invocation-status.schema.json"))?;
@@ -70,6 +71,7 @@ fn check(destination: &Path) -> Result<()> {
     check_schema::<CatalogRequest>(&destination.join("catalog-request.schema.json"))?;
     check_schema::<AdmissionRequest>(&destination.join("admission-request.schema.json"))?;
     check_schema::<CapabilityGrantSet>(&destination.join("capability-grant-set.schema.json"))?;
+    check_schema::<AuthorityRevisionSet>(&destination.join("authority-revision-set.schema.json"))?;
     check_schema::<InvocationRequest>(&destination.join("invocation-request.schema.json"))?;
     check_schema::<InvocationOutcome>(&destination.join("invocation-outcome.schema.json"))?;
     check_schema::<InvocationStatus>(&destination.join("invocation-status.schema.json"))?;

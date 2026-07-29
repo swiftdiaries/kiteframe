@@ -3,11 +3,14 @@ use _native::{
     load_capability_grant_set_inner, load_invocation_outcome_inner, load_invocation_status_inner,
 };
 use kiteframe_contract::{
-    ActorRef, AdmissionId, AgentRef, CapabilityGrant, CapabilityGrantParts, CapabilityGrantSet,
-    CapabilityGrantSetParts, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage, InvocationId,
-    InvocationOutcome, InvocationStatus, NormalizedResourceSelector, PolicyRevision, RetryClass,
-    SessionRef, Sha256Digest, StableCapabilityError, Suspension, TaskRef, Timestamp,
+    ActorRef, AdmissionId, AgentRef, ApprovalRequirement, AuthorityRevision, AuthorityRevisionSet,
+    CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, CapabilityName,
+    CapabilityReleaseVersion, CatalogIdentity, ConfirmationRequirement, ConsentRequirement,
+    Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage, EffectClassification,
+    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, ExecutionMode, InvocationId,
+    InvocationOutcome, InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
+    RequiredEvidence, RetryClass, SessionRef, Sha256Digest, StableCapabilityError, Suspension,
+    TaskRef, Timestamp,
 };
 use pyo3::Python;
 
@@ -19,6 +22,14 @@ fn grant_set_projection_exposes_only_stable_scalar_and_tuple_values() {
     assert_eq!(projection.actor(), "actor:alice");
     assert_eq!(projection.issued_at(), 100);
     assert_eq!(projection.expires_at(), 200);
+    assert_eq!(projection.catalog_name(), "provider.test");
+    assert_eq!(
+        projection.authority_revisions().authority_revision_digest(),
+        grant_set()
+            .authority_revisions()
+            .authority_revision_digest()
+            .to_string()
+    );
     assert!(
         projection
             .canonical_json()
@@ -138,25 +149,48 @@ fn outcome_and_status_expose_detached_structured_values() {
 fn grant_set() -> CapabilityGrantSet {
     CapabilityGrantSet::try_new(CapabilityGrantSetParts {
         admission_id: AdmissionId::new("adm-1").unwrap(),
+        admission_request_digest: Sha256Digest::from_bytes([9; 32]),
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
         task: TaskRef::new("task:triage").unwrap(),
         session: SessionRef::new("session:1").unwrap(),
         policy_revision: PolicyRevision::new("policy:7").unwrap(),
+        catalog_identity: CatalogIdentity {
+            name: "provider.test".to_owned(),
+            revision: "revision-1".to_owned(),
+        },
         catalog_digest: Sha256Digest::from_bytes([1; 32]),
+        authority_revisions: AuthorityRevisionSet::try_new(vec![
+            AuthorityRevision::try_new("policy", "7").unwrap(),
+        ])
+        .unwrap(),
         issued_at: Timestamp::new(100),
         expires_at: Timestamp::new(200),
         grants: vec![
-            CapabilityGrant::try_new(CapabilityGrantParts {
+            EffectiveCapabilityGrant::try_new(EffectiveCapabilityGrantParts {
                 capability: CapabilityIdentity::try_new(
                     CapabilityName::new("cases.comment").unwrap(),
                     CapabilityReleaseVersion::new("1.0.0").unwrap(),
                 )
                 .unwrap(),
                 resources: vec![NormalizedResourceSelector::new("tenant:t1/case:case-1").unwrap()],
+                execution_modes: NonEmptySet::try_new(std::collections::BTreeSet::from([
+                    ExecutionMode::Immediate,
+                ]))
+                .unwrap(),
+                maximum_effect: EffectClassification::ReadOnly,
+                expires_at: Timestamp::new(180),
+                required_evidence: RequiredEvidence::new(
+                    ConfirmationRequirement::None,
+                    ApprovalRequirement::None,
+                    ConsentRequirement::None,
+                ),
+                freshness: Default::default(),
+                preconditions: Vec::new(),
             })
             .unwrap(),
         ],
+        optional_denials: Vec::new(),
     })
     .unwrap()
 }
