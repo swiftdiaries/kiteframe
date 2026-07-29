@@ -34,6 +34,38 @@ def test_runtime_inputs_survive_source_fixture_removal(tmp_path: Path) -> None:
     )
 
 
+def test_nondefault_inputs_survive_source_fixture_removal(tmp_path: Path) -> None:
+    workspace = Path(__file__).resolve().parents[3]
+    package_source = workspace / "tests/fixtures/packages/support-agent-runtime-inputs"
+    target_source = workspace / "tests/fixtures/components/deepagents-test.json"
+    package = tmp_path / "support-agent"
+    target = tmp_path / "deepagents-test.json"
+    shutil.copytree(package_source, package)
+    shutil.copy2(target_source, target)
+    inputs = resolve_package(package, package / "bindings/deepagents.yaml", target)
+    shutil.rmtree(package)
+    target.unlink()
+
+    capture = inputs.runtime_binding.content_capture
+    assert capture is not None
+    assert capture.enabled is True
+    assert capture.classifications == ("confidential",)
+    assert capture.redaction_policy == "redaction-policies.default"
+    assert capture.retention_policy == "retention-policies.default"
+    assert capture.access_policy == "access-policies.default"
+    assert capture.encrypted_content_store == "content-stores.encrypted"
+
+    model_requirement = inputs.resolved_agent.model_requirements[0]
+    assert model_requirement.max_latency_class == "interactive"
+    assert model_requirement.residency == "global"
+    model_component = next(
+        component
+        for component in inputs.target_components
+        if component.symbol == "models.anthropic.sonnet"
+    )
+    assert model_component.model_modalities == ("text",)
+
+
 def test_resolved_agent_loader_is_inspection_only() -> None:
     workspace = Path(__file__).resolve().parents[3]
     resolved = load_resolved_agent(

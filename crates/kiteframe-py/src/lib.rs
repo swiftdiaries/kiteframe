@@ -9,7 +9,7 @@ use error::KiteframeDiagnosticError;
 pub use ir::{
     PyComponentDescriptor, PyResolvedAgent, PyResolvedCapabilityRequirement,
     PyResolvedModelRequirement, PyResolvedRuntimeInputs, PyResolvedSubagent, PyResolvedTextAsset,
-    PyRuntimeBinding,
+    PyRuntimeBinding, PyRuntimeBindingContentCapture,
 };
 use pyo3::prelude::*;
 use pyo3_stub_gen::{StubGenConfig, StubInfo};
@@ -39,6 +39,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyResolvedTextAsset>()?;
     module.add_class::<PyResolvedModelRequirement>()?;
     module.add_class::<PyRuntimeBinding>()?;
+    module.add_class::<PyRuntimeBindingContentCapture>()?;
     module.add_class::<PyComponentDescriptor>()?;
     module.add_class::<PyResolvedRuntimeInputs>()?;
     module.add(

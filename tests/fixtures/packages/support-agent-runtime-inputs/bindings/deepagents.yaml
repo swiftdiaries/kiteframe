@@ -1,0 +1,14 @@
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: deepagents }
+spec:
+  models: { primary: models.anthropic.sonnet }
+  capabilityProvider: capability-providers.primary
+  auditSink: audit-sinks.ledger
+  contentCapture:
+    enabled: true
+    classifications: [confidential]
+    redactionPolicy: redaction-policies.default
+    retentionPolicy: retention-policies.default
+    accessPolicy: access-policies.default
+    encryptedContentStore: content-stores.encrypted

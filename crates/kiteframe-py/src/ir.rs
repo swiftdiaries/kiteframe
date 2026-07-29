@@ -1,9 +1,10 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use kiteframe_contract::{
-    ComponentKind, ComponentMetadata, ModelCapability, ModelLatencyClass, RegistrySymbol,
-    ResolvedAgent, ResolvedCapabilityRequirement, ResolvedModelRequirement, ResolvedSubagent,
-    RuntimeBinding, RuntimeTarget, ValidatedTextAsset,
+    BindingContentCapturePolicy, ComponentKind, ComponentMetadata, DataClassification,
+    LatencyClass, ModelCapability, ModelLatencyClass, ModelModality, RegistrySymbol, ResolvedAgent,
+    ResolvedCapabilityRequirement, ResolvedModelRequirement, ResolvedSubagent, RuntimeBinding,
+    RuntimeTarget, ValidatedTextAsset,
 };
 use kiteframe_core::canonical_json;
 use pyo3::{prelude::*, types::PyTuple};
@@ -38,6 +39,24 @@ fn latency_class_name(latency: ModelLatencyClass) -> &'static str {
     match latency {
         ModelLatencyClass::Interactive => "interactive",
         ModelLatencyClass::Batch => "batch",
+    }
+}
+
+fn requirement_latency_class_name(latency: LatencyClass) -> &'static str {
+    match latency {
+        LatencyClass::Interactive => "interactive",
+    }
+}
+
+fn model_modality_name(modality: ModelModality) -> &'static str {
+    match modality {
+        ModelModality::Text => "text",
+    }
+}
+
+fn data_classification_name(classification: DataClassification) -> &'static str {
+    match classification {
+        DataClassification::Confidential => "confidential",
     }
 }
 
@@ -128,6 +147,25 @@ impl PyResolvedModelRequirement {
     }
 
     #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Optional[builtins.str]", imports = ("typing", "builtins")))]
+    fn max_latency_class(&self) -> Option<&'static str> {
+        self.inner
+            .requirement()
+            .max_latency_class
+            .map(requirement_latency_class_name)
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Optional[builtins.str]", imports = ("typing", "builtins")))]
+    fn residency(&self) -> Option<&str> {
+        self.inner
+            .requirement()
+            .residency
+            .as_ref()
+            .map(|residency| residency.as_str())
+    }
+
+    #[getter]
     fn required(&self) -> bool {
         self.inner.requirement().required
     }
@@ -149,6 +187,67 @@ impl From<RuntimeBinding> for PyRuntimeBinding {
         Self {
             inner: Arc::new(inner),
         }
+    }
+}
+
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    module = "kiteframe._native",
+    name = "RuntimeBindingContentCapture"
+)]
+pub struct PyRuntimeBindingContentCapture {
+    inner: Arc<BindingContentCapturePolicy>,
+}
+
+impl From<BindingContentCapturePolicy> for PyRuntimeBindingContentCapture {
+    fn from(inner: BindingContentCapturePolicy) -> Self {
+        Self {
+            inner: Arc::new(inner),
+        }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyRuntimeBindingContentCapture {
+    #[getter]
+    fn enabled(&self) -> bool {
+        self.inner.enabled
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "builtins.tuple[builtins.str, ...]", imports = ("builtins",)))]
+    fn classifications<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .classifications
+                .iter()
+                .copied()
+                .map(data_classification_name),
+        )
+    }
+
+    #[getter]
+    fn redaction_policy(&self) -> &str {
+        self.inner.redaction_policy.as_str()
+    }
+
+    #[getter]
+    fn retention_policy(&self) -> &str {
+        self.inner.retention_policy.as_str()
+    }
+
+    #[getter]
+    fn access_policy(&self) -> &str {
+        self.inner.access_policy.as_str()
+    }
+
+    #[getter]
+    fn encrypted_content_store(&self) -> &str {
+        self.inner.encrypted_content_store.as_str()
     }
 }
 
@@ -215,6 +314,15 @@ impl PyRuntimeBinding {
     #[getter]
     fn audit_sink(&self) -> &str {
         self.inner.spec.audit_sink.as_str()
+    }
+
+    #[getter]
+    fn content_capture(&self) -> Option<PyRuntimeBindingContentCapture> {
+        self.inner
+            .spec
+            .content_capture
+            .clone()
+            .map(PyRuntimeBindingContentCapture::from)
     }
 }
 
@@ -306,6 +414,21 @@ impl PyComponentDescriptor {
             .model
             .as_ref()
             .map(|model| latency_class_name(model.latency_class))
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(type_repr = "typing.Optional[builtins.tuple[builtins.str, ...]]", imports = ("typing", "builtins")))]
+    fn model_modalities<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        self.inner
+            .model
+            .as_ref()
+            .map(|model| {
+                PyTuple::new(
+                    py,
+                    model.modalities.iter().copied().map(model_modality_name),
+                )
+            })
+            .transpose()
     }
 }
 
