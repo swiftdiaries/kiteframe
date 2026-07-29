@@ -24,7 +24,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 
 from .compatibility import AMBIENT_TOOL_NAMES
-from .context import KiteframeSessionContext
+from .context import KiteframeSessionContext, _snapshot_session_context
 from .tools import CapabilityTool
 
 AUTHORIZATION_POLICY_STALE = "KF-AUTH-004"
@@ -161,6 +161,42 @@ def _grant_projection(grant: EffectiveCapabilityGrant) -> tuple[object, ...]:
     )
 
 
+def _suspension_projection(
+    session: KiteframeSessionContext,
+) -> tuple[str, str, str, str] | None:
+    suspension = session.suspension
+    if suspension is None:
+        return None
+    return (
+        suspension.checkpoint_ref,
+        suspension.evidence_kind,
+        suspension.evidence_request_ref,
+        suspension.proposal_digest,
+    )
+
+
+def _same_authority_session(
+    left: KiteframeSessionContext,
+    right: KiteframeSessionContext,
+) -> bool:
+    return (
+        type(left) is KiteframeSessionContext
+        and type(right) is KiteframeSessionContext
+        and left.actor == right.actor
+        and left.session == right.session
+        and left.task == right.task
+        and left.admission_id == right.admission_id
+        and left.grant_digest == right.grant_digest
+        and (
+            left.authority_revisions.authority_revision_digest
+            == right.authority_revisions.authority_revision_digest
+        )
+        and sorted(_grant_projection(grant) for grant in left.grants)
+        == sorted(_grant_projection(grant) for grant in right.grants)
+        and _suspension_projection(left) == _suspension_projection(right)
+    )
+
+
 def _validate_child_declarations(
     declarations: tuple[ResolvedSubagent, ...],
 ) -> None:
@@ -284,6 +320,7 @@ def _declared_child_binding_boundary() -> tuple[
         _validate_child_declarations(declarations)
         if type(session) is not KiteframeSessionContext:
             raise TypeError("session must be exact KiteframeSessionContext")
+        session_snapshot = _snapshot_session_context(session)
         compiled_child_names = tuple(
             child["name"] for child in compiled_children
         )
@@ -310,7 +347,7 @@ def _declared_child_binding_boundary() -> tuple[
         binding = object.__new__(DeclaredChildTaskTool)
         object.__setattr__(binding, "tool", tool)
         object.__setattr__(binding, "declarations", declarations)
-        object.__setattr__(binding, "session", session)
+        object.__setattr__(binding, "session", session_snapshot)
         object.__setattr__(
             binding,
             "compiled_child_names",
@@ -320,7 +357,7 @@ def _declared_child_binding_boundary() -> tuple[
         provenance_by_binding[binding] = (
             tool,
             declarations,
-            session,
+            session_snapshot,
             compiled_child_names,
             producer,
         )
@@ -383,6 +420,8 @@ class KiteframeGuardMiddleware(AgentMiddleware):
     def __post_init__(self) -> None:
         if type(self.session) is not KiteframeSessionContext:
             raise TypeError("session must be exact KiteframeSessionContext")
+        session_snapshot = _snapshot_session_context(self.session)
+        object.__setattr__(self, "session", session_snapshot)
         if not isinstance(self.admitted_tools, tuple) or not all(
             isinstance(tool, CapabilityTool) for tool in self.admitted_tools
         ):
@@ -399,7 +438,10 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             )
         if (
             self.declared_child_tool is not None
-            and self.declared_child_tool.session is not self.session
+            and not _same_authority_session(
+                self.declared_child_tool.session,
+                self.session,
+            )
         ):
             raise ValueError(
                 "declared child tool must bind the exact authority session"
@@ -434,10 +476,11 @@ class KiteframeGuardMiddleware(AgentMiddleware):
 
         if type(session) is not KiteframeSessionContext:
             raise TypeError("session must be exact KiteframeSessionContext")
+        session_snapshot = _snapshot_session_context(session)
         if (
-            session.actor != self.session.actor
-            or session.session != self.session.session
-            or session.task != self.session.task
+            session_snapshot.actor != self.session.actor
+            or session_snapshot.session != self.session.session
+            or session_snapshot.task != self.session.task
         ):
             raise ValueError(
                 "authority replacement must retain actor/session/task identity"
@@ -448,12 +491,16 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             raise TypeError(
                 "admitted_tools must be a tuple of CapabilityTool"
             )
-        if any(tool.session is not session for tool in admitted_tools):
+        if any(
+            not _same_authority_session(tool.session, session_snapshot)
+            for tool in admitted_tools
+        ):
             raise ValueError(
                 "admitted tools must bind the exact authority session"
             )
         grant_identities = sorted(
-            (grant.name, grant.version) for grant in session.grants
+            (grant.name, grant.version)
+            for grant in session_snapshot.grants
         )
         tool_identities = sorted(
             (tool.requirement.name, tool.requirement.version)
@@ -465,7 +512,7 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             )
         return replace(
             self,
-            session=session,
+            session=session_snapshot,
             admitted_tools=admitted_tools,
             declared_child_tool=None,
             authority_provider=None,
@@ -485,7 +532,10 @@ class KiteframeGuardMiddleware(AgentMiddleware):
         if self.authority_provider is None:
             return self.session
         try:
-            current = await self.authority_provider.current(self.session, now)
+            provider_session = _snapshot_session_context(self.session)
+            current = _snapshot_session_context(
+                await self.authority_provider.current(provider_session, now)
+            )
         except Exception:
             raise _policy_stale() from None
         if (
@@ -504,7 +554,8 @@ class KiteframeGuardMiddleware(AgentMiddleware):
         if self.tool_registry is None:
             return self.admitted_tools
         try:
-            tools = await self.tool_registry.admitted_tools(session)
+            registry_session = _snapshot_session_context(session)
+            tools = await self.tool_registry.admitted_tools(registry_session)
         except Exception:
             raise _registry_unresolved() from None
         if not isinstance(tools, tuple) or not all(
@@ -578,17 +629,11 @@ class KiteframeGuardMiddleware(AgentMiddleware):
         child_authority_matches = (
             child_binding is not None
             and _is_trusted_declared_child_binding(child_binding)
-            and child_binding.session is self.session
-            and session.admission_id == self.session.admission_id
-            and session.grant_digest == self.session.grant_digest
-            and (
-                session.authority_revisions.authority_revision_digest
-                == self.session.authority_revisions.authority_revision_digest
+            and _same_authority_session(
+                child_binding.session,
+                self.session,
             )
-            and sorted(_grant_projection(grant) for grant in session.grants)
-            == sorted(
-                _grant_projection(grant) for grant in self.session.grants
-            )
+            and _same_authority_session(session, self.session)
         )
         if child is not None and child_authority_matches:
             if child.name in names:

@@ -691,6 +691,44 @@ def test_capability_tool_builder_rejects_session_subclasses(
         )
 
 
+@pytest.mark.asyncio
+async def test_capability_tools_detach_retained_session_from_caller_mutation(
+    read_requirement: ResolvedCapabilityRequirement,
+    write_requirement: ResolvedCapabilityRequirement,
+    native_grants: tuple[EffectiveCapabilityGrant, ...],
+    session: KiteframeSessionContext,
+    fake_invoker: FakeInvoker,
+    checkpoint_store: FakeCheckpointStore,
+    suspension_bridge: FakeSuspensionBridge,
+) -> None:
+    original_digest = session.grant_digest
+    built = build_capability_tools(
+        (read_requirement, write_requirement),
+        native_grants,
+        grant_digest=original_digest,
+        invoker=fake_invoker,
+        session=session,
+        checkpoint_store=checkpoint_store,
+        suspension_bridge=suspension_bridge,
+    )
+    read_tool = next(tool for tool in built if tool.name == "cases.read")
+
+    assert read_tool.session is not session
+    object.__setattr__(session, "grant_digest", "ff" * 32)
+    object.__setattr__(
+        session.trace_context,
+        "traceparent",
+        "00-ffffffffffffffffffffffffffffffff"
+        "-eeeeeeeeeeeeeeee-01",
+    )
+
+    result = await read_tool.ainvoke({"case_id": "case-1"})
+
+    assert result == {"ok": True}
+    assert fake_invoker.requests[-1].grant_digest == original_digest
+    assert fake_invoker.requests[-1].traceparent == VALID_TRACEPARENT
+
+
 @pytest.fixture
 def read_tool(tools: tuple[CapabilityTool, ...]) -> CapabilityTool:
     return next(tool for tool in tools if tool.name == "cases.read")

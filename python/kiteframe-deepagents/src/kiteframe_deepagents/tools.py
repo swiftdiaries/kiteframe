@@ -25,7 +25,7 @@ from kiteframe.provider import CapabilityInvoker
 from langchain_core.tools import ArgsSchema, BaseTool, ToolException
 from pydantic import ConfigDict, Field
 
-from .context import KiteframeSessionContext
+from .context import KiteframeSessionContext, _snapshot_session_context
 
 INVALID_PROVIDER_RESULT = "KF-CAP-002: invalid capability provider result"
 PROVIDER_UNAVAILABLE = "KF-CAP-004: capability provider unavailable"
@@ -496,10 +496,11 @@ def build_capability_tools(
         )
     if type(session) is not KiteframeSessionContext:
         raise TypeError("session must be exact KiteframeSessionContext")
-    if grant_digest != session.grant_digest:
+    session_snapshot = _snapshot_session_context(session)
+    if grant_digest != session_snapshot.grant_digest:
         raise ValueError("grant digest does not match the session")
     if sorted(_grant_projection(grant) for grant in grants) != sorted(
-        _grant_projection(grant) for grant in session.grants
+        _grant_projection(grant) for grant in session_snapshot.grants
     ):
         raise ValueError("effective grants do not match the session")
     if not isinstance(invoker, CapabilityInvoker):
@@ -547,7 +548,7 @@ def build_capability_tools(
                     requirement=requirement,
                     grant=grant,
                     grant_digest=grant_digest,
-                    session=session,
+                    session=session_snapshot,
                 ),
                 handle_tool_error=True,
             )

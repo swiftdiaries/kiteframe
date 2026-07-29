@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
@@ -357,6 +358,33 @@ class FixedAuthorityProvider:
         return self.session
 
 
+@dataclass(frozen=True, slots=True)
+class MutatingAfterReturnAuthorityProvider:
+    session: KiteframeSessionContext
+    received: list[KiteframeSessionContext]
+
+    async def current(
+        self,
+        session: KiteframeSessionContext,
+        now: int,
+    ) -> KiteframeSessionContext:
+        del now
+        self.received.append(session)
+        asyncio.get_running_loop().call_soon(
+            object.__setattr__,
+            session,
+            "grant_digest",
+            "ee" * 32,
+        )
+        asyncio.get_running_loop().call_soon(
+            object.__setattr__,
+            self.session,
+            "grant_digest",
+            "ff" * 32,
+        )
+        return self.session
+
+
 class FailingToolRegistry:
     async def admitted_tools(
         self,
@@ -375,6 +403,21 @@ class FixedToolRegistry:
         session: KiteframeSessionContext,
     ) -> tuple[CapabilityTool, ...]:
         del session
+        return self.tools
+
+
+@dataclass(slots=True)
+class YieldingToolRegistry:
+    tools: tuple[CapabilityTool, ...]
+    sessions: list[KiteframeSessionContext]
+
+    async def admitted_tools(
+        self,
+        session: KiteframeSessionContext,
+    ) -> tuple[CapabilityTool, ...]:
+        self.sessions.append(session)
+        await asyncio.sleep(0)
+        object.__setattr__(session, "grant_digest", "dd" * 32)
         return self.tools
 
 
@@ -551,14 +594,37 @@ async def test_authority_refresh_replaces_the_complete_immutable_snapshot(
     refreshed = middleware.with_authority(next_session, (next_tool,))
 
     assert refreshed is not middleware
-    assert refreshed.session is next_session
-    assert refreshed.session.authority_revisions is next_session.authority_revisions
+    assert refreshed.session is not next_session
+    assert (
+        refreshed.session.authority_revisions.authority_revision_digest
+        == next_session.authority_revisions.authority_revision_digest
+    )
     assert refreshed.admitted_tools == (next_tool,)
     assert middleware.session is original_session
     assert (
         middleware.session.authority_revisions.authority_revision_digest
         != refreshed.session.authority_revisions.authority_revision_digest
     )
+
+
+@pytest.mark.asyncio
+async def test_guard_detaches_constructor_session_from_later_mutation() -> None:
+    source = session_context()
+    matching_tool = build_tool(session_context(), FakeInvoker())
+    guard = KiteframeGuardMiddleware(
+        session=source,
+        admitted_tools=(matching_tool,),
+        clock=FixedClock(ISSUED_AT),
+    )
+    retained_digest = guard.session.grant_digest
+
+    assert guard.session is not source
+    object.__setattr__(source, "grant_digest", "ff" * 32)
+
+    assert guard.session.grant_digest == retained_digest
+    assert tool_names(
+        await guard.visible_tools(now=ISSUED_AT)
+    ) == {"cases.read"}
 
 
 @pytest.mark.asyncio
@@ -570,7 +636,8 @@ async def test_atomic_authority_replacement_uses_complete_context_and_tools(
 
     refreshed = middleware.with_authority(next_session, (next_tool,))
 
-    assert refreshed.session is next_session
+    assert refreshed.session is not next_session
+    assert refreshed.session.grant_digest == next_session.grant_digest
     assert refreshed.admitted_tools == (next_tool,)
     assert refreshed.authority_provider is None
     assert refreshed.tool_registry is None
@@ -581,6 +648,49 @@ async def test_atomic_authority_replacement_uses_complete_context_and_tools(
     assert middleware.session.authority_revisions is not (
         next_session.authority_revisions
     )
+
+
+@pytest.mark.asyncio
+async def test_authority_replacement_detaches_session_from_later_mutation(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    source = session_context(revision="8")
+    next_tool = build_tool(source, FakeInvoker())
+    retained_digest = source.grant_digest
+
+    refreshed = middleware.with_authority(source, (next_tool,))
+
+    assert refreshed.session is not source
+    object.__setattr__(source, "grant_digest", "ff" * 32)
+    assert refreshed.session.grant_digest == retained_digest
+    assert tool_names(
+        await refreshed.visible_tools(now=ISSUED_AT)
+    ) == {"cases.read"}
+
+
+@pytest.mark.asyncio
+async def test_dynamic_authority_is_snapshotted_before_the_next_await() -> None:
+    provider_session = session_context()
+    refreshed_tool = build_tool(session_context(), FakeInvoker())
+    registry = YieldingToolRegistry((refreshed_tool,), [])
+    provider = MutatingAfterReturnAuthorityProvider(provider_session, [])
+    guard = KiteframeGuardMiddleware(
+        session=session_context(),
+        admitted_tools=(refreshed_tool,),
+        clock=FixedClock(ISSUED_AT),
+        authority_provider=provider,
+        tool_registry=registry,
+    )
+    retained_digest = guard.session.grant_digest
+
+    visible = await guard.visible_tools(now=ISSUED_AT)
+
+    assert provider.received[0] is not guard.session
+    assert guard.session.grant_digest == retained_digest
+    assert registry.sessions[0] is not provider_session
+    assert registry.sessions[0].grant_digest == "dd" * 32
+    assert provider_session.grant_digest == "ff" * 32
+    assert tool_names(visible) == {"cases.read"}
 
 
 def test_atomic_authority_replacement_rejects_session_identity_change(
@@ -617,6 +727,29 @@ def test_declared_child_builder_rejects_session_subclasses() -> None:
             declarations=child_declarations(),
             session=subclassed_session(session_context()),
         )
+
+
+@pytest.mark.asyncio
+async def test_declared_child_binding_detaches_session_from_caller_mutation(
+) -> None:
+    source = session_context()
+    binding = build_child_binding(source)
+    retained_digest = binding.session.grant_digest
+
+    assert binding.session is not source
+    object.__setattr__(source, "grant_digest", "ff" * 32)
+
+    guard_session = session_context()
+    guard = KiteframeGuardMiddleware(
+        session=guard_session,
+        admitted_tools=(build_tool(guard_session, FakeInvoker()),),
+        clock=FixedClock(ISSUED_AT),
+        declared_child_tool=binding,
+    )
+    assert binding.session.grant_digest == retained_digest
+    assert tool_names(
+        await guard.visible_tools(now=ISSUED_AT)
+    ) == {"cases.read", "task"}
 
 
 def test_atomic_authority_replacement_rejects_stale_tools(

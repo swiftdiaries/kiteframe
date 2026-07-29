@@ -495,7 +495,12 @@ def test_compile_snapshots_the_exact_immutable_session(
     assert guard.session is not original
     assert guard.session.grant_digest == original.grant_digest
     assert guard.session.grants is not original.grants
-    assert kwargs["tools"][0].session is guard.session
+    assert kwargs["tools"][0].session is not guard.session
+    assert kwargs["tools"][0].session is not original
+    assert (
+        kwargs["tools"][0].session.grant_digest
+        == guard.session.grant_digest
+    )
 
     object.__setattr__(original, "grant_digest", "ff" * 32)
     object.__setattr__(original.trace_context, "traceparent", "00-mutated")
