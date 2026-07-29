@@ -225,6 +225,12 @@ impl ResolvedAgent {
     pub fn models(&self) -> &BTreeMap<ModelRole, ResolvedModelRequirement> {
         &self.models
     }
+    pub fn prompts(&self) -> &BTreeMap<PackagePath, ValidatedTextAsset> {
+        &self.prompts
+    }
+    pub fn skills(&self) -> &BTreeMap<PackagePath, ValidatedTextAsset> {
+        &self.skills
+    }
     pub fn subagents(&self) -> &[ResolvedSubagent] {
         &self.subagents
     }

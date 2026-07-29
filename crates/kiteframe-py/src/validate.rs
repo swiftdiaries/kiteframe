@@ -5,8 +5,9 @@ use std::{
 };
 
 use kiteframe_contract::{
-    CapabilityLock, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage,
-    PackageIdentity, PackagePath, ResolvedAgent,
+    CapabilityLock, ComponentMetadata, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticStage, PackageIdentity, PackagePath, RegistrySymbol, ResolvedAgent, RuntimeBinding,
+    RuntimeTarget,
 };
 use kiteframe_core::{
     AgentPackage, PackageLimits, canonical_json, load_package, load_runtime_binding,
@@ -18,10 +19,11 @@ use pyo3_stub_gen::derive::gen_stub_pyfunction;
 
 use crate::{
     error::{canonical_ir_error, diagnostic_error, ir_parse_error, package_resolution_error},
-    ir::PyResolvedAgent,
+    ir::{PyResolvedAgent, PyResolvedRuntimeInputs},
 };
 
 #[gen_stub_pyfunction]
+/// Loads canonical resolved IR for inspection only; use `resolve_package` for compilation inputs.
 #[pyfunction]
 pub(crate) fn load_resolved_agent(
     #[gen_stub(override_type(
@@ -45,17 +47,31 @@ pub(crate) fn resolve_package(
     package: PathBuf,
     binding: PathBuf,
     target: PathBuf,
-) -> PyResult<PyResolvedAgent> {
+) -> PyResult<PyResolvedRuntimeInputs> {
     resolve_package_inner(&package, &binding, &target)
-        .map(PyResolvedAgent::from)
+        .map(|inputs| {
+            PyResolvedRuntimeInputs::new(
+                inputs.resolved_agent,
+                inputs.runtime_binding,
+                inputs.runtime_target,
+                inputs.target_components,
+            )
+        })
         .map_err(package_resolution_error)
+}
+
+struct ResolvedRuntimeInputs {
+    resolved_agent: ResolvedAgent,
+    runtime_binding: RuntimeBinding,
+    runtime_target: RuntimeTarget,
+    target_components: BTreeMap<RegistrySymbol, ComponentMetadata>,
 }
 
 fn resolve_package_inner(
     package_root: &Path,
     binding_path: &Path,
     target_path: &Path,
-) -> Result<ResolvedAgent, Vec<Diagnostic>> {
+) -> Result<ResolvedRuntimeInputs, Vec<Diagnostic>> {
     let package = load_package(package_root, PackageLimits::V1)?;
     let lock = read_lock(default_lock_path(&package))?;
     verify_lock(&package, &lock, None)?;
@@ -64,13 +80,19 @@ fn resolve_package_inner(
     let (target, components) = load_runtime_target_catalog(target_path)?;
     let child_locks = read_child_locks(&package)?;
 
-    resolve_agent(ResolutionInput {
+    let resolved_agent = resolve_agent(ResolutionInput {
         package,
         lock,
         child_locks,
-        binding,
-        target,
-        components,
+        binding: binding.clone(),
+        target: target.clone(),
+        components: components.clone(),
+    })?;
+    Ok(ResolvedRuntimeInputs {
+        resolved_agent,
+        runtime_binding: binding,
+        runtime_target: target.target,
+        target_components: components.components,
     })
 }
 
@@ -175,4 +197,49 @@ fn single_diagnostic(
     message: &'static str,
 ) -> Vec<Diagnostic> {
     vec![Diagnostic::error(code, category, stage, message)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_package_inner;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolution_retains_exact_validated_runtime_inputs() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let package = workspace.join("tests/fixtures/packages/support-agent");
+        let inputs = resolve_package_inner(
+            &package,
+            &package.join("bindings/deepagents.yaml"),
+            &workspace.join("tests/fixtures/components/deepagents-test.json"),
+        )
+        .expect("fixture package resolves");
+
+        assert_eq!(
+            inputs.runtime_binding.metadata.runtime.as_str(),
+            "deepagents"
+        );
+        assert_eq!(inputs.runtime_target.as_str(), "deepagents");
+        assert_eq!(
+            inputs
+                .runtime_binding
+                .spec
+                .models
+                .get("primary")
+                .expect("primary binding model")
+                .as_str(),
+            "models.anthropic.sonnet"
+        );
+        assert!(
+            inputs
+                .target_components
+                .contains_key("models.anthropic.sonnet")
+        );
+        assert!(
+            inputs
+                .target_components
+                .contains_key("capability-providers.primary")
+        );
+        assert!(inputs.target_components.contains_key("audit-sinks.ledger"));
+    }
 }

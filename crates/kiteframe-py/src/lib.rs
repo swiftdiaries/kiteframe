@@ -6,7 +6,11 @@ mod service;
 mod validate;
 
 use error::KiteframeDiagnosticError;
-pub use ir::{PyResolvedAgent, PyResolvedCapabilityRequirement, PyResolvedSubagent};
+pub use ir::{
+    PyComponentDescriptor, PyResolvedAgent, PyResolvedCapabilityRequirement,
+    PyResolvedModelRequirement, PyResolvedRuntimeInputs, PyResolvedSubagent, PyResolvedTextAsset,
+    PyRuntimeBinding,
+};
 use pyo3::prelude::*;
 use pyo3_stub_gen::{StubGenConfig, StubInfo};
 pub use service::{
@@ -32,6 +36,11 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyResolvedAgent>()?;
     module.add_class::<PyResolvedCapabilityRequirement>()?;
     module.add_class::<PyResolvedSubagent>()?;
+    module.add_class::<PyResolvedTextAsset>()?;
+    module.add_class::<PyResolvedModelRequirement>()?;
+    module.add_class::<PyRuntimeBinding>()?;
+    module.add_class::<PyComponentDescriptor>()?;
+    module.add_class::<PyResolvedRuntimeInputs>()?;
     module.add(
         "KiteframeDiagnosticError",
         module.py().get_type::<KiteframeDiagnosticError>(),

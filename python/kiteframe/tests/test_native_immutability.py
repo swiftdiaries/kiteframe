@@ -7,6 +7,7 @@ from kiteframe import (
     KiteframeDiagnosticError,
     ResolvedAgent,
     ResolvedCapabilityRequirement,
+    ResolvedRuntimeInputs,
     ResolvedSubagent,
     load_resolved_agent,
     resolve_package,
@@ -72,18 +73,42 @@ def test_noncanonical_ir_is_rejected(golden_ir: bytes) -> None:
         load_resolved_agent(spaced)
 
 
-def test_resolve_package_uses_the_validated_rust_pipeline(
+def test_resolve_package_returns_all_compilation_inputs(
     workspace: Path,
-    golden_ir: bytes,
 ) -> None:
     package = workspace / "tests/fixtures/packages/support-agent"
-    resolved = resolve_package(
+    inputs = resolve_package(
         package,
         package / "bindings/deepagents.yaml",
         workspace / "tests/fixtures/components/deepagents-test.json",
     )
 
-    assert resolved.canonical_json() == golden_ir
+    assert isinstance(inputs, ResolvedRuntimeInputs)
+    assert inputs.resolved_agent.package_name == "support-agent"
+    assert inputs.resolved_agent.catalog_name == "support"
+    assert inputs.resolved_agent.catalog_revision == "v1"
+    assert len(inputs.resolved_agent.catalog_digest) == 64
+    assert inputs.runtime_target == "deepagents"
+    assert inputs.runtime_binding.runtime == "deepagents"
+    assert {component.symbol for component in inputs.target_components} >= {
+        "models.anthropic.sonnet",
+        "capability-providers.primary",
+        "audit-sinks.ledger",
+    }
+
+
+def test_runtime_inputs_are_not_constructible_or_mutable(workspace: Path) -> None:
+    with pytest.raises(TypeError):
+        ResolvedRuntimeInputs()  # type: ignore[call-arg]
+
+    package = workspace / "tests/fixtures/packages/support-agent"
+    inputs = resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        workspace / "tests/fixtures/components/deepagents-test.json",
+    )
+    with pytest.raises(AttributeError):
+        inputs.runtime_target = "forged"  # type: ignore[misc]
 
 
 def test_resolver_diagnostics_are_exposed_as_redacted_json(
