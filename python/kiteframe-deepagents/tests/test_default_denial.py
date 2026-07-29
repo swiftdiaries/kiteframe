@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, NoReturn, cast
 
 import pytest
-from deepagents import CompiledSubAgent
+from deepagents import CompiledSubAgent, SubAgentMiddleware
 from deepagents.backends import StateBackend
 from kiteframe import (
     InvocationOutcome,
@@ -675,6 +675,48 @@ def test_trusted_binding_rejects_task_tool_substitution(
 
     with pytest.raises(TypeError, match="trusted compiled-child builder"):
         replace(middleware, declared_child_tool=binding)
+
+
+def test_subclass_cannot_override_provenance_validation(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    class ForgedChildBinding(DeclaredChildTaskTool):
+        def __init__(self) -> None:
+            object.__setattr__(self, "tool", declared_child_tool())
+            object.__setattr__(self, "declarations", child_declarations())
+            object.__setattr__(self, "session", middleware.session)
+
+        def _is_valid(self) -> bool:
+            return True
+
+    with pytest.raises(TypeError, match="exact DeclaredChildTaskTool"):
+        replace(
+            middleware,
+            declared_child_tool=ForgedChildBinding(),
+        )
+
+
+def test_exact_binding_fabricated_outside_builder_is_rejected(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    children = compiled_children()
+    producer = SubAgentMiddleware(
+        backend=StateBackend(),
+        subagents=children,
+    )
+    fabricated = object.__new__(DeclaredChildTaskTool)
+    object.__setattr__(fabricated, "tool", producer.tools[0])
+    object.__setattr__(fabricated, "declarations", child_declarations())
+    object.__setattr__(fabricated, "session", middleware.session)
+    object.__setattr__(
+        fabricated,
+        "compiled_child_names",
+        tuple(child["name"] for child in children),
+    )
+    object.__setattr__(fabricated, "producer", producer)
+
+    with pytest.raises(TypeError, match="trusted compiled-child builder"):
+        replace(middleware, declared_child_tool=fabricated)
 
 
 def test_compiled_child_names_must_match_native_declarations(

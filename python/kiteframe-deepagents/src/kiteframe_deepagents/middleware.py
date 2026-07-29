@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, TypeAlias, runtime_checkable
+from weakref import WeakKeyDictionary
 
 from deepagents import CompiledSubAgent, SubAgentMiddleware
 from deepagents.backends import BackendProtocol
@@ -217,7 +218,13 @@ def _validate_compiled_children(
         raise ValueError("compiled child names must be unique")
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(
+    frozen=True,
+    slots=True,
+    init=False,
+    eq=False,
+    weakref_slot=True,
+)
 class DeclaredChildTaskTool:
     """Trusted task tool bound to exact immutable compiled child declarations."""
 
@@ -232,17 +239,75 @@ class DeclaredChildTaskTool:
             "DeclaredChildTaskTool requires the trusted compiled-child builder"
         )
 
-    @classmethod
-    def _from_compiled_children(
-        cls,
+
+_DeclaredChildProvenance: TypeAlias = tuple[
+    BaseTool,
+    tuple[ResolvedSubagent, ...],
+    KiteframeSessionContext,
+    tuple[str, ...],
+    SubAgentMiddleware,
+]
+
+
+class _DeclaredChildTaskToolBuilder(Protocol):
+    def __call__(
+        self,
         *,
-        tool: BaseTool,
+        backend: BackendProtocol,
+        compiled_children: tuple[CompiledSubAgent, ...],
         declarations: tuple[ResolvedSubagent, ...],
         session: KiteframeSessionContext,
-        compiled_child_names: tuple[str, ...],
-        producer: SubAgentMiddleware,
+    ) -> DeclaredChildTaskTool: ...
+
+
+def _declared_child_binding_boundary() -> tuple[
+    _DeclaredChildTaskToolBuilder,
+    Callable[[object], bool],
+]:
+    provenance_by_binding: WeakKeyDictionary[
+        DeclaredChildTaskTool,
+        _DeclaredChildProvenance,
+    ] = WeakKeyDictionary()
+
+    def builder(
+        *,
+        backend: BackendProtocol,
+        compiled_children: tuple[CompiledSubAgent, ...],
+        declarations: tuple[ResolvedSubagent, ...],
+        session: KiteframeSessionContext,
     ) -> DeclaredChildTaskTool:
-        binding = object.__new__(cls)
+        """Build a public task tool and bind its native declarations."""
+
+        if not isinstance(backend, BackendProtocol):
+            raise TypeError("backend must implement BackendProtocol")
+        _validate_compiled_children(compiled_children)
+        _validate_child_declarations(declarations)
+        if not isinstance(session, KiteframeSessionContext):
+            raise TypeError("session must be KiteframeSessionContext")
+        compiled_child_names = tuple(
+            child["name"] for child in compiled_children
+        )
+        if sorted(compiled_child_names) != sorted(
+            declaration.package_name for declaration in declarations
+        ):
+            raise ValueError(
+                "compiled child names must exactly match native declarations"
+            )
+
+        producer = SubAgentMiddleware(
+            backend=backend,
+            subagents=compiled_children,
+        )
+        if (
+            type(producer) is not SubAgentMiddleware
+            or len(producer.tools) != 1
+            or not isinstance(producer.tools[0], BaseTool)
+            or producer.tools[0].name != "task"
+        ):
+            raise TypeError("compiled-child producer did not create task tool")
+
+        tool = producer.tools[0]
+        binding = object.__new__(DeclaredChildTaskTool)
         object.__setattr__(binding, "tool", tool)
         object.__setattr__(binding, "declarations", declarations)
         object.__setattr__(binding, "session", session)
@@ -252,69 +317,53 @@ class DeclaredChildTaskTool:
             compiled_child_names,
         )
         object.__setattr__(binding, "producer", producer)
+        provenance_by_binding[binding] = (
+            tool,
+            declarations,
+            session,
+            compiled_child_names,
+            producer,
+        )
         return binding
 
-    def _is_valid(self) -> bool:
+    def verifier(candidate: object) -> bool:
+        if type(candidate) is not DeclaredChildTaskTool:
+            return False
+        provenance = provenance_by_binding.get(candidate)
+        if provenance is None:
+            return False
+        tool, declarations, session, compiled_child_names, producer = provenance
         if (
-            not isinstance(self.tool, BaseTool)
-            or self.tool.name != "task"
-            or not isinstance(self.producer, SubAgentMiddleware)
-            or len(self.producer.tools) != 1
-            or self.producer.tools[0] is not self.tool
-            or self.producer.subagent_names
-            != frozenset(self.compiled_child_names)
+            candidate.tool is not tool
+            or candidate.declarations is not declarations
+            or candidate.session is not session
+            or candidate.compiled_child_names is not compiled_child_names
+            or candidate.producer is not producer
+            or type(producer) is not SubAgentMiddleware
+            or len(producer.tools) != 1
+            or producer.tools[0] is not tool
+            or tool.name != "task"
+            or producer.subagent_names != frozenset(compiled_child_names)
         ):
             return False
         try:
-            _validate_child_declarations(self.declarations)
+            _validate_child_declarations(declarations)
         except (TypeError, ValueError):
             return False
-        return sorted(self.compiled_child_names) == sorted(
-            declaration.package_name for declaration in self.declarations
+        return sorted(compiled_child_names) == sorted(
+            declaration.package_name for declaration in declarations
         )
 
+    builder.__name__ = "build_declared_child_task_tool"
+    builder.__qualname__ = "build_declared_child_task_tool"
+    return builder, verifier
 
-def build_declared_child_task_tool(
-    *,
-    backend: BackendProtocol,
-    compiled_children: tuple[CompiledSubAgent, ...],
-    declarations: tuple[ResolvedSubagent, ...],
-    session: KiteframeSessionContext,
-) -> DeclaredChildTaskTool:
-    """Build the public Deep Agents task tool and bind its native declarations."""
 
-    if not isinstance(backend, BackendProtocol):
-        raise TypeError("backend must implement BackendProtocol")
-    _validate_compiled_children(compiled_children)
-    _validate_child_declarations(declarations)
-    if not isinstance(session, KiteframeSessionContext):
-        raise TypeError("session must be KiteframeSessionContext")
-    if sorted(child["name"] for child in compiled_children) != sorted(
-        declaration.package_name for declaration in declarations
-    ):
-        raise ValueError(
-            "compiled child names must exactly match native declarations"
-        )
-
-    producer = SubAgentMiddleware(
-        backend=backend,
-        subagents=compiled_children,
-    )
-    if (
-        len(producer.tools) != 1
-        or not isinstance(producer.tools[0], BaseTool)
-        or producer.tools[0].name != "task"
-    ):
-        raise TypeError("compiled-child producer did not create task tool")
-    return DeclaredChildTaskTool._from_compiled_children(
-        tool=producer.tools[0],
-        declarations=declarations,
-        session=session,
-        compiled_child_names=tuple(
-            child["name"] for child in compiled_children
-        ),
-        producer=producer,
-    )
+(
+    build_declared_child_task_tool,
+    _is_trusted_declared_child_binding,
+) = _declared_child_binding_boundary()
+del _declared_child_binding_boundary
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,12 +391,11 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             )
         if not isinstance(self.clock, SessionClock):
             raise TypeError("clock must provide session time")
-        if self.declared_child_tool is not None and not isinstance(
-            self.declared_child_tool,
-            DeclaredChildTaskTool,
+        if self.declared_child_tool is not None and (
+            type(self.declared_child_tool) is not DeclaredChildTaskTool
         ):
             raise TypeError(
-                "declared_child_tool must be DeclaredChildTaskTool"
+                "declared_child_tool must be exact DeclaredChildTaskTool"
             )
         if (
             self.declared_child_tool is not None
@@ -358,7 +406,9 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             )
         if (
             self.declared_child_tool is not None
-            and not self.declared_child_tool._is_valid()
+            and not _is_trusted_declared_child_binding(
+                self.declared_child_tool
+            )
         ):
             raise TypeError(
                 "declared_child_tool must come from the trusted "
@@ -527,7 +577,7 @@ class KiteframeGuardMiddleware(AgentMiddleware):
         child = None if child_binding is None else child_binding.tool
         child_authority_matches = (
             child_binding is not None
-            and child_binding._is_valid()
+            and _is_trusted_declared_child_binding(child_binding)
             and child_binding.session is self.session
             and session.admission_id == self.session.admission_id
             and session.grant_digest == self.session.grant_digest
