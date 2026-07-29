@@ -302,6 +302,10 @@ async def test_unknown_invocation_identity_fails_before_transport() -> None:
         ),
     )
     try:
+        with pytest.raises(TypeError):
+            client._requirements[  # type: ignore[reportPrivateUsage]
+                ("cases.comment", "1.0.0")
+            ] = runtime_requirement()
         with pytest.raises(ValueError, match="resolved runtime inputs"):
             await client.invoke(request)
     finally:

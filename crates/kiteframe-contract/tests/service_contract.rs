@@ -449,6 +449,81 @@ fn terminal_status_is_validated_against_the_locked_descriptor() {
 }
 
 #[test]
+fn denied_outcome_and_status_require_the_exact_canonical_diagnostic_tuple() {
+    let descriptor = response_descriptor(BTreeSet::from([ExecutionMode::Immediate]));
+    let request = invocation_request(None);
+    let canonical = Diagnostic::error(
+        kiteframe_contract::DiagnosticCode::InvocationDenied,
+        kiteframe_contract::DiagnosticCategory::Authorization,
+        kiteframe_contract::DiagnosticStage::Invoke,
+        "invocation denied",
+    );
+
+    let valid_outcome = InvocationOutcome::Denied {
+        invocation_id: request.invocation_id().clone(),
+        diagnostic: canonical.clone(),
+    };
+    let valid_status = InvocationStatus::Denied {
+        invocation_id: request.invocation_id().clone(),
+        diagnostic: canonical.clone(),
+    };
+    assert!(
+        valid_outcome
+            .validate_against(&request, &descriptor)
+            .is_ok()
+    );
+    assert!(valid_status.validate_against(&request, &descriptor).is_ok());
+
+    for (field, diagnostic) in contradictory_denial_diagnostics(canonical) {
+        let outcome = InvocationOutcome::Denied {
+            invocation_id: request.invocation_id().clone(),
+            diagnostic: diagnostic.clone(),
+        };
+        let status = InvocationStatus::Denied {
+            invocation_id: request.invocation_id().clone(),
+            diagnostic,
+        };
+        assert!(
+            outcome.validate_against(&request, &descriptor).is_err(),
+            "denied outcome accepted mismatched {field}"
+        );
+        assert!(
+            status.validate_against(&request, &descriptor).is_err(),
+            "denied status accepted mismatched {field}"
+        );
+    }
+}
+
+#[test]
+fn outcome_unknown_requires_the_exact_canonical_diagnostic_tuple() {
+    let canonical = Diagnostic::outcome_unknown("status is required");
+    assert!(
+        InvocationOutcome::outcome_unknown(InvocationId::new("inv-1").unwrap(), canonical.clone())
+            .is_ok()
+    );
+    assert!(
+        InvocationStatus::outcome_unknown(InvocationId::new("inv-1").unwrap(), canonical.clone())
+            .is_ok()
+    );
+
+    for (field, diagnostic) in contradictory_status_first_diagnostics(canonical) {
+        assert!(
+            InvocationOutcome::outcome_unknown(
+                InvocationId::new("inv-1").unwrap(),
+                diagnostic.clone()
+            )
+            .is_err(),
+            "outcome accepted mismatched {field}"
+        );
+        assert!(
+            InvocationStatus::outcome_unknown(InvocationId::new("inv-1").unwrap(), diagnostic)
+                .is_err(),
+            "status accepted mismatched {field}"
+        );
+    }
+}
+
+#[test]
 fn admission_rejects_resource_selector_broader_than_resolved_requirement() {
     let request = RequestedCapability::try_new(
         capability_identity(),
@@ -628,6 +703,48 @@ fn response_descriptor(execution_modes: BTreeSet<ExecutionMode>) -> CapabilityDe
 fn stable_error(code: &str) -> StableCapabilityError {
     StableCapabilityError::try_new(code, "conflict", RetryClass::AfterRefresh, "case changed")
         .unwrap()
+}
+
+fn contradictory_denial_diagnostics(canonical: Diagnostic) -> Vec<(&'static str, Diagnostic)> {
+    let mut code = canonical.clone();
+    code.code = kiteframe_contract::DiagnosticCode::AdmissionDenied;
+    let mut category = canonical.clone();
+    category.category = kiteframe_contract::DiagnosticCategory::Capability;
+    let mut severity = canonical.clone();
+    severity.severity = kiteframe_contract::DiagnosticSeverity::Warning;
+    let mut stage = canonical.clone();
+    stage.stage = kiteframe_contract::DiagnosticStage::Admit;
+    let mut retry = canonical;
+    retry.retry = RetryClass::AfterRefresh;
+    vec![
+        ("code", code),
+        ("category", category),
+        ("severity", severity),
+        ("stage", stage),
+        ("retry", retry),
+    ]
+}
+
+fn contradictory_status_first_diagnostics(
+    canonical: Diagnostic,
+) -> Vec<(&'static str, Diagnostic)> {
+    let mut code = canonical.clone();
+    code.code = kiteframe_contract::DiagnosticCode::ResultInvalid;
+    let mut category = canonical.clone();
+    category.category = kiteframe_contract::DiagnosticCategory::Authorization;
+    let mut severity = canonical.clone();
+    severity.severity = kiteframe_contract::DiagnosticSeverity::Warning;
+    let mut stage = canonical.clone();
+    stage.stage = kiteframe_contract::DiagnosticStage::Admit;
+    let mut retry = canonical;
+    retry.retry = RetryClass::Never;
+    vec![
+        ("code", code),
+        ("category", category),
+        ("severity", severity),
+        ("stage", stage),
+        ("retry", retry),
+    ]
 }
 
 fn capability_identity() -> CapabilityIdentity {

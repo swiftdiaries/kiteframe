@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import Any, Concatenate, ParamSpec, Self, TypeVar
 from urllib.parse import quote
 
@@ -376,7 +377,7 @@ class ProviderHttpClient:
                     "resolved runtime inputs contain a duplicate capability identity"
                 )
             requirements[identity] = requirement
-        self._requirements = requirements
+        self._requirements = MappingProxyType(requirements)
 
     async def __aenter__(self) -> Self:
         return self

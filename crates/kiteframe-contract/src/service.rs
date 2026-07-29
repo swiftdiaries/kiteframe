@@ -7,8 +7,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CapabilityDescriptor, CapabilityIdentity, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, IdempotencyRequirement, ResolvedCapabilityRequirement, RetryClass,
-    SafeMessage, Sha256Digest,
+    DiagnosticSeverity, DiagnosticStage, IdempotencyRequirement, ResolvedCapabilityRequirement,
+    RetryClass, SafeMessage, Sha256Digest,
 };
 
 macro_rules! string_ref {
@@ -1402,8 +1402,13 @@ impl<'de> Deserialize<'de> for InvocationStatus {
 }
 
 fn validate_status_first(diagnostic: &Diagnostic) -> Result<(), String> {
-    if diagnostic.retry != RetryClass::StatusFirst {
-        return Err("outcome_unknown diagnostics must require a status-first retry".to_owned());
+    if diagnostic.code != DiagnosticCode::OutcomeUnknown
+        || diagnostic.category != DiagnosticCategory::Capability
+        || diagnostic.severity != DiagnosticSeverity::Error
+        || diagnostic.stage != DiagnosticStage::Invoke
+        || diagnostic.retry != RetryClass::StatusFirst
+    {
+        return Err("outcome_unknown diagnostic must match the canonical control tuple".to_owned());
     }
     Ok(())
 }
@@ -1411,7 +1416,9 @@ fn validate_status_first(diagnostic: &Diagnostic) -> Result<(), String> {
 fn validate_denial_diagnostic(diagnostic: &Diagnostic) -> Result<(), Diagnostic> {
     if diagnostic.code == DiagnosticCode::InvocationDenied
         && diagnostic.category == DiagnosticCategory::Authorization
+        && diagnostic.severity == DiagnosticSeverity::Error
         && diagnostic.stage == DiagnosticStage::Invoke
+        && diagnostic.retry == RetryClass::Never
     {
         Ok(())
     } else {
