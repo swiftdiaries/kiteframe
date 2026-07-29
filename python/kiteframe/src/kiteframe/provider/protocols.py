@@ -4,8 +4,8 @@ from typing import Protocol, runtime_checkable
 
 from kiteframe._native import (
     AdmissionRequest,
-    CatalogFetchResult,
     CapabilityGrantSet,
+    CatalogFetchResult,
     CatalogRequest,
     InvocationOutcome,
     InvocationRequest,

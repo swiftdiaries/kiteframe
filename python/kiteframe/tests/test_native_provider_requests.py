@@ -127,10 +127,12 @@ def valid_status_request() -> bytes:
 def valid_capability_catalog() -> bytes:
     wire = {
         "descriptors": [],
+        "expiresAt": 200,
         "identity": {
             "name": "provider.test",
             "revision": "revision-1",
         },
+        "issuedAt": 100,
     }
     digest = hashlib.sha256(canonical_bytes(wire)).hexdigest()
     return canonical_bytes({**wire, "catalogDigest": digest})
@@ -248,6 +250,8 @@ def test_provider_request_properties_are_stable_native_values(
     assert status_request.baggage == {"kiteframe.request_id": "10" * 16}
     assert catalog.name == "provider.test"
     assert catalog.revision == "revision-1"
+    assert catalog.issued_at == 100
+    assert catalog.expires_at == 200
     assert len(catalog.catalog_digest) == 64
     assert catalog.descriptor_digests == ()
 

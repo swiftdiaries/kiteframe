@@ -104,10 +104,12 @@ def valid_grant_json() -> bytes:
 def valid_catalog_json() -> bytes:
     catalog = {
         "descriptors": [],
+        "expiresAt": 200,
         "identity": {
             "name": "provider.test",
             "revision": "revision-1",
         },
+        "issuedAt": 100,
     }
     digest = hashlib.sha256(canonical_bytes(catalog)).hexdigest()
     return canonical_bytes({**catalog, "catalogDigest": digest})
