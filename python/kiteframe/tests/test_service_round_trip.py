@@ -1,6 +1,7 @@
 import hashlib
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -69,7 +70,12 @@ def valid_catalog_json() -> bytes:
 
 
 def valid_admission_json() -> bytes:
-    capability = {"name": "cases.comment", "version": "1.0.0"}
+    workspace = Path(__file__).resolve().parents[3]
+    resolved = json.loads(
+        (workspace / "tests/fixtures/resolved/support-agent.json").read_bytes()
+    )
+    requirement = resolved["capabilityRequirements"][0]
+    capability = requirement["lockedCapability"]["identity"]
     return canonical_bytes(
         {
             "actor": "actor:alice",
@@ -82,17 +88,11 @@ def valid_admission_json() -> bytes:
             "requiredCapabilities": [
                 {
                     "capability": capability,
-                    "resources": ["tenant:t1/case:case-1"],
+                    "resources": requirement["resources"],
                 }
             ],
             "resolvedDigest": "03" * 32,
-            "resolvedRequirements": [
-                {
-                    "identity": capability,
-                    "required": True,
-                    "resources": ["tenant:t1/case:case-1"],
-                }
-            ],
+            "resolvedRequirements": [requirement],
             "session": "session:1",
             "task": "task:triage",
             "traceContext": {"traceparent": VALID_TRACEPARENT},

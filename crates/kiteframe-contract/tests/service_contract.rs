@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
@@ -259,6 +262,41 @@ fn service_schemas_express_non_bypassable_collection_and_text_invariants() {
     assert_eq!(
         outcome["$defs"]["Suspension"]["properties"]["checkpointRef"]["minLength"],
         json!(1)
+    );
+}
+
+#[test]
+fn checked_in_admission_schema_requires_the_exact_locked_capability() {
+    let schema: serde_json::Value = serde_json::from_slice(
+        &fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../schemas/v1alpha1/admission-request.schema.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let requirement = &schema["$defs"]["ResolvedCapabilityRequirement"];
+    let locked_capability = &schema["$defs"]["LockedCapability"];
+
+    assert_eq!(
+        requirement["required"],
+        json!(["lockedCapability", "required", "resources"])
+    );
+    assert_eq!(
+        requirement["properties"]["lockedCapability"],
+        json!({"$ref": "#/$defs/LockedCapability"})
+    );
+    assert_eq!(
+        locked_capability["required"],
+        json!([
+            "identity",
+            "descriptor",
+            "descriptorDigest",
+            "inputSchemaDigest",
+            "outputSchemaDigest",
+            "stableErrorSetDigest",
+            "safetyMetadataDigest"
+        ])
     );
 }
 

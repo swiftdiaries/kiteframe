@@ -64,10 +64,9 @@ def catalog_request():
 
 
 def admission_request():
-    capability = {
-        "name": "cases.comment",
-        "version": "1.0.0",
-    }
+    requirement = resolved_requirement_wire()
+    capability = requirement["lockedCapability"]["identity"]
+    resources = requirement["resources"]
     return load_admission_request(
         canonical_bytes(
             {
@@ -81,16 +80,12 @@ def admission_request():
                 "requiredCapabilities": [
                     {
                         "capability": capability,
-                        "resources": ["tenant:t1/case:case-1"],
+                        "resources": resources,
                     }
                 ],
                 "resolvedDigest": "03" * 32,
                 "resolvedRequirements": [
-                    {
-                        "identity": capability,
-                        "required": True,
-                        "resources": ["tenant:t1/case:case-1"],
-                    }
+                    requirement
                 ],
                 "session": "session:1",
                 "task": "task:triage",
@@ -101,6 +96,15 @@ def admission_request():
             }
         )
     )
+
+
+@lru_cache
+def resolved_requirement_wire():
+    workspace = Path(__file__).resolve().parents[4]
+    resolved = json.loads(
+        (workspace / "tests/fixtures/resolved/support-agent.json").read_bytes()
+    )
+    return resolved["capabilityRequirements"][0]
 
 
 def invocation_request():
@@ -148,10 +152,10 @@ def grant_set_bytes(**overrides: object) -> bytes:
         "grants": [
             {
                 "capability": {
-                    "name": "cases.comment",
-                    "version": "1.0.0",
+                    "name": "cases.read",
+                    "version": "1.2.0",
                 },
-                "resources": ["tenant:t1/case:case-1"],
+                "resources": ["tenant:support"],
             }
         ],
         "issuedAt": 100,
