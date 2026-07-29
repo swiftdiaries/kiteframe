@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, NoReturn, cast
 
 import pytest
+from deepagents import CompiledSubAgent
+from deepagents.backends import StateBackend
 from kiteframe import (
     InvocationOutcome,
     InvocationRequest,
@@ -33,6 +35,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import Field
 
@@ -43,6 +46,7 @@ from kiteframe_deepagents.context import (
 from kiteframe_deepagents.middleware import (
     DeclaredChildTaskTool,
     KiteframeGuardMiddleware,
+    build_declared_child_task_tool,
 )
 from kiteframe_deepagents.tools import (
     CapabilitySuspensionBridge,
@@ -414,6 +418,26 @@ def declared_child_tool() -> BaseTool:
     return StructuredTool.from_function(task, name="task")
 
 
+def compiled_children() -> tuple[CompiledSubAgent, ...]:
+    child: CompiledSubAgent = {
+        "name": "case-child",
+        "description": "Read a case.",
+        "runnable": RunnableLambda(lambda state: state),
+    }
+    return (child,)
+
+
+def build_child_binding(
+    session: KiteframeSessionContext,
+) -> DeclaredChildTaskTool:
+    return build_declared_child_task_tool(
+        backend=StateBackend(),
+        compiled_children=compiled_children(),
+        declarations=child_declarations(),
+        session=session,
+    )
+
+
 def build_tool(
     session: KiteframeSessionContext,
     invoker: object,
@@ -603,12 +627,8 @@ async def test_session_task_and_suspension_state_remove_tools(
 async def test_only_the_exact_declared_child_tool_is_visible(
     middleware: KiteframeGuardMiddleware,
 ) -> None:
-    child = declared_child_tool()
-    binding = DeclaredChildTaskTool(
-        tool=child,
-        declarations=child_declarations(),
-        session=middleware.session,
-    )
+    binding = build_child_binding(middleware.session)
+    child = binding.tool
     with_child = replace(middleware, declared_child_tool=binding)
 
     assert tool_names(
@@ -636,16 +656,50 @@ def test_name_correct_undeclared_child_tool_is_rejected(
         replace(middleware, declared_child_tool=declared_child_tool())
 
 
+def test_forged_task_cannot_be_wrapped_with_valid_declarations_and_session(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    with pytest.raises(TypeError, match="trusted compiled-child builder"):
+        DeclaredChildTaskTool(
+            tool=declared_child_tool(),
+            declarations=child_declarations(),
+            session=middleware.session,
+        )
+
+
+def test_trusted_binding_rejects_task_tool_substitution(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    binding = build_child_binding(middleware.session)
+    cast(list[BaseTool], binding.producer.tools)[0] = declared_child_tool()
+
+    with pytest.raises(TypeError, match="trusted compiled-child builder"):
+        replace(middleware, declared_child_tool=binding)
+
+
+def test_compiled_child_names_must_match_native_declarations(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    mismatched: CompiledSubAgent = {
+        "name": "forged-child",
+        "description": "A mismatched child.",
+        "runnable": RunnableLambda(lambda state: state),
+    }
+
+    with pytest.raises(ValueError, match="exactly match native declarations"):
+        build_declared_child_task_tool(
+            backend=StateBackend(),
+            compiled_children=(mismatched,),
+            declarations=child_declarations(),
+            session=middleware.session,
+        )
+
+
 @pytest.mark.asyncio
 async def test_declared_child_is_hidden_until_authority_snapshot_is_replaced(
     middleware: KiteframeGuardMiddleware,
 ) -> None:
-    child = declared_child_tool()
-    binding = DeclaredChildTaskTool(
-        tool=child,
-        declarations=child_declarations(),
-        session=middleware.session,
-    )
+    binding = build_child_binding(middleware.session)
     changed_authority = session_context(revision="8")
     stale = replace(
         middleware,
@@ -656,11 +710,7 @@ async def test_declared_child_is_hidden_until_authority_snapshot_is_replaced(
     assert await stale.visible_tools(now=ISSUED_AT) == ()
 
     changed_tool = build_tool(changed_authority, FakeInvoker())
-    changed_binding = DeclaredChildTaskTool(
-        tool=child,
-        declarations=child_declarations(),
-        session=changed_authority,
-    )
+    changed_binding = build_child_binding(changed_authority)
     refreshed = replace(
         middleware.with_authority(changed_authority, (changed_tool,)),
         declared_child_tool=changed_binding,
