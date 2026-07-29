@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -13,24 +13,37 @@ from kiteframe import (
     InvocationRequest,
     InvocationStatus,
     KiteframeDiagnosticError,
+    ResolvedSubagent,
     StatusRequest,
     load_capability_grant_set,
     load_invocation_outcome,
     load_resolved_agent,
 )
+from langchain.agents import create_agent
 from langchain.agents.middleware import (
     ModelRequest,
     ModelResponse,
     ToolCallRequest,
 )
-from langchain_core.messages import ToolMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import Field
 
 from kiteframe_deepagents.context import (
     KiteframeSessionContext,
     KiteframeTraceContext,
 )
-from kiteframe_deepagents.middleware import KiteframeGuardMiddleware
+from kiteframe_deepagents.middleware import (
+    DeclaredChildTaskTool,
+    KiteframeGuardMiddleware,
+)
 from kiteframe_deepagents.tools import (
     CapabilitySuspensionBridge,
     CapabilityTool,
@@ -72,6 +85,85 @@ def canonical_bytes(value: object) -> bytes:
 
 def canonical_digest(domain: bytes, value: object) -> str:
     return hashlib.sha256(domain + canonical_bytes(value)).hexdigest()
+
+
+def _hash_domain(domain: bytes, chunks: list[bytes]) -> bytes:
+    hasher = hashlib.sha256()
+    hasher.update(b"kiteframe:v1\0")
+    hasher.update(len(domain).to_bytes(8, "big"))
+    hasher.update(domain)
+    for chunk in chunks:
+        hasher.update(len(chunk).to_bytes(8, "big"))
+        hasher.update(chunk)
+    return hasher.digest()
+
+
+def _canonical_component(domain: bytes, value: object) -> bytes:
+    return _hash_domain(domain, [canonical_bytes(value)])
+
+
+def _resolved_digest(resolved: dict[str, Any]) -> str:
+    components = [
+        _canonical_component(
+            b"resolved/identity",
+            [resolved["schemaVersion"], resolved["packageIdentity"]],
+        ),
+        _hash_domain(
+            b"resolved/portable",
+            [bytes.fromhex(resolved["portableDigest"])],
+        ),
+        _hash_domain(
+            b"resolved/lock",
+            [bytes.fromhex(resolved["lockDigest"])],
+        ),
+        _canonical_component(
+            b"resolved/catalog",
+            [resolved["catalogIdentity"], resolved["catalogDigest"]],
+        ),
+        _hash_domain(
+            b"resolved/binding",
+            [bytes.fromhex(resolved["bindingDigest"])],
+        ),
+        _canonical_component(b"resolved/prompts", resolved["prompts"]),
+        _canonical_component(b"resolved/skills", resolved["skills"]),
+        _canonical_component(
+            b"resolved/features",
+            [resolved["requiredFeatures"], resolved["optionalFeatures"]],
+        ),
+        _canonical_component(b"resolved/models", resolved["models"]),
+        _canonical_component(
+            b"resolved/capabilities",
+            resolved["capabilityRequirements"],
+        ),
+        _canonical_component(b"resolved/children", resolved["subagents"]),
+        _canonical_component(
+            b"resolved/content-capture",
+            resolved["contentCapture"],
+        ),
+        _canonical_component(b"resolved/report", resolved["compilationReport"]),
+    ]
+    return _hash_domain(b"resolved-agent", components).hex()
+
+
+def child_declarations() -> tuple[ResolvedSubagent, ...]:
+    resolved = json.loads(
+        (WORKSPACE / "tests/fixtures/resolved/support-agent.json").read_bytes()
+    )
+    resolved["subagents"] = [
+        {
+            "delegation": {
+                "agent": "agents/case-child/agent.yaml",
+                "capabilities": ["cases.read"],
+            },
+            "packageIdentity": {
+                "name": "case-child",
+                "version": "0.1.0",
+            },
+            "resolvedDigest": "ab" * 32,
+        }
+    ]
+    resolved["resolvedDigest"] = _resolved_digest(resolved)
+    return load_resolved_agent(canonical_bytes(resolved)).subagents
 
 
 def grant_set_values(*, revision: str = "7") -> dict[str, Any]:
@@ -159,6 +251,33 @@ class FakeInvoker:
         )
 
 
+@dataclass
+class RecordingInvoker:
+    requests: list[InvocationRequest]
+
+    async def invoke(self, request: InvocationRequest) -> InvocationOutcome:
+        self.requests.append(request)
+        return load_invocation_outcome(
+            canonical_bytes(
+                {
+                    "invocation_id": request.invocation_id,
+                    "result": {"authority": "refreshed"},
+                    "status": "succeeded",
+                }
+            )
+        )
+
+    async def status(
+        self,
+        request: StatusRequest,
+        invocation: InvocationRequest,
+        requirement: object,
+    ) -> InvocationStatus:
+        raise AssertionError(
+            f"unexpected provider status: {request}, {invocation}, {requirement}"
+        )
+
+
 class FakeCheckpointStore(IdempotencyCheckpointStore):
     async def persist_idempotency_key(
         self,
@@ -223,6 +342,70 @@ class FailingToolRegistry:
         raise RuntimeError("registry secret")
 
 
+@dataclass(frozen=True, slots=True)
+class FixedToolRegistry:
+    tools: tuple[CapabilityTool, ...]
+
+    async def admitted_tools(
+        self,
+        session: KiteframeSessionContext,
+    ) -> tuple[CapabilityTool, ...]:
+        del session
+        return self.tools
+
+
+class RefreshToolCallingModel(BaseChatModel):
+    bound_tools: list[
+        tuple[
+            dict[str, Any] | type | Callable[..., Any] | BaseTool,
+            ...,
+        ]
+    ] = Field(default_factory=list)
+    model_calls: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "refresh-tool-calling-test"
+
+    def bind_tools(
+        self,
+        tools: Sequence[
+            dict[str, Any] | type | Callable[..., Any] | BaseTool
+        ],
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> RefreshToolCallingModel:
+        del tool_choice, kwargs
+        self.bound_tools.append(tuple(tools))
+        return self
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: object | None = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        del messages, stop, run_manager, kwargs
+        self.model_calls += 1
+        if self.model_calls == 1:
+            message = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "args": {},
+                        "id": "call:refreshed",
+                        "name": "cases.read",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        else:
+            message = AIMessage(content="done")
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
 def declared_child_tool() -> BaseTool:
     def task(child: str) -> str:
         """Invoke one declared child agent."""
@@ -231,21 +414,28 @@ def declared_child_tool() -> BaseTool:
     return StructuredTool.from_function(task, name="task")
 
 
-@pytest.fixture
-def capability_tool() -> CapabilityTool:
+def build_tool(
+    session: KiteframeSessionContext,
+    invoker: object,
+) -> CapabilityTool:
     requirement = load_resolved_agent(
         (WORKSPACE / "tests/fixtures/resolved/support-agent.json").read_bytes()
     ).capability_requirements[0]
-    session = session_context()
     return build_capability_tools(
         (requirement,),
         session.grants,
         grant_digest=session.grant_digest,
-        invoker=FakeInvoker(),
+        invoker=cast(Any, invoker),
         session=session,
         checkpoint_store=FakeCheckpointStore(),
         suspension_bridge=FakeSuspensionBridge(),
     )[0]
+
+
+@pytest.fixture
+def capability_tool() -> CapabilityTool:
+    session = session_context()
+    return build_tool(session, FakeInvoker())
 
 
 @pytest.fixture
@@ -293,10 +483,10 @@ async def test_expired_or_revoked_grants_disappear_from_each_model_request(
     ) == {"cases.read"}
 
     next_session = session_context(revision="8")
-    revoked = middleware.with_authority(
-        next_session.grants,
-        next_session.authority_revisions,
-        grant_digest=next_session.grant_digest,
+    revoked = replace(
+        middleware,
+        authority_provider=FixedAuthorityProvider(next_session),
+        tool_registry=FixedToolRegistry(middleware.admitted_tools),
     )
     assert tool_names(
         await revoked.visible_tools(now=ISSUED_AT)
@@ -312,21 +502,69 @@ async def test_authority_refresh_replaces_the_complete_immutable_snapshot(
 ) -> None:
     original_session = middleware.session
     next_session = session_context(revision="8")
+    next_tool = build_tool(next_session, FakeInvoker())
 
-    refreshed = middleware.with_authority(
-        next_session.grants,
-        next_session.authority_revisions,
-        grant_digest=next_session.grant_digest,
-    )
+    refreshed = middleware.with_authority(next_session, (next_tool,))
 
     assert refreshed is not middleware
-    assert refreshed.session is not original_session
+    assert refreshed.session is next_session
     assert refreshed.session.authority_revisions is next_session.authority_revisions
+    assert refreshed.admitted_tools == (next_tool,)
     assert middleware.session is original_session
     assert (
         middleware.session.authority_revisions.authority_revision_digest
         != refreshed.session.authority_revisions.authority_revision_digest
     )
+
+
+@pytest.mark.asyncio
+async def test_atomic_authority_replacement_uses_complete_context_and_tools(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    next_session = session_context(revision="8")
+    next_tool = build_tool(next_session, FakeInvoker())
+
+    refreshed = middleware.with_authority(next_session, (next_tool,))
+
+    assert refreshed.session is next_session
+    assert refreshed.admitted_tools == (next_tool,)
+    assert refreshed.authority_provider is None
+    assert refreshed.tool_registry is None
+    assert refreshed.declared_child_tool is None
+    assert tool_names(
+        await refreshed.visible_tools(now=ISSUED_AT)
+    ) == {"cases.read"}
+    assert middleware.session.authority_revisions is not (
+        next_session.authority_revisions
+    )
+
+
+def test_atomic_authority_replacement_rejects_session_identity_change(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    next_session = replace(session_context(revision="8"), actor="actor:mallory")
+    next_tool = build_tool(next_session, FakeInvoker())
+
+    with pytest.raises(ValueError, match="identity"):
+        middleware.with_authority(next_session, (next_tool,))
+
+
+def test_atomic_authority_replacement_rejects_stale_tools(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    next_session = session_context(revision="8")
+
+    with pytest.raises(ValueError, match="exact authority"):
+        middleware.with_authority(next_session, middleware.admitted_tools)
+
+
+def test_atomic_authority_replacement_rejects_incomplete_tools(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    next_session = session_context(revision="8")
+
+    with pytest.raises(ValueError, match="exact authority"):
+        middleware.with_authority(next_session, ())
 
 
 @pytest.mark.asyncio
@@ -366,19 +604,36 @@ async def test_only_the_exact_declared_child_tool_is_visible(
     middleware: KiteframeGuardMiddleware,
 ) -> None:
     child = declared_child_tool()
-    with_child = replace(middleware, declared_child_tool=child)
+    binding = DeclaredChildTaskTool(
+        tool=child,
+        declarations=child_declarations(),
+        session=middleware.session,
+    )
+    with_child = replace(middleware, declared_child_tool=binding)
 
     assert tool_names(
         await with_child.visible_tools(now=ISSUED_AT)
     ) == {"cases.read", "task"}
 
     forged_same_name = declared_child_tool()
-    with pytest.raises(KiteframeDiagnosticError) as error:
-        await with_child.awrap_tool_call(
-            forged_tool_call("task", forged_same_name),
-            should_not_run,
-        )
-    assert error.value.code == "KF-AUTH-003"
+    executed: list[BaseTool | None] = []
+
+    async def capture(request: ToolCallRequest) -> ToolMessage:
+        executed.append(request.tool)
+        return ToolMessage(content="ok", tool_call_id="call:task")
+
+    await with_child.awrap_tool_call(
+        forged_tool_call("task", forged_same_name),
+        capture,
+    )
+    assert executed == [child]
+
+
+def test_name_correct_undeclared_child_tool_is_rejected(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    with pytest.raises(TypeError, match="DeclaredChildTaskTool"):
+        replace(middleware, declared_child_tool=declared_child_tool())
 
 
 @pytest.mark.asyncio
@@ -386,26 +641,33 @@ async def test_declared_child_is_hidden_until_authority_snapshot_is_replaced(
     middleware: KiteframeGuardMiddleware,
 ) -> None:
     child = declared_child_tool()
+    binding = DeclaredChildTaskTool(
+        tool=child,
+        declarations=child_declarations(),
+        session=middleware.session,
+    )
     changed_authority = session_context(revision="8")
     stale = replace(
         middleware,
-        declared_child_tool=child,
+        declared_child_tool=binding,
         authority_provider=FixedAuthorityProvider(changed_authority),
     )
 
     assert await stale.visible_tools(now=ISSUED_AT) == ()
 
+    changed_tool = build_tool(changed_authority, FakeInvoker())
+    changed_binding = DeclaredChildTaskTool(
+        tool=child,
+        declarations=child_declarations(),
+        session=changed_authority,
+    )
     refreshed = replace(
-        middleware.with_authority(
-            changed_authority.grants,
-            changed_authority.authority_revisions,
-            grant_digest=changed_authority.grant_digest,
-        ),
-        declared_child_tool=child,
+        middleware.with_authority(changed_authority, (changed_tool,)),
+        declared_child_tool=changed_binding,
     )
     assert tool_names(
         await refreshed.visible_tools(now=ISSUED_AT)
-    ) == {"task"}
+    ) == {"cases.read", "task"}
 
 
 @pytest.mark.asyncio
@@ -431,6 +693,39 @@ async def test_each_model_request_replaces_the_original_tool_list(
     original_tools = cast(list[BaseTool], original.tools)
     assert {tool.name for tool in captured_tools} == {"cases.read"}
     assert {tool.name for tool in original_tools} == {"read_file"}
+
+
+@pytest.mark.asyncio
+async def test_compiled_graph_executes_tool_rebuilt_for_refreshed_authority(
+    capability_tool: CapabilityTool,
+) -> None:
+    refreshed_session = session_context(revision="8")
+    refreshed_invoker = RecordingInvoker(requests=[])
+    refreshed_tool = build_tool(refreshed_session, refreshed_invoker)
+    model = RefreshToolCallingModel()
+    guard = KiteframeGuardMiddleware(
+        session=session_context(),
+        admitted_tools=(capability_tool,),
+        clock=FixedClock(ISSUED_AT),
+        authority_provider=FixedAuthorityProvider(refreshed_session),
+        tool_registry=FixedToolRegistry((refreshed_tool,)),
+    )
+    graph = create_agent(
+        model=model,
+        tools=[capability_tool],
+        middleware=[guard],
+    )
+
+    result = await graph.ainvoke(
+        {"messages": [HumanMessage(content="read the case")]}
+    )
+
+    assert result["messages"][-1].content == "done"
+    assert model.bound_tools[-1] == (refreshed_tool,)
+    assert len(refreshed_invoker.requests) == 1
+    assert refreshed_invoker.requests[0].grant_digest == (
+        refreshed_session.grant_digest
+    )
 
 
 @pytest.mark.parametrize("name", AMBIENT_NAMES)
@@ -468,6 +763,20 @@ async def test_malformed_forged_call_is_stably_denied(
 ) -> None:
     request = forged_tool_call("cases.read")
     request = request.override(tool_call=cast(Any, {"args": {}, "id": "call:1"}))
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        await middleware.awrap_tool_call(request, should_not_run)
+    assert error.value.code == "KF-AUTH-003"
+
+
+@pytest.mark.parametrize("tool_call", [None, [], "cases.read", 7])
+@pytest.mark.asyncio
+async def test_non_mapping_forged_call_is_stably_denied(
+    tool_call: object,
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    request = forged_tool_call("cases.read")
+    request = request.override(tool_call=cast(Any, tool_call))
 
     with pytest.raises(KiteframeDiagnosticError) as error:
         await middleware.awrap_tool_call(request, should_not_run)

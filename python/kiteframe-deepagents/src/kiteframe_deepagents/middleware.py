@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
 from kiteframe import (
-    AuthorityRevisionSet,
     EffectiveCapabilityGrant,
     KiteframeDiagnosticError,
+    ResolvedSubagent,
 )
 from langchain.agents.middleware import (
     AgentMiddleware,
@@ -158,13 +158,49 @@ def _grant_projection(grant: EffectiveCapabilityGrant) -> tuple[object, ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class DeclaredChildTaskTool:
+    """Public task tool bound to exact immutable compiled child declarations."""
+
+    tool: BaseTool
+    declarations: tuple[ResolvedSubagent, ...]
+    session: KiteframeSessionContext
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tool, BaseTool) or self.tool.name != "task":
+            raise TypeError("tool must be the public task BaseTool")
+        if (
+            not isinstance(self.declarations, tuple)
+            or not self.declarations
+            or not all(
+                isinstance(declaration, ResolvedSubagent)
+                for declaration in self.declarations
+            )
+        ):
+            raise TypeError(
+                "declarations must be a non-empty tuple of ResolvedSubagent"
+            )
+        identities = [
+            (
+                declaration.package_name,
+                declaration.package_version,
+                declaration.resolved_digest,
+            )
+            for declaration in self.declarations
+        ]
+        if len(identities) != len(set(identities)):
+            raise ValueError("compiled child declarations must be unique")
+        if not isinstance(self.session, KiteframeSessionContext):
+            raise TypeError("session must be KiteframeSessionContext")
+
+
+@dataclass(frozen=True, slots=True)
 class KiteframeGuardMiddleware(AgentMiddleware):
     """Expose only tools backed by the complete current authority snapshot."""
 
     session: KiteframeSessionContext
     admitted_tools: tuple[CapabilityTool, ...]
     clock: SessionClock
-    declared_child_tool: BaseTool | None = None
+    declared_child_tool: DeclaredChildTaskTool | None = None
     authority_provider: AuthorityProvider | None = None
     tool_registry: AdmittedToolRegistry | None = None
 
@@ -182,12 +218,19 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             )
         if not isinstance(self.clock, SessionClock):
             raise TypeError("clock must provide session time")
-        if self.declared_child_tool is not None and (
-            not isinstance(self.declared_child_tool, BaseTool)
-            or self.declared_child_tool.name != "task"
+        if self.declared_child_tool is not None and not isinstance(
+            self.declared_child_tool,
+            DeclaredChildTaskTool,
         ):
             raise TypeError(
-                "declared_child_tool must be the exact public task tool"
+                "declared_child_tool must be DeclaredChildTaskTool"
+            )
+        if (
+            self.declared_child_tool is not None
+            and self.declared_child_tool.session is not self.session
+        ):
+            raise ValueError(
+                "declared child tool must bind the exact authority session"
             )
         if self.authority_provider is not None and not isinstance(
             self.authority_provider,
@@ -202,42 +245,49 @@ class KiteframeGuardMiddleware(AgentMiddleware):
 
     def with_authority(
         self,
-        grants: tuple[EffectiveCapabilityGrant, ...],
-        authority_revisions: AuthorityRevisionSet,
-        *,
-        grant_digest: str | None = None,
-        admitted_tools: tuple[CapabilityTool, ...] | None = None,
+        session: KiteframeSessionContext,
+        admitted_tools: tuple[CapabilityTool, ...],
     ) -> KiteframeGuardMiddleware:
-        """Return a new middleware and complete immutable session snapshot."""
+        """Atomically replace one complete session and its rebuilt tools."""
 
-        if not isinstance(grants, tuple) or not all(
-            isinstance(grant, EffectiveCapabilityGrant) for grant in grants
+        if not isinstance(session, KiteframeSessionContext):
+            raise TypeError("session must be KiteframeSessionContext")
+        if (
+            session.actor != self.session.actor
+            or session.session != self.session.session
+            or session.task != self.session.task
+        ):
+            raise ValueError(
+                "authority replacement must retain actor/session/task identity"
+            )
+        if not isinstance(admitted_tools, tuple) or not all(
+            isinstance(tool, CapabilityTool) for tool in admitted_tools
         ):
             raise TypeError(
-                "grants must be a tuple of native EffectiveCapabilityGrant"
+                "admitted_tools must be a tuple of CapabilityTool"
             )
-        if not isinstance(authority_revisions, AuthorityRevisionSet):
-            raise TypeError(
-                "authority_revisions must be native AuthorityRevisionSet"
+        if any(tool.session is not session for tool in admitted_tools):
+            raise ValueError(
+                "admitted tools must bind the exact authority session"
             )
-        session = replace(
-            self.session,
-            grants=grants,
-            authority_revisions=authority_revisions,
-            grant_digest=(
-                self.session.grant_digest
-                if grant_digest is None
-                else grant_digest
-            ),
+        grant_identities = sorted(
+            (grant.name, grant.version) for grant in session.grants
         )
+        tool_identities = sorted(
+            (tool.requirement.name, tool.requirement.version)
+            for tool in admitted_tools
+        )
+        if grant_identities != tool_identities:
+            raise ValueError(
+                "admitted tools must cover the exact authority grant set"
+            )
         return replace(
             self,
             session=session,
-            admitted_tools=(
-                self.admitted_tools
-                if admitted_tools is None
-                else admitted_tools
-            ),
+            admitted_tools=admitted_tools,
+            declared_child_tool=None,
+            authority_provider=None,
+            tool_registry=None,
         )
 
     def _now(self) -> int:
@@ -341,9 +391,12 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             if self._matches_current_authority(tool, session, grants, now):
                 visible.append(tool)
 
-        child = self.declared_child_tool
+        child_binding = self.declared_child_tool
+        child = None if child_binding is None else child_binding.tool
         child_authority_matches = (
-            session.admission_id == self.session.admission_id
+            child_binding is not None
+            and child_binding.session is self.session
+            and session.admission_id == self.session.admission_id
             and session.grant_digest == self.session.grant_digest
             and (
                 session.authority_revisions.authority_revision_digest
@@ -388,24 +441,28 @@ class KiteframeGuardMiddleware(AgentMiddleware):
     ) -> Any:
         """Deny forged, hidden, expired, and same-name substituted calls."""
 
+        tool_call = request.tool_call
+        if not isinstance(tool_call, Mapping):
+            raise _invocation_denied()
+        name = tool_call.get("name")
+        if not isinstance(name, str):
+            raise _invocation_denied()
         try:
             visible = await self._currently_invocable_tools()
         except KiteframeDiagnosticError:
             raise
         except Exception:
             raise _middleware_failed() from None
-        name = request.tool_call.get("name")
-        if not isinstance(name, str):
-            raise _invocation_denied()
         tool = visible.get(name)
-        if tool is None or request.tool is not tool:
+        if tool is None:
             raise _invocation_denied()
-        return await handler(request)
+        return await handler(request.override(tool=tool))
 
 
 __all__ = [
     "AdmittedToolRegistry",
     "AuthorityProvider",
+    "DeclaredChildTaskTool",
     "KiteframeGuardMiddleware",
     "SessionClock",
 ]
