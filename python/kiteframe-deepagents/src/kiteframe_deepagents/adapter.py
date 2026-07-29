@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from typing import Any, NoReturn, cast
 
-from deepagents import create_deep_agent
+from deepagents import CompiledSubAgent, create_deep_agent
 from kiteframe import (
     FrozenComponentRegistry,
     KiteframeDiagnosticError,
     ResolvedRuntimeInputs,
+    ResolvedSubagent,
 )
 from langgraph.graph.state import CompiledStateGraph
 
@@ -24,7 +26,16 @@ from .components import (
     validate_components,
 )
 from .context import KiteframeSessionContext, _snapshot_session_context
-from .middleware import KiteframeGuardMiddleware
+from .delegation import (
+    DeclaredSubAgentInput,
+    DelegationAncestryEntry,
+    _admission_denied,
+    intersect_child_envelope,
+)
+from .middleware import (
+    KiteframeGuardMiddleware,
+    build_declared_child_task_tool,
+)
 from .target import SUPPORTED_FEATURES, TARGET
 from .tools import (
     CapabilitySuspensionBridge,
@@ -55,6 +66,16 @@ class _UnavailableSuspensionBridge:
     async def suspend(self, request: object, outcome: object) -> NoReturn:
         del request, outcome
         raise _runtime_error("capability suspension bridge is unresolved")
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedAgent:
+    runtime_inputs: ResolvedRuntimeInputs
+    components: ValidatedComponents
+    session: KiteframeSessionContext
+    declaration: ResolvedSubagent | None
+    ancestry: tuple[DelegationAncestryEntry, ...]
+    children: tuple[_PreparedAgent, ...]
 
 
 def _primary_model_symbol(inputs: ResolvedRuntimeInputs) -> str:
@@ -88,17 +109,14 @@ class DeepAgentsAdapter:
         registry: FrozenComponentRegistry,
     ) -> ValidatedComponents:
         if not isinstance(runtime_inputs, ResolvedRuntimeInputs):
-            raise TypeError(
-                "runtime_inputs must be native ResolvedRuntimeInputs"
-            )
+            raise TypeError("runtime_inputs must be native ResolvedRuntimeInputs")
         if not isinstance(registry, FrozenComponentRegistry):
             raise TypeError("registry must be a FrozenComponentRegistry")
         if runtime_inputs.runtime_target != TARGET:
             raise _runtime_error("runtime target is unsupported")
 
         unsupported = (
-            set(runtime_inputs.resolved_agent.required_features)
-            - SUPPORTED_FEATURES
+            set(runtime_inputs.resolved_agent.required_features) - SUPPORTED_FEATURES
         )
         if unsupported:
             raise _runtime_error("required runtime feature is unsupported")
@@ -115,22 +133,170 @@ class DeepAgentsAdapter:
         runtime_inputs: ResolvedRuntimeInputs,
         registry: FrozenComponentRegistry,
         session: KiteframeSessionContext,
+        *,
+        declared_children: tuple[DeclaredSubAgentInput, ...] = (),
     ) -> CompiledStateGraph:
         """Compile one closed runtime snapshot through the public constructor."""
 
         session_snapshot = _snapshot_session_context(session)
-        components = self.validate(runtime_inputs, registry)
-
-        resolved = runtime_inputs.resolved_agent
-        if resolved.subagents:
-            raise _runtime_error("declared child compilation is unresolved")
+        prepared = self._prepare_agent(
+            runtime_inputs,
+            registry,
+            session_snapshot,
+            declared_children,
+            declaration=None,
+            ancestry=(),
+            identities=(
+                (
+                    runtime_inputs.resolved_agent.package_name,
+                    runtime_inputs.resolved_agent.resolved_digest,
+                ),
+            ),
+        )
         try:
             verify_compatibility()
         except Exception:
-            raise _runtime_error(
-                "deep agents compatibility is unresolved"
-            ) from None
+            raise _runtime_error("deep agents compatibility is unresolved") from None
+        return self._compile_prepared(prepared)
 
+    def _prepare_agent(
+        self,
+        runtime_inputs: ResolvedRuntimeInputs,
+        registry: FrozenComponentRegistry,
+        session: KiteframeSessionContext,
+        declared_children: tuple[DeclaredSubAgentInput, ...],
+        *,
+        declaration: ResolvedSubagent | None,
+        ancestry: tuple[DelegationAncestryEntry, ...],
+        identities: tuple[tuple[str, str], ...],
+    ) -> _PreparedAgent:
+        """Validate a complete declared tree before constructing any graph."""
+
+        validated = self.validate(runtime_inputs, registry)
+        try:
+            components = replace(
+                validated,
+                middleware=tuple(
+                    deepcopy(component) for component in validated.middleware
+                ),
+            )
+        except Exception:
+            raise _runtime_error("middleware session isolation is unresolved") from None
+        if type(declared_children) is not tuple or not all(
+            type(child) is DeclaredSubAgentInput for child in declared_children
+        ):
+            raise TypeError(
+                "declared_children must be exact immutable DeclaredSubAgentInput values"
+            )
+        resolved = runtime_inputs.resolved_agent
+        declarations = resolved.subagents
+        if not declarations:
+            if declared_children:
+                raise _admission_denied()
+            return _PreparedAgent(
+                runtime_inputs=runtime_inputs,
+                components=components,
+                session=session,
+                declaration=declaration,
+                ancestry=ancestry,
+                children=(),
+            )
+        if not declared_children:
+            raise _runtime_error("declared child compilation is unresolved")
+
+        declaration_identities = tuple(
+            (
+                child.package_name,
+                child.package_version,
+                child.resolved_digest,
+            )
+            for child in declarations
+        )
+        supplied_identities = tuple(
+            (
+                child.declaration.package_name,
+                child.declaration.package_version,
+                child.declaration.resolved_digest,
+            )
+            for child in declared_children
+        )
+        if (
+            len(declaration_identities) != len(set(declaration_identities))
+            or len(supplied_identities) != len(set(supplied_identities))
+            or sorted(declaration_identities) != sorted(supplied_identities)
+        ):
+            raise _admission_denied()
+        supplied_by_identity = dict(
+            zip(
+                supplied_identities,
+                declared_children,
+                strict=True,
+            )
+        )
+
+        prepared_children: list[_PreparedAgent] = []
+        for child_declaration in declarations:
+            declaration_identity = (
+                child_declaration.package_name,
+                child_declaration.package_version,
+                child_declaration.resolved_digest,
+            )
+            child = supplied_by_identity[declaration_identity]
+            child_resolved = child.runtime_inputs.resolved_agent
+            child_identity = (
+                child_declaration.package_name,
+                child_declaration.resolved_digest,
+            )
+            if (
+                child_resolved.package_name != child_declaration.package_name
+                or child_resolved.resolved_digest != child_declaration.resolved_digest
+                or child_identity in identities
+                or child.session.actor != session.actor
+                or child.session.session != session.session
+                or child.session.task != session.task
+            ):
+                raise _admission_denied()
+            envelope = intersect_child_envelope(
+                parent=session.grants,
+                delegation=child_declaration,
+                child_requirements=child_resolved.capability_requirements,
+                child_admission=child.session,
+                ancestry=ancestry,
+                parent_agent=resolved.package_name,
+                child_agent=child_declaration.package_name,
+            )
+            if envelope.authority_revisions is not child.session.authority_revisions:
+                raise _admission_denied()
+            prepared_children.append(
+                self._prepare_agent(
+                    child.runtime_inputs,
+                    registry,
+                    child.session,
+                    child.children,
+                    declaration=child_declaration,
+                    ancestry=envelope.ancestry,
+                    identities=(*identities, child_identity),
+                )
+            )
+        return _PreparedAgent(
+            runtime_inputs=runtime_inputs,
+            components=components,
+            session=session,
+            declaration=declaration,
+            ancestry=ancestry,
+            children=tuple(prepared_children),
+        )
+
+    def _compile_prepared(
+        self,
+        prepared: _PreparedAgent,
+    ) -> CompiledStateGraph:
+        """Construct one already-validated tree from its leaves upward."""
+
+        runtime_inputs = prepared.runtime_inputs
+        components = prepared.components
+        session_snapshot = prepared.session
+        resolved = runtime_inputs.resolved_agent
         try:
             package_backend = build_package_backend(
                 resolved.prompts,
@@ -162,14 +328,46 @@ class DeepAgentsAdapter:
                 checkpoint_store=checkpoint_store,
                 suspension_bridge=suspension_bridge,
             )
+            compiled_children: list[CompiledSubAgent] = []
+            for child in prepared.children:
+                child_graph = self._compile_prepared(child)
+                child_declaration = child.declaration
+                if child_declaration is None:
+                    raise TypeError("compiled child declaration is unresolved")
+                description = _system_prompt(child.runtime_inputs).strip()
+                if not description:
+                    raise TypeError("compiled child description is unresolved")
+                compiled_children.append(
+                    {
+                        "name": child_declaration.package_name,
+                        "description": description,
+                        "runnable": child_graph,
+                    }
+                )
+            declared_child_tool = (
+                build_declared_child_task_tool(
+                    backend=package_backend,
+                    compiled_children=tuple(compiled_children),
+                    declarations=resolved.subagents,
+                    session=session_snapshot,
+                )
+                if compiled_children
+                else None
+            )
             guard = KiteframeGuardMiddleware(
                 session=session_snapshot,
                 admitted_tools=capability_tools,
                 clock=_SystemClock(),
+                declared_child_tool=declared_child_tool,
             )
             system_prompt = _system_prompt(runtime_inputs)
             skills = package_backend.skill_sources(resolved.skills)
             model_symbol = _primary_model_symbol(runtime_inputs)
+            public_tools = (
+                (*capability_tools, declared_child_tool.tool)
+                if declared_child_tool is not None
+                else capability_tools
+            )
         except KiteframeDiagnosticError:
             raise
         except Exception:
@@ -178,7 +376,7 @@ class DeepAgentsAdapter:
         try:
             graph = create_deep_agent(
                 model=components.primary_model,
-                tools=capability_tools,
+                tools=public_tools,
                 system_prompt=system_prompt,
                 middleware=(*components.middleware, guard),
                 subagents=None,
