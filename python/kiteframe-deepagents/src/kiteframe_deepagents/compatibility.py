@@ -85,6 +85,14 @@ def bootstrap_deepagents_deployment(
 ) -> KiteframeHarnessProfileToken:
     """Install one deny-only profile and bind its token before registry freeze."""
 
+    provider, separator, model_name = model_key.partition(":")
+    if (
+        separator != ":"
+        or not provider
+        or not model_name
+        or ":" in model_name
+    ):
+        raise ValueError("model_key must use the exact provider:model form")
     verify_compatibility()
     expected = KiteframeHarnessProfileToken(
         model_key=model_key,

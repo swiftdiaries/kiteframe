@@ -8,15 +8,23 @@ from .compatibility import (
     deny_only_profile,
     verify_compatibility,
 )
-from .components import DurableCheckpointer, ValidatedComponents
-from .context import KiteframeSessionContext
+from .components import (
+    AuditSink,
+    CheckpointerProtocol,
+    DurableCheckpointer,
+    ValidatedComponents,
+)
+from .context import KiteframeSessionContext, KiteframeTraceContext
 
 __all__ = [
+    "AuditSink",
+    "CheckpointerProtocol",
     "DENY_ONLY_PROFILE",
     "DeepAgentsCompatibility",
     "DurableCheckpointer",
     "KiteframeSessionContext",
     "KiteframeHarnessProfileToken",
+    "KiteframeTraceContext",
     "ValidatedComponents",
     "bootstrap_deepagents_deployment",
     "deny_only_profile",

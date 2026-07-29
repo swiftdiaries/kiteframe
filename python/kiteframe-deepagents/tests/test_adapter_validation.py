@@ -4,10 +4,13 @@ import builtins
 import hashlib
 import json
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from deepagents import create_deep_agent
+from deepagents.backends import StateBackend
 from kiteframe import (
     ComponentKind,
     ComponentRegistry,
@@ -18,12 +21,15 @@ from kiteframe import (
 )
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.store.memory import InMemoryStore
+from pydantic import Field
 
 from kiteframe_deepagents.adapter import DeepAgentsAdapter
 from kiteframe_deepagents.compatibility import (
     AMBIENT_TOOL_NAMES,
     KiteframeHarnessProfileToken,
+    bootstrap_deepagents_deployment,
 )
 from kiteframe_deepagents.components import (
     DurableCheckpointer,
@@ -38,6 +44,7 @@ from kiteframe_deepagents.target import (
 WORKSPACE = Path(__file__).resolve().parents[3]
 MODEL_SYMBOL = "models.anthropic.sonnet"
 MODEL_KEY = "kiteframe-test:adapter"
+MODEL_IDENTIFIER = "adapter"
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -50,7 +57,39 @@ def canonical_bytes(value: object) -> bytes:
 
 
 class AdapterTestModel(FakeMessagesListChatModel):
-    model_name: str = MODEL_KEY
+    model_name: str = MODEL_IDENTIFIER
+    tool_requests: list[tuple[str, ...]] = Field(default_factory=list)
+
+    def _get_ls_params(
+        self,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del stop, kwargs
+        return {
+            "ls_provider": "kiteframe-test",
+            "ls_model_name": self.model_name,
+            "ls_model_type": "chat",
+        }
+
+    def bind_tools(
+        self,
+        tools: Sequence[Any],
+        **kwargs: Any,
+    ) -> AdapterTestModel:
+        del kwargs
+        self.tool_requests.append(tuple(tool.name for tool in tools))
+        return self
+
+
+class AmbiguousTestModel(AdapterTestModel):
+    def _get_ls_params(
+        self,
+        stop: list[str] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del stop, kwargs
+        return {}
 
 
 class FirstMiddleware(AgentMiddleware):
@@ -73,6 +112,25 @@ class TestDurableCheckpointer:
 
     async def aget_tuple(self, config: object) -> None:
         del config
+
+
+class TestCapabilityInvoker:
+    async def invoke(self, request: object) -> object:
+        return request
+
+    async def status(
+        self,
+        request: object,
+        invocation: object,
+        requirement: object,
+    ) -> object:
+        del invocation, requirement
+        return request
+
+
+class TestAuditSink:
+    async def append(self, record: object) -> object:
+        return record
 
 
 @pytest.fixture
@@ -149,6 +207,78 @@ spec:
     )
 
 
+@pytest.fixture
+def backend_inputs(tmp_path: Path) -> ResolvedRuntimeInputs:
+    source = WORKSPACE / "tests/fixtures/packages/support-agent"
+    package = tmp_path / "support-agent"
+    shutil.copytree(source, package)
+    (package / "bindings/deepagents.yaml").write_text(
+        """\
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: deepagents }
+spec:
+  models: { primary: models.anthropic.sonnet }
+  components:
+    backend: backends.workspace
+    harnessProfile: profiles.deepagents
+  capabilityProvider: capability-providers.primary
+  auditSink: audit-sinks.ledger
+"""
+    )
+    return resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        WORKSPACE / "tests/fixtures/components/deepagents-test.json",
+    )
+
+
+@pytest.fixture
+def checkpointed_inputs(tmp_path: Path) -> ResolvedRuntimeInputs:
+    source = WORKSPACE / "tests/fixtures/packages/support-agent"
+    package = tmp_path / "support-agent"
+    shutil.copytree(source, package)
+    (package / "bindings/deepagents.yaml").write_text(
+        """\
+apiVersion: kiteframe.dev/binding/v1alpha1
+kind: RuntimeBinding
+metadata: { runtime: deepagents }
+spec:
+  models: { primary: models.anthropic.sonnet }
+  components:
+    checkpointer: checkpointers.durable
+    harnessProfile: profiles.deepagents
+  capabilityProvider: capability-providers.primary
+  auditSink: audit-sinks.ledger
+"""
+    )
+    return resolve_package(
+        package,
+        package / "bindings/deepagents.yaml",
+        WORKSPACE / "tests/fixtures/components/deepagents-test.json",
+    )
+
+
+@pytest.fixture
+def content_capture_inputs(tmp_path: Path) -> ResolvedRuntimeInputs:
+    source = WORKSPACE / "tests/fixtures/packages/support-agent-runtime-inputs"
+    package = tmp_path / "support-agent-runtime-inputs"
+    shutil.copytree(source, package)
+    binding = package / "bindings/deepagents.yaml"
+    binding.write_text(
+        binding.read_text().replace(
+            "  capabilityProvider:",
+            "  components: { harnessProfile: profiles.deepagents }\n"
+            "  capabilityProvider:",
+        )
+    )
+    return resolve_package(
+        package,
+        binding,
+        WORKSPACE / "tests/fixtures/components/deepagents-test.json",
+    )
+
+
 def profile_token(model_key: str = MODEL_KEY) -> KiteframeHarnessProfileToken:
     return KiteframeHarnessProfileToken(
         model_key=model_key,
@@ -162,7 +292,12 @@ def registry_for(
     inputs: ResolvedRuntimeInputs,
     *,
     include_model: bool = True,
+    model: object | None = None,
+    backend: object | None = None,
     checkpointer: object | None = None,
+    store: object | None = None,
+    capability_provider: object | None = None,
+    audit_sink: object | None = None,
     profile: KiteframeHarnessProfileToken | None = None,
 ) -> FrozenComponentRegistry:
     registry = ComponentRegistry()
@@ -172,24 +307,37 @@ def registry_for(
         registry.register(
             ComponentKind.MODEL,
             MODEL_SYMBOL,
-            AdapterTestModel(responses=[AIMessage(content="done")]),
+            model or AdapterTestModel(responses=[AIMessage(content="done")]),
         )
     registry.register(
         ComponentKind.CAPABILITY_PROVIDER,
         inputs.runtime_binding.capability_provider,
-        object(),
+        capability_provider or TestCapabilityInvoker(),
     )
     registry.register(
         ComponentKind.AUDIT_SINK,
         inputs.runtime_binding.audit_sink,
-        object(),
+        audit_sink or TestAuditSink(),
     )
+    if inputs.runtime_binding.backend is not None:
+        registry.register(
+            ComponentKind.BACKEND,
+            inputs.runtime_binding.backend,
+            backend or StateBackend(),
+        )
     if inputs.runtime_binding.checkpointer is not None:
         assert checkpointer is not None
         registry.register(
             ComponentKind.CHECKPOINTER,
             inputs.runtime_binding.checkpointer,
             checkpointer,
+        )
+    capture = inputs.runtime_binding.content_capture
+    if capture is not None and capture.enabled:
+        registry.register(
+            ComponentKind.ENCRYPTED_CONTENT_STORE,
+            capture.encrypted_content_store,
+            store or InMemoryStore(),
         )
     registry.register(
         ComponentKind.HARNESS_PROFILE,
@@ -265,6 +413,150 @@ def test_suspendable_capability_requires_durable_checkpointer(
     assert "durable checkpointer" in str(error.value)
 
 
+def test_configured_checkpointer_is_retained_without_suspension(
+    adapter: DeepAgentsAdapter,
+    checkpointed_inputs: ResolvedRuntimeInputs,
+) -> None:
+    checkpointer = EphemeralCheckpointer()
+
+    components = adapter.validate(
+        checkpointed_inputs,
+        registry_for(checkpointed_inputs, checkpointer=checkpointer),
+    )
+
+    assert components.checkpointer is checkpointer
+
+
+def test_enabled_content_capture_retains_validated_store(
+    adapter: DeepAgentsAdapter,
+    content_capture_inputs: ResolvedRuntimeInputs,
+) -> None:
+    store = InMemoryStore()
+
+    components = adapter.validate(
+        content_capture_inputs,
+        registry_for(content_capture_inputs, store=store),
+    )
+
+    assert components.store is store
+
+
+@pytest.mark.parametrize(
+    ("inputs_fixture", "invalid_component"),
+    [
+        ("backend_inputs", "backend"),
+        ("checkpointed_inputs", "checkpointer"),
+        ("runtime_inputs", "capability_provider"),
+        ("runtime_inputs", "audit_sink"),
+    ],
+)
+def test_runtime_component_types_fail_closed_before_constructor(
+    request: pytest.FixtureRequest,
+    adapter: DeepAgentsAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+    inputs_fixture: str,
+    invalid_component: str,
+) -> None:
+    inputs = request.getfixturevalue(inputs_fixture)
+    called = False
+
+    def forbidden_constructor(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        del args, kwargs
+        called = True
+
+    monkeypatch.setattr(
+        "kiteframe_deepagents.compatibility.create_deep_agent",
+        forbidden_constructor,
+    )
+
+    if invalid_component == "backend":
+        registry = registry_for(inputs, backend=object())
+    elif invalid_component == "checkpointer":
+        registry = registry_for(inputs, checkpointer=object())
+    elif invalid_component == "capability_provider":
+        registry = registry_for(inputs, capability_provider=object())
+    else:
+        registry = registry_for(inputs, audit_sink=object())
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        adapter.validate(inputs, registry)
+
+    assert error.value.code == "KF-RUNTIME-001"
+    assert called is False
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["target", "feature", "exact-kind", "type"],
+)
+def test_preconstruction_fail_closed_matrix_never_calls_constructor(
+    failure: str,
+    tmp_path: Path,
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def forbidden_constructor(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        del args, kwargs
+        called = True
+
+    monkeypatch.setattr(
+        "kiteframe_deepagents.compatibility.create_deep_agent",
+        forbidden_constructor,
+    )
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        if failure == "type":
+            adapter.validate(
+                runtime_inputs,
+                registry_for(runtime_inputs, capability_provider=object()),
+            )
+        else:
+            source = (
+                WORKSPACE
+                / (
+                    "python/kiteframe-deepagents/tests/fixtures/"
+                    "unsupported-feature-agent"
+                    if failure == "feature"
+                    else "tests/fixtures/packages/support-agent"
+                )
+            )
+            package = tmp_path / source.name
+            shutil.copytree(source, package)
+            binding = package / "bindings/deepagents.yaml"
+            target_data = json.loads(
+                (
+                    WORKSPACE
+                    / "tests/fixtures/components/deepagents-test.json"
+                ).read_bytes()
+            )
+            if failure == "target":
+                binding.write_text(
+                    binding.read_text().replace(
+                        "runtime: deepagents",
+                        "runtime: unsupported",
+                    )
+                )
+                target_data["target"] = "unsupported"
+            elif failure == "feature":
+                target_data["components"][MODEL_SYMBOL]["features"] = [
+                    "kiteframe.runtime.review-unsupported@1"
+                ]
+            else:
+                target_data["components"][MODEL_SYMBOL]["kind"] = "audit_sink"
+            target = tmp_path / f"{failure}-target.json"
+            target.write_bytes(canonical_bytes(target_data))
+            inputs = resolve_package(package, binding, target)
+            adapter.validate(inputs, registry_for(inputs))
+
+    assert error.value.code == "KF-RUNTIME-001"
+    assert called is False
+
+
 def test_validation_returns_components_in_binding_order(
     adapter: DeepAgentsAdapter,
     tmp_path: Path,
@@ -306,9 +598,9 @@ spec:
     model = AdapterTestModel(responses=[AIMessage(content="done")])
     first = FirstMiddleware()
     second = SecondMiddleware()
-    backend = object()
-    provider = object()
-    audit_sink = object()
+    backend = StateBackend()
+    provider = TestCapabilityInvoker()
+    audit_sink = TestAuditSink()
     registry.register(ComponentKind.MODEL, MODEL_SYMBOL, model)
     registry.register(
         ComponentKind.MIDDLEWARE,
@@ -362,6 +654,46 @@ def test_profile_token_must_attest_the_resolved_model_key(
     assert "harness profile" in str(error.value)
 
 
+def test_validated_bare_model_uses_attested_provider_qualified_profile(
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+) -> None:
+    bootstrap_deepagents_deployment(
+        ComponentRegistry(),
+        model_key=MODEL_KEY,
+        profile_symbol="profiles.bootstrap-only",
+    )
+    components = adapter.validate(runtime_inputs, registry_for(runtime_inputs))
+    model = components.primary_model
+    assert isinstance(model, AdapterTestModel)
+
+    graph = create_deep_agent(model=model, subagents=[])
+    graph.invoke({"messages": [HumanMessage(content="hello")]})
+
+    assert AMBIENT_TOOL_NAMES.isdisjoint(model.tool_requests[0])
+    assert "task" not in model.tool_requests[0]
+
+
+def test_bare_model_without_runtime_provider_is_rejected(
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+) -> None:
+    model = AmbiguousTestModel(responses=[AIMessage(content="done")])
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        adapter.validate(
+            runtime_inputs,
+            registry_for(
+                runtime_inputs,
+                model=model,
+                profile=profile_token(MODEL_IDENTIFIER),
+            ),
+        )
+
+    assert error.value.code == "KF-RUNTIME-001"
+    assert "stable model provider" in str(error.value)
+
+
 def test_validation_is_resolution_only(
     adapter: DeepAgentsAdapter,
     runtime_inputs: ResolvedRuntimeInputs,
@@ -385,5 +717,5 @@ def test_validation_is_resolution_only(
     components = adapter.validate(runtime_inputs, registry)
 
     assert isinstance(components.primary_model, AdapterTestModel)
-    assert components.primary_model.model_name == MODEL_KEY
+    assert components.primary_model.model_name == MODEL_IDENTIFIER
     assert isinstance(TestDurableCheckpointer(), DurableCheckpointer)

@@ -166,6 +166,26 @@ def test_bootstrap_is_idempotent_without_replacing_the_static_profile(
     assert registrations == [(model_key, DENY_ONLY_PROFILE)]
 
 
+def test_bootstrap_rejects_ambiguous_bare_profile_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registrations: list[tuple[str, object]] = []
+    monkeypatch.setattr(
+        compatibility,
+        "register_harness_profile",
+        lambda key, profile: registrations.append((key, profile)),
+    )
+
+    with pytest.raises(ValueError, match="provider:model"):
+        bootstrap_deepagents_deployment(
+            ComponentRegistry(),
+            model_key="bare-model",
+            profile_symbol="profiles.deepagents",
+        )
+
+    assert registrations == []
+
+
 def test_registered_deny_only_profile_exposes_no_ambient_or_task_tools() -> None:
     model = registered_model()
     graph = create_deep_agent(model=model, subagents=[])

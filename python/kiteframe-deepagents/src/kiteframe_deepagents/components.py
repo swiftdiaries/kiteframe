@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
@@ -14,6 +15,7 @@ from kiteframe import (
     KiteframeDiagnosticError,
     ResolvedRuntimeInputs,
 )
+from kiteframe.provider import CapabilityInvoker
 from kiteframe.registry import ComponentUnresolvedError
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models import BaseChatModel
@@ -31,15 +33,27 @@ RUNTIME_COMPONENT_UNRESOLVED = "KF-RUNTIME-001"
 
 
 @runtime_checkable
-class DurableCheckpointer(Protocol):
-    """The minimum restart-safe checkpointer attestation used by Kiteframe."""
-
-    kiteframe_durable: Literal[True]
+class CheckpointerProtocol(Protocol):
+    """The public async operation required from a configured checkpointer."""
 
     async def aget_tuple(
         self,
         config: RunnableConfig,
     ) -> CheckpointTuple | None: ...
+
+
+@runtime_checkable
+class DurableCheckpointer(CheckpointerProtocol, Protocol):
+    """The additional restart-safe attestation required for suspension."""
+
+    kiteframe_durable: Literal[True]
+
+
+@runtime_checkable
+class AuditSink(Protocol):
+    """Deployment-owned append-only audit boundary."""
+
+    async def append(self, record: object) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,11 +62,11 @@ class ValidatedComponents:
 
     models: tuple[tuple[str, BaseChatModel], ...]
     middleware: tuple[AgentMiddleware, ...]
-    package_backend: BackendProtocol | object | None
-    checkpointer: DurableCheckpointer | None
+    package_backend: BackendProtocol | None
+    checkpointer: CheckpointerProtocol | None
     store: BaseStore | None
-    capability_provider: object
-    audit_sink: object
+    capability_provider: CapabilityInvoker
+    audit_sink: AuditSink
     harness_profile: KiteframeHarnessProfileToken
     compilation_report: CompilationReport
 
@@ -123,10 +137,39 @@ def _resolve(
 
 
 def _model_key(model: BaseChatModel) -> str:
-    value = getattr(model, "model_name", None)
-    if not isinstance(value, str) or not value:
+    identifier = getattr(model, "model_name", None) or getattr(
+        model,
+        "model",
+        None,
+    )
+    if not isinstance(identifier, str) or not identifier:
         raise _runtime_error("model component has no stable model key")
-    return value
+    if ":" in identifier:
+        provider, separator, model_name = identifier.partition(":")
+        if (
+            separator != ":"
+            or not provider
+            or not model_name
+            or ":" in model_name
+        ):
+            raise _runtime_error("model component has an ambiguous model key")
+        return identifier
+
+    lookup = getattr(model, "_get_ls_params", None)
+    if not callable(lookup):
+        raise _runtime_error("model component has no stable model provider")
+    try:
+        parameters = lookup()
+    except (AttributeError, TypeError, NotImplementedError) as error:
+        raise _runtime_error(
+            "model component has no stable model provider"
+        ) from error
+    if not isinstance(parameters, Mapping):
+        raise _runtime_error("model component has no stable model provider")
+    provider = parameters.get("ls_provider")
+    if not isinstance(provider, str) or not provider or ":" in provider:
+        raise _runtime_error("model component has no stable model provider")
+    return f"{provider}:{identifier}"
 
 
 def _requires_durable_checkpoint(inputs: ResolvedRuntimeInputs) -> bool:
@@ -161,12 +204,15 @@ def validate_components(
             raise _runtime_error("middleware component has an invalid public type")
         middleware.append(component)
 
-    package_backend: object | None = None
+    package_backend: BackendProtocol | None = None
     if binding.backend is not None:
         _require_descriptor(descriptors, binding.backend, ComponentKind.BACKEND)
-        package_backend = _resolve(registry, ComponentKind.BACKEND, binding.backend)
+        candidate = _resolve(registry, ComponentKind.BACKEND, binding.backend)
+        if not isinstance(candidate, BackendProtocol):
+            raise _runtime_error("backend component has an invalid public type")
+        package_backend = candidate
 
-    checkpointer: DurableCheckpointer | None = None
+    checkpointer: CheckpointerProtocol | None = None
     checkpointer_descriptor: object | None = None
     if binding.checkpointer is not None:
         checkpointer_descriptor = _require_descriptor(
@@ -179,10 +225,11 @@ def validate_components(
             ComponentKind.CHECKPOINTER,
             binding.checkpointer,
         )
-        if isinstance(candidate, DurableCheckpointer) and (
-            candidate.kiteframe_durable is True
-        ):
-            checkpointer = candidate
+        if not isinstance(candidate, CheckpointerProtocol):
+            raise _runtime_error(
+                "checkpointer component has an invalid public type"
+            )
+        checkpointer = candidate
 
     requires_durable = _requires_durable_checkpoint(inputs)
     descriptor_is_durable = (
@@ -190,7 +237,10 @@ def validate_components(
         and getattr(checkpointer_descriptor, "durable", False) is True
     )
     if requires_durable and (
-        checkpointer is None or not descriptor_is_durable
+        checkpointer is None
+        or not isinstance(checkpointer, DurableCheckpointer)
+        or checkpointer.kiteframe_durable is not True
+        or not descriptor_is_durable
     ):
         raise _runtime_error(
             "suspendable capability requires a durable checkpointer"
@@ -224,6 +274,10 @@ def validate_components(
         ComponentKind.CAPABILITY_PROVIDER,
         binding.capability_provider,
     )
+    if not isinstance(capability_provider, CapabilityInvoker):
+        raise _runtime_error(
+            "capability provider component has an invalid public type"
+        )
     _require_descriptor(
         descriptors,
         binding.audit_sink,
@@ -234,6 +288,8 @@ def validate_components(
         ComponentKind.AUDIT_SINK,
         binding.audit_sink,
     )
+    if not isinstance(audit_sink, AuditSink):
+        raise _runtime_error("audit sink component has an invalid public type")
 
     profile_symbol = binding.harness_profile
     if profile_symbol is None:
@@ -280,6 +336,8 @@ def validate_components(
 
 
 __all__ = [
+    "AuditSink",
+    "CheckpointerProtocol",
     "DurableCheckpointer",
     "ValidatedComponents",
     "validate_components",
