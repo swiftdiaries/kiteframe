@@ -11,9 +11,11 @@ from kiteframe._native import (
     load_capability_catalog,
     load_capability_grant_set,
     load_catalog_request,
+    load_effect_proposal,
     load_invocation_outcome,
     load_invocation_request,
     load_invocation_status,
+    load_status_request,
 )
 
 VALID_TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -171,6 +173,32 @@ def valid_invocation_json() -> bytes:
             "traceContext": {"traceparent": VALID_TRACEPARENT},
         }
     )
+
+
+@pytest.fixture
+def service_goldens() -> list[tuple[Callable[[bytes], Any], bytes]]:
+    profile_path = (
+        Path(__file__).parent
+        / "fixtures/conformance/crankshaft-wfm-profile.json"
+    )
+    profile = json.loads(profile_path.read_bytes())
+    return [
+        (load_admission_request, canonical_bytes(profile["admissionRequest"])),
+        (load_capability_grant_set, canonical_bytes(profile["grantSet"])),
+        (load_invocation_request, canonical_bytes(profile["invocationRequest"])),
+        (load_status_request, canonical_bytes(profile["statusRequest"])),
+        (load_effect_proposal, canonical_bytes(profile["effectProposal"])),
+        (load_invocation_outcome, canonical_bytes(profile["suspendedOutcome"])),
+    ]
+
+
+def test_service_variants_round_trip_without_field_loss(
+    service_goldens: list[tuple[Callable[[bytes], Any], bytes]],
+) -> None:
+    for loader, payload in service_goldens:
+        value = loader(payload)
+        assert value.canonical_json() == payload
+        assert not hasattr(value, "__dict__")
 
 
 @pytest.mark.parametrize(

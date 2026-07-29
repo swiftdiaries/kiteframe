@@ -89,6 +89,7 @@ fn status_request_loader_and_projection_preserve_native_trace_context() {
 #[test]
 fn resolved_requirement_projection_exposes_exact_locked_semantics() {
     let descriptor = descriptor();
+    let expected_descriptor = canonical_json(&descriptor).unwrap();
     let requirement = ResolvedCapabilityRequirement::try_new(
         LockedCapability::try_new(
             descriptor.identity().clone(),
@@ -131,7 +132,32 @@ fn resolved_requirement_projection_exposes_exact_locked_semantics() {
                 expected
             );
         }
+        assert_eq!(
+            projected
+                .getattr(py, "descriptor")
+                .unwrap()
+                .call_method0(py, "canonical_json")
+                .unwrap()
+                .extract::<Vec<u8>>(py)
+                .unwrap(),
+            expected_descriptor
+        );
     });
+}
+
+#[test]
+fn invocation_projection_binds_admission_without_authority_material() {
+    let projected = PyInvocationRequest::from(invocation_request());
+    let wire: serde_json::Value =
+        serde_json::from_slice(&projected.canonical_json().unwrap()).unwrap();
+    let object = wire.as_object().unwrap();
+
+    assert_eq!(projected.admission_id(), "adm-1");
+    assert_eq!(projected.grant_digest(), "0a".repeat(32));
+    assert!(object.contains_key("admissionId"));
+    assert!(object.contains_key("grantDigest"));
+    assert!(!object.contains_key("authorityRevisions"));
+    assert!(!object.contains_key("policyRevision"));
 }
 
 #[test]

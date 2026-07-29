@@ -1,6 +1,6 @@
 use _native::{
-    ProviderResponseError, PyCapabilityCatalog, PyCapabilityGrantSet, PyCatalogFetchResult,
-    PyCatalogRequest, PyInvocationOutcome, PyInvocationStatus, load_capability_grant_set_inner,
+    ProviderResponseError, PyCapabilityGrantSet, PyCatalogFetchResult, PyCatalogRequest,
+    PyInvocationOutcome, PyInvocationStatus, load_capability_grant_set_inner,
     load_invocation_outcome_inner, load_invocation_status_inner,
 };
 use kiteframe_contract::{
@@ -14,7 +14,10 @@ use kiteframe_contract::{
     PolicyRevision, ProtectedEvidenceRequestRef, RequiredEvidence, RetryClass, SessionRef,
     Sha256Digest, StableCapabilityError, Suspension, TaskRef, Timestamp, TraceContext,
 };
-use pyo3::Python;
+use pyo3::{
+    Python,
+    types::{PyAnyMethods, PyTupleMethods},
+};
 
 #[test]
 fn grant_set_projection_exposes_only_stable_scalar_and_tuple_values() {

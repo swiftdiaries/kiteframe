@@ -9,8 +9,10 @@ permissions:
 
 jobs:
   wave-2:
-    name: Wave 2 and 3 gates
+    name: Wave 2 and 3R gates
     runs-on: ubuntu-latest
+    env:
+      PYO3_PYTHON: python
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -95,6 +97,16 @@ jobs:
       - name: Type-check Python package
         working-directory: python/kiteframe
         run: uv run --project . pyright
+
+      - name: Run Wave 3R no-loss and consumer gates
+        working-directory: python/kiteframe
+        run: >-
+          uv run --project . pytest -q
+          tests/test_native_golden.py
+          tests/test_service_round_trip.py
+          tests/test_wave4_consumer_gate.py
+          tests/test_wave5_consumer_gate.py
+          tests/conformance/test_crankshaft_profile.py
 
   fuzz:
     name: Strict YAML invariant and fuzz gates

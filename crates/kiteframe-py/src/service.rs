@@ -585,6 +585,14 @@ impl PyCapabilityDescriptor {
     pub fn consent(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         serialized_to_python(py, self.inner.consent())
     }
+
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.bytes",
+        imports = ("builtins",)
+    ))]
+    pub fn canonical_json(&self) -> PyResult<Vec<u8>> {
+        canonical_json(self.inner.as_ref()).map_err(|diagnostic| diagnostic_error(vec![diagnostic]))
+    }
 }
 
 #[gen_stub_pyclass]

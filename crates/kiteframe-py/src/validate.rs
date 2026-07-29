@@ -202,6 +202,7 @@ fn single_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::resolve_package_inner;
+    use kiteframe_contract::{ModelRole, RegistrySymbol};
     use std::path::PathBuf;
 
     #[test]
@@ -225,7 +226,7 @@ mod tests {
                 .runtime_binding
                 .spec
                 .models
-                .get("primary")
+                .get(&ModelRole::new("primary").unwrap())
                 .expect("primary binding model")
                 .as_str(),
             "models.anthropic.sonnet"
@@ -233,13 +234,17 @@ mod tests {
         assert!(
             inputs
                 .target_components
-                .contains_key("models.anthropic.sonnet")
+                .contains_key(&RegistrySymbol::new("models.anthropic.sonnet").unwrap())
         );
         assert!(
             inputs
                 .target_components
-                .contains_key("capability-providers.primary")
+                .contains_key(&RegistrySymbol::new("capability-providers.primary").unwrap())
         );
-        assert!(inputs.target_components.contains_key("audit-sinks.ledger"));
+        assert!(
+            inputs
+                .target_components
+                .contains_key(&RegistrySymbol::new("audit-sinks.ledger").unwrap())
+        );
     }
 }

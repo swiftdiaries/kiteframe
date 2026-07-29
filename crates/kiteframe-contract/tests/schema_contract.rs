@@ -1,6 +1,8 @@
 use kiteframe_contract::{
-    AgentManifest, CapabilityVersion, ContentCaptureRequirement, PackagePath, PackageVersion,
-    ResourceSelector, RuntimeBinding,
+    AdmissionRequest, AgentManifest, CapabilityCatalog, CapabilityGrantSet, CapabilityVersion,
+    CatalogRequest, ContentCaptureRequirement, EffectProposal, InvocationOutcome,
+    InvocationRequest, InvocationStatus, PackagePath, PackageVersion, ResolvedAgent,
+    ResourceSelector, RuntimeBinding, StatusRequest,
 };
 use schemars::JsonSchema;
 
@@ -128,6 +130,38 @@ fn binding_contains_symbols_but_no_executable_or_secret_fields() {
     assert!(!text.contains("endpoint"));
     assert!(!text.contains("capturedContent"));
     assert!(!text.contains("portableGrant"));
+}
+
+#[test]
+fn wave3r_portable_schemas_have_no_platform_or_deployment_specific_fields() {
+    let schemas = [
+        serde_json::to_value(schemars::schema_for!(ResolvedAgent)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(CatalogRequest)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(AdmissionRequest)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(InvocationRequest)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(StatusRequest)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(CapabilityCatalog)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(CapabilityGrantSet)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(EffectProposal)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(InvocationOutcome)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(InvocationStatus)).unwrap(),
+    ];
+
+    for schema in schemas {
+        let text = serde_json::to_string(&schema).unwrap().to_lowercase();
+        for forbidden in [
+            "crankshaft",
+            "openfga",
+            "credential",
+            "clientcertificate",
+            "providertuple",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "portable schema contains forbidden field family {forbidden}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -13,7 +13,14 @@
       }
     },
     "expiresAt": {
-      "$ref": "#/$defs/Timestamp"
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "identity": {
       "$ref": "#/$defs/CatalogIdentity"

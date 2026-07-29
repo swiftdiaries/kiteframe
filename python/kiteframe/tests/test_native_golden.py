@@ -16,10 +16,16 @@ from kiteframe._native import (
     load_invocation_status,
 )
 
+WORKSPACE = Path(__file__).resolve().parents[3]
+RESOLVED_GOLDEN = WORKSPACE / "tests/fixtures/resolved/support-agent.json"
+LOCK_GOLDEN = json.loads(
+    (WORKSPACE / "tests/fixtures/packages/support-agent/capability.lock").read_bytes()
+)
+
 
 @pytest.fixture
 def workspace() -> Path:
-    return Path(__file__).resolve().parents[3]
+    return WORKSPACE
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -105,6 +111,21 @@ def test_python_round_trip_preserves_exact_golden_bytes(workspace: Path) -> None
     expected = (workspace / "tests/fixtures/resolved/support-agent.json").read_bytes()
     resolved = load_resolved_agent(expected)
     assert resolved.canonical_json() == expected
+
+
+def test_locked_requirement_is_lossless_across_rust_and_python() -> None:
+    resolved = load_resolved_agent(RESOLVED_GOLDEN.read_bytes())
+    requirement = resolved.capability_requirements[0]
+    expected = LOCK_GOLDEN["capabilities"][0]
+
+    assert requirement.descriptor_digest == expected["descriptorDigest"]
+    assert requirement.input_schema_digest == expected["inputSchemaDigest"]
+    assert requirement.output_schema_digest == expected["outputSchemaDigest"]
+    assert requirement.stable_error_set_digest == expected["stableErrorSetDigest"]
+    assert requirement.safety_metadata_digest == expected["safetyMetadataDigest"]
+    assert requirement.descriptor.canonical_json() == canonical_bytes(
+        expected["descriptor"]
+    )
 
 
 def test_digest_tuple_matches_rust_fixture(workspace: Path) -> None:

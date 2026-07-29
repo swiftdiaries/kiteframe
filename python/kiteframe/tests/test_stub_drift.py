@@ -1,5 +1,7 @@
 import ast
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import kiteframe
@@ -14,6 +16,8 @@ def native_stub_path() -> Path:
 
 
 def test_generated_native_stub_has_no_drift() -> None:
+    environment = dict(os.environ)
+    environment["PYO3_PYTHON"] = sys.executable
     completed = subprocess.run(
         [
             "cargo",
@@ -27,6 +31,7 @@ def test_generated_native_stub_has_no_drift() -> None:
         cwd=workspace_root(),
         capture_output=True,
         check=False,
+        env=environment,
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
@@ -62,16 +67,32 @@ def test_rust_owned_stub_classes_are_read_only_and_nonconstructible() -> None:
 
     for name in [
         "AdmissionRequest",
+        "AuthorityRevision",
+        "AuthorityRevisionSet",
         "CapabilityCatalog",
-        "CapabilityGrant",
+        "CapabilityDenial",
+        "CapabilityDescriptor",
         "CapabilityGrantSet",
+        "CatalogFetchResult",
         "CatalogRequest",
+        "ComponentDescriptor",
+        "Diagnostic",
+        "EffectProposal",
+        "EffectiveCapabilityGrant",
         "InvocationRequest",
         "InvocationOutcome",
         "InvocationStatus",
         "ResolvedAgent",
         "ResolvedCapabilityRequirement",
+        "ResolvedModelRequirement",
+        "ResolvedRuntimeInputs",
         "ResolvedSubagent",
+        "ResolvedTextAsset",
+        "RuntimeBinding",
+        "RuntimeBindingContentCapture",
+        "StableCapabilityError",
+        "StatusRequest",
+        "Suspension",
     ]:
         methods = {
             node.name: node
@@ -89,7 +110,7 @@ def test_rust_owned_stub_classes_are_read_only_and_nonconstructible() -> None:
         assert all(
             any(
                 isinstance(decorator, ast.Name)
-                and decorator.id == "property"
+                and decorator.id in {"property", "staticmethod"}
                 for decorator in method.decorator_list
             )
             for method_name, method in methods.items()

@@ -23,25 +23,51 @@ fn frozen_projection_retains_validated_binding_target_and_component_values() {
     ))
     .expect("fixture IR validates");
 
-    let projection =
-        PyResolvedRuntimeInputs::new(resolved, binding, target.target, components.components);
-
-    assert_eq!(projection.runtime_target(), "deepagents");
-    assert_eq!(projection.runtime_binding().runtime(), "deepagents");
-    assert_eq!(
-        projection.runtime_binding().capability_provider(),
-        "capability-providers.primary"
-    );
-    assert_eq!(
-        projection.runtime_binding().audit_sink(),
-        "audit-sinks.ledger"
-    );
     Python::attach(|py| {
-        let components = projection
-            .target_components(py)
-            .expect("component projections build");
+        let projection = Py::new(
+            py,
+            PyResolvedRuntimeInputs::new(resolved, binding, target.target, components.components),
+        )
+        .expect("runtime inputs project");
+        let projection = projection.bind(py);
+        assert_eq!(
+            projection
+                .getattr("runtime_target")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "deepagents"
+        );
+        let binding = projection.getattr("runtime_binding").unwrap();
+        assert_eq!(
+            binding
+                .getattr("runtime")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "deepagents"
+        );
+        assert_eq!(
+            binding
+                .getattr("capability_provider")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "capability-providers.primary"
+        );
+        assert_eq!(
+            binding
+                .getattr("audit_sink")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "audit-sinks.ledger"
+        );
+        let components = projection.getattr("target_components").unwrap();
         let symbols = components
-            .iter()
+            .try_iter()
+            .unwrap()
+            .map(Result::unwrap)
             .map(|component| {
                 component
                     .getattr("symbol")

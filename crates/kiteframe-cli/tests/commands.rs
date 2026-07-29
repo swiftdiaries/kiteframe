@@ -472,8 +472,8 @@ fn human_explain_renders_every_safe_resolution_section_to_stderr() {
     let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
     for expected in [
         "package: support-agent 0.1.0",
-        "portable digest: 00165f500c6d060e774df30b153642d302ea478fe7b751e2a003a67ff3ac4977",
-        "lock digest: 4a1f12410089007ca5ef1613faad7f5a5b3cf8921fef5cd0a71e75fa3982916e",
+        "portable digest: 8e4bc069211c846d023c8b40abb3f13adc0b359b08017679b8a15e0d5bfd529d",
+        "lock digest: fd6c9979ae1e30f4f5e0943c22f7eabea447bf92673b93486c4af404fea0e099",
         "capabilities:",
         "cases.read@1.2.0 (required)",
         "models:",
