@@ -6,7 +6,7 @@ mod service;
 mod validate;
 
 use error::KiteframeDiagnosticError;
-use ir::{PyResolvedAgent, PyResolvedCapabilityRequirement, PyResolvedSubagent};
+pub use ir::{PyResolvedAgent, PyResolvedCapabilityRequirement, PyResolvedSubagent};
 use pyo3::prelude::*;
 use pyo3_stub_gen::{StubGenConfig, StubInfo};
 pub use service::{

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use _native::{
     ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCatalogRequest,
-    PyInvocationRequest, load_capability_catalog_inner,
+    PyInvocationRequest, PyResolvedAgent, load_capability_catalog_inner,
     load_capability_grant_set_for_request_inner, load_catalog_request_inner,
     load_invocation_outcome_for_request_inner, load_invocation_request_inner,
     load_invocation_status_for_invocation_id_inner,
@@ -15,8 +15,8 @@ use kiteframe_contract::{
     ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
     EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId, InvocationOutcome,
     InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet, NormalizedResourceSelector,
-    PolicyRevision, RequestedCapability, ResolvedCapabilityRequirement, ResourceSelectorSchema,
-    SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+    PolicyRevision, RequestedCapability, ResolvedAgent, ResolvedCapabilityRequirement,
+    ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::prelude::*;
@@ -91,6 +91,22 @@ fn resolved_requirement_projection_exposes_exact_locked_semantics() {
     assert_eq!(projected.output_schema_digest(), "05".repeat(32));
     assert_eq!(projected.stable_error_set_digest(), "06".repeat(32));
     assert_eq!(projected.safety_metadata_digest(), "07".repeat(32));
+}
+
+#[test]
+fn resolved_agent_projection_exposes_verified_catalog_correlation() {
+    let resolved: ResolvedAgent = serde_json::from_slice(include_bytes!(
+        "../../../tests/fixtures/resolved/support-agent.json"
+    ))
+    .unwrap();
+    let projected = PyResolvedAgent::from(resolved);
+
+    assert_eq!(projected.catalog_name(), "support");
+    assert_eq!(projected.catalog_revision(), "v1");
+    assert_eq!(
+        projected.catalog_digest(),
+        "6710f3261083b4b1a2c202e185b234bb1d58ed479962995fa3613422b503894b"
+    );
 }
 
 #[test]
