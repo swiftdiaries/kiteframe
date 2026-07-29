@@ -75,7 +75,26 @@ def valid_grant_json() -> bytes:
             }
         ],
         "issuedAt": 100,
-        "optionalDenials": [],
+        "optionalDenials": [
+            {
+                "capability": {
+                    "name": "notes.read",
+                    "version": "1.0.0",
+                },
+                "diagnostic": {
+                    "category": "authorization",
+                    "code": "KF-AUTH-001",
+                    "details": {},
+                    "help": None,
+                    "message": "optional capability denied",
+                    "package_path": None,
+                    "retry": "never",
+                    "severity": "warning",
+                    "source_range": None,
+                    "stage": "admit",
+                },
+            }
+        ],
         "policyRevision": "policy:7",
         "session": "session:1",
         "task": "task:triage",
@@ -215,6 +234,16 @@ def test_python_cannot_mutate_grant_then_reserialize() -> None:
     assert len(revisions.authority_revision_digest) == 64
     with pytest.raises(AttributeError):
         revisions.entries += ()  # type: ignore[misc]
+
+    denial = grant.optional_denials[0]
+    assert (denial.name, denial.version) == ("notes.read", "1.0.0")
+    assert denial.diagnostic.code == "KF-AUTH-001"
+    assert denial.diagnostic.category == "authorization"
+    assert denial.diagnostic.severity == "warning"
+    assert denial.diagnostic.stage == "admit"
+    assert denial.diagnostic.retry == "never"
+    assert denial.diagnostic.message == "optional capability denied"
+    assert denial.diagnostic.details == ()
 
 
 @pytest.mark.parametrize(

@@ -11,10 +11,10 @@ use kiteframe_contract::{
     ConsentRequirement, DelegationAncestry, Diagnostic, DiagnosticCategory, DiagnosticCode,
     DiagnosticSeverity, DiagnosticStage, EffectClassification, EffectiveCapabilityGrant,
     EffectiveCapabilityGrantParts, EvidenceRequirement, ExecutionMode, FreshnessRequirement,
-    IdempotencyRequirement, InvocationId, InvocationRequest, LockedCapability, NonEmptySet,
-    NormalizedResourceSelector, PreconditionDescriptor, PreconditionKind, RequestedCapability,
-    RequiredEvidence, ResolvedCapabilityRequirement, ResourceSelectorSchema, RetryClass,
-    SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+    IdempotencyRequirement, InvocationId, InvocationOutcome, InvocationRequest, LockedCapability,
+    NonEmptySet, NormalizedResourceSelector, PreconditionDescriptor, PreconditionKind,
+    RequestedCapability, RequiredEvidence, ResolvedCapabilityRequirement, ResourceSelectorSchema,
+    RetryClass, SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
 };
 use serde_json::json;
 
@@ -181,25 +181,54 @@ fn authority_revisions_are_canonical_and_reject_duplicate_sources() {
 
 #[test]
 fn invocation_requires_exact_admitted_grant_digest_and_never_carries_authority_revisions() {
-    let request = InvocationRequest::try_new(
-        InvocationId::new("inv-1").unwrap(),
-        AdmissionId::new("adm-1").unwrap(),
-        digest(77),
-        required_identity(),
-        "tenant:t1/case:case-1",
-        json!({}),
-        BTreeMap::new(),
-        None,
-        Default::default(),
-        trace_context(),
-    )
-    .unwrap();
+    let request = invocation_request(digest(77));
     assert_eq!(request.grant_digest(), &digest(77));
 
     let wire = serde_json::to_value(request).unwrap();
     assert!(wire.get("admissionId").is_some());
     assert!(wire.get("grantDigest").is_some());
     assert!(wire.get("authorityRevisions").is_none());
+}
+
+#[test]
+fn changed_grant_digest_fails_before_descriptor_and_result_validation() {
+    let admission = admission_request();
+    let grant_set = CapabilityGrantSet::try_new(grant_set_parts(&admission)).unwrap();
+    let request = invocation_request(digest(99));
+    let invalid_for_request = optional_descriptor();
+    let invalid_result = InvocationOutcome::Succeeded {
+        invocation_id: request.invocation_id().clone(),
+        result: json!("not-an-object"),
+    };
+
+    let diagnostic = invalid_result
+        .validate_against_admission(&request, &grant_set, &invalid_for_request)
+        .unwrap_err();
+
+    assert_eq!(diagnostic.code.as_str(), "KF-CAP-002");
+    assert_eq!(
+        diagnostic.message.as_str(),
+        "invocation admission correlation does not match its capability grant set"
+    );
+
+    let valid_request = invocation_request(*grant_set.grant_digest());
+    assert!(
+        valid_request
+            .validate_admission_correlation(&grant_set)
+            .is_ok()
+    );
+    let wrong_admission = invocation_request_with(
+        AdmissionId::new("adm-other").unwrap(),
+        *grant_set.grant_digest(),
+    );
+    assert_eq!(
+        wrong_admission
+            .validate_admission_correlation(&grant_set)
+            .unwrap_err()
+            .code
+            .as_str(),
+        "KF-CAP-002"
+    );
 }
 
 #[test]
@@ -223,6 +252,29 @@ fn assert_invalid(response: CapabilityGrantSet, request: &AdmissionRequest) {
             .as_str(),
         "KF-CAP-002"
     );
+}
+
+fn invocation_request(grant_digest: Sha256Digest) -> InvocationRequest {
+    invocation_request_with(AdmissionId::new("adm-1").unwrap(), grant_digest)
+}
+
+fn invocation_request_with(
+    admission_id: AdmissionId,
+    grant_digest: Sha256Digest,
+) -> InvocationRequest {
+    InvocationRequest::try_new(
+        InvocationId::new("inv-1").unwrap(),
+        admission_id,
+        grant_digest,
+        required_identity(),
+        "tenant:t1/case:case-1",
+        json!({}),
+        BTreeMap::new(),
+        None,
+        Default::default(),
+        trace_context(),
+    )
+    .unwrap()
 }
 
 fn admission_request() -> AdmissionRequest {

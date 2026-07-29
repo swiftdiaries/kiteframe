@@ -1392,6 +1392,31 @@ impl InvocationRequest {
         Ok(())
     }
 
+    pub fn validate_admission_correlation(
+        &self,
+        grant_set: &CapabilityGrantSet,
+    ) -> Result<(), Diagnostic> {
+        if self.admission_id != grant_set.admission_id
+            || self.grant_digest != grant_set.grant_digest
+        {
+            return Err(result_invalid(
+                DiagnosticStage::Invoke,
+                "invocation admission correlation does not match its capability grant set",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_admission(
+        &self,
+        grant_set: &CapabilityGrantSet,
+        descriptor: &CapabilityDescriptor,
+    ) -> Result<(), Vec<Diagnostic>> {
+        self.validate_admission_correlation(grant_set)
+            .map_err(|diagnostic| vec![diagnostic])?;
+        self.validate_against(descriptor)
+    }
+
     pub fn invocation_id(&self) -> &InvocationId {
         &self.invocation_id
     }
@@ -1647,6 +1672,16 @@ impl InvocationOutcome {
             }
         }
     }
+
+    pub fn validate_against_admission(
+        &self,
+        request: &InvocationRequest,
+        grant_set: &CapabilityGrantSet,
+        descriptor: &CapabilityDescriptor,
+    ) -> Result<(), Diagnostic> {
+        request.validate_admission_correlation(grant_set)?;
+        self.validate_against(request, descriptor)
+    }
 }
 
 impl<'de> Deserialize<'de> for InvocationOutcome {
@@ -1794,6 +1829,16 @@ impl InvocationStatus {
                 })
             }
         }
+    }
+
+    pub fn validate_against_admission(
+        &self,
+        request: &InvocationRequest,
+        grant_set: &CapabilityGrantSet,
+        descriptor: &CapabilityDescriptor,
+    ) -> Result<(), Diagnostic> {
+        request.validate_admission_correlation(grant_set)?;
+        self.validate_against(request, descriptor)
     }
 
     pub fn validate_for_invocation_id(

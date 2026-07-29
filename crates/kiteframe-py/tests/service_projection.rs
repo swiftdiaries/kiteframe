@@ -4,13 +4,13 @@ use _native::{
 };
 use kiteframe_contract::{
     ActorRef, AdmissionId, AgentRef, ApprovalRequirement, AuthorityRevision, AuthorityRevisionSet,
-    CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, CapabilityName,
-    CapabilityReleaseVersion, CatalogIdentity, ConfirmationRequirement, ConsentRequirement,
-    Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage, EffectClassification,
-    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, ExecutionMode, InvocationId,
-    InvocationOutcome, InvocationStatus, NonEmptySet, NormalizedResourceSelector, PolicyRevision,
-    RequiredEvidence, RetryClass, SessionRef, Sha256Digest, StableCapabilityError, Suspension,
-    TaskRef, Timestamp,
+    CapabilityDenial, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
+    CapabilityName, CapabilityReleaseVersion, CatalogIdentity, ConfirmationRequirement,
+    ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity,
+    DiagnosticStage, EffectClassification, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts,
+    ExecutionMode, InvocationId, InvocationOutcome, InvocationStatus, NonEmptySet,
+    NormalizedResourceSelector, PolicyRevision, RequiredEvidence, RetryClass, SessionRef,
+    Sha256Digest, StableCapabilityError, Suspension, TaskRef, Timestamp,
 };
 use pyo3::Python;
 
@@ -37,6 +37,49 @@ fn grant_set_projection_exposes_only_stable_scalar_and_tuple_values() {
             .windows(b"cases.comment".len())
             .any(|window| window == b"cases.comment")
     );
+    Python::attach(|py| {
+        let denials = projection.optional_denials(py).unwrap();
+        assert_eq!(denials.len(), 1);
+        let denial = denials.get_item(0).unwrap();
+        assert_eq!(
+            denial.getattr("name").unwrap().extract::<String>().unwrap(),
+            "notes.read"
+        );
+        let diagnostic = denial.getattr("diagnostic").unwrap();
+        assert_eq!(
+            diagnostic
+                .getattr("code")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "KF-AUTH-001"
+        );
+        assert_eq!(
+            diagnostic
+                .getattr("category")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "authorization"
+        );
+        assert_eq!(
+            diagnostic
+                .getattr("severity")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "warning"
+        );
+        assert_eq!(
+            diagnostic
+                .getattr("message")
+                .unwrap()
+                .extract::<String>()
+                .unwrap(),
+            "optional capability denied"
+        );
+        assert_eq!(diagnostic.getattr("details").unwrap().len().unwrap(), 0);
+    });
 }
 
 #[test]
@@ -190,7 +233,28 @@ fn grant_set() -> CapabilityGrantSet {
             })
             .unwrap(),
         ],
-        optional_denials: Vec::new(),
+        optional_denials: vec![
+            CapabilityDenial::try_new(
+                CapabilityIdentity::try_new(
+                    CapabilityName::new("notes.read").unwrap(),
+                    CapabilityReleaseVersion::new("1.0.0").unwrap(),
+                )
+                .unwrap(),
+                Diagnostic {
+                    code: DiagnosticCode::AdmissionDenied,
+                    category: DiagnosticCategory::Authorization,
+                    severity: DiagnosticSeverity::Warning,
+                    stage: DiagnosticStage::Admit,
+                    package_path: None,
+                    source_range: None,
+                    message: "optional capability denied".into(),
+                    help: None,
+                    retry: RetryClass::Never,
+                    details: Default::default(),
+                },
+            )
+            .unwrap(),
+        ],
     })
     .unwrap()
 }
