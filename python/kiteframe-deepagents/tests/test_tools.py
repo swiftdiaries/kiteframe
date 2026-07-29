@@ -609,6 +609,26 @@ def session() -> KiteframeSessionContext:
     )
 
 
+class SessionContextSubclass(KiteframeSessionContext):
+    pass
+
+
+def subclassed_session(
+    source: KiteframeSessionContext,
+) -> SessionContextSubclass:
+    return SessionContextSubclass(
+        actor=source.actor,
+        session=source.session,
+        task=source.task,
+        admission_id=source.admission_id,
+        grant_digest=source.grant_digest,
+        grants=source.grants,
+        authority_revisions=source.authority_revisions,
+        trace_context=source.trace_context,
+        suspension=source.suspension,
+    )
+
+
 @pytest.fixture
 def events() -> list[str]:
     return []
@@ -648,6 +668,27 @@ def tools(
         checkpoint_store=checkpoint_store,
         suspension_bridge=suspension_bridge,
     )
+
+
+def test_capability_tool_builder_rejects_session_subclasses(
+    read_requirement: ResolvedCapabilityRequirement,
+    write_requirement: ResolvedCapabilityRequirement,
+    native_grants: tuple[EffectiveCapabilityGrant, ...],
+    session: KiteframeSessionContext,
+    fake_invoker: FakeInvoker,
+    checkpoint_store: FakeCheckpointStore,
+    suspension_bridge: FakeSuspensionBridge,
+) -> None:
+    with pytest.raises(TypeError, match="exact KiteframeSessionContext"):
+        build_capability_tools(
+            (read_requirement, write_requirement),
+            native_grants,
+            grant_digest=session.grant_digest,
+            invoker=fake_invoker,
+            session=subclassed_session(session),
+            checkpoint_store=checkpoint_store,
+            suspension_bridge=suspension_bridge,
+        )
 
 
 @pytest.fixture

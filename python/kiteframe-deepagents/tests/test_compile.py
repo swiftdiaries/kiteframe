@@ -153,6 +153,39 @@ class TestAuditSink:
         return record
 
 
+class ChangingSessionContext(KiteframeSessionContext):
+    """Adversarial subclass whose authority changes between property reads."""
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "grant_digest":
+            reads = object.__getattribute__(self, "__dict__").get(
+                "_grant_reads",
+                0,
+            )
+            object.__getattribute__(self, "__dict__")["_grant_reads"] = (
+                reads + 1
+            )
+            if reads % 2:
+                return "ff" * 32
+        return super().__getattribute__(name)
+
+
+def changing_session_context(
+    source: KiteframeSessionContext,
+) -> ChangingSessionContext:
+    return ChangingSessionContext(
+        actor=source.actor,
+        session=source.session,
+        task=source.task,
+        admission_id=source.admission_id,
+        grant_digest=source.grant_digest,
+        grants=source.grants,
+        authority_revisions=source.authority_revisions,
+        trace_context=source.trace_context,
+        suspension=source.suspension,
+    )
+
+
 @pytest.fixture
 def adapter() -> DeepAgentsAdapter:
     return DeepAgentsAdapter()
@@ -241,6 +274,74 @@ spec:
   auditSink: audit-sinks.ledger
 """
     )
+    return resolve_package(
+        package,
+        binding,
+        WORKSPACE / "tests/fixtures/components/deepagents-test.json",
+    )
+
+
+@pytest.fixture
+def child_inputs(tmp_path: Path) -> ResolvedRuntimeInputs:
+    source = WORKSPACE / "tests/fixtures/packages/support-agent"
+    package = tmp_path / "child-agent"
+    shutil.copytree(source, package)
+    (package / "agent.yaml").write_text(
+        """\
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: support-agent, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  models:
+    primary: { capabilities: [text, tool-calling] }
+  capabilities:
+    - { name: cases.read, version: "^1.0", required: true, resources: [tenant:support] }
+  delegation:
+    - agent: agents/case-child/agent.yaml
+      capabilities: [cases.read]
+"""
+    )
+    child = package / "agents/case-child"
+    (child / "prompts").mkdir(parents=True)
+    (child / "agent.yaml").write_text(
+        """\
+apiVersion: kiteframe.dev/v1alpha1
+kind: Agent
+metadata: { name: case-child, version: 0.1.0 }
+spec:
+  prompt: { system: prompts/system.md }
+  models:
+    primary: { capabilities: [text] }
+  capabilities:
+    - { name: cases.read, version: "^1.0", required: true, resources: [tenant:support] }
+"""
+    )
+    (child / "prompts/system.md").write_text(
+        "Read support cases safely.\n"
+    )
+    lock_path = package / "capability.lock"
+    lock = json.loads(lock_path.read_bytes())
+    lock["packagePortableDigest"] = (
+        "c9d348731150757463bb3f7926f0016a"
+        "ded8141a9ea3d4a95897fb939a703025"
+    )
+    lock["lockDigest"] = (
+        "b1d0fbd64d25b0abc323185027e2bdef"
+        "e4bbcca88ca1594fa52bae01f89d0a81"
+    )
+    lock_path.write_bytes(canonical_bytes(lock))
+    child_lock = dict(lock)
+    child_lock["packagePortableDigest"] = (
+        "506a229f8ddf397c0caa044b0fce344e"
+        "a0e92214b69e6ff209d17b5e1f73b069"
+    )
+    child_lock["lockDigest"] = (
+        "4545be62393b2d55e643202f61f2b6f5"
+        "8c9ae62752855db3974dea4ad587ebc1"
+    )
+    (child / "capability.lock").write_bytes(canonical_bytes(child_lock))
+    binding = package / "bindings/deepagents.yaml"
     return resolve_package(
         package,
         binding,
@@ -370,6 +471,80 @@ def test_constructor_receives_only_resolved_and_registered_values(
     assert isinstance(kwargs["middleware"][-1], KiteframeGuardMiddleware)
     assert isinstance(kwargs["middleware"][0], TenantMiddleware)
     assert kwargs["middleware"][-1].admitted_tools == kwargs["tools"]
+
+
+def test_compile_snapshots_the_exact_immutable_session(
+    monkeypatch: pytest.MonkeyPatch,
+    compiled_graph: CompiledStateGraph,
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+) -> None:
+    original = session_context(with_case_grant=True)
+    create_spy = Mock(return_value=compiled_graph)
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+
+    adapter.compile(
+        runtime_inputs,
+        frozen_registry(runtime_inputs),
+        original,
+    )
+
+    kwargs = create_spy.call_args.kwargs
+    guard = kwargs["middleware"][-1]
+    assert type(guard.session) is KiteframeSessionContext
+    assert guard.session is not original
+    assert guard.session.grant_digest == original.grant_digest
+    assert guard.session.grants is not original.grants
+    assert kwargs["tools"][0].session is guard.session
+
+    object.__setattr__(original, "grant_digest", "ff" * 32)
+    object.__setattr__(original.trace_context, "traceparent", "00-mutated")
+    assert guard.session.grant_digest != original.grant_digest
+    assert guard.session.trace_context.traceparent != "00-mutated"
+
+
+def test_session_subclass_is_rejected_before_public_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    compiled_graph: CompiledStateGraph,
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+) -> None:
+    create_spy = Mock(return_value=compiled_graph)
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+    forged = changing_session_context(
+        session_context(with_case_grant=True)
+    )
+    assert forged.grant_digest != forged.grant_digest
+
+    with pytest.raises(TypeError, match="exact KiteframeSessionContext"):
+        adapter.compile(
+            runtime_inputs,
+            frozen_registry(runtime_inputs),
+            forged,
+        )
+
+    create_spy.assert_not_called()
+
+
+def test_declared_children_fail_before_public_construction(
+    monkeypatch: pytest.MonkeyPatch,
+    compiled_graph: CompiledStateGraph,
+    adapter: DeepAgentsAdapter,
+    child_inputs: ResolvedRuntimeInputs,
+) -> None:
+    create_spy = Mock(return_value=compiled_graph)
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        adapter.compile(
+            child_inputs,
+            frozen_registry(child_inputs),
+            session_context(with_case_grant=False),
+        )
+
+    assert error.value.code == "KF-RUNTIME-001"
+    assert "declared child" in str(error.value)
+    create_spy.assert_not_called()
 
 
 def test_validated_skills_are_exposed_only_by_the_virtual_package_backend(

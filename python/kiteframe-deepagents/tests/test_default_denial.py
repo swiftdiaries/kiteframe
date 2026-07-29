@@ -240,6 +240,26 @@ def session_context(*, revision: str = "7") -> KiteframeSessionContext:
     )
 
 
+class SessionContextSubclass(KiteframeSessionContext):
+    pass
+
+
+def subclassed_session(
+    source: KiteframeSessionContext,
+) -> SessionContextSubclass:
+    return SessionContextSubclass(
+        actor=source.actor,
+        session=source.session,
+        task=source.task,
+        admission_id=source.admission_id,
+        grant_digest=source.grant_digest,
+        grants=source.grants,
+        authority_revisions=source.authority_revisions,
+        trace_context=source.trace_context,
+        suspension=source.suspension,
+    )
+
+
 class FakeInvoker:
     async def invoke(self, request: InvocationRequest) -> InvocationOutcome:
         raise AssertionError(f"unexpected provider invocation: {request}")
@@ -571,6 +591,32 @@ def test_atomic_authority_replacement_rejects_session_identity_change(
 
     with pytest.raises(ValueError, match="identity"):
         middleware.with_authority(next_session, (next_tool,))
+
+
+def test_guard_and_authority_replacement_reject_session_subclasses(
+    middleware: KiteframeGuardMiddleware,
+) -> None:
+    forged_initial = subclassed_session(session_context())
+    with pytest.raises(TypeError, match="exact KiteframeSessionContext"):
+        replace(middleware, session=forged_initial)
+
+    next_session = session_context(revision="8")
+    next_tool = build_tool(next_session, FakeInvoker())
+    with pytest.raises(TypeError, match="exact KiteframeSessionContext"):
+        middleware.with_authority(
+            subclassed_session(next_session),
+            (next_tool,),
+        )
+
+
+def test_declared_child_builder_rejects_session_subclasses() -> None:
+    with pytest.raises(TypeError, match="exact KiteframeSessionContext"):
+        build_declared_child_task_tool(
+            backend=StateBackend(),
+            compiled_children=compiled_children(),
+            declarations=child_declarations(),
+            session=subclassed_session(session_context()),
+        )
 
 
 def test_atomic_authority_replacement_rejects_stale_tools(

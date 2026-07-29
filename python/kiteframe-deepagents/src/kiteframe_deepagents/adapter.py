@@ -23,7 +23,7 @@ from .components import (
     build_package_backend,
     validate_components,
 )
-from .context import KiteframeSessionContext
+from .context import KiteframeSessionContext, _snapshot_session_context
 from .middleware import KiteframeGuardMiddleware
 from .target import SUPPORTED_FEATURES, TARGET
 from .tools import (
@@ -118,9 +118,8 @@ class DeepAgentsAdapter:
     ) -> CompiledStateGraph:
         """Compile one closed runtime snapshot through the public constructor."""
 
+        session_snapshot = _snapshot_session_context(session)
         components = self.validate(runtime_inputs, registry)
-        if not isinstance(session, KiteframeSessionContext):
-            raise TypeError("session must be KiteframeSessionContext")
 
         resolved = runtime_inputs.resolved_agent
         if resolved.subagents:
@@ -156,15 +155,15 @@ class DeepAgentsAdapter:
             )
             capability_tools = build_capability_tools(
                 resolved.capability_requirements,
-                session.grants,
-                grant_digest=session.grant_digest,
+                session_snapshot.grants,
+                grant_digest=session_snapshot.grant_digest,
                 invoker=components.capability_provider,
-                session=session,
+                session=session_snapshot,
                 checkpoint_store=checkpoint_store,
                 suspension_bridge=suspension_bridge,
             )
             guard = KiteframeGuardMiddleware(
-                session=session,
+                session=session_snapshot,
                 admitted_tools=capability_tools,
                 clock=_SystemClock(),
             )

@@ -198,8 +198,8 @@ def build_native_invocation_request(
         )
     if not isinstance(grant, EffectiveCapabilityGrant):
         raise TypeError("grant must be native EffectiveCapabilityGrant")
-    if not isinstance(session, KiteframeSessionContext):
-        raise TypeError("session must be KiteframeSessionContext")
+    if type(session) is not KiteframeSessionContext:
+        raise TypeError("session must be exact KiteframeSessionContext")
     if (requirement.name, requirement.version) != (
         grant.name,
         grant.version,
@@ -494,8 +494,8 @@ def build_capability_tools(
         raise TypeError(
             "grants must be a tuple of native EffectiveCapabilityGrant"
         )
-    if not isinstance(session, KiteframeSessionContext):
-        raise TypeError("session must be KiteframeSessionContext")
+    if type(session) is not KiteframeSessionContext:
+        raise TypeError("session must be exact KiteframeSessionContext")
     if grant_digest != session.grant_digest:
         raise ValueError("grant digest does not match the session")
     if sorted(_grant_projection(grant) for grant in grants) != sorted(

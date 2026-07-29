@@ -282,8 +282,8 @@ def _declared_child_binding_boundary() -> tuple[
             raise TypeError("backend must implement BackendProtocol")
         _validate_compiled_children(compiled_children)
         _validate_child_declarations(declarations)
-        if not isinstance(session, KiteframeSessionContext):
-            raise TypeError("session must be KiteframeSessionContext")
+        if type(session) is not KiteframeSessionContext:
+            raise TypeError("session must be exact KiteframeSessionContext")
         compiled_child_names = tuple(
             child["name"] for child in compiled_children
         )
@@ -381,8 +381,8 @@ class KiteframeGuardMiddleware(AgentMiddleware):
     tools: Sequence[BaseTool] = field(default=(), init=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.session, KiteframeSessionContext):
-            raise TypeError("session must be KiteframeSessionContext")
+        if type(self.session) is not KiteframeSessionContext:
+            raise TypeError("session must be exact KiteframeSessionContext")
         if not isinstance(self.admitted_tools, tuple) or not all(
             isinstance(tool, CapabilityTool) for tool in self.admitted_tools
         ):
@@ -432,8 +432,8 @@ class KiteframeGuardMiddleware(AgentMiddleware):
     ) -> KiteframeGuardMiddleware:
         """Atomically replace one complete session and its rebuilt tools."""
 
-        if not isinstance(session, KiteframeSessionContext):
-            raise TypeError("session must be KiteframeSessionContext")
+        if type(session) is not KiteframeSessionContext:
+            raise TypeError("session must be exact KiteframeSessionContext")
         if (
             session.actor != self.session.actor
             or session.session != self.session.session
@@ -489,7 +489,7 @@ class KiteframeGuardMiddleware(AgentMiddleware):
         except Exception:
             raise _policy_stale() from None
         if (
-            not isinstance(current, KiteframeSessionContext)
+            type(current) is not KiteframeSessionContext
             or current.actor != self.session.actor
             or current.session != self.session.session
             or current.task != self.session.task
