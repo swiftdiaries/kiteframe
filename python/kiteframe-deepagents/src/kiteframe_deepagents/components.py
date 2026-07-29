@@ -3,16 +3,30 @@
 from __future__ import annotations
 
 import json
+import posixpath
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Literal, Protocol, runtime_checkable
 
-from deepagents.backends import BackendProtocol
+from deepagents.backends import BackendProtocol, StateBackend
+from deepagents.backends.protocol import (
+    EditResult,
+    FileDownloadResponse,
+    FileInfo,
+    FileUploadResponse,
+    GlobResult,
+    GrepResult,
+    LsResult,
+    ReadResult,
+    WriteResult,
+)
 from kiteframe import (
     CompilationReport,
     ComponentKind,
     FrozenComponentRegistry,
     KiteframeDiagnosticError,
     ResolvedRuntimeInputs,
+    ResolvedTextAsset,
 )
 from kiteframe.provider import CapabilityInvoker
 from kiteframe.registry import ComponentUnresolvedError
@@ -28,6 +42,8 @@ from .compatibility import (
 )
 
 RUNTIME_COMPONENT_UNRESOLVED = "KF-RUNTIME-001"
+RUNTIME_CONSTRUCTION_FAILED = "KF-RUNTIME-002"
+PACKAGE_PREFIX = "/__kiteframe__"
 
 
 @runtime_checkable
@@ -52,6 +68,188 @@ class AuditSink(Protocol):
     """Deployment-owned append-only audit boundary."""
 
     async def append(self, record: object) -> object: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedPackageBackend(BackendProtocol):
+    """Read-only validated package assets over a deployment runtime backend."""
+
+    runtime_backend: BackendProtocol
+    _assets: tuple[tuple[str, str], ...]
+    _skill_assets: tuple[tuple[str, str], ...]
+    _skill_sources: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.runtime_backend, BackendProtocol):
+            raise TypeError("runtime_backend must implement BackendProtocol")
+        paths = tuple(path for path, _text in self._assets)
+        if len(paths) != len(set(paths)):
+            raise ValueError("validated package asset paths must be unique")
+        if any(
+            not path.startswith(f"{PACKAGE_PREFIX}/")
+            for path in paths
+        ):
+            raise ValueError("validated package assets must use virtual paths")
+
+    def skill_sources(
+        self,
+        skills: tuple[ResolvedTextAsset, ...],
+    ) -> list[str]:
+        """Return virtual sources only for the exact validated skill snapshot."""
+
+        if tuple((asset.path, asset.text) for asset in skills) != (
+            self._skill_assets
+        ):
+            raise ValueError("skill assets do not match the validated snapshot")
+        return list(self._skill_sources)
+
+    @staticmethod
+    def _is_package_path(path: str) -> bool:
+        normalized = posixpath.normpath(f"/{path.lstrip('/')}")
+        return normalized == PACKAGE_PREFIX or normalized.startswith(
+            f"{PACKAGE_PREFIX}/"
+        )
+
+    def _content(self, path: str) -> str | None:
+        return next(
+            (content for candidate, content in self._assets if candidate == path),
+            None,
+        )
+
+    def ls(self, path: str) -> LsResult:
+        if not self._is_package_path(path):
+            return self.runtime_backend.ls(path)
+        normalized = path.rstrip("/")
+        prefix = f"{normalized}/"
+        entries: dict[str, FileInfo] = {}
+        for asset_path, content in self._assets:
+            if not asset_path.startswith(prefix):
+                continue
+            relative = asset_path[len(prefix) :]
+            if "/" in relative:
+                directory = relative.split("/", maxsplit=1)[0]
+                entry_path = f"{prefix}{directory}/"
+                entries[entry_path] = FileInfo(
+                    path=entry_path,
+                    is_dir=True,
+                    size=0,
+                    modified_at="",
+                )
+            elif relative:
+                entries[asset_path] = FileInfo(
+                    path=asset_path,
+                    is_dir=False,
+                    size=len(content.encode()),
+                    modified_at="",
+                )
+        return LsResult(
+            entries=[entries[key] for key in sorted(entries)]
+        )
+
+    def read(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> ReadResult:
+        if not self._is_package_path(file_path):
+            return self.runtime_backend.read(file_path, offset, limit)
+        content = self._content(file_path)
+        if content is None:
+            return ReadResult(error="file_not_found")
+        lines = content.splitlines(keepends=True)
+        sliced = "".join(lines[offset : offset + limit])
+        return ReadResult(
+            file_data={"content": sliced, "encoding": "utf-8"}
+        )
+
+    def grep(
+        self,
+        pattern: str,
+        path: str | None = None,
+        glob: str | None = None,
+    ) -> GrepResult:
+        if path is not None and self._is_package_path(path):
+            del pattern, glob
+            return GrepResult(error="permission_denied")
+        return self.runtime_backend.grep(pattern, path, glob)
+
+    def glob(
+        self,
+        pattern: str,
+        path: str | None = None,
+    ) -> GlobResult:
+        if path is not None and self._is_package_path(path):
+            del pattern
+            return GlobResult(error="permission_denied")
+        return self.runtime_backend.glob(pattern, path)
+
+    def write(self, file_path: str, content: str) -> WriteResult:
+        if self._is_package_path(file_path):
+            del content
+            return WriteResult(error="permission_denied")
+        return self.runtime_backend.write(file_path, content)
+
+    def edit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> EditResult:
+        if self._is_package_path(file_path):
+            del old_string, new_string, replace_all
+            return EditResult(error="permission_denied")
+        return self.runtime_backend.edit(
+            file_path,
+            old_string,
+            new_string,
+            replace_all,
+        )
+
+    def upload_files(
+        self,
+        files: list[tuple[str, bytes]],
+    ) -> list[FileUploadResponse]:
+        responses: list[FileUploadResponse] = []
+        for path, content in files:
+            if self._is_package_path(path):
+                responses.append(
+                    FileUploadResponse(path=path, error="permission_denied")
+                )
+            else:
+                responses.extend(
+                    self.runtime_backend.upload_files([(path, content)])
+                )
+        return responses
+
+    def download_files(
+        self,
+        paths: list[str],
+    ) -> list[FileDownloadResponse]:
+        responses: list[FileDownloadResponse] = []
+        for path in paths:
+            if not self._is_package_path(path):
+                responses.extend(self.runtime_backend.download_files([path]))
+                continue
+            content = self._content(path)
+            if content is None:
+                responses.append(
+                    FileDownloadResponse(
+                        path=path,
+                        content=None,
+                        error="file_not_found",
+                    )
+                )
+            else:
+                responses.append(
+                    FileDownloadResponse(
+                        path=path,
+                        content=content.encode(),
+                        error=None,
+                    )
+                )
+        return responses
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +302,90 @@ def _runtime_error(message: str) -> KiteframeDiagnosticError:
         ).encode(),
     )
     return error
+
+
+def _construction_error(
+    component_symbol: str,
+    exception_class: str,
+) -> KiteframeDiagnosticError:
+    message = (
+        f"component {component_symbol} construction failed "
+        f"({exception_class})"
+    )
+    error = KiteframeDiagnosticError(message)
+    setattr(error, "code", RUNTIME_CONSTRUCTION_FAILED)  # noqa: B010
+    setattr(  # noqa: B010
+        error,
+        "diagnostics_json",
+        json.dumps(
+            [
+                {
+                    "category": "runtime",
+                    "code": RUNTIME_CONSTRUCTION_FAILED,
+                    "details": {
+                        "component": component_symbol,
+                        "exceptionClass": exception_class,
+                    },
+                    "help": None,
+                    "message": message,
+                    "package_path": None,
+                    "retry": "never",
+                    "severity": "error",
+                    "source_range": None,
+                    "stage": "compile",
+                }
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode(),
+    )
+    return error
+
+
+def build_package_backend(
+    prompts: tuple[ResolvedTextAsset, ...],
+    skills: tuple[ResolvedTextAsset, ...],
+    runtime_backend: BackendProtocol | None,
+) -> ValidatedPackageBackend:
+    """Build a closed virtual view from native validated text assets."""
+
+    if not isinstance(prompts, tuple) or not all(
+        isinstance(asset, ResolvedTextAsset) for asset in prompts
+    ):
+        raise TypeError("prompts must be native ResolvedTextAsset values")
+    if not isinstance(skills, tuple) or not all(
+        isinstance(asset, ResolvedTextAsset) for asset in skills
+    ):
+        raise TypeError("skills must be native ResolvedTextAsset values")
+
+    assets: list[tuple[str, str]] = [
+        (f"{PACKAGE_PREFIX}/{asset.path}", asset.text) for asset in prompts
+    ]
+    skill_sources: list[str] = []
+    skill_names: set[str] = set()
+    for asset in skills:
+        path = PurePosixPath(asset.path)
+        skill_name = path.parent.name if path.name == "SKILL.md" else path.stem
+        if not skill_name or skill_name in skill_names:
+            raise ValueError("validated skill names must be unique")
+        skill_names.add(skill_name)
+        source = f"{PACKAGE_PREFIX}/skills/{skill_name}"
+        skill_sources.append(source)
+        assets.append(
+            (f"{source}/{skill_name}/SKILL.md", asset.text)
+        )
+
+    return ValidatedPackageBackend(
+        runtime_backend=(
+            runtime_backend
+            if runtime_backend is not None
+            else StateBackend()
+        ),
+        _assets=tuple(assets),
+        _skill_assets=tuple((asset.path, asset.text) for asset in skills),
+        _skill_sources=tuple(skill_sources),
+    )
 
 
 def _target_descriptors(
@@ -318,6 +600,8 @@ __all__ = [
     "AuditSink",
     "CheckpointerProtocol",
     "DurableCheckpointer",
+    "ValidatedPackageBackend",
     "ValidatedComponents",
+    "build_package_backend",
     "validate_components",
 ]
