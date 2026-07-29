@@ -1,0 +1,33 @@
+{
+  "createDeepAgentParameters": [
+    "model",
+    "tools",
+    "system_prompt",
+    "middleware",
+    "subagents",
+    "skills",
+    "memory",
+    "permissions",
+    "backend",
+    "interrupt_on",
+    "response_format",
+    "state_schema",
+    "context_schema",
+    "checkpointer",
+    "store",
+    "debug",
+    "name",
+    "cache"
+  ],
+  "deepagentsVersion": "0.6.12",
+  "supportedFeatures": [
+    "kiteframe.capability.deferred@1",
+    "kiteframe.capability.dynamic-visibility@1",
+    "kiteframe.capability.point-of-use-auth@1",
+    "kiteframe.capability.suspendable@1",
+    "kiteframe.delegation.narrowing@1",
+    "kiteframe.runtime.deepagents.public-create@1"
+  ],
+  "target": "deepagents",
+  "upstreamCommit": "196a0870fcf8a7f29d1fb37886dd323b190f9c16"
+}
