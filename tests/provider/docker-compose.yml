@@ -1,0 +1,26 @@
+services:
+  provider:
+    image: "${KITEFRAME_PROVIDER_IMAGE:-kiteframe-provider:test}"
+    command:
+      - "--bind"
+      - "0.0.0.0:8443"
+      - "--certificate"
+      - "/run/kiteframe/tls/certificate.pem"
+      - "--private-key"
+      - "/run/kiteframe/tls/private-key.pem"
+    ports:
+      - "127.0.0.1:18443:8443"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./fixtures:/run/kiteframe/tls:ro
+    healthcheck:
+      test:
+        - CMD
+        - test
+        - -r
+        - /run/kiteframe/tls/certificate.pem
+      interval: 2s
+      timeout: 1s
+      retries: 10

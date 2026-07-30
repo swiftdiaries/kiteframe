@@ -40,6 +40,19 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --all-features
 
+      - name: Test authenticated provider HTTP profile
+        run: cargo test -p kiteframe-provider-http --test http_profile
+
+      - name: Check server authority boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -R -E 'ProviderAuthenticator|CatalogFetchResult' \
+            crates/kiteframe-provider-http/src; then
+            echo "client authentication or catalog-fetch authority leaked into the server" >&2
+            exit 1
+          fi
+
       - name: Check generated schemas
         run: cargo run -p kiteframe-schema -- --check schemas/v1alpha1
 

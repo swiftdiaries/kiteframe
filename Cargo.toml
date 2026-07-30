@@ -7,6 +7,7 @@ members = [
     "crates/kiteframe-openfga",
     "crates/kiteframe-audit",
     "crates/kiteframe-provider",
+    "crates/kiteframe-provider-http",
     "crates/kiteframe-provider-sqlite",
     "crates/kiteframe-py",
     "crates/kiteframe-resolver",
