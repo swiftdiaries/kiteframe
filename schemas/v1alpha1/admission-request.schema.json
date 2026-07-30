@@ -24,6 +24,9 @@
     "delegationAncestry": {
       "$ref": "#/$defs/DelegationAncestry"
     },
+    "delegationAncestryDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
     "lockDigest": {
       "$ref": "#/$defs/Sha256Digest"
     },
@@ -79,6 +82,7 @@
     "optionalCapabilities",
     "resolvedRequirements",
     "delegationAncestry",
+    "delegationAncestryDigest",
     "contextualFacts",
     "traceContext",
     "requestDigest"
@@ -327,9 +331,33 @@
     "DelegationAncestry": {
       "type": "array",
       "items": {
-        "type": "string"
+        "$ref": "#/$defs/DelegationEdge"
       },
       "uniqueItems": true
+    },
+    "DelegationEdge": {
+      "type": "object",
+      "properties": {
+        "childAgent": {
+          "type": "string"
+        },
+        "delegatedCapabilities": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapabilityName"
+          },
+          "uniqueItems": true
+        },
+        "parentAgent": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "parentAgent",
+        "childAgent",
+        "delegatedCapabilities"
+      ]
     },
     "EffectClassification": {
       "type": "string",

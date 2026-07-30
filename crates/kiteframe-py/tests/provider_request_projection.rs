@@ -2,23 +2,24 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use _native::{
     ProviderResponseError, PyAdmissionRequest, PyCapabilityCatalog, PyCatalogRequest,
-    PyInvocationRequest, PyResolvedAgent, PyStatusRequest, load_capability_catalog_inner,
-    load_capability_grant_set_for_request_inner, load_catalog_request_inner,
-    load_invocation_outcome_for_request_inner, load_invocation_request_inner,
-    load_invocation_status_for_request_inner, load_status_request_inner,
+    PyDelegationEdge, PyInvocationRequest, PyResolvedAgent, PyStatusRequest,
+    load_capability_catalog_inner, load_capability_grant_set_for_request_inner,
+    load_catalog_request_inner, load_invocation_outcome_for_request_inner,
+    load_invocation_request_inner, load_invocation_status_for_request_inner,
+    load_status_request_inner,
 };
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
     AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog, CapabilityDescriptor,
     CapabilityDescriptorParts, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
     CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CatalogRequest, CheckpointRef,
-    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
-    EffectProposal, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceKind,
-    EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId, InvocationOutcome,
-    InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet, NormalizedResourceSelector,
-    PolicyRevision, ProtectedEvidenceRequestRef, RequestedCapability, RequiredEvidence,
-    ResolvedAgent, ResolvedCapabilityRequirement, ResourceSelectorSchema, SessionRef, Sha256Digest,
-    StatusRequest, Suspension, TaskRef, Timestamp, TraceContext,
+    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, DelegationEdge,
+    EffectClassification, EffectProposal, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts,
+    EvidenceKind, EvidenceReferences, ExecutionMode, IdempotencyRequirement, InvocationId,
+    InvocationOutcome, InvocationRequest, InvocationStatus, LockedCapability, NonEmptySet,
+    NormalizedResourceSelector, PolicyRevision, ProtectedEvidenceRequestRef, RequestedCapability,
+    RequiredEvidence, ResolvedAgent, ResolvedCapabilityRequirement, ResourceSelectorSchema,
+    SessionRef, Sha256Digest, StatusRequest, Suspension, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_core::canonical_json;
 use pyo3::prelude::*;
@@ -52,13 +53,20 @@ fn request_and_catalog_projections_expose_only_stable_values() {
     assert_eq!(catalog.name(), "provider.test");
     assert_eq!(catalog.revision(), "revision-1");
     Python::attach(|py| {
+        let edges = admission.delegation_ancestry(py).unwrap();
+        let edge = edges
+            .get_item(0)
+            .unwrap()
+            .extract::<PyRef<PyDelegationEdge>>()
+            .unwrap();
+        assert_eq!(edge.parent_agent(), "agent:root");
+        assert_eq!(edge.child_agent(), "agent:case-worker");
         assert_eq!(
-            admission
-                .delegation_ancestry(py)
+            edge.delegated_capabilities(py)
                 .unwrap()
                 .extract::<Vec<String>>()
                 .unwrap(),
-            vec![String::from("agent:root")]
+            vec![String::from("cases.comment")]
         );
         assert_eq!(
             admission
@@ -458,7 +466,12 @@ fn admission_request() -> AdmissionRequest {
         optional_capabilities: Vec::new(),
         resolved_requirements: vec![resolved_requirement()],
         delegation_ancestry: DelegationAncestry::try_new(vec![
-            AgentRef::new("agent:root").unwrap(),
+            DelegationEdge::try_new(
+                AgentRef::new("agent:root").unwrap(),
+                AgentRef::new("agent:case-worker").unwrap(),
+                vec![CapabilityName::new("cases.comment").unwrap()],
+            )
+            .unwrap(),
         ])
         .unwrap(),
         contextual_facts: BTreeMap::new(),
@@ -472,6 +485,7 @@ fn invocation_request() -> InvocationRequest {
         InvocationId::new("inv-1").unwrap(),
         AdmissionId::new("adm-1").unwrap(),
         Sha256Digest::from_bytes([10; Sha256Digest::BYTE_LENGTH]),
+        DelegationAncestry::default().digest().unwrap(),
         capability_identity(),
         "tenant:t1/case:case-1",
         json!({"caseId": "case-1"}),
@@ -502,6 +516,7 @@ fn grant_set_parts() -> CapabilityGrantSetParts {
     CapabilityGrantSetParts {
         admission_id: AdmissionId::new("adm-1").unwrap(),
         admission_request_digest: *request.request_digest(),
+        delegation_ancestry_digest: *request.delegation_ancestry_digest(),
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
         task: TaskRef::new("task:triage").unwrap(),

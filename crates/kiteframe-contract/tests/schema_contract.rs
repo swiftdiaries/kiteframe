@@ -2,7 +2,7 @@ use kiteframe_contract::{
     AdmissionRequest, AgentManifest, CapabilityCatalog, CapabilityGrantSet, CapabilityVersion,
     CatalogRequest, ComponentKind, ComponentMetadataCatalog, ContentCaptureRequirement,
     EffectProposal, InvocationOutcome, InvocationRequest, InvocationStatus, PackagePath,
-    PackageVersion, ResolvedAgent, ResourceSelector, RuntimeBinding, StatusRequest,
+    PackageVersion, RegistrySymbol, ResolvedAgent, ResourceSelector, RuntimeBinding, StatusRequest,
 };
 use schemars::JsonSchema;
 
@@ -133,7 +133,7 @@ fn binding_contains_symbols_but_no_executable_or_secret_fields() {
 }
 
 #[test]
-fn binding_and_target_retain_the_exact_harness_profile_symbol_and_kind() {
+fn binding_and_target_retain_runtime_guard_symbols_and_exact_kinds() {
     let binding = serde_yaml_ng::from_str::<RuntimeBinding>(
         r#"
 apiVersion: kiteframe.dev/binding/v1alpha1
@@ -141,7 +141,10 @@ kind: RuntimeBinding
 metadata: { runtime: deepagents }
 spec:
   models: { primary: models.anthropic.sonnet }
-  components: { harnessProfile: profiles.deepagents }
+  components:
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
+    harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
 "#,
@@ -157,21 +160,46 @@ spec:
             .as_str(),
         "profiles.deepagents"
     );
+    assert_eq!(
+        binding
+            .spec
+            .components
+            .authority_provider
+            .as_ref()
+            .expect("authority provider remains selected")
+            .as_str(),
+        "authority.current"
+    );
+    assert_eq!(
+        binding
+            .spec
+            .components
+            .admitted_tool_registry
+            .as_ref()
+            .expect("admitted tool registry remains selected")
+            .as_str(),
+        "admitted-tools.dynamic"
+    );
 
     let catalog = serde_json::from_value::<ComponentMetadataCatalog>(serde_json::json!({
         "target": "deepagents",
         "components": {
+            "admitted-tools.dynamic": {"kind": "admitted_tool_registry"},
+            "authority.current": {"kind": "authority_provider"},
             "profiles.deepagents": {"kind": "harness_profile"}
         }
     }))
-    .expect("harness profile metadata validates");
+    .expect("runtime guard metadata validates");
     assert_eq!(
-        catalog
-            .components
-            .values()
-            .next()
-            .expect("profile descriptor remains present")
-            .kind,
+        catalog.components[&RegistrySymbol::new("authority.current").unwrap()].kind,
+        ComponentKind::AuthorityProvider
+    );
+    assert_eq!(
+        catalog.components[&RegistrySymbol::new("admitted-tools.dynamic").unwrap()].kind,
+        ComponentKind::AdmittedToolRegistry
+    );
+    assert_eq!(
+        catalog.components[&RegistrySymbol::new("profiles.deepagents").unwrap()].kind,
         ComponentKind::HarnessProfile
     );
 }

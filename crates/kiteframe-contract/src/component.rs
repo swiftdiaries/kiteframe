@@ -25,6 +25,8 @@ pub enum ComponentKind {
     Middleware,
     Backend,
     Checkpointer,
+    AuthorityProvider,
+    AdmittedToolRegistry,
     CapabilityProvider,
     AuditSink,
     RedactionPolicy,

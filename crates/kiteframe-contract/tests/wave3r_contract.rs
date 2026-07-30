@@ -266,6 +266,7 @@ fn invocation_request_with(
         InvocationId::new("inv-1").unwrap(),
         admission_id,
         grant_digest,
+        DelegationAncestry::default().digest().unwrap(),
         required_identity(),
         "tenant:t1/case:case-1",
         json!({}),
@@ -316,6 +317,7 @@ fn grant_set_parts(request: &AdmissionRequest) -> CapabilityGrantSetParts {
     CapabilityGrantSetParts {
         admission_id: AdmissionId::new("adm-1").unwrap(),
         admission_request_digest: *request.request_digest(),
+        delegation_ancestry_digest: *request.delegation_ancestry_digest(),
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
         task: TaskRef::new("task:triage").unwrap(),

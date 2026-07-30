@@ -3,6 +3,9 @@ kind: RuntimeBinding
 metadata: { runtime: deepagents }
 spec:
   models: { primary: models.anthropic.sonnet }
-  components: { harnessProfile: profiles.deepagents }
+  components:
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
+    harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger

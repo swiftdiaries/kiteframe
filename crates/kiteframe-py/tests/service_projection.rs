@@ -244,6 +244,7 @@ fn grant_set() -> CapabilityGrantSet {
     CapabilityGrantSet::try_new(CapabilityGrantSetParts {
         admission_id: AdmissionId::new("adm-1").unwrap(),
         admission_request_digest: Sha256Digest::from_bytes([9; 32]),
+        delegation_ancestry_digest: Sha256Digest::from_bytes([10; 32]),
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
         task: TaskRef::new("task:triage").unwrap(),

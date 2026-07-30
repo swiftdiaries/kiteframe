@@ -29,6 +29,8 @@
         "middleware",
         "backend",
         "checkpointer",
+        "authority_provider",
+        "admitted_tool_registry",
         "capability_provider",
         "audit_sink",
         "redaction_policy",

@@ -7,12 +7,14 @@ use kiteframe_contract::{
     CapabilityDescriptor as ContractCapabilityDescriptor, CapabilityErrorDescriptor,
     CapabilityGrantSet as ContractCapabilityGrantSet,
     CatalogFetchResult as ContractCatalogFetchResult, CatalogRequest as ContractCatalogRequest,
+    DelegationAncestry as ContractDelegationAncestry, DelegationEdge as ContractDelegationEdge,
     Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticSeverity, DiagnosticStage,
     EffectClassification, EffectProposal as ContractEffectProposal,
     EffectiveCapabilityGrant as ContractEffectiveCapabilityGrant, EvidenceKind, ExecutionMode,
     InvocationOutcome as ContractInvocationOutcome, InvocationRequest as ContractInvocationRequest,
     InvocationStatus as ContractInvocationStatus, RetryClass, StableCapabilityError,
     StatusRequest as ContractStatusRequest, Suspension, TraceContext,
+    resource_selector_is_subset_of, select_invocation_resource,
 };
 use kiteframe_core::canonical_json;
 use pyo3::{
@@ -428,6 +430,10 @@ impl PyEffectProposal {
         self.inner.grant_digest().to_string()
     }
     #[getter]
+    pub fn delegation_ancestry_digest(&self) -> String {
+        self.inner.delegation_ancestry_digest().to_string()
+    }
+    #[getter]
     pub fn capability_name(&self) -> &str {
         self.inner.capability().name().as_str()
     }
@@ -727,6 +733,54 @@ pub struct PyAdmissionRequest {
     inner: Arc<ContractAdmissionRequest>,
 }
 
+#[gen_stub_pyclass]
+#[pyclass(
+    frozen,
+    immutable_type,
+    from_py_object,
+    module = "kiteframe._native",
+    name = "DelegationEdge"
+)]
+#[derive(Clone)]
+pub struct PyDelegationEdge {
+    inner: ContractDelegationEdge,
+}
+
+impl From<ContractDelegationEdge> for PyDelegationEdge {
+    fn from(inner: ContractDelegationEdge) -> Self {
+        Self { inner }
+    }
+}
+
+#[gen_stub_pymethods]
+#[pymethods]
+impl PyDelegationEdge {
+    #[getter]
+    pub fn parent_agent(&self) -> &str {
+        self.inner.parent_agent().as_str()
+    }
+
+    #[getter]
+    pub fn child_agent(&self) -> &str {
+        self.inner.child_agent().as_str()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.str, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn delegated_capabilities<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .delegated_capabilities()
+                .iter()
+                .map(|capability| capability.as_str()),
+        )
+    }
+}
+
 impl From<ContractAdmissionRequest> for PyAdmissionRequest {
     fn from(inner: ContractAdmissionRequest) -> Self {
         Self {
@@ -775,7 +829,7 @@ impl PyAdmissionRequest {
 
     #[getter]
     #[gen_stub(override_return_type(
-        type_repr = "builtins.tuple[builtins.str, ...]",
+        type_repr = "builtins.tuple[DelegationEdge, ...]",
         imports = ("builtins",)
     ))]
     pub fn delegation_ancestry<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
@@ -783,10 +837,16 @@ impl PyAdmissionRequest {
             py,
             self.inner
                 .delegation_ancestry()
-                .agents()
+                .edges()
                 .iter()
-                .map(|agent| agent.as_str()),
+                .cloned()
+                .map(PyDelegationEdge::from),
         )
+    }
+
+    #[getter]
+    pub fn delegation_ancestry_digest(&self) -> String {
+        self.inner.delegation_ancestry_digest().to_string()
     }
 
     #[getter]
@@ -906,6 +966,11 @@ impl PyInvocationRequest {
     #[getter]
     pub fn grant_digest(&self) -> String {
         self.inner.grant_digest().to_string()
+    }
+
+    #[getter]
+    pub fn delegation_ancestry_digest(&self) -> String {
+        self.inner.delegation_ancestry_digest().to_string()
     }
 
     #[getter]
@@ -1370,6 +1435,11 @@ impl PyCapabilityGrantSet {
     #[getter]
     pub fn admission_request_digest(&self) -> String {
         self.inner.admission_request_digest().to_string()
+    }
+
+    #[getter]
+    pub fn delegation_ancestry_digest(&self) -> String {
+        self.inner.delegation_ancestry_digest().to_string()
     }
 
     #[getter]
@@ -1957,11 +2027,60 @@ pub fn load_invocation_status(
 
 #[gen_stub_pyfunction]
 #[pyfunction]
+pub fn build_delegation_edge(
+    parent_agent: &str,
+    child_agent: &str,
+    delegated_capabilities: Vec<String>,
+) -> PyResult<PyDelegationEdge> {
+    serde_json::from_value::<ContractDelegationEdge>(serde_json::json!({
+        "parentAgent": parent_agent,
+        "childAgent": child_agent,
+        "delegatedCapabilities": delegated_capabilities,
+    }))
+    .map(PyDelegationEdge::from)
+    .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid delegation edge"))
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn delegation_ancestry_digest(edges: Vec<PyRef<'_, PyDelegationEdge>>) -> PyResult<String> {
+    ContractDelegationAncestry::try_new(edges.into_iter().map(|edge| edge.inner.clone()).collect())
+        .and_then(|ancestry| ancestry.digest())
+        .map(|digest| digest.to_string())
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("invalid delegation ancestry"))
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+pub fn resource_selector_is_within(requested: &str, allowed: &str) -> bool {
+    resource_selector_is_subset_of(requested, allowed)
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
+#[pyo3(signature = (*, requirement, grant, selected_resource=None))]
+pub fn select_resource_for_requirement(
+    requirement: &PyResolvedCapabilityRequirement,
+    grant: &PyEffectiveCapabilityGrant,
+    selected_resource: Option<&str>,
+) -> PyResult<String> {
+    select_invocation_resource(
+        requirement.inner.as_ref(),
+        grant.inner.as_ref(),
+        selected_resource,
+    )
+    .map(|resource| resource.as_str().to_owned())
+    .map_err(|_| pyo3::exceptions::PyValueError::new_err("capability resource is not selected"))
+}
+
+#[gen_stub_pyfunction]
+#[pyfunction]
 #[pyo3(signature = (
     *,
     invocation_id,
     admission_id,
     grant_digest,
+    delegation_ancestry_digest,
     requirement,
     selected_resource,
     arguments,
@@ -1977,6 +2096,7 @@ pub fn build_invocation_request_for_requirement(
     invocation_id: &str,
     admission_id: &str,
     grant_digest: &str,
+    delegation_ancestry_digest: &str,
     requirement: &PyResolvedCapabilityRequirement,
     selected_resource: &str,
     arguments: &Bound<'_, PyAny>,
@@ -1997,6 +2117,7 @@ pub fn build_invocation_request_for_requirement(
         },
         "evidenceRefs": python_to_json_value(evidence_refs)?,
         "grantDigest": grant_digest,
+        "delegationAncestryDigest": delegation_ancestry_digest,
         "idempotencyKey": idempotency_key,
         "invocationId": invocation_id,
         "preconditions": python_to_json_value(preconditions)?,

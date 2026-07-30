@@ -13,6 +13,7 @@ from kiteframe import (
     InvocationRequest,
     KiteframeDiagnosticError,
     StatusRequest,
+    delegation_ancestry_digest,
     load_admission_request,
     load_capability_catalog,
     load_catalog_request,
@@ -35,6 +36,10 @@ def canonical_bytes(value: object) -> bytes:
     ).encode()
 
 
+def canonical_digest(domain: bytes, value: object) -> str:
+    return hashlib.sha256(domain + canonical_bytes(value)).hexdigest()
+
+
 @pytest.fixture
 def valid_catalog_request() -> bytes:
     return canonical_bytes(
@@ -55,7 +60,7 @@ def valid_admission_request() -> bytes:
         "name": "cases.read",
         "version": "1.2.0",
     }
-    return canonical_bytes(
+    values = (
         {
             "actor": "actor:alice",
             "agent": "agent:case-worker",
@@ -66,6 +71,7 @@ def valid_admission_request() -> bytes:
             },
             "contextualFacts": {},
             "delegationAncestry": [],
+            "delegationAncestryDigest": delegation_ancestry_digest([]),
             "lockDigest": "02" * 32,
             "optionalCapabilities": [],
             "portableDigest": "01" * 32,
@@ -85,6 +91,12 @@ def valid_admission_request() -> bytes:
             "traceContext": {"traceparent": VALID_TRACEPARENT},
         }
     )
+    values.pop("requestDigest")
+    values["requestDigest"] = canonical_digest(
+        b"kiteframe:admission-request:v1\0",
+        values,
+    )
+    return canonical_bytes(values)
 
 
 @pytest.fixture
@@ -97,6 +109,7 @@ def valid_invocation_request() -> bytes:
                 "name": "cases.comment",
                 "version": "1.0.0",
             },
+            "delegationAncestryDigest": delegation_ancestry_digest([]),
             "evidenceRefs": {
                 "approval": "evidence://approval/1",
             },
@@ -229,11 +242,13 @@ def test_provider_request_properties_are_stable_native_values(
     assert admission.catalog_revision == "revision-1"
     assert admission.catalog_digest == "04" * 32
     assert admission.request_digest == (
-        "a6f8a332833d30e14a05e70e719adf8c3156593a588151f2a4b96b0ca3ede119"
+        "eb435592a130ad03fca76bbbc4139dc8d5c3a56332217ca0db1df5eedc097f7e"
     )
+    assert admission.delegation_ancestry_digest == delegation_ancestry_digest([])
     assert admission.required_capabilities == (("cases.read", "1.2.0"),)
     assert invocation.invocation_id == "inv-1"
     assert invocation.admission_id == "adm-1"
+    assert invocation.delegation_ancestry_digest == delegation_ancestry_digest([])
     assert invocation.capability_name == "cases.comment"
     assert invocation.capability_version == "1.0.0"
     assert invocation.selected_resource == "tenant:t1/case:case-1"

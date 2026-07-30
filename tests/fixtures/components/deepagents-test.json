@@ -4,8 +4,14 @@
     "access-policies.default": {
       "kind": "access_policy"
     },
+    "admitted-tools.dynamic": {
+      "kind": "admitted_tool_registry"
+    },
     "audit-sinks.ledger": {
       "kind": "audit_sink"
+    },
+    "authority.current": {
+      "kind": "authority_provider"
     },
     "backends.workspace": {
       "kind": "backend"

@@ -220,6 +220,14 @@ fn validate_runtime_inputs(
             ComponentKind::Checkpointer,
         ),
         (
+            binding.spec.components.authority_provider.as_ref(),
+            ComponentKind::AuthorityProvider,
+        ),
+        (
+            binding.spec.components.admitted_tool_registry.as_ref(),
+            ComponentKind::AdmittedToolRegistry,
+        ),
+        (
             binding.spec.components.harness_profile.as_ref(),
             ComponentKind::HarnessProfile,
         ),

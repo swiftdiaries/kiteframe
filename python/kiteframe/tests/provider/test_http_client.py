@@ -12,6 +12,7 @@ import pytest
 from kiteframe import (
     CatalogRequest,
     KiteframeDiagnosticError,
+    delegation_ancestry_digest,
     load_admission_request,
     load_catalog_request,
     load_invocation_outcome_for_request,
@@ -53,6 +54,10 @@ def canonical_bytes(value: object) -> bytes:
     ).encode()
 
 
+def canonical_digest(domain: bytes, value: object) -> str:
+    return hashlib.sha256(domain + canonical_bytes(value)).hexdigest()
+
+
 def catalog_request():
     return load_catalog_request(
         canonical_bytes(
@@ -75,41 +80,40 @@ def admission_request():
     requirement = resolved_requirement_wire()
     capability = requirement["lockedCapability"]["identity"]
     resources = requirement["resources"]
-    return load_admission_request(
-        canonical_bytes(
+    values = {
+        "actor": "actor:alice",
+        "agent": "agent:case-worker",
+        "catalogDigest": "04" * 32,
+        "catalogIdentity": {
+            "name": "provider.test",
+            "revision": "revision-1",
+        },
+        "contextualFacts": {},
+        "delegationAncestry": [],
+        "delegationAncestryDigest": delegation_ancestry_digest([]),
+        "lockDigest": "02" * 32,
+        "optionalCapabilities": [],
+        "portableDigest": "01" * 32,
+        "requiredCapabilities": [
             {
-                "actor": "actor:alice",
-                "agent": "agent:case-worker",
-                "catalogDigest": "04" * 32,
-                "catalogIdentity": {
-                    "name": "provider.test",
-                    "revision": "revision-1",
-                },
-                "contextualFacts": {},
-                "delegationAncestry": [],
-                "lockDigest": "02" * 32,
-                "optionalCapabilities": [],
-                "portableDigest": "01" * 32,
-                "requestDigest": (
-                    "9681f9098ff800dbf70fcb37505eca5edf0be98772e2f2c1ee395b31d3063251"
-                ),
-                "requiredCapabilities": [
-                    {
-                        "capability": capability,
-                        "resources": resources,
-                    }
-                ],
-                "resolvedDigest": "03" * 32,
-                "resolvedRequirements": [requirement],
-                "session": "session:1",
-                "task": "task:triage",
-                "traceContext": {
-                    "traceparent": VALID_TRACEPARENT,
-                    "tracestate": "vendor=value",
-                },
+                "capability": capability,
+                "resources": resources,
             }
-        )
+        ],
+        "resolvedDigest": "03" * 32,
+        "resolvedRequirements": [requirement],
+        "session": "session:1",
+        "task": "task:triage",
+        "traceContext": {
+            "traceparent": VALID_TRACEPARENT,
+            "tracestate": "vendor=value",
+        },
+    }
+    values["requestDigest"] = canonical_digest(
+        b"kiteframe:admission-request:v1\0",
+        values,
     )
+    return load_admission_request(canonical_bytes(values))
 
 
 @lru_cache
@@ -131,6 +135,7 @@ def invocation_request():
                     "name": "cases.read",
                     "version": "1.2.0",
                 },
+                "delegationAncestryDigest": delegation_ancestry_digest([]),
                 "evidenceRefs": {"approval": "evidence://approval/1"},
                 "grantDigest": "0a" * 32,
                 "invocationId": "inv-1",
@@ -187,21 +192,6 @@ def catalog_response() -> httpx.Response:
 
 
 def grant_set_bytes(variant: str = "valid") -> bytes:
-    grant_digests = {
-        "valid": "426fa5aeb72b6b14549a1396a01991b6"
-        + "31a4572c33b6e962189344960ac5e1f1",
-        "actor": "0b773c8d152cc2cd1186bcc3ac9b4965"
-        + "f9b813169827fe7957a2b028dcfb1e20",
-        "agent": "f1fadb560891c52eb71ca3ccf233e343"
-        + "16625394a21b608cad2b7e3883afd649",
-        "task": "8ffff06f5f7eb206e31fe511ab488ac8" + "b3484d5cac9ddd299e9e7da0dcc77ace",
-        "session": "27734b9b2d0977d5ab202e22b1860e2"
-        + "4e7f0b191fe0d8fd33d62af6bc615d57d",
-        "unrequested": "c873291f8270f66f91986cae3f441142"
-        + "7ca19563866ad9a3a3437b211ed34e11",
-        "broader": "feeea71dd3d24b1fbaba3c9a23b9d3a8"
-        + "dc7d1ae2f1a2c0afd9aa269dd9db0064",
-    }
     grant = {
         "capability": {"name": "cases.read", "version": "1.2.0"},
         "executionModes": ["immediate"],
@@ -223,9 +213,7 @@ def grant_set_bytes(variant: str = "valid") -> bytes:
     grant_set = {
         "actor": "actor:alice",
         "admissionId": "adm-1",
-        "admissionRequestDigest": (
-            "9681f9098ff800dbf70fcb37505eca5edf0be98772e2f2c1ee395b31d3063251"
-        ),
+        "admissionRequestDigest": admission_request().request_digest,
         "agent": "agent:case-worker",
         "authorityRevisions": {
             "authorityRevisionDigest": (
@@ -235,6 +223,7 @@ def grant_set_bytes(variant: str = "valid") -> bytes:
         },
         "catalogDigest": "04" * 32,
         "catalogIdentity": {"name": "provider.test", "revision": "revision-1"},
+        "delegationAncestryDigest": delegation_ancestry_digest([]),
         "expiresAt": 200,
         "grants": [grant],
         "issuedAt": 100,
@@ -261,7 +250,11 @@ def grant_set_bytes(variant: str = "valid") -> bytes:
     elif variant == "broader":
         grant_set["grants"] = [{**grant, "resources": ["tenant:support/*"]}]
 
-    return canonical_bytes({**grant_set, "grantDigest": grant_digests[variant]})
+    grant_set["grantDigest"] = canonical_digest(
+        b"kiteframe:capability-grant-set:v1\0",
+        grant_set,
+    )
+    return canonical_bytes(grant_set)
 
 
 def traceback_retains(error: BaseException, secret: str) -> bool:
@@ -512,6 +505,7 @@ def expected_proposal_digest(
             "name": request.capability_name,
             "version": request.capability_version,
         },
+        "delegationAncestryDigest": request.delegation_ancestry_digest,
         "effect": effect,
         "grantDigest": request.grant_digest,
         "idempotencyKey": request.idempotency_key,
@@ -576,6 +570,7 @@ async def test_unknown_invocation_identity_fails_before_transport() -> None:
                     "name": "cases.comment",
                     "version": "1.0.0",
                 },
+                "delegationAncestryDigest": delegation_ancestry_digest([]),
                 "evidenceRefs": {},
                 "grantDigest": "0a" * 32,
                 "invocationId": "inv-1",

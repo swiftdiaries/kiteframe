@@ -1,10 +1,11 @@
+import hashlib
 import json
 import pickle
 from pathlib import Path
 
 import pytest
 
-from kiteframe import load_resolved_agent, resolve_package
+from kiteframe import delegation_ancestry_digest, load_resolved_agent, resolve_package
 from kiteframe._native import (
     CapabilityGrantSet,
     EffectiveCapabilityGrant,
@@ -38,7 +39,7 @@ def canonical_bytes(value: object) -> bytes:
 
 
 def valid_grant_set_bytes() -> bytes:
-    return canonical_bytes(
+    values = (
         {
             "actor": "actor:alice",
             "admissionId": "adm-1",
@@ -49,6 +50,7 @@ def valid_grant_set_bytes() -> bytes:
                 "name": "provider.test",
                 "revision": "revision-1",
             },
+            "delegationAncestryDigest": delegation_ancestry_digest([]),
             "authorityRevisions": {
                 "authorityRevisionDigest": (
                     "bb4b094d4e6b440e6babaf51624f70d185297df32b5508d36ff03046dd77cbaa"
@@ -105,6 +107,11 @@ def valid_grant_set_bytes() -> bytes:
             "task": "task:triage",
         }
     )
+    values.pop("grantDigest")
+    values["grantDigest"] = hashlib.sha256(
+        b"kiteframe:capability-grant-set:v1\0" + canonical_bytes(values)
+    ).hexdigest()
+    return canonical_bytes(values)
 
 
 def test_python_round_trip_preserves_exact_golden_bytes(workspace: Path) -> None:

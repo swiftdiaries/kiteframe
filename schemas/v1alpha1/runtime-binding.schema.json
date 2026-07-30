@@ -106,6 +106,8 @@
         "components": {
           "$ref": "#/$defs/TypedComponentSymbols",
           "default": {
+            "admittedToolRegistry": null,
+            "authorityProvider": null,
             "backend": null,
             "checkpointer": null,
             "harnessProfile": null,
@@ -147,6 +149,28 @@
     "TypedComponentSymbols": {
       "type": "object",
       "properties": {
+        "admittedToolRegistry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistrySymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "authorityProvider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RegistrySymbol"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "backend": {
           "anyOf": [
             {

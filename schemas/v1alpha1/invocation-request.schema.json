@@ -10,6 +10,9 @@
     "capability": {
       "$ref": "#/$defs/CapabilityIdentity"
     },
+    "delegationAncestryDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
     "evidenceRefs": {
       "type": "object",
       "additionalProperties": {
@@ -46,6 +49,7 @@
     "invocationId",
     "admissionId",
     "grantDigest",
+    "delegationAncestryDigest",
     "capability",
     "selectedResource",
     "arguments",

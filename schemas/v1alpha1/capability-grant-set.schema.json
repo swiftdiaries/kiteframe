@@ -24,6 +24,9 @@
     "catalogIdentity": {
       "$ref": "#/$defs/CatalogIdentity"
     },
+    "delegationAncestryDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
     "expiresAt": {
       "$ref": "#/$defs/Timestamp"
     },
@@ -59,6 +62,7 @@
   "required": [
     "admissionId",
     "admissionRequestDigest",
+    "delegationAncestryDigest",
     "actor",
     "agent",
     "task",

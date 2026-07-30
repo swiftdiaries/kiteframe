@@ -12,6 +12,9 @@
     "capability": {
       "$ref": "#/$defs/CapabilityIdentity"
     },
+    "delegationAncestryDigest": {
+      "$ref": "#/$defs/Sha256Digest"
+    },
     "effect": {
       "$ref": "#/$defs/EffectClassification"
     },
@@ -42,6 +45,7 @@
     "invocationId",
     "admissionId",
     "grantDigest",
+    "delegationAncestryDigest",
     "capability",
     "selectedResource",
     "argumentsDigest",

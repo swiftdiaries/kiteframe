@@ -107,6 +107,10 @@ pub struct TypedComponentSymbols {
     #[serde(default)]
     pub checkpointer: Option<RegistrySymbol>,
     #[serde(default)]
+    pub authority_provider: Option<RegistrySymbol>,
+    #[serde(default)]
+    pub admitted_tool_registry: Option<RegistrySymbol>,
+    #[serde(default)]
     pub harness_profile: Option<RegistrySymbol>,
 }
 

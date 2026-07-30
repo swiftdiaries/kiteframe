@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from kiteframe import delegation_ancestry_digest
 from kiteframe._native import (
     load_admission_request,
     load_capability_catalog,
@@ -30,8 +31,12 @@ def canonical_bytes(value: object) -> bytes:
     ).encode()
 
 
+def canonical_digest(domain: bytes, value: object) -> str:
+    return hashlib.sha256(domain + canonical_bytes(value)).hexdigest()
+
+
 def valid_grant_json() -> bytes:
-    return canonical_bytes(
+    values = (
         {
             "actor": "actor:alice",
             "admissionId": "adm-1",
@@ -42,6 +47,7 @@ def valid_grant_json() -> bytes:
                 "name": "provider.test",
                 "revision": "revision-1",
             },
+            "delegationAncestryDigest": delegation_ancestry_digest([]),
             "authorityRevisions": {
                 "authorityRevisionDigest": (
                     "bb4b094d4e6b440e6babaf51624f70d185297df32b5508d36ff03046dd77cbaa"
@@ -101,6 +107,12 @@ def valid_grant_json() -> bytes:
             "task": "task:triage",
         }
     )
+    values.pop("grantDigest")
+    values["grantDigest"] = canonical_digest(
+        b"kiteframe:capability-grant-set:v1\0",
+        values,
+    )
+    return canonical_bytes(values)
 
 
 def valid_catalog_json() -> bytes:
@@ -124,7 +136,7 @@ def valid_admission_json() -> bytes:
     )
     requirement = resolved["capabilityRequirements"][0]
     capability = requirement["lockedCapability"]["identity"]
-    return canonical_bytes(
+    values = (
         {
             "actor": "actor:alice",
             "agent": "agent:case-worker",
@@ -135,6 +147,7 @@ def valid_admission_json() -> bytes:
             },
             "contextualFacts": {},
             "delegationAncestry": [],
+            "delegationAncestryDigest": delegation_ancestry_digest([]),
             "lockDigest": "02" * 32,
             "optionalCapabilities": [],
             "portableDigest": "01" * 32,
@@ -154,6 +167,12 @@ def valid_admission_json() -> bytes:
             "traceContext": {"traceparent": VALID_TRACEPARENT},
         }
     )
+    values.pop("requestDigest")
+    values["requestDigest"] = canonical_digest(
+        b"kiteframe:admission-request:v1\0",
+        values,
+    )
+    return canonical_bytes(values)
 
 
 def valid_invocation_json() -> bytes:
@@ -165,6 +184,7 @@ def valid_invocation_json() -> bytes:
                 "name": "cases.comment",
                 "version": "1.0.0",
             },
+            "delegationAncestryDigest": delegation_ancestry_digest([]),
             "evidenceRefs": {"approval": "evidence://approval/1"},
             "grantDigest": "09" * 32,
             "invocationId": "inv-1",

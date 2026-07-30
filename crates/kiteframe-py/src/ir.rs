@@ -18,6 +18,8 @@ fn component_kind_name(kind: ComponentKind) -> &'static str {
         ComponentKind::Middleware => "middleware",
         ComponentKind::Backend => "backend",
         ComponentKind::Checkpointer => "checkpointer",
+        ComponentKind::AuthorityProvider => "authority_provider",
+        ComponentKind::AdmittedToolRegistry => "admitted_tool_registry",
         ComponentKind::CapabilityProvider => "capability_provider",
         ComponentKind::AuditSink => "audit_sink",
         ComponentKind::RedactionPolicy => "redaction_policy",
@@ -303,6 +305,26 @@ impl PyRuntimeBinding {
             .spec
             .components
             .checkpointer
+            .as_ref()
+            .map(RegistrySymbol::as_str)
+    }
+
+    #[getter]
+    fn authority_provider(&self) -> Option<&str> {
+        self.inner
+            .spec
+            .components
+            .authority_provider
+            .as_ref()
+            .map(RegistrySymbol::as_str)
+    }
+
+    #[getter]
+    fn admitted_tool_registry(&self) -> Option<&str> {
+        self.inner
+            .spec
+            .components
+            .admitted_tool_registry
             .as_ref()
             .map(RegistrySymbol::as_str)
     }

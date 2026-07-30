@@ -16,21 +16,22 @@ use pyo3_stub_gen::{StubGenConfig, StubInfo};
 pub use service::{
     ProviderResponseError, PyAdmissionRequest, PyAuthorityRevision, PyAuthorityRevisionSet,
     PyCapabilityCatalog, PyCapabilityDenial, PyCapabilityDescriptor, PyCapabilityGrantSet,
-    PyCatalogFetchResult, PyCatalogRequest, PyDiagnostic, PyEffectProposal,
+    PyCatalogFetchResult, PyCatalogRequest, PyDelegationEdge, PyDiagnostic, PyEffectProposal,
     PyEffectiveCapabilityGrant, PyInvocationOutcome, PyInvocationRequest, PyInvocationStatus,
-    PyStableCapabilityError, PyStatusRequest, PySuspension,
+    PyStableCapabilityError, PyStatusRequest, PySuspension, build_delegation_edge,
     build_invocation_request_for_requirement, build_status_request, load_admission_request_inner,
     load_capability_catalog_inner, load_capability_grant_set_for_request_inner,
     load_capability_grant_set_inner, load_catalog_request_inner, load_effect_proposal_inner,
     load_invocation_outcome_for_request_inner, load_invocation_outcome_inner,
     load_invocation_request_inner, load_invocation_status_for_request_inner,
-    load_invocation_status_inner, load_status_request_inner,
+    load_invocation_status_inner, load_status_request_inner, select_resource_for_requirement,
 };
 
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyCatalogRequest>()?;
     module.add_class::<PyAdmissionRequest>()?;
+    module.add_class::<PyDelegationEdge>()?;
     module.add_class::<PyInvocationRequest>()?;
     module.add_class::<PyStatusRequest>()?;
     module.add_class::<PyEffectProposal>()?;
@@ -67,6 +68,19 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(service::load_admission_request, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_invocation_request, module)?)?;
     module.add_function(wrap_pyfunction!(service::load_status_request, module)?)?;
+    module.add_function(wrap_pyfunction!(service::build_delegation_edge, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        service::delegation_ancestry_digest,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        service::resource_selector_is_within,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        service::select_resource_for_requirement,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         service::build_invocation_request_for_requirement,
         module

@@ -11,6 +11,7 @@ import pytest
 from kiteframe import (
     CatalogRequest,
     KiteframeDiagnosticError,
+    delegation_ancestry_digest,
     load_admission_request,
     load_capability_grant_set_for_request,
     load_effect_proposal,
@@ -201,6 +202,7 @@ def support_invocation_bytes() -> bytes:
             "admissionId": "admission:support-1",
             "arguments": {},
             "capability": {"name": "cases.read", "version": "1.2.0"},
+            "delegationAncestryDigest": delegation_ancestry_digest([]),
             "evidenceRefs": {},
             "grantDigest": "55" * 32,
             "invocationId": "invocation:support-1",

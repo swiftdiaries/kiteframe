@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ApprovalRequirement, CapabilityDescriptor, CapabilityIdentity, CatalogIdentity,
+    ApprovalRequirement, CapabilityDescriptor, CapabilityIdentity, CapabilityName, CatalogIdentity,
     ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
     DiagnosticSeverity, DiagnosticStage, EffectClassification, ExecutionMode, FreshnessRequirement,
     IdempotencyRequirement, NonEmptySet, PreconditionDescriptor, ResolvedCapabilityRequirement,
@@ -325,21 +325,99 @@ impl<'de> Deserialize<'de> for EvidenceReferences {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, JsonSchema)]
-#[serde(transparent)]
-pub struct DelegationAncestry(#[schemars(extend("uniqueItems" = true))] Vec<AgentRef>);
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DelegationEdge {
+    parent_agent: AgentRef,
+    child_agent: AgentRef,
+    #[schemars(extend("uniqueItems" = true))]
+    delegated_capabilities: Vec<CapabilityName>,
+}
 
-impl DelegationAncestry {
-    pub fn try_new(agents: Vec<AgentRef>) -> Result<Self, String> {
-        let unique_agents: BTreeSet<_> = agents.iter().collect();
-        if unique_agents.len() != agents.len() {
-            return Err("delegation ancestry must not contain duplicate agents".to_owned());
+impl DelegationEdge {
+    pub fn try_new(
+        parent_agent: AgentRef,
+        child_agent: AgentRef,
+        mut delegated_capabilities: Vec<CapabilityName>,
+    ) -> Result<Self, String> {
+        if parent_agent == child_agent {
+            return Err("delegation edge cannot target its parent agent".to_owned());
         }
-        Ok(Self(agents))
+        delegated_capabilities.sort();
+        if delegated_capabilities
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
+            return Err("delegated capabilities must be unique".to_owned());
+        }
+        Ok(Self {
+            parent_agent,
+            child_agent,
+            delegated_capabilities,
+        })
     }
 
-    pub fn agents(&self) -> &[AgentRef] {
+    pub fn parent_agent(&self) -> &AgentRef {
+        &self.parent_agent
+    }
+
+    pub fn child_agent(&self) -> &AgentRef {
+        &self.child_agent
+    }
+
+    pub fn delegated_capabilities(&self) -> &[CapabilityName] {
+        &self.delegated_capabilities
+    }
+}
+
+impl<'de> Deserialize<'de> for DelegationEdge {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            parent_agent: AgentRef,
+            child_agent: AgentRef,
+            delegated_capabilities: Vec<CapabilityName>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(
+            raw.parent_agent,
+            raw.child_agent,
+            raw.delegated_capabilities,
+        )
+        .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct DelegationAncestry(#[schemars(extend("uniqueItems" = true))] Vec<DelegationEdge>);
+
+impl DelegationAncestry {
+    pub fn try_new(edges: Vec<DelegationEdge>) -> Result<Self, String> {
+        let mut seen_agents = BTreeSet::new();
+        let mut previous_child: Option<&AgentRef> = None;
+        for edge in &edges {
+            if previous_child.is_some_and(|child| child != edge.parent_agent()) {
+                return Err("delegation ancestry edges must form one ordered path".to_owned());
+            }
+            if previous_child.is_none() && !seen_agents.insert(edge.parent_agent()) {
+                return Err("delegation ancestry must not contain duplicate agents".to_owned());
+            }
+            if !seen_agents.insert(edge.child_agent()) {
+                return Err("delegation ancestry must not contain duplicate agents".to_owned());
+            }
+            previous_child = Some(edge.child_agent());
+        }
+        Ok(Self(edges))
+    }
+
+    pub fn edges(&self) -> &[DelegationEdge] {
         &self.0
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, String> {
+        canonical_digest(b"kiteframe:delegation-ancestry:v1\0", self)
     }
 }
 
@@ -370,8 +448,8 @@ impl CatalogRequest {
 
 impl<'de> Deserialize<'de> for DelegationAncestry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let agents = Vec::<AgentRef>::deserialize(deserializer)?;
-        Self::try_new(agents).map_err(D::Error::custom)
+        let edges = Vec::<DelegationEdge>::deserialize(deserializer)?;
+        Self::try_new(edges).map_err(D::Error::custom)
     }
 }
 
@@ -454,6 +532,7 @@ pub struct AdmissionRequest {
     optional_capabilities: Vec<RequestedCapability>,
     resolved_requirements: Vec<ResolvedCapabilityRequirement>,
     delegation_ancestry: DelegationAncestry,
+    delegation_ancestry_digest: Sha256Digest,
     contextual_facts: BTreeMap<String, String>,
     trace_context: TraceContext,
     request_digest: Sha256Digest,
@@ -493,13 +572,17 @@ impl AdmissionRequest {
                 !resolved
                     .resources()
                     .iter()
-                    .any(|allowed| selector_is_subset_of(requested.as_str(), allowed))
+                    .any(|allowed| resource_selector_is_subset_of(requested.as_str(), allowed))
             }) {
                 return Err(vec![invalid(
                     "requested resource selector is broader than the resolved requirement",
                 )]);
             }
         }
+        let delegation_ancestry_digest = parts
+            .delegation_ancestry
+            .digest()
+            .map_err(|message| vec![invalid(message)])?;
         let request_digest =
             admission_request_digest(&parts).map_err(|message| vec![invalid(message)])?;
         Ok(Self {
@@ -516,6 +599,7 @@ impl AdmissionRequest {
             optional_capabilities: parts.optional_capabilities,
             resolved_requirements: parts.resolved_requirements,
             delegation_ancestry: parts.delegation_ancestry,
+            delegation_ancestry_digest,
             contextual_facts: parts.contextual_facts,
             trace_context: parts.trace_context,
             request_digest,
@@ -558,6 +642,10 @@ impl AdmissionRequest {
         &self.delegation_ancestry
     }
 
+    pub fn delegation_ancestry_digest(&self) -> &Sha256Digest {
+        &self.delegation_ancestry_digest
+    }
+
     pub fn optional_capabilities(&self) -> &[RequestedCapability] {
         &self.optional_capabilities
     }
@@ -594,6 +682,7 @@ impl<'de> Deserialize<'de> for AdmissionRequest {
             optional_capabilities: Vec<RequestedCapability>,
             resolved_requirements: Vec<ResolvedCapabilityRequirement>,
             delegation_ancestry: DelegationAncestry,
+            delegation_ancestry_digest: Sha256Digest,
             contextual_facts: BTreeMap<String, String>,
             trace_context: TraceContext,
             request_digest: Sha256Digest,
@@ -617,6 +706,11 @@ impl<'de> Deserialize<'de> for AdmissionRequest {
             trace_context: raw.trace_context,
         })
         .map_err(|errors| D::Error::custom(errors[0].message.as_str()))?;
+        if value.delegation_ancestry_digest != raw.delegation_ancestry_digest {
+            return Err(D::Error::custom(
+                "delegation ancestry digest does not match its ordered edges",
+            ));
+        }
         if value.request_digest != raw.request_digest {
             return Err(D::Error::custom(
                 "request digest does not match canonical admission request",
@@ -643,6 +737,7 @@ fn admission_request_digest(parts: &AdmissionRequestParts) -> Result<Sha256Diges
         optional_capabilities: &'a [RequestedCapability],
         resolved_requirements: &'a [ResolvedCapabilityRequirement],
         delegation_ancestry: &'a DelegationAncestry,
+        delegation_ancestry_digest: Sha256Digest,
         contextual_facts: &'a BTreeMap<String, String>,
         trace_context: &'a TraceContext,
     }
@@ -662,6 +757,7 @@ fn admission_request_digest(parts: &AdmissionRequestParts) -> Result<Sha256Diges
             optional_capabilities: &parts.optional_capabilities,
             resolved_requirements: &parts.resolved_requirements,
             delegation_ancestry: &parts.delegation_ancestry,
+            delegation_ancestry_digest: parts.delegation_ancestry.digest()?,
             contextual_facts: &parts.contextual_facts,
             trace_context: &parts.trace_context,
         },
@@ -672,11 +768,57 @@ fn normalize_requests(requests: &mut [RequestedCapability]) {
     requests.sort_by(|left, right| left.capability.cmp(&right.capability));
 }
 
-fn selector_is_subset_of(requested: &str, allowed: &str) -> bool {
+pub fn resource_selector_is_subset_of(requested: &str, allowed: &str) -> bool {
     requested == allowed
         || allowed
             .strip_suffix(":*")
             .is_some_and(|prefix| requested.starts_with(&format!("{prefix}:")))
+}
+
+pub fn select_invocation_resource(
+    requirement: &ResolvedCapabilityRequirement,
+    grant: &EffectiveCapabilityGrant,
+    selected: Option<&str>,
+) -> Result<NormalizedResourceSelector, String> {
+    if requirement.identity() != grant.capability() {
+        return Err("capability grant does not match the resolved requirement".to_owned());
+    }
+    let is_allowed = |candidate: &str| {
+        requirement
+            .resources()
+            .iter()
+            .any(|allowed| resource_selector_is_subset_of(candidate, allowed))
+            && grant
+                .resources()
+                .iter()
+                .any(|allowed| resource_selector_is_subset_of(candidate, allowed.as_str()))
+    };
+    if let Some(selected) = selected {
+        let normalized = NormalizedResourceSelector::new(selected)?;
+        if normalized.as_str().ends_with(":*") || !is_allowed(normalized.as_str()) {
+            return Err(
+                "selected resource must be concrete and within current authority".to_owned(),
+            );
+        }
+        return Ok(normalized);
+    }
+
+    let candidates: BTreeSet<_> = requirement
+        .resources()
+        .iter()
+        .map(String::as_str)
+        .chain(
+            grant
+                .resources()
+                .iter()
+                .map(NormalizedResourceSelector::as_str),
+        )
+        .filter(|candidate| !candidate.ends_with(":*") && is_allowed(candidate))
+        .collect();
+    if candidates.len() != 1 {
+        return Err("selected resource must be explicit and concrete".to_owned());
+    }
+    NormalizedResourceSelector::new(*candidates.iter().next().expect("one candidate"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -956,6 +1098,7 @@ impl<'de> Deserialize<'de> for CapabilityDenial {
 pub struct CapabilityGrantSetParts {
     pub admission_id: AdmissionId,
     pub admission_request_digest: Sha256Digest,
+    pub delegation_ancestry_digest: Sha256Digest,
     pub actor: ActorRef,
     pub agent: AgentRef,
     pub task: TaskRef,
@@ -975,6 +1118,7 @@ pub struct CapabilityGrantSetParts {
 pub struct CapabilityGrantSet {
     admission_id: AdmissionId,
     admission_request_digest: Sha256Digest,
+    delegation_ancestry_digest: Sha256Digest,
     actor: ActorRef,
     agent: AgentRef,
     task: TaskRef,
@@ -1021,6 +1165,7 @@ impl CapabilityGrantSet {
         Ok(Self {
             admission_id: parts.admission_id,
             admission_request_digest: parts.admission_request_digest,
+            delegation_ancestry_digest: parts.delegation_ancestry_digest,
             actor: parts.actor,
             agent: parts.agent,
             task: parts.task,
@@ -1043,6 +1188,7 @@ impl CapabilityGrantSet {
             || self.task != request.task
             || self.session != request.session
             || self.admission_request_digest != request.request_digest
+            || self.delegation_ancestry_digest != request.delegation_ancestry_digest
             || self.catalog_identity != request.catalog_identity
             || self.catalog_digest != request.catalog_digest
         {
@@ -1106,10 +1252,9 @@ impl CapabilityGrantSet {
                 ));
             };
             if grant.resources.iter().any(|granted| {
-                !requested
-                    .resources
-                    .iter()
-                    .any(|requested| selector_is_subset_of(granted.as_str(), requested.as_str()))
+                !requested.resources.iter().any(|requested| {
+                    resource_selector_is_subset_of(granted.as_str(), requested.as_str())
+                })
             }) {
                 return Err(result_invalid(
                     DiagnosticStage::Admit,
@@ -1137,6 +1282,9 @@ impl CapabilityGrantSet {
     }
     pub fn admission_request_digest(&self) -> &Sha256Digest {
         &self.admission_request_digest
+    }
+    pub fn delegation_ancestry_digest(&self) -> &Sha256Digest {
+        &self.delegation_ancestry_digest
     }
     pub fn actor(&self) -> &ActorRef {
         &self.actor
@@ -1186,6 +1334,7 @@ impl<'de> Deserialize<'de> for CapabilityGrantSet {
         struct Raw {
             admission_id: AdmissionId,
             admission_request_digest: Sha256Digest,
+            delegation_ancestry_digest: Sha256Digest,
             actor: ActorRef,
             agent: AgentRef,
             task: TaskRef,
@@ -1204,6 +1353,7 @@ impl<'de> Deserialize<'de> for CapabilityGrantSet {
         let value = Self::try_new(CapabilityGrantSetParts {
             admission_id: raw.admission_id,
             admission_request_digest: raw.admission_request_digest,
+            delegation_ancestry_digest: raw.delegation_ancestry_digest,
             actor: raw.actor,
             agent: raw.agent,
             task: raw.task,
@@ -1233,6 +1383,7 @@ fn grant_digest(parts: &CapabilityGrantSetParts) -> Result<Sha256Digest, String>
     struct Wire<'a> {
         admission_id: &'a AdmissionId,
         admission_request_digest: &'a Sha256Digest,
+        delegation_ancestry_digest: &'a Sha256Digest,
         actor: &'a ActorRef,
         agent: &'a AgentRef,
         task: &'a TaskRef,
@@ -1251,6 +1402,7 @@ fn grant_digest(parts: &CapabilityGrantSetParts) -> Result<Sha256Digest, String>
         &Wire {
             admission_id: &parts.admission_id,
             admission_request_digest: &parts.admission_request_digest,
+            delegation_ancestry_digest: &parts.delegation_ancestry_digest,
             actor: &parts.actor,
             agent: &parts.agent,
             task: &parts.task,
@@ -1360,6 +1512,7 @@ pub struct InvocationRequest {
     invocation_id: InvocationId,
     admission_id: AdmissionId,
     grant_digest: Sha256Digest,
+    delegation_ancestry_digest: Sha256Digest,
     capability: CapabilityIdentity,
     selected_resource: NormalizedResourceSelector,
     arguments: Value,
@@ -1376,6 +1529,7 @@ impl InvocationRequest {
         invocation_id: InvocationId,
         admission_id: AdmissionId,
         grant_digest: Sha256Digest,
+        delegation_ancestry_digest: Sha256Digest,
         capability: CapabilityIdentity,
         selected_resource: impl Into<String>,
         arguments: Value,
@@ -1388,6 +1542,7 @@ impl InvocationRequest {
             invocation_id,
             admission_id,
             grant_digest,
+            delegation_ancestry_digest,
             capability,
             selected_resource: NormalizedResourceSelector::new(selected_resource)?,
             arguments,
@@ -1437,6 +1592,7 @@ impl InvocationRequest {
     ) -> Result<(), Diagnostic> {
         if self.admission_id != grant_set.admission_id
             || self.grant_digest != grant_set.grant_digest
+            || self.delegation_ancestry_digest != grant_set.delegation_ancestry_digest
         {
             return Err(result_invalid(
                 DiagnosticStage::Invoke,
@@ -1464,6 +1620,9 @@ impl InvocationRequest {
     }
     pub fn grant_digest(&self) -> &Sha256Digest {
         &self.grant_digest
+    }
+    pub fn delegation_ancestry_digest(&self) -> &Sha256Digest {
+        &self.delegation_ancestry_digest
     }
     pub fn capability(&self) -> &CapabilityIdentity {
         &self.capability
@@ -1494,6 +1653,7 @@ pub struct EffectProposal {
     invocation_id: InvocationId,
     admission_id: AdmissionId,
     grant_digest: Sha256Digest,
+    delegation_ancestry_digest: Sha256Digest,
     capability: CapabilityIdentity,
     selected_resource: NormalizedResourceSelector,
     arguments_digest: Sha256Digest,
@@ -1510,6 +1670,7 @@ struct EffectProposalDigestInput<'a> {
     invocation_id: &'a InvocationId,
     admission_id: &'a AdmissionId,
     grant_digest: &'a Sha256Digest,
+    delegation_ancestry_digest: &'a Sha256Digest,
     capability: &'a CapabilityIdentity,
     selected_resource: &'a NormalizedResourceSelector,
     arguments_digest: &'a Sha256Digest,
@@ -1534,6 +1695,7 @@ impl EffectProposal {
             request.invocation_id.clone(),
             request.admission_id.clone(),
             request.grant_digest,
+            request.delegation_ancestry_digest,
             request.capability.clone(),
             request.selected_resource.clone(),
             arguments_digest,
@@ -1550,6 +1712,7 @@ impl EffectProposal {
         invocation_id: InvocationId,
         admission_id: AdmissionId,
         grant_digest: Sha256Digest,
+        delegation_ancestry_digest: Sha256Digest,
         capability: CapabilityIdentity,
         selected_resource: NormalizedResourceSelector,
         arguments_digest: Sha256Digest,
@@ -1564,6 +1727,7 @@ impl EffectProposal {
                 invocation_id: &invocation_id,
                 admission_id: &admission_id,
                 grant_digest: &grant_digest,
+                delegation_ancestry_digest: &delegation_ancestry_digest,
                 capability: &capability,
                 selected_resource: &selected_resource,
                 arguments_digest: &arguments_digest,
@@ -1579,6 +1743,7 @@ impl EffectProposal {
             invocation_id,
             admission_id,
             grant_digest,
+            delegation_ancestry_digest,
             capability,
             selected_resource,
             arguments_digest,
@@ -1597,6 +1762,9 @@ impl EffectProposal {
     }
     pub fn grant_digest(&self) -> &Sha256Digest {
         &self.grant_digest
+    }
+    pub fn delegation_ancestry_digest(&self) -> &Sha256Digest {
+        &self.delegation_ancestry_digest
     }
     pub fn capability(&self) -> &CapabilityIdentity {
         &self.capability
@@ -1629,6 +1797,7 @@ impl<'de> Deserialize<'de> for EffectProposal {
             invocation_id: InvocationId,
             admission_id: AdmissionId,
             grant_digest: Sha256Digest,
+            delegation_ancestry_digest: Sha256Digest,
             capability: CapabilityIdentity,
             selected_resource: NormalizedResourceSelector,
             arguments_digest: Sha256Digest,
@@ -1644,6 +1813,7 @@ impl<'de> Deserialize<'de> for EffectProposal {
             raw.invocation_id,
             raw.admission_id,
             raw.grant_digest,
+            raw.delegation_ancestry_digest,
             raw.capability,
             raw.selected_resource,
             raw.arguments_digest,

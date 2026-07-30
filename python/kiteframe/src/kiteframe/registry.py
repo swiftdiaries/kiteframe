@@ -15,6 +15,8 @@ class ComponentKind(str, Enum):
     MIDDLEWARE = "middleware"
     BACKEND = "backend"
     CHECKPOINTER = "checkpointer"
+    AUTHORITY_PROVIDER = "authority_provider"
+    ADMITTED_TOOL_REGISTRY = "admitted_tool_registry"
     CAPABILITY_PROVIDER = "capability_provider"
     AUDIT_SINK = "audit_sink"
     REDACTION_POLICY = "redaction_policy"
@@ -60,13 +62,9 @@ def validate_registry_symbol(symbol: str) -> str:
     previous_separator = False
     for index, character in enumerate(symbol):
         is_lowercase_letter = (
-            character.isascii()
-            and character.islower()
-            and character.isalpha()
+            character.isascii() and character.islower() and character.isalpha()
         )
-        is_noninitial_digit = (
-            character.isascii() and character.isdigit() and index > 0
-        )
+        is_noninitial_digit = character.isascii() and character.isdigit() and index > 0
         if is_lowercase_letter or is_noninitial_digit:
             previous_separator = False
         elif character in "._-" and index > 0 and not previous_separator:

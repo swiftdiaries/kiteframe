@@ -60,10 +60,11 @@ pub use schema::{
 pub use service::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, AuthorityRevision,
     AuthorityRevisionSet, BaggageCorrelationId, CapabilityDenial, CapabilityGrantSet,
-    CapabilityGrantSetParts, CatalogRequest, CheckpointRef, DelegationAncestry, EffectProposal,
-    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceKind, EvidenceReferences,
-    IdempotencyKey, InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus,
-    NormalizedResourceSelector, PolicyRevision, ProtectedEvidenceRequestRef, RequestedCapability,
-    RequiredEvidence, SessionRef, StableCapabilityError, StatusFirstDiagnostic, StatusRequest,
-    Suspension, TaskRef, Timestamp, TraceContext,
+    CapabilityGrantSetParts, CatalogRequest, CheckpointRef, DelegationAncestry, DelegationEdge,
+    EffectProposal, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceKind,
+    EvidenceReferences, IdempotencyKey, InvocationId, InvocationOutcome, InvocationRequest,
+    InvocationStatus, NormalizedResourceSelector, PolicyRevision, ProtectedEvidenceRequestRef,
+    RequestedCapability, RequiredEvidence, SessionRef, StableCapabilityError,
+    StatusFirstDiagnostic, StatusRequest, Suspension, TaskRef, Timestamp, TraceContext,
+    resource_selector_is_subset_of, select_invocation_resource,
 };

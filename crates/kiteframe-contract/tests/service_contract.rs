@@ -8,7 +8,7 @@ use kiteframe_contract::{
     AuthorityRevision, AuthorityRevisionSet, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, CapabilityName,
     CapabilityReleaseVersion, CatalogIdentity, CatalogRequest, CheckpointRef,
-    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, Diagnostic,
+    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, DelegationEdge, Diagnostic,
     EffectClassification, EffectProposal, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts,
     EvidenceKind, EvidenceReferences, EvidenceRequirement, ExecutionMode, IdempotencyRequirement,
     IdempotencyScope, InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus,
@@ -16,7 +16,7 @@ use kiteframe_contract::{
     PreconditionDescriptor, ProtectedEvidenceRequestRef, RequestedCapability, RequiredEvidence,
     ResolvedCapabilityRequirement, ResourceSelectorSchema, RetryClass, SessionRef, Sha256Digest,
     StableCapabilityError, StatusFirstDiagnostic, StatusRequest, Suspension, TaskRef, Timestamp,
-    TraceContext,
+    TraceContext, select_invocation_resource,
 };
 use serde_json::json;
 
@@ -173,6 +173,7 @@ fn proposal_digest_changes_for_another_invocation_and_rejects_tampering() {
         InvocationId::new("inv-2").unwrap(),
         baseline.admission_id().clone(),
         *baseline.grant_digest(),
+        *baseline.delegation_ancestry_digest(),
         baseline.capability().clone(),
         baseline.selected_resource().as_str(),
         json!({"caseId": "case-1"}),
@@ -428,33 +429,175 @@ fn wire_deserialization_cannot_bypass_service_value_invariants() {
 
 #[test]
 fn delegation_ancestry_preserves_path_order_in_the_admission_digest() {
-    let ordered_agents = vec![
-        AgentRef::new("agent:z-root").unwrap(),
-        AgentRef::new("agent:a-parent").unwrap(),
+    let ordered_edges = vec![
+        DelegationEdge::try_new(
+            AgentRef::new("agent:z-root").unwrap(),
+            AgentRef::new("agent:a-parent").unwrap(),
+            vec![CapabilityName::new("cases.read").unwrap()],
+        )
+        .unwrap(),
+        DelegationEdge::try_new(
+            AgentRef::new("agent:a-parent").unwrap(),
+            AgentRef::new("agent:case-child").unwrap(),
+            vec![CapabilityName::new("cases.read").unwrap()],
+        )
+        .unwrap(),
     ];
-    let ordered_ancestry = DelegationAncestry::try_new(ordered_agents).unwrap();
+    let ordered_ancestry = DelegationAncestry::try_new(ordered_edges.clone()).unwrap();
     assert_eq!(
         ordered_ancestry
-            .agents()
+            .edges()
             .iter()
-            .map(AgentRef::as_str)
+            .map(|edge| {
+                (
+                    edge.parent_agent().as_str(),
+                    edge.child_agent().as_str(),
+                    edge.delegated_capabilities()[0].as_str(),
+                )
+            })
             .collect::<Vec<_>>(),
-        vec!["agent:z-root", "agent:a-parent"]
+        vec![
+            ("agent:z-root", "agent:a-parent", "cases.read"),
+            ("agent:a-parent", "agent:case-child", "cases.read"),
+        ]
     );
 
     let ordered = valid_admission_request_with_ancestry(ordered_ancestry);
-    let reversed = valid_admission_request_with_ancestry(
-        DelegationAncestry::try_new(vec![
-            AgentRef::new("agent:a-parent").unwrap(),
-            AgentRef::new("agent:z-root").unwrap(),
+    assert_eq!(
+        serde_json::to_value(&ordered).unwrap()["delegationAncestry"],
+        json!([
+            {
+                "parentAgent": "agent:z-root",
+                "childAgent": "agent:a-parent",
+                "delegatedCapabilities": ["cases.read"]
+            },
+            {
+                "parentAgent": "agent:a-parent",
+                "childAgent": "agent:case-child",
+                "delegatedCapabilities": ["cases.read"]
+            }
         ])
-        .unwrap(),
+    );
+    assert_eq!(
+        serde_json::to_value(&ordered).unwrap()["delegationAncestryDigest"],
+        json!(ordered.delegation_ancestry_digest().to_string())
     );
 
-    assert_ne!(ordered.request_digest(), reversed.request_digest());
+    assert!(DelegationAncestry::try_new(ordered_edges.into_iter().rev().collect()).is_err());
+}
+
+#[test]
+fn delegation_edge_child_and_capability_tampering_are_rejected() {
+    let ancestry = DelegationAncestry::try_new(vec![
+        DelegationEdge::try_new(
+            AgentRef::new("agent:root").unwrap(),
+            AgentRef::new("agent:child").unwrap(),
+            vec![CapabilityName::new("cases.read").unwrap()],
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let request = valid_admission_request_with_ancestry(ancestry);
+
+    for (field, value) in [
+        ("childAgent", json!("agent:forged-child")),
+        ("delegatedCapabilities", json!(["cases.write"])),
+    ] {
+        let mut wire = serde_json::to_value(&request).unwrap();
+        wire["delegationAncestry"][0][field] = value;
+        assert!(serde_json::from_value::<AdmissionRequest>(wire).is_err());
+    }
+}
+
+#[test]
+fn invocation_correlation_binds_the_exact_delegation_ancestry_digest() {
+    let ancestry = DelegationAncestry::try_new(vec![
+        DelegationEdge::try_new(
+            AgentRef::new("agent:root").unwrap(),
+            AgentRef::new("agent:child").unwrap(),
+            vec![CapabilityName::new("cases.read").unwrap()],
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let request = valid_admission_request_with_ancestry(ancestry);
+    let mut parts = grant_set_parts();
+    parts.admission_request_digest = *request.request_digest();
+    parts.delegation_ancestry_digest = *request.delegation_ancestry_digest();
+    let grant_set = CapabilityGrantSet::try_new(parts).unwrap();
+    let invocation = InvocationRequest::try_new(
+        InvocationId::new("inv-edge-1").unwrap(),
+        grant_set.admission_id().clone(),
+        *grant_set.grant_digest(),
+        *grant_set.delegation_ancestry_digest(),
+        capability_identity(),
+        "tenant:t1/case:case-1",
+        json!({"caseId": "case-1"}),
+        BTreeMap::new(),
+        None,
+        EvidenceReferences::default(),
+        trace_context(),
+    )
+    .unwrap();
+    invocation
+        .validate_admission_correlation(&grant_set)
+        .unwrap();
+
+    let tampered = InvocationRequest::try_new(
+        InvocationId::new("inv-edge-2").unwrap(),
+        grant_set.admission_id().clone(),
+        *grant_set.grant_digest(),
+        digest(99),
+        capability_identity(),
+        "tenant:t1/case:case-1",
+        json!({"caseId": "case-1"}),
+        BTreeMap::new(),
+        None,
+        EvidenceReferences::default(),
+        trace_context(),
+    )
+    .unwrap();
+    assert!(tampered.validate_admission_correlation(&grant_set).is_err());
+}
+
+#[test]
+fn native_resource_selection_accepts_wildcard_narrowing_but_never_selects_a_wildcard() {
+    let descriptor = read_only_descriptor();
+    let locked = LockedCapability::try_new(
+        capability_identity(),
+        descriptor.clone(),
+        *descriptor.descriptor_digest(),
+        digest(5),
+        digest(6),
+        digest(7),
+        digest(8),
+    )
+    .unwrap();
+    let requirement = ResolvedCapabilityRequirement::try_new(
+        locked,
+        true,
+        vec![String::from("tenant:t1/case:*")],
+    )
+    .unwrap();
+    let exact_grant = effective_grant(capability_identity(), "tenant:t1/case:case-1");
+    let wildcard_grant = effective_grant(capability_identity(), "tenant:t1/case:*");
+
     assert_eq!(
-        serde_json::to_value(ordered).unwrap()["delegationAncestry"],
-        json!(["agent:z-root", "agent:a-parent"])
+        select_invocation_resource(&requirement, &exact_grant, Some("tenant:t1/case:case-1"),)
+            .unwrap()
+            .as_str(),
+        "tenant:t1/case:case-1"
+    );
+    assert_eq!(
+        select_invocation_resource(&requirement, &exact_grant, None)
+            .unwrap()
+            .as_str(),
+        "tenant:t1/case:case-1"
+    );
+    assert!(select_invocation_resource(&requirement, &wildcard_grant, None).is_err());
+    assert!(
+        select_invocation_resource(&requirement, &wildcard_grant, Some("tenant:t1/case:*"),)
+            .is_err()
     );
 }
 
@@ -927,6 +1070,7 @@ fn invocation_request_for(
         InvocationId::new("inv-1").unwrap(),
         admission_id,
         grant_digest,
+        DelegationAncestry::default().digest().unwrap(),
         capability,
         selected_resource,
         arguments,
@@ -1180,6 +1324,7 @@ fn grant_set_parts() -> CapabilityGrantSetParts {
     CapabilityGrantSetParts {
         admission_id: AdmissionId::new("adm-1").unwrap(),
         admission_request_digest: *request.request_digest(),
+        delegation_ancestry_digest: *request.delegation_ancestry_digest(),
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
         task: TaskRef::new("task:triage").unwrap(),
