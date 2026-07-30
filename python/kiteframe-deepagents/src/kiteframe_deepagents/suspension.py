@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import re
+from collections.abc import (
+    AsyncIterator,
+    Collection,
+    Iterator,
+    Sequence,
+)
 from dataclasses import asdict, dataclass
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from kiteframe import (
     InvocationOutcome,
@@ -12,6 +19,15 @@ from kiteframe import (
     ResolvedCapabilityRequirement,
     build_invocation_request_for_requirement,
 )
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,
+    ChannelVersions,
+    Checkpoint,
+    CheckpointMetadata,
+    CheckpointTuple,
+)
+from langgraph.checkpoint.serde.base import SerializerProtocol
 from langgraph.types import Command, interrupt
 
 from .context import KiteframeSessionContext
@@ -19,14 +35,15 @@ from .context import KiteframeSessionContext
 SUSPENSION_TYPE = "kiteframe.capability.suspension"
 INVALID_SUSPENSION = "KF-CAP-002: invalid capability suspension"
 EvidenceKind = Literal["confirmation", "approval", "consent"]
-PROTECTED_EVIDENCE_REFERENCE_TYPE = (
-    "kiteframe.protected-evidence-reference"
-)
 _PROTECTED_REFERENCE_PATTERN = re.compile(
     r"(?:evidence-ref-[A-Za-z0-9][A-Za-z0-9._~-]{0,127}"
     r"|evidence://[A-Za-z0-9][A-Za-z0-9._~:/-]{0,255})"
 )
 _REFERENCE_ISSUER = object()
+_RESUME_CHANNEL = "__resume__"
+_SERIALIZED_REFERENCE_KEY = (
+    "__kiteframe_resolver_issued_evidence_reference_v1__"
+)
 
 
 def _exact_non_empty(value: object, name: str) -> str:
@@ -93,6 +110,274 @@ async def resolve_protected_evidence_reference(
         _protected_evidence_ref(reference),
         _issuer=_REFERENCE_ISSUER,
     )
+
+
+def _resolver_issued_resume(value: object) -> bool:
+    if type(value) is ProtectedEvidenceReference:
+        return True
+    if type(value) is list:
+        return bool(value) and all(_resolver_issued_resume(item) for item in value)
+    if type(value) is tuple:
+        return bool(value) and all(_resolver_issued_resume(item) for item in value)
+    if type(value) is dict:
+        return bool(value) and all(
+            type(key) is str and _resolver_issued_resume(item)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _encode_protected_reference(value: object) -> object:
+    if type(value) is ProtectedEvidenceReference:
+        return {_SERIALIZED_REFERENCE_KEY: value._reference}
+    if type(value) is list:
+        return [_encode_protected_reference(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_encode_protected_reference(item) for item in value)
+    if type(value) is dict:
+        return {
+            key: _encode_protected_reference(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _decode_protected_reference(value: object) -> object:
+    if (
+        type(value) is dict
+        and set(value) == {_SERIALIZED_REFERENCE_KEY}
+    ):
+        return ProtectedEvidenceReference(
+            _protected_evidence_ref(value[_SERIALIZED_REFERENCE_KEY]),
+            _issuer=_REFERENCE_ISSUER,
+        )
+    if type(value) is list:
+        return [_decode_protected_reference(item) for item in value]
+    if type(value) is tuple:
+        return tuple(_decode_protected_reference(item) for item in value)
+    if type(value) is dict:
+        return {
+            key: _decode_protected_reference(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class _ProtectedResumeSerializer:
+    delegate: SerializerProtocol
+
+    def dumps_typed(self, obj: Any) -> tuple[str, bytes]:
+        return self.delegate.dumps_typed(
+            _encode_protected_reference(obj)
+        )
+
+    def loads_typed(self, data: tuple[str, bytes]) -> Any:
+        return _decode_protected_reference(
+            self.delegate.loads_typed(data)
+        )
+
+
+class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
+    """Reject forged LangGraph resume writes before durable persistence."""
+
+    __slots__ = ("delegate",)
+
+    def __init__(self, delegate: BaseCheckpointSaver[Any]) -> None:
+        protected_delegate = copy.copy(delegate)
+        protected_delegate.serde = _ProtectedResumeSerializer(
+            delegate.serde
+        )
+        self.delegate = protected_delegate
+        self.serde = protected_delegate.serde
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    @property
+    def config_specs(self) -> list[Any]:
+        return self.delegate.config_specs
+
+    def with_allowlist(
+        self,
+        extra_allowlist: Collection[tuple[str, ...]],
+    ) -> _ProtectedResumeCheckpointer:
+        source = copy.copy(self.delegate)
+        serializer = self.serde
+        if type(serializer) is not _ProtectedResumeSerializer:
+            raise TypeError("protected resume serializer is unresolved")
+        source.serde = serializer.delegate
+        return type(self)(source.with_allowlist(extra_allowlist))
+
+    def get_tuple(
+        self,
+        config: RunnableConfig,
+    ) -> CheckpointTuple | None:
+        return self.delegate.get_tuple(config)
+
+    def list(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> Iterator[CheckpointTuple]:
+        return self.delegate.list(
+            config,
+            filter=filter,
+            before=before,
+            limit=limit,
+        )
+
+    def put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        return self.delegate.put(
+            config,
+            checkpoint,
+            metadata,
+            new_versions,
+        )
+
+    @staticmethod
+    def _validate_writes(writes: Sequence[tuple[str, Any]]) -> None:
+        for channel, value in writes:
+            if channel == _RESUME_CHANNEL and not _resolver_issued_resume(value):
+                raise TypeError(
+                    "resume payload must be a resolver-issued "
+                    "protected evidence reference"
+                )
+
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        self._validate_writes(writes)
+        self.delegate.put_writes(  # type: ignore[attr-defined]
+            config,
+            writes,
+            task_id,
+            task_path,
+        )
+
+    def delete_thread(self, thread_id: str) -> None:
+        self.delegate.delete_thread(thread_id)
+
+    def delete_for_runs(self, run_ids: Sequence[str]) -> None:
+        self.delegate.delete_for_runs(run_ids)
+
+    def copy_thread(
+        self,
+        source_thread_id: str,
+        target_thread_id: str,
+    ) -> None:
+        self.delegate.copy_thread(source_thread_id, target_thread_id)
+
+    def prune(
+        self,
+        thread_ids: Sequence[str],
+        *,
+        strategy: str = "keep_latest",
+    ) -> None:
+        self.delegate.prune(thread_ids, strategy=strategy)
+
+    async def aget_tuple(
+        self,
+        config: RunnableConfig,
+    ) -> CheckpointTuple | None:
+        return await self.delegate.aget_tuple(config)
+
+    async def alist(
+        self,
+        config: RunnableConfig | None,
+        *,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[CheckpointTuple]:
+        async for checkpoint in self.delegate.alist(
+            config,
+            filter=filter,
+            before=before,
+            limit=limit,
+        ):
+            yield checkpoint
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        return await self.delegate.aput(
+            config,
+            checkpoint,
+            metadata,
+            new_versions,
+        )
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        self._validate_writes(writes)
+        await self.delegate.aput_writes(  # type: ignore[attr-defined]
+            config,
+            writes,
+            task_id,
+            task_path,
+        )
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        await self.delegate.adelete_thread(thread_id)
+
+    async def adelete_for_runs(self, run_ids: Sequence[str]) -> None:
+        await self.delegate.adelete_for_runs(run_ids)
+
+    async def acopy_thread(
+        self,
+        source_thread_id: str,
+        target_thread_id: str,
+    ) -> None:
+        await self.delegate.acopy_thread(
+            source_thread_id,
+            target_thread_id,
+        )
+
+    async def aprune(
+        self,
+        thread_ids: Sequence[str],
+        *,
+        strategy: str = "keep_latest",
+    ) -> None:
+        await self.delegate.aprune(thread_ids, strategy=strategy)
+
+    def get_next_version(self, current: Any, channel: None) -> Any:
+        return self.delegate.get_next_version(current, channel)
+
+
+def protect_resume_checkpointer(
+    checkpointer: object,
+) -> BaseCheckpointSaver[Any]:
+    """Guard public LangGraph resume writes without replacing the saver."""
+
+    if not isinstance(checkpointer, BaseCheckpointSaver):
+        raise TypeError(
+            "suspendable checkpointer must be a public BaseCheckpointSaver"
+        )
+    return _ProtectedResumeCheckpointer(checkpointer)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,15 +453,12 @@ class LangGraphSuspensionBridge:
     ) -> str:
         envelope = SuspensionEnvelope.from_native(request, outcome)
         resumed = interrupt(asdict(envelope))
-        if (
-            type(resumed) is not dict
-            or set(resumed) != {"reference", "type"}
-            or resumed.get("type") != PROTECTED_EVIDENCE_REFERENCE_TYPE
-        ):
+        if type(resumed) is not ProtectedEvidenceReference:
             raise TypeError(
-                "resume payload must be a protected evidence reference"
+                "resume payload must be a resolver-issued "
+                "protected evidence reference"
             )
-        return _protected_evidence_ref(resumed.get("reference"))
+        return _protected_evidence_ref(resumed._reference)
 
 
 def resume_command(evidence_ref: ProtectedEvidenceReference) -> Command:
@@ -186,12 +468,7 @@ def resume_command(evidence_ref: ProtectedEvidenceReference) -> Command:
         raise TypeError(
             "evidence_ref must be an exact ProtectedEvidenceReference"
         )
-    return Command(
-        resume={
-            "reference": evidence_ref._reference,
-            "type": PROTECTED_EVIDENCE_REFERENCE_TYPE,
-        }
-    )
+    return Command(resume=evidence_ref)
 
 
 def build_resumed_invocation_request(

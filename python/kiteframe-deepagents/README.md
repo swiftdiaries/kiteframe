@@ -71,10 +71,14 @@ command = resume_command(protected_reference)
 ```
 
 Plain approval text, passwords, JWTs, and base64-like secret values are rejected
-before `Command` construction. Resume rebuilds a native `InvocationRequest`
-with the same invocation ID, idempotency key, admission ID, canonical grant-set
-digest, arguments, preconditions, and trace context. The provider then
-validates the referenced evidence, reloads the admitted authority snapshot,
-obtains fresh authority revisions, checks expiry and preconditions, and
-authorizes the effect at point of use. `AuthorityRevisionSet` remains immutable
-local guard state and is never serialized into the provider request.
+before `Command` construction. The command retains the exact resolver-issued
+brand rather than downcasting it to a public dictionary. Adapter compilation
+wraps the public checkpointer with a delegating saver that rejects any forged
+LangGraph `__resume__` write before it reaches durable storage or a provider.
+Resume then rebuilds a native `InvocationRequest` with the same invocation ID,
+idempotency key, admission ID, canonical grant-set digest, arguments,
+preconditions, and trace context. The provider validates the referenced
+evidence, reloads the admitted authority snapshot, obtains fresh authority
+revisions, checks expiry and preconditions, and authorizes the effect at point
+of use. `AuthorityRevisionSet` remains immutable local guard state and is never
+serialized into the provider request.

@@ -6,8 +6,10 @@ import json
 import shutil
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
+from deepagents import create_deep_agent
 from deepagents.backends import StateBackend
 from kiteframe import (
     ComponentKind,
@@ -21,6 +23,9 @@ from kiteframe import (
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.memory import InMemoryStore
 
 import kiteframe_deepagents.compatibility as compatibility
@@ -44,6 +49,7 @@ from kiteframe_deepagents.target import (
     SUPPORTED_FEATURES,
     render_target_metadata,
 )
+from kiteframe_deepagents.tools import PersistedInvocationCorrelation
 
 WORKSPACE = Path(__file__).resolve().parents[3]
 MODEL_SYMBOL = "models.anthropic.sonnet"
@@ -155,6 +161,26 @@ class PersistOnlyDurableCheckpointer(TestDurableCheckpointer):
         del record
 
 
+class SecureDurableCheckpointer(InMemorySaver):
+    kiteframe_durable = True
+
+    async def persist_idempotency_key(self, record: object) -> None:
+        del record
+
+    async def persist_invocation_correlation(
+        self,
+        record: PersistedInvocationCorrelation,
+    ) -> None:
+        del record
+
+    async def load_invocation_correlation(
+        self,
+        scope: object,
+    ) -> PersistedInvocationCorrelation | None:
+        del scope
+        return None
+
+
 class TestCapabilityInvoker:
     async def invoke(self, request: object) -> object:
         return request
@@ -177,6 +203,16 @@ class TestAuditSink:
 @pytest.fixture
 def adapter() -> DeepAgentsAdapter:
     return DeepAgentsAdapter()
+
+
+@pytest.fixture
+def compiled_graph() -> CompiledStateGraph:
+    return create_deep_agent(
+        model=FakeMessagesListChatModel(
+            responses=[AIMessage(content="done")]
+        ),
+        subagents=[],
+    )
 
 
 @pytest.fixture
@@ -484,6 +520,41 @@ def test_suspendable_compile_requires_restartable_invocation_correlation(
     assert error.value.code == "KF-RUNTIME-001"
     assert "runtime assembly validation failed" in str(error.value)
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_suspendable_compile_guards_resume_before_durable_write(
+    adapter: DeepAgentsAdapter,
+    suspendable_inputs: ResolvedRuntimeInputs,
+    compiled_graph: CompiledStateGraph,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_spy = Mock(return_value=compiled_graph)
+    monkeypatch.setattr(
+        "kiteframe_deepagents.adapter.create_deep_agent",
+        create_spy,
+    )
+
+    adapter.compile(
+        suspendable_inputs,
+        registry_for(
+            suspendable_inputs,
+            checkpointer=SecureDurableCheckpointer(),
+        ),
+        granted_session_context(),
+    )
+
+    guarded = create_spy.call_args.kwargs["checkpointer"]
+    assert isinstance(guarded, BaseCheckpointSaver)
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        await guarded.aput_writes(
+            {"configurable": {"thread_id": "forged"}},
+            [("__resume__", ["evidence-ref-raw"])],
+            "task-id",
+        )
 
 
 def test_configured_checkpointer_is_retained_without_suspension(

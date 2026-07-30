@@ -30,6 +30,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command
 
 from kiteframe_deepagents.context import (
     KiteframeSessionContext,
@@ -39,6 +40,7 @@ from kiteframe_deepagents.suspension import (
     EvidenceReferenceResolver,
     LangGraphSuspensionBridge,
     ProtectedEvidenceReference,
+    protect_resume_checkpointer,
     resolve_protected_evidence_reference,
     resume_command,
 )
@@ -546,7 +548,9 @@ def compile_graph(
     builder.add_node("invoke_tool", invoke_tool)
     builder.add_edge(START, "invoke_tool")
     builder.add_edge("invoke_tool", END)
-    return builder.compile(checkpointer=checkpointer)
+    return builder.compile(
+        checkpointer=protect_resume_checkpointer(checkpointer)
+    )
 
 
 @pytest.mark.asyncio
@@ -798,11 +802,91 @@ async def test_resolver_issues_branded_reference_before_command() -> None:
         FakeEvidenceReferenceResolver({EVIDENCE_HANDLE: EVIDENCE_REF}),
     )
     command = resume_command(reference)
-    serialized = json.dumps(command.resume)
 
-    assert EVIDENCE_REF in serialized
-    assert EVIDENCE_HANDLE not in serialized
-    assert RAW_EVIDENCE not in serialized
+    assert command.resume is reference
+    with pytest.raises(TypeError):
+        json.dumps(command.resume)
+    checkpointer = protect_resume_checkpointer(
+        FakeDurableCheckpointer()
+    ).with_allowlist(set())
+    restored = checkpointer.serde.loads_typed(
+        checkpointer.serde.dumps_typed(reference)
+    )
+    assert type(restored) is ProtectedEvidenceReference
+    assert resume_command(restored).resume is restored
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("forged_resume", "smuggled_value"),
+    [
+        pytest.param(
+            {
+                "reference": "evidence-ref-raw",
+                "type": "kiteframe.protected-evidence-reference",
+            },
+            "evidence-ref-raw",
+            id="forged-dict",
+        ),
+        pytest.param(
+            "evidence-ref-raw",
+            "evidence-ref-raw",
+            id="direct-reference",
+        ),
+        pytest.param(
+            "evidence-ref-hunter2",
+            "evidence-ref-hunter2",
+            id="password",
+        ),
+        pytest.param(
+            "evidence-ref-c2VjcmV0",
+            "evidence-ref-c2VjcmV0",
+            id="base64",
+        ),
+        pytest.param(
+            (
+                "evidence-ref-eyJhbGciOiJIUzI1NiJ9."
+                "eyJzdWIiOiJhbGljZSJ9.signature"
+            ),
+            (
+                "evidence-ref-eyJhbGciOiJIUzI1NiJ9."
+                "eyJzdWIiOiJhbGljZSJ9.signature"
+            ),
+            id="jwt",
+        ),
+    ],
+)
+async def test_forged_resume_never_reaches_checkpoint_or_provider(
+    forged_resume: object,
+    smuggled_value: str,
+) -> None:
+    checkpointer = FakeDurableCheckpointer()
+    invoker = FakeInvoker()
+    graph = compile_graph(checkpointer=checkpointer, invoker=invoker)
+    config: RunnableConfig = {
+        "configurable": {"thread_id": f"forged-{smuggled_value}"}
+    }
+    await graph.ainvoke(
+        {
+            "arguments": {
+                "body": "hello",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        config,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        await graph.ainvoke(Command(resume=forged_resume), config)
+
+    checkpoint = await checkpointer.latest(config)
+    serialized = json.dumps(checkpoint, default=str)
+    assert smuggled_value not in serialized
+    assert all(request.evidence_refs == {} for request in invoker.requests)
 
 
 def test_adapter_source_is_closed_and_uses_only_public_deepagents_apis() -> None:
@@ -828,8 +912,9 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
         "target",
     }
     json_modules = {"json"}
-    json_decoders: set[str] = set()
-    tainted_values: set[str] = set()
+    json_decoders: set[tuple[str, ...]] = set()
+    tainted_values: set[tuple[str, ...]] = set()
+    semantic_aliases: dict[tuple[str, ...], set[str]] = {}
 
     def attribute_path(expression: ast.AST) -> tuple[str, ...] | None:
         if isinstance(expression, ast.Name):
@@ -840,13 +925,42 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
                 return (*prefix, expression.attr)
         return None
 
-    def assigned_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        return {
-            target.id
-            for target in targets
-            if isinstance(target, ast.Name)
-        }
+    def semantic_words(identifier: str) -> set[str]:
+        normalized = re.sub(
+            r"(?<=[a-z0-9])(?=[A-Z])",
+            "_",
+            identifier,
+        )
+        return set(re.findall(r"[a-z0-9]+", normalized.lower()))
+
+    def assignment_pairs(
+        target: ast.AST,
+        value: ast.AST,
+    ) -> list[tuple[tuple[str, ...], ast.AST]]:
+        if isinstance(target, ast.Starred):
+            return assignment_pairs(target.value, value)
+        if (
+            isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(value, (ast.Tuple, ast.List))
+            and len(target.elts) == len(value.elts)
+        ):
+            return [
+                pair
+                for child_target, child_value in zip(
+                    target.elts,
+                    value.elts,
+                    strict=True,
+                )
+                for pair in assignment_pairs(child_target, child_value)
+            ]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [
+                pair
+                for child_target in target.elts
+                for pair in assignment_pairs(child_target, value)
+            ]
+        path = attribute_path(target)
+        return [(path, value)] if path is not None else []
 
     def contains_canonical_json(expression: ast.AST) -> bool:
         return any(
@@ -856,11 +970,13 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
             for child in ast.walk(expression)
         )
 
-    def referenced_names(expression: ast.AST) -> set[str]:
+    def referenced_paths(
+        expression: ast.AST,
+    ) -> set[tuple[str, ...]]:
         return {
-            child.id
+            path
             for child in ast.walk(expression)
-            if isinstance(child, ast.Name)
+            if (path := attribute_path(child)) is not None
         }
 
     def is_json_decoder(expression: ast.AST) -> bool:
@@ -869,11 +985,12 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
             path is not None
             and (
                 (len(path) == 2 and path[0] in json_modules and path[1] == "loads")
-                or (len(path) == 1 and path[0] in json_decoders)
+                or path in json_decoders
             )
         )
 
-    assignments: list[ast.Assign | ast.AnnAssign] = []
+    assignments: list[tuple[tuple[str, ...], ast.AST]] = []
+    entrypoints: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -881,6 +998,8 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
                     violations.append("private Deep Agents import")
                 if alias.name == "json":
                     json_modules.add(alias.asname or alias.name)
+                local_name = alias.asname or alias.name.split(".", maxsplit=1)[0]
+                semantic_aliases[(local_name,)] = semantic_words(alias.name)
         if isinstance(node, ast.ImportFrom) and node.module is not None:
             if node.module.startswith("deepagents._") or (
                 node.module == "deepagents"
@@ -889,53 +1008,75 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
                 violations.append("private Deep Agents import")
             if node.module == "json":
                 json_decoders.update(
-                    alias.asname or alias.name
+                    (alias.asname or alias.name,)
                     for alias in node.names
                     if alias.name == "loads"
                 )
+            for alias in node.names:
+                semantic_aliases[(alias.asname or alias.name,)] = (
+                    semantic_words(alias.name)
+                )
         if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            assignments.append(node)
+            if node.value is None:
+                continue
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            for target in targets:
+                assignments.extend(assignment_pairs(target, node.value))
         if (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name in {"compile", "validate"}
         ):
-            arguments = (*node.args.args, *node.args.kwonlyargs)
-            for argument in arguments:
-                identifiers = [argument.arg]
-                if argument.annotation is not None:
-                    identifiers.append(ast.unparse(argument.annotation))
-                words = {
-                    word
-                    for identifier in identifiers
-                    for word in re.sub(
-                        r"(?<=[a-z0-9])(?=[A-Z])",
-                        "_",
-                        identifier,
-                    )
-                    .lower()
-                    .split("_")
-                }
-                if not words.isdisjoint(forbidden_input_words):
-                    violations.append("open compilation input")
+            entrypoints.append(node)
 
     changed = True
     while changed:
         changed = False
-        for assignment in assignments:
-            value = assignment.value
-            if value is None:
-                continue
-            names = assigned_names(assignment)
-            if is_json_decoder(value):
-                new_decoders = names - json_decoders
-                json_decoders.update(new_decoders)
-                changed = changed or bool(new_decoders)
-            if contains_canonical_json(value) or not referenced_names(
-                value
-            ).isdisjoint(tainted_values):
-                new_tainted = names - tainted_values
-                tainted_values.update(new_tainted)
-                changed = changed or bool(new_tainted)
+        for target, value in assignments:
+            if (
+                is_json_decoder(value)
+                and target not in json_decoders
+            ):
+                json_decoders.add(target)
+                changed = True
+            if (
+                contains_canonical_json(value)
+                or not referenced_paths(value).isdisjoint(tainted_values)
+            ) and target not in tainted_values:
+                tainted_values.add(target)
+                changed = True
+            inherited_words = {
+                word
+                for path in referenced_paths(value)
+                for word in semantic_aliases.get(path, set())
+            }
+            if inherited_words:
+                current_words = semantic_aliases.setdefault(target, set())
+                new_words = inherited_words - current_words
+                current_words.update(new_words)
+                changed = changed or bool(new_words)
+
+    for entrypoint in entrypoints:
+        arguments = (
+            *entrypoint.args.args,
+            *entrypoint.args.kwonlyargs,
+        )
+        for argument in arguments:
+            words = semantic_words(argument.arg)
+            if argument.annotation is not None:
+                words.update(
+                    semantic_words(ast.unparse(argument.annotation))
+                )
+                words.update(
+                    word
+                    for path in referenced_paths(argument.annotation)
+                    for word in semantic_aliases.get(path, set())
+                )
+            if not words.isdisjoint(forbidden_input_words):
+                violations.append("open compilation input")
 
     for node in ast.walk(tree):
         if (
@@ -944,7 +1085,7 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
             and node.args
             and (
                 contains_canonical_json(node.args[0])
-                or not referenced_names(node.args[0]).isdisjoint(
+                or not referenced_paths(node.args[0]).isdisjoint(
                     tainted_values
                 )
             )
@@ -977,6 +1118,28 @@ def _adapter_tree_violations(source_root: Path) -> list[str]:
         (
             "def validate(runtime_inputs, *, "
             "candidate: RuntimeTarget): pass\n"
+        ),
+        (
+            "from runtime import RuntimeTarget as RT\n"
+            "def validate(runtime_inputs, *, candidate: RT): pass\n"
+        ),
+        (
+            "from runtime import RuntimeTarget as RT\n"
+            "PublicType = RT\n"
+            "def validate(runtime_inputs, *, candidate: PublicType): pass\n"
+        ),
+        (
+            "import json\n"
+            "payload, ignored = native.canonical_json(), None\n"
+            "decode = json.loads\n"
+            "decode(payload)\n"
+        ),
+        (
+            "import json\n"
+            "holder.payload = native.canonical_json()\n"
+            "shadow = holder.payload\n"
+            "decode = json.loads\n"
+            "decode(shadow)\n"
         ),
     ],
 )

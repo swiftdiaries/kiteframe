@@ -38,7 +38,10 @@ from .middleware import (
     KiteframeGuardMiddleware,
     build_declared_child_task_tool,
 )
-from .suspension import LangGraphSuspensionBridge
+from .suspension import (
+    LangGraphSuspensionBridge,
+    protect_resume_checkpointer,
+)
 from .target import SUPPORTED_FEATURES, TARGET
 from .tools import (
     DurableInvocationCheckpointStore,
@@ -360,6 +363,11 @@ class DeepAgentsAdapter:
                 )
                 else _UnavailableSuspensionBridge()
             )
+            graph_checkpointer = (
+                protect_resume_checkpointer(components.checkpointer)
+                if isinstance(suspension_bridge, LangGraphSuspensionBridge)
+                else components.checkpointer
+            )
             capability_tools = build_capability_tools(
                 resolved.capability_requirements,
                 session_snapshot.grants,
@@ -426,7 +434,7 @@ class DeepAgentsAdapter:
                 permissions=None,
                 backend=package_backend,
                 interrupt_on=None,
-                checkpointer=cast(Any, components.checkpointer),
+                checkpointer=cast(Any, graph_checkpointer),
                 store=components.store,
                 name=resolved.package_name,
             )
