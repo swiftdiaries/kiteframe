@@ -360,6 +360,7 @@ rtk git commit -m "feat: define provider authorization seams"
 - Create: `openfga/authorization-model.fga`
 - Create: `openfga/test-tuples.yaml`
 - Test: `crates/kiteframe-openfga/tests/openfga_contract.rs`
+- Test: `crates/kiteframe-openfga/tests/openfga_container.rs`
 
 **Interfaces:**
 - Consumes: `AuthorizationBackend`, `AuthorityRevisionSet`, authenticated human/workload correlation, and deployment `OpenFgaConfig`.
@@ -424,6 +425,10 @@ model
 
 type actor
 
+type workload
+  relations
+    define actor: [actor]
+
 type task
   relations
     define actor: [actor]
@@ -431,16 +436,19 @@ type task
 type agent
   relations
     define assigned_task: [task]
+    define actor: actor from assigned_task
 
 type session
   relations
     define task: [task]
+    define actor: actor from task
 
 type capability
   relations
     define allowed_actor: [actor]
-    define allowed_task: [task, session#task, agent#assigned_task]
-    define can_invoke: allowed_actor and allowed_task
+    define allowed_task_actor: [task#actor, session#actor, agent#actor]
+    define allowed_workload_actor: [workload#actor]
+    define can_invoke: allowed_actor and allowed_task_actor and allowed_workload_actor
 
 type resource
   relations
@@ -448,7 +456,7 @@ type resource
     define can_invoke: can_invoke from capability
 ```
 
-Use contextual tuples to bind the verified human actor, verified workload caller/run, exact capability/resource, calling agent, task, session, admission, and ephemeral conditions. Human, workload, and task checks remain distinct intersections; a workload allow never substitutes for missing human authority.
+The checked OpenFGA user is the correlated business actor. Stored, pinned policy tuples grant the capability/resource and its actor, task/session/agent-actor, and workload-actor relationships; removing any such tuple revokes access. Contextual tuples bind only separately verified workload/run, actor/task/session/agent/admission provenance, and ephemeral conditions—they never create capability, resource, or policy-grant edges. Human, workload, and task checks remain distinct intersections; a workload allow never substitutes for missing human authority.
 
 - [ ] **Step 4: Implement `ListObjects` and `Check` requests**
 
