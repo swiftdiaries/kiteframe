@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    num::NonZeroU64,
     sync::{Arc, Mutex},
 };
 
@@ -10,15 +11,20 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use kiteframe_contract::{
-    ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, CapabilityCatalog,
-    CapabilityGrantSet, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CatalogIdentity, DelegationAncestry, DelegationEdge, Diagnostic, DiagnosticCategory,
-    DiagnosticCode, DiagnosticStage, EvidenceReferences, InvocationId, InvocationOutcome,
-    InvocationRequest, InvocationStatus, RetryClass, SessionRef, Sha256Digest, SourceRange,
-    TaskRef, Timestamp, TraceContext,
+    ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
+    CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts, CapabilityGrantSet,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
+    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, DelegationEdge, Diagnostic,
+    DiagnosticCategory, DiagnosticCode, DiagnosticStage, EffectClassification, EvidenceReferences,
+    ExecutionMode, FreshnessRequirement, IdempotencyKey, IdempotencyRequirement, IdempotencyScope,
+    InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus, NonEmptySet,
+    NormalizedResourceSelector, ResourceSelectorSchema, RetryClass, SessionRef, Sha256Digest,
+    SourceRange, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    VerifiedHumanPrincipal, VerifiedProviderPrincipals, VerifiedWorkloadPrincipal,
+    IdempotencyScopeValue, InMemoryInvocationStore, InvocationReservationInput,
+    InvocationStatusContext, InvocationStore, VerifiedHumanPrincipal, VerifiedProviderPrincipals,
+    VerifiedWorkloadPrincipal,
 };
 use kiteframe_provider_http::{
     AuthenticatedStatusRequest, HttpErrorKind, ProviderHttpError, ProviderHttpServices,
@@ -34,7 +40,7 @@ const TRACEPARENT: &str = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-
 async fn exact_v1_routes_return_stable_native_contract_bodies() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events),
     );
 
@@ -98,7 +104,7 @@ async fn exact_v1_routes_return_stable_native_contract_bodies() {
 async fn catalog_etag_revalidation_returns_bodyless_304_without_client_fetch_result() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events.clone()),
     );
     let first = send(&app, request(Method::GET, "/v1/capability-catalog", None)).await;
@@ -139,7 +145,7 @@ async fn catalog_etag_revalidation_returns_bodyless_304_without_client_fetch_res
 async fn every_route_traces_then_authenticates_both_principals_before_service_logic() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events.clone()),
     );
     let requests = [
@@ -195,7 +201,10 @@ async fn credential_headers_are_visible_only_to_verifier_and_never_to_services()
         observed_contexts: Arc::new(Mutex::new(Vec::new())),
         observed_traces: Arc::new(Mutex::new(Vec::new())),
     });
-    let app = provider_router(ProviderHttpState::new(services.clone()), verifier.clone());
+    let app = provider_router(
+        ProviderHttpState::new(services.clone(), Arc::new(InMemoryInvocationStore::new())),
+        verifier.clone(),
+    );
     let mut request = request(Method::GET, "/v1/capability-catalog", None);
     request.headers_mut().insert(
         header::AUTHORIZATION,
@@ -241,7 +250,7 @@ async fn credential_headers_are_visible_only_to_verifier_and_never_to_services()
 async fn independently_verified_human_and_workload_tenant_mismatch_denies_before_service() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         Arc::new(MismatchedTenantVerifier {
             events: events.clone(),
         }),
@@ -260,7 +269,7 @@ async fn independently_verified_human_and_workload_tenant_mismatch_denies_before
 async fn status_request_for_another_invocation_is_denied_with_full_principal_context() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services_with_foreign_invocation(events.clone()).await,
         allowing_principal_verifier(events.clone()),
     );
 
@@ -273,12 +282,7 @@ async fn status_request_for_another_invocation_is_denied_with_full_principal_con
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(
         events.lock().unwrap().as_slice(),
-        [
-            "trace",
-            "authenticate_human",
-            "authenticate_workload",
-            "status",
-        ]
+        ["trace", "authenticate_human", "authenticate_workload"]
     );
 }
 
@@ -286,7 +290,10 @@ async fn status_request_for_another_invocation_is_denied_with_full_principal_con
 async fn opaque_sensitive_diagnostic_fields_are_default_deny_projected() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        ProviderHttpState::new(Arc::new(AdversarialDiagnosticServices)),
+        ProviderHttpState::new(
+            Arc::new(AdversarialDiagnosticServices),
+            Arc::new(InMemoryInvocationStore::new()),
+        ),
         allowing_principal_verifier(events),
     );
 
@@ -318,7 +325,7 @@ async fn opaque_sensitive_diagnostic_fields_are_default_deny_projected() {
 async fn trace_baggage_is_allowlisted_and_sensitive_names_are_rejected_before_auth() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events.clone()),
     );
     let mut allowed = request(Method::GET, "/v1/capability-catalog", None);
@@ -365,7 +372,7 @@ async fn repeated_tracestate_and_baggage_headers_are_combined() {
         observed_traces: Arc::new(Mutex::new(Vec::new())),
     });
     let app = provider_router(
-        ProviderHttpState::new(services.clone()),
+        ProviderHttpState::new(services.clone(), Arc::new(InMemoryInvocationStore::new())),
         allowing_principal_verifier(events),
     );
     let mut request = request(Method::GET, "/v1/capability-catalog", None);
@@ -406,7 +413,7 @@ async fn repeated_tracestate_and_baggage_headers_are_combined() {
 async fn malformed_oversized_and_identity_mismatch_requests_are_stable_diagnostics() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events),
     );
     let malformed = send(
@@ -449,7 +456,7 @@ async fn malformed_oversized_and_identity_mismatch_requests_are_stable_diagnosti
 async fn oversized_bodies_are_rejected_on_catalog_and_status_routes() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events),
     );
     for uri in ["/v1/capability-catalog", "/v1/capability-invocations/inv-1"] {
@@ -471,10 +478,49 @@ async fn oversized_bodies_are_rejected_on_catalog_and_status_routes() {
 }
 
 #[tokio::test]
+async fn chunked_or_undeclared_get_bodies_are_rejected_before_route_logic() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = provider_router(
+        test_services(events.clone()).await,
+        allowing_principal_verifier(events.clone()),
+    );
+
+    let mut chunked = request(
+        Method::GET,
+        "/v1/capability-catalog",
+        Some(json!({"small": true})),
+    );
+    chunked
+        .headers_mut()
+        .insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+    let response = send(&app, chunked).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let undeclared = request(
+        Method::GET,
+        "/v1/capability-invocations/inv-1",
+        Some(json!({"small": true})),
+    );
+    let response = send(&app, undeclared).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "trace",
+            "authenticate_human",
+            "authenticate_workload",
+            "trace",
+            "authenticate_human",
+            "authenticate_workload",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn only_the_four_declared_method_path_contracts_are_accepted() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events),
     );
     for (method, uri) in [
@@ -508,7 +554,7 @@ async fn only_the_four_declared_method_path_contracts_are_accepted() {
 async fn admission_rejects_delegation_ancestry_whose_leaf_is_not_verified_agent() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events.clone()),
     );
     let response = send(
@@ -532,7 +578,7 @@ async fn admission_rejects_delegation_ancestry_whose_leaf_is_not_verified_agent(
 async fn admission_accepts_only_when_every_nested_delegation_agent_is_verified() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let app = provider_router(
-        test_services(events.clone()),
+        test_services(events.clone()).await,
         allowing_principal_verifier(events.clone()),
     );
     let response = send(
@@ -561,6 +607,7 @@ async fn admission_accepts_only_when_every_nested_delegation_agent_is_verified()
 async fn running_router_rejects_mismatched_origin_and_redirect_forwarding_hints() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let state = test_services(events.clone())
+        .await
         .with_origin("https://provider.example")
         .unwrap();
     let app = provider_router(state, allowing_principal_verifier(events));
@@ -579,10 +626,20 @@ async fn running_router_rejects_mismatched_origin_and_redirect_forwarding_hints(
     let response = send(&app, forwarded).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
+    let mut mismatched_host = request(Method::GET, "/v1/capability-catalog", None);
+    mismatched_host
+        .headers_mut()
+        .insert(header::HOST, "attacker.example".parse().unwrap());
+    let response = send(&app, mismatched_host).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
     let mut matching = request(Method::GET, "/v1/capability-catalog", None);
     matching
         .headers_mut()
         .insert(header::ORIGIN, "https://provider.example".parse().unwrap());
+    matching
+        .headers_mut()
+        .insert(header::HOST, "provider.example".parse().unwrap());
     assert_eq!(send(&app, matching).await.status(), StatusCode::OK);
 }
 
@@ -884,12 +941,125 @@ impl RecordingServices {
     }
 }
 
-fn test_services(events: Arc<Mutex<Vec<&'static str>>>) -> ProviderHttpState {
-    ProviderHttpState::new(Arc::new(RecordingServices {
-        events,
-        observed_contexts: Arc::new(Mutex::new(Vec::new())),
-        observed_traces: Arc::new(Mutex::new(Vec::new())),
-    }))
+async fn test_services(events: Arc<Mutex<Vec<&'static str>>>) -> ProviderHttpState {
+    test_services_with_store(events, false).await
+}
+
+async fn test_services_with_foreign_invocation(
+    events: Arc<Mutex<Vec<&'static str>>>,
+) -> ProviderHttpState {
+    test_services_with_store(events, true).await
+}
+
+async fn test_services_with_store(
+    events: Arc<Mutex<Vec<&'static str>>>,
+    include_foreign: bool,
+) -> ProviderHttpState {
+    let store = Arc::new(InMemoryInvocationStore::new());
+    reserve_invocation(&store, "inv-1", "human-7", "actor-7", "key-1").await;
+    if include_foreign {
+        reserve_invocation(
+            &store,
+            "inv-other",
+            "human-other",
+            "actor-other",
+            "key-other",
+        )
+        .await;
+    }
+    ProviderHttpState::new(
+        Arc::new(RecordingServices {
+            events,
+            observed_contexts: Arc::new(Mutex::new(Vec::new())),
+            observed_traces: Arc::new(Mutex::new(Vec::new())),
+        }),
+        store,
+    )
+}
+
+async fn reserve_invocation(
+    store: &InMemoryInvocationStore,
+    invocation_id: &str,
+    human_ref: &str,
+    actor_ref: &str,
+    idempotency_key: &str,
+) {
+    store
+        .reserve_or_get(
+            InvocationReservationInput {
+                invocation_id: InvocationId::new(invocation_id).unwrap(),
+                status_id: format!("status-{invocation_id}"),
+                scope: IdempotencyScopeValue::try_new(
+                    ActorRef::new(actor_ref).unwrap(),
+                    capability_identity(),
+                    NormalizedResourceSelector::new(format!("case:{invocation_id}")).unwrap(),
+                    "cases.read",
+                )
+                .unwrap(),
+                idempotency_key: IdempotencyKey::new(idempotency_key).unwrap(),
+                request_digest: digest(10),
+                admission_id: AdmissionId::new("admission-5").unwrap(),
+                grant_digest: digest(11),
+                catalog_identity: catalog().identity().clone(),
+                catalog_digest: *catalog().catalog_digest(),
+                authority_revision_digest: digest(12),
+                status_context: InvocationStatusContext::try_new(
+                    "tenant-1",
+                    human_ref,
+                    "workload-2",
+                    "run-9",
+                    actor_ref,
+                    "agent-2",
+                    "task-4",
+                    "session-3",
+                    "admission-5",
+                )
+                .unwrap(),
+                proposal_digest: digest(13),
+                protected_evidence_refs: vec![],
+            },
+            &status_descriptor(),
+            Timestamp::new(u64::MAX),
+        )
+        .await
+        .unwrap();
+}
+
+fn status_descriptor() -> CapabilityDescriptor {
+    CapabilityDescriptor::try_new(CapabilityDescriptorParts {
+        identity: capability_identity(),
+        summary: "Read a case".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["caseId"],
+            "properties": {"caseId": {"type": "string"}}
+        }),
+        output_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["caseId"],
+            "properties": {"caseId": {"type": "string"}}
+        }),
+        stable_errors: vec![],
+        execution_modes: NonEmptySet::try_new(BTreeSet::from([ExecutionMode::Deferred])).unwrap(),
+        resource_selector_schema: ResourceSelectorSchema::try_new(json!({
+            "type": "string",
+            "pattern": "^case:[A-Za-z0-9-]+$"
+        }))
+        .unwrap(),
+        effect: EffectClassification::ReadOnly,
+        idempotency: IdempotencyRequirement::Required {
+            scope: IdempotencyScope::ActorCapabilityResourceOperation,
+            retention_seconds: NonZeroU64::new(3_600).unwrap(),
+        },
+        freshness: FreshnessRequirement::default(),
+        preconditions: vec![],
+        confirmation: ConfirmationRequirement::None,
+        approval: ApprovalRequirement::None,
+        consent: ConsentRequirement::None,
+    })
+    .unwrap()
 }
 
 fn allowing_principal_verifier(

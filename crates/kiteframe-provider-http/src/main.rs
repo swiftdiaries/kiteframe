@@ -7,6 +7,7 @@ use kiteframe_contract::{
     AdmissionRequest, CapabilityCatalog, CapabilityGrantSet, Diagnostic, DiagnosticCategory,
     DiagnosticCode, DiagnosticStage, InvocationOutcome, InvocationRequest, InvocationStatus,
 };
+use kiteframe_provider::InMemoryInvocationStore;
 use kiteframe_provider_http::{
     AuthenticatedStatusRequest, HttpErrorKind, ProviderHttpError, ProviderHttpServices,
     ProviderHttpState, ProviderPrincipalVerifier, ProviderRequestContext, ServerBindConfig,
@@ -57,9 +58,12 @@ async fn main() {
     }
     let origin = config.origin_url().as_str().to_owned();
     let router = provider_router(
-        ProviderHttpState::new(Arc::new(UnconfiguredServices))
-            .with_origin(&origin)
-            .unwrap_or_else(|message| exit_with_error(message)),
+        ProviderHttpState::new(
+            Arc::new(UnconfiguredServices),
+            Arc::new(InMemoryInvocationStore::new()),
+        )
+        .with_origin(&origin)
+        .unwrap_or_else(|message| exit_with_error(message)),
         Arc::new(RejectingVerifier),
     );
     if let Err(message) = serve(router, config).await {

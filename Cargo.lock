@@ -1435,6 +1435,7 @@ dependencies = [
  "axum",
  "axum-server",
  "clap",
+ "http-body",
  "http-body-util",
  "kiteframe-contract",
  "kiteframe-provider",

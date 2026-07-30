@@ -16,7 +16,7 @@ use kiteframe_contract::{
     AdmissionRequest, CapabilityCatalog, CapabilityGrantSet, InvocationId, InvocationOutcome,
     InvocationRequest, InvocationStatus, StatusRequest, TraceContext,
 };
-use kiteframe_provider::InvocationStatusContext;
+use kiteframe_provider::{InvocationStatusContext, InvocationStore};
 use tower_http::limit::RequestBodyLimitLayer;
 use url::Url;
 
@@ -56,13 +56,18 @@ pub trait ProviderHttpServices: Send + Sync {
 #[derive(Clone)]
 pub struct ProviderHttpState {
     services: Arc<dyn ProviderHttpServices>,
+    status_store: Arc<dyn InvocationStore>,
     origin: Url,
 }
 
 impl ProviderHttpState {
-    pub fn new(services: Arc<dyn ProviderHttpServices>) -> Self {
+    pub fn new(
+        services: Arc<dyn ProviderHttpServices>,
+        status_store: Arc<dyn InvocationStore>,
+    ) -> Self {
         Self {
             services,
+            status_store,
             origin: Url::parse("https://provider.invalid")
                 .expect("static default provider origin is valid"),
         }
@@ -171,6 +176,15 @@ async fn enforce_runtime_origin(
             return Err(ProviderHttpError::identity_mismatch());
         }
     }
+    if let Some(host) = request.headers().get(header::HOST) {
+        let host = host
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<axum::http::uri::Authority>().ok());
+        if !host.is_some_and(|host| authority_matches_origin(&host, &expected)) {
+            return Err(ProviderHttpError::identity_mismatch());
+        }
+    }
     if request.uri().scheme().is_some() || request.uri().authority().is_some() {
         let absolute = Url::parse(&request.uri().to_string()).ok().and_then(|url| {
             crate::ServerBindConfig::origin(&url.origin().ascii_serialization()).ok()
@@ -184,6 +198,20 @@ async fn enforce_runtime_origin(
         return Err(ProviderHttpError::identity_mismatch());
     }
     Ok(response)
+}
+
+fn authority_matches_origin(authority: &axum::http::uri::Authority, origin: &Url) -> bool {
+    let expected_port = origin.port_or_known_default();
+    let scheme_default_port = match origin.scheme() {
+        "https" => Some(443),
+        "http" => Some(80),
+        _ => None,
+    };
+    let actual_port = authority.port_u16().or(scheme_default_port);
+    origin
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(authority.host()))
+        && actual_port == expected_port
 }
 
 async fn catalog(
@@ -250,6 +278,13 @@ async fn status(
     let request = StatusRequest::new(invocation_id, context.trace_context().clone());
     let expected_invocation_id = request.invocation_id().clone();
     let request = AuthenticatedStatusRequest::try_new(request, context)?;
+    state
+        .status_store
+        .status(request.request(), request.status_context())
+        .await
+        .map_err(|diagnostic| {
+            ProviderHttpError::new(HttpErrorKind::IdentityMismatch, diagnostic)
+        })?;
     let response = state.services.status(request).await?;
     response
         .validate_invocation_id(&expected_invocation_id)
@@ -313,7 +348,27 @@ async fn enforce_exact_contract(
     if known_path && !allowed {
         return Err(ProviderHttpError::method_not_allowed());
     }
+    if method == Method::GET && request_has_body(&request) {
+        return Err(ProviderHttpError::payload_too_large());
+    }
     Ok(next.run(request).await)
+}
+
+fn request_has_body(request: &Request) -> bool {
+    use http_body::Body as _;
+
+    if request.headers().contains_key(header::TRANSFER_ENCODING) {
+        return true;
+    }
+    let content_lengths = request.headers().get_all(header::CONTENT_LENGTH);
+    if content_lengths
+        .iter()
+        .any(|value| value.to_str().ok() != Some("0"))
+    {
+        return true;
+    }
+    let hint = request.body().size_hint();
+    hint.lower() != 0 || hint.upper().is_none_or(|upper| upper != 0)
 }
 
 async fn normalize_body_limit_response(request: Request, next: Next) -> Response {
