@@ -2,16 +2,23 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver the standardized capability provider with monotonic admission, current point-of-use authorization, a real OpenFGA reference backend, schema-validated invocation, durable idempotency/status, and write-ahead audit ordering.
+**Goal:** Deliver the standardized capability provider on the mandatory Wave 3R contract closure, with authenticated dual-principal admission, monotonic authority, current point-of-use authorization, a real OpenFGA reference backend, schema-validated invocation, durable idempotency/status, and write-ahead audit ordering.
 
-**Architecture:** `kiteframe-provider` is a Rust state machine over pluggable authorization, operation, invocation-store, and audit interfaces. Admission computes a time-bounded visibility envelope but never authorizes execution. `kiteframe-provider-http` exposes the four V1 routes, while `kiteframe-openfga` implements the replaceable reference authorization backend through pinned store/model configuration and current `Check` calls.
+**Architecture:** Wave 5 starts only after Wave 3R lands the canonical locked-capability, effective-grant, authority-revision, status, client catalog-fetch, client provider-authentication, and suspension contracts. `kiteframe-provider` owns the authoritative `CapabilityCatalog` and locked descriptor registry and is a Rust state machine over the applicable shared contracts plus pluggable authorization, operation, invocation-store, and audit interfaces; it does not define shadow grant or descriptor types or depend on runtime assembly state. `kiteframe-provider-http` uses a server-owned `ProviderPrincipalVerifier` to authenticate separately verified human and workload principals before route/application logic. The Wave 3R client-side `ProviderAuthenticator` supplies the credential headers consumed by that verifier, but is not a server interface. `kiteframe-openfga` implements the replaceable reference authorization backend through pinned store/model configuration and current `Check` calls.
 
 **Tech Stack:** Rust 1.97.1, Tokio, axum, reqwest/rustls, jsonschema, async-trait, OpenFGA HTTP API, testcontainers, SQLite for the reference invocation store, append-only JSONL audit fixture.
 
 ## Global Constraints
 
+- Wave 3R (`docs/superpowers/plans/2026-07-28-kiteframe-v1-wave-3r-contract-closure.md`) is a hard prerequisite. Do not create the Wave 5 crates until its contract/schema/stub gate passes.
+- Consume the applicable exact Wave 3R contracts: `ResolvedCapabilityRequirement` containing exact `LockedCapability`; `EffectiveCapabilityGrant`; `AuthorityRevisionSet`; `StatusRequest`; and the expanded `Suspension`. `ProviderAuthenticator` and `CatalogFetchResult` remain client-side contracts: the former supplies credential headers and the latter interprets catalog HTTP `200`/`304` responses.
+- The provider owns the authoritative `CapabilityCatalog` and locked descriptor registry. Admission exact-matches the client's expected catalog identity/digest and resolved requirements against that provider-owned state, then persists the exact provider-validated `LockedCapability` with the admission.
+- Do not introduce an internal `EffectiveGrant`, re-fetch a descriptor already persisted with an admission, reconstruct runtime inputs in provider code, or make the provider depend on runtime-specific assembly state.
 - Visible authority equals package requirements ∩ deployment policy ∩ actor authority ∩ task/session grants ∩ available locked catalog versions.
 - Explicit deny wins, absence is deny, and narrower resource, expiry, evidence, effect, or execution-mode terms win.
+- Each `EffectiveCapabilityGrant` preserves exact identity, normalized resources, narrowed execution modes, maximum effect, per-capability expiry, required evidence, freshness, and preconditions.
+- Every admission proves the expected catalog identity and digest, resolves every required capability, records optional-denial diagnostics, and emits a canonical `AuthorityRevisionSet` plus digest.
+- `AuthorityRevisionSet` is provider-produced state, never client-supplied authority. Invocation binds to a persisted admission by `admission_id` plus the canonical grant-set `grant_digest`; the provider loads the admitted grant/revision snapshot and obtains current revisions from authorization backends before every read or effect.
 - Admission filters visibility but never replaces point-of-use authorization.
 - Every read and effectful invocation requires a current authorization decision; cached admission never overrides revocation.
 - Required admission denial stops session construction with `KF-AUTH-001`; optional denial removes the grant with a stable diagnostic.
@@ -23,6 +30,10 @@
 - A durable write-ahead authorization record and receipt precede every effect. Audit append failure blocks the effect with `KF-AUDIT-001`.
 - Provider result validation occurs before the result reaches the adapter or model.
 - Provider, OpenFGA, audit, operation, or storage failure never exposes an unrestricted fallback.
+- Every provider route authenticates before route/application logic. Human and workload identities are verified separately; after native request decoding, admission/invocation/status correlate verified tenant/human/workload/run context with every portable actor/agent/task/session/admission reference carried by that request, and any mismatch fails closed.
+- Credentials establish transport principals but are never portable authority, grant material, descriptor content, telemetry baggage, diagnostics, status data, or audit payload.
+- Provider-internal row/field ACLs may narrow data before serialization. Portable capability descriptors and schemas expose only stable semantic projections, never provider ACL rule names, legacy fields, or presentation/session shapes.
+- Suspension and resume evidence is bound to the canonical proposal digest; resume revalidates evidence kind/reference, grant/catalog/descriptor/authority revisions, freshness, preconditions, and point-of-use authorization.
 
 ---
 
@@ -35,6 +46,7 @@ crates/kiteframe-provider/
     ├── lib.rs                                 # Provider service facade
     ├── authority.rs                           # Resource/effect/evidence envelope intersection
     ├── admission.rs                           # Grant-set construction and required/optional behavior
+    ├── principal.rs                           # Verified transport/portable identity correlation
     ├── authorization.rs                       # Replaceable backend trait and current decision
     ├── operation.rs                           # Trusted semantic operation registry
     ├── invocation.rs                          # Validation and execution state machine
@@ -58,6 +70,7 @@ crates/kiteframe-provider-http/
     ├── lib.rs                                 # axum router factory
     ├── routes.rs                              # Four V1 handlers
     ├── response.rs                            # Stable body and transport status mapping
+    ├── auth.rs                                # ProviderPrincipalVerifier middleware and credential stripping
     ├── trace.rs                               # W3C propagation and baggage filtering
     └── main.rs                                # TLS server configuration
 crates/kiteframe-provider-sqlite/
@@ -69,7 +82,9 @@ openfga/
 └── test-tuples.yaml
 tests/provider/
 ├── docker-compose.yml
-└── fixtures/                                  # Catalog, policy, effects, evidence, failures
+└── fixtures/
+    ├── catalog-policy-effects/                 # Catalog, policy, effects, evidence, failures
+    └── crankshaft-profile/                     # Provider-neutral workforce-shaped conformance corpus
 ```
 
 ### Task 1: Implement monotonic authority envelopes and admission behavior
@@ -83,8 +98,8 @@ tests/provider/
 - Test: `crates/kiteframe-provider/tests/admission.rs`
 
 **Interfaces:**
-- Consumes: Wave 3 `AdmissionRequest`, `CapabilityGrantSet`, locked descriptors, resolved requirements, diagnostics.
-- Produces: `AuthorityTerm`, `EffectiveEnvelope`, `intersect_authority(...)`, `AdmissionService::admit(...)`.
+- Consumes: provider-owned authoritative `CapabilityCatalog` and locked descriptor registry; `AdmissionRequest` carrying expected catalog identity/digest and Wave 3R `ResolvedCapabilityRequirement { locked_capability: LockedCapability, .. }`; canonical `EffectiveCapabilityGrant`, `AuthorityRevisionSet`, and diagnostics.
+- Produces: provider-internal `AuthorityTerm`, `intersect_authority(...) -> Result<Option<EffectiveCapabilityGrant>, Vec<Diagnostic>>`, and `AdmissionService::admit(...)`; the only emitted grant value is canonical `EffectiveCapabilityGrant`, and the admission persists each exact provider-validated `LockedCapability`.
 
 - [ ] **Step 1: Write failing deny-precedence and monotonicity tests**
 
@@ -96,18 +111,19 @@ fn explicit_deny_wins_over_allows() {
         AuthorityTerm::deny("cases.read"),
         AuthorityTerm::allow(grant("cases.read", "tenant:t1/case:case-1")),
     ];
-    assert!(intersect_authority(&terms).unwrap().is_empty());
+    assert!(intersect_authority(&resolved_requirement(), &terms).unwrap().is_none());
 }
 
 #[test]
 fn narrower_resource_expiry_and_evidence_win() {
-    let effective = intersect_authority(&[
+    let effective = intersect_authority(&resolved_requirement(), &[
         term("tenant:t1/case:*", HOUR_2, Evidence::Confirmation),
         term("tenant:t1/case:case-7", HOUR_1, Evidence::Approval),
-    ]).unwrap();
+    ]).unwrap().unwrap();
     assert_eq!(effective.resources(), ["tenant:t1/case:case-7"]);
     assert_eq!(effective.expires_at(), HOUR_1);
-    assert_eq!(effective.evidence(), Evidence::Approval);
+    assert_eq!(effective.required_evidence(), Evidence::Approval);
+    assert_eq!(effective.maximum_effect(), EffectClassification::ReadOnly);
 }
 
 proptest! {
@@ -116,8 +132,13 @@ proptest! {
         base in authority_term_strategy(),
         restriction in narrower_term_strategy(),
     ) {
-        let before = intersect_authority(std::slice::from_ref(&base)).unwrap();
-        let after = intersect_authority(&[base, restriction]).unwrap();
+        let requirement = resolved_requirement();
+        let before = intersect_authority(&requirement, std::slice::from_ref(&base))
+            .unwrap()
+            .unwrap();
+        let after = intersect_authority(&requirement, &[base, restriction])
+            .unwrap()
+            .unwrap();
         prop_assert!(after.is_subset_of(&before));
     }
 }
@@ -132,41 +153,70 @@ Expected: FAIL because the provider crate does not exist.
 - [ ] **Step 3: Implement selector and envelope partial ordering**
 
 ```rust
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EffectiveGrant {
-    pub identity: CapabilityIdentity,
-    pub resources: NonEmptySet<NormalizedResourceSelector>,
-    pub execution_modes: NonEmptySet<ExecutionMode>,
-    pub maximum_effect: EffectClassification,
-    pub expires_at: Timestamp,
-    pub required_evidence: EvidenceRequirementSet,
-    pub freshness: FreshnessRequirement,
-}
-
 pub fn intersect_authority(
+    requirement: &ResolvedCapabilityRequirement,
     terms: &[AuthorityTerm],
-) -> Result<EffectiveEnvelope, Vec<Diagnostic>> {
+) -> Result<Option<EffectiveCapabilityGrant>, Vec<Diagnostic>> {
     if terms.is_empty() || terms.iter().any(AuthorityTerm::is_explicit_deny) {
-        return Ok(EffectiveEnvelope::empty());
+        return Ok(None);
     }
-    terms.iter().map(AuthorityTerm::allow_value).try_fold(
-        EffectiveEnvelope::unbounded_for(terms[0].identity()),
-        EffectiveEnvelope::intersect,
-    )
+    EffectiveCapabilityGrant::intersect(
+        requirement.locked_capability(),
+        terms.iter().map(AuthorityTerm::allow_value),
+    ).map(Some)
 }
 ```
 
 For V1 selectors, normalize `/`-separated resource segments with literals and `*`; resolve `${context.*}` before admission; define subset as literal ≤ matching wildcard and exact equality otherwise. Reject unresolved placeholders and wildcard widening.
 
-- [ ] **Step 4: Implement required/optional admission**
+- [ ] **Step 4: Implement catalog-bound required/optional admission**
 
-`AdmissionService` obtains available exact locked versions, requests policy candidates, intersects package/deployment/actor/task/session terms, and creates a canonical expiring `CapabilityGrantSet`. Missing `required_for_session_start` terms produce `KF-AUTH-001`; optional misses append a stable safe diagnostic and do not create a grant.
+`AdmissionService` first exact-matches the request's expected catalog identity and digest to the provider-owned authoritative `CapabilityCatalog`. It then walks every `ResolvedCapabilityRequirement`, exact-matches its embedded `LockedCapability` against the provider-owned locked descriptor registry, persists that exact provider-validated lock with the admission, intersects package/deployment/human/workload/task/session terms, and emits one `EffectiveCapabilityGrant` per admitted capability. A client-resolved requirement is evidence of what the caller selected, never provider catalog authority. Missing required terms produce `KF-AUTH-001`; optional misses append a stable safe diagnostic and do not create a grant. Canonically sort source/revision entries into `AuthorityRevisionSet`, compute its digest, and include it plus per-capability expiry in the grant set.
+
+```rust
+#[tokio::test]
+async fn admission_proves_catalog_and_all_required_capabilities() {
+    let service = service();
+    let result = service.admit(admission_request()).await.unwrap();
+    assert_eq!(result.catalog_identity(), expected_catalog_identity());
+    assert_eq!(result.catalog_digest(), expected_catalog_digest());
+    assert_eq!(result.grants().len(), 2);
+    assert_eq!(result.optional_denials()[0].code.as_str(), "KF-AUTH-001");
+    assert_eq!(
+        result.authority_revisions().entries(),
+        [
+            revision("deployment-policy", "deploy-7"),
+            revision("openfga-model", "model-3"),
+            revision("tenant-policy", "tenant-42"),
+        ]
+    );
+    assert_eq!(
+        result.authority_revision_digest(),
+        result.authority_revisions().digest()
+    );
+    let persisted = service
+        .load_admission(result.admission_id(), result.grant_digest())
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted.locked_capability(&capability_identity("cases.read", "1.0.0")),
+        authoritative_registry().locked_capability("cases.read", "1.0.0"),
+    );
+}
+
+#[tokio::test]
+async fn client_lock_drift_from_provider_registry_fails_closed() {
+    let request = admission_request_with_tampered_locked_descriptor();
+    let error = service().admit(request).await.unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-CAP-001");
+}
+```
 
 - [ ] **Step 5: Run authority and admission tests**
 
 Run: `rtk cargo test -p kiteframe-provider --test authority --test admission`
 
-Expected: PASS for deny precedence, absence, version/resource/effect/mode/expiry/evidence intersection, required denial, optional omission, and canonical grant digest.
+Expected: PASS for catalog identity/digest mismatch, deny precedence, absence, exact locked-version/resource/effect/mode/per-capability-expiry/evidence/freshness/precondition intersection, required denial, optional diagnostics, canonical authority-revision ordering/digest, and canonical grant digest.
 
 - [ ] **Step 6: Commit monotonic admission**
 
@@ -175,21 +225,46 @@ rtk git add crates/kiteframe-provider
 rtk git commit -m "feat: admit monotonic capability grants"
 ```
 
-### Task 2: Define replaceable authorization and semantic operation interfaces
+### Task 2: Correlate authenticated principals and define provider extension interfaces
 
 **Files:**
+- Create: `crates/kiteframe-provider/src/principal.rs`
 - Create: `crates/kiteframe-provider/src/authorization.rs`
 - Create: `crates/kiteframe-provider/src/operation.rs`
 - Modify: `crates/kiteframe-provider/src/lib.rs`
+- Test: `crates/kiteframe-provider/tests/principal_boundary.rs`
 - Test: `crates/kiteframe-provider/tests/interfaces.rs`
 
 **Interfaces:**
-- Consumes: actor/agent/task/session refs, exact capability identity, selected resource, trace and policy context.
-- Produces: `AuthorizationBackend`, `AuthorizationDecision`, `CapabilityOperation`, `OperationRegistry`, and `InvocationContext`.
+- Consumes: server-produced `VerifiedProviderPrincipals` containing separately verified human/workload principals; portable actor/agent/task/session/admission refs; exact capability identity; selected resource; trace context; and provider-loaded persisted admission/grant/revision state.
+- Produces: provider-internal `AuthenticatedInvocationContext`, `correlate_principals(...)`, `AuthorizationBackend`, `AuthorizationDecision`, `CapabilityOperation`, `OperationRegistry`, and `InvocationContext`.
 
-- [ ] **Step 1: Write failing registry and current-check tests**
+- [ ] **Step 1: Write failing dual-principal, mismatch, registry, and current-check tests**
 
 ```rust
+#[test]
+fn independently_verified_human_and_workload_are_both_required() {
+    let context = correlate_principals(
+        verified_human("tenant-1", "human-7"),
+        verified_workload("tenant-1", "harness-2", "run-9"),
+        portable_refs("actor-7", "agent-2", "task-4", "session-3", "admission-5"),
+    ).unwrap();
+    assert_eq!(context.tenant_ref().as_str(), "tenant-1");
+    assert_eq!(context.human_ref().as_str(), "human-7");
+    assert_eq!(context.workload_ref().as_str(), "harness-2");
+    assert_eq!(context.run_ref().as_str(), "run-9");
+}
+
+#[test]
+fn verified_tenant_or_subject_mismatch_fails_closed() {
+    let error = correlate_principals(
+        verified_human("tenant-1", "human-7"),
+        verified_workload("tenant-2", "harness-2", "run-9"),
+        portable_refs("actor-other", "agent-2", "task-4", "session-3", "admission-5"),
+    ).unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-AUTH-003");
+}
+
 #[tokio::test]
 async fn duplicate_operation_registration_is_rejected() {
     let mut registry = OperationRegistry::new();
@@ -211,11 +286,13 @@ async fn invocation_uses_current_check_not_admission_decision() {
 
 - [ ] **Step 2: Run interface tests**
 
-Run: `rtk cargo test -p kiteframe-provider --test interfaces`
+Run: `rtk cargo test -p kiteframe-provider --test principal_boundary --test interfaces`
 
-Expected: FAIL because the backend and operation interfaces do not exist.
+Expected: FAIL because principal correlation, backend, and operation interfaces do not exist.
 
-- [ ] **Step 3: Add the authorization interface**
+- [ ] **Step 3: Add fail-closed principal correlation and the authorization interface**
+
+`AuthenticatedInvocationContext` is created only from separately verified human and workload principal values returned by the server-side `ProviderPrincipalVerifier` as `VerifiedProviderPrincipals`. Correlation exact-matches verified tenant, human-to-portable-actor mapping, workload-to-portable-agent mapping, run/task/session/admission bindings, and expiries. It stores opaque principal references, never bearer tokens, cookies, API keys, raw claims, or caller-supplied tenant/user fields. The human principal remains the business actor; the workload principal is a separately constrained calling identity and provenance term, never substitute authority.
 
 ```rust
 #[async_trait::async_trait]
@@ -230,11 +307,11 @@ pub trait AuthorizationBackend: Send + Sync {
         request: &InvocationAuthorizationRequest,
     ) -> Result<AuthorizationDecision, Diagnostic>;
 
-    async fn revision(&self) -> Result<PolicyRevision, Diagnostic>;
+    async fn revisions(&self) -> Result<AuthorityRevisionSet, Diagnostic>;
 }
 ```
 
-`AuthorizationDecision::Allow` contains a decision reference, model ID, policy revision, decided timestamp, and narrowed conditions. `Deny` contains only a safe reason category and decision reference.
+`AuthorizationDecision::Allow` contains a decision reference, canonical `AuthorityRevisionSet`, decided timestamp, and narrowed conditions. `Deny` contains only a safe reason category and decision reference. Every request to this interface includes the correlated authenticated principal references and portable actor/agent/task/session/admission refs.
 
 - [ ] **Step 4: Add trusted exact-version operation registration**
 
@@ -257,11 +334,13 @@ pub trait CapabilityOperation: Send + Sync {
 
 `OperationRegistry` is deployment-built, rejects duplicate exact identities, and freezes before service startup. It never loads a module named by a manifest, lock, or request.
 
+Provider operations may apply deployment-internal row and field ACLs before producing a result. The result returned to Kiteframe must validate against the embedded locked output schema and contain only the stable semantic projection. `FieldDecision`, legacy DTO fields, UI field IDs, and policy rule names never cross the provider boundary.
+
 - [ ] **Step 5: Run interface tests**
 
-Run: `rtk cargo test -p kiteframe-provider --test interfaces`
+Run: `rtk cargo test -p kiteframe-provider --test principal_boundary --test interfaces`
 
-Expected: PASS.
+Expected: PASS for dual-principal verification, tenant/human/workload/run correlation, portable-ref mismatch denial, credential non-retention, current authorization, exact operation registration, and stable projection output.
 
 - [ ] **Step 6: Commit provider extension interfaces**
 
@@ -283,7 +362,7 @@ rtk git commit -m "feat: define provider authorization seams"
 - Test: `crates/kiteframe-openfga/tests/openfga_contract.rs`
 
 **Interfaces:**
-- Consumes: `AuthorizationBackend` and deployment `OpenFgaConfig`.
+- Consumes: `AuthorizationBackend`, `AuthorityRevisionSet`, authenticated human/workload correlation, and deployment `OpenFgaConfig`.
 - Produces: `OpenFgaAuthorizationBackend`.
 
 - [ ] **Step 1: Write failing request-mapping and outage tests**
@@ -314,6 +393,20 @@ async fn outage_or_stale_revision_fails_closed() {
     let backend = unavailable_backend();
     let error = backend.check(&invocation_auth_request()).await.unwrap_err();
     assert_eq!(error.code.as_str(), "KF-AUTH-004");
+}
+
+#[tokio::test]
+async fn revision_set_records_model_store_and_tenant_policy_sources() {
+    let revisions = backend_for(&fake_openfga()).revisions().await.unwrap();
+    assert_eq!(
+        revisions.entries(),
+        [
+            revision("openfga-model", "model-1"),
+            revision("openfga-store", "store-1"),
+            revision("tenant-policy", "tenant-policy-7"),
+        ]
+    );
+    assert_eq!(revisions.digest(), canonical_authority_revision_digest());
 }
 ```
 
@@ -355,11 +448,11 @@ type resource
     define can_invoke: can_invoke from capability
 ```
 
-Use contextual tuples to bind exact capability/resource, calling agent, task, session, and ephemeral conditions. Actor and task checks remain distinct intersections.
+Use contextual tuples to bind the verified human actor, verified workload caller/run, exact capability/resource, calling agent, task, session, admission, and ephemeral conditions. Human, workload, and task checks remain distinct intersections; a workload allow never substitutes for missing human authority.
 
 - [ ] **Step 4: Implement `ListObjects` and `Check` requests**
 
-Configure reqwest with rustls, redirects disabled, fixed base origin, bounded bodies, and timeouts. Always include `authorization_model_id`, condition context, contextual tuples, and current timestamp. Record the pinned model ID and a deployment policy revision in every allow decision.
+Configure reqwest with rustls, redirects disabled, fixed base origin, bounded bodies, and timeouts. Always include `authorization_model_id`, condition context, contextual tuples, and current timestamp. Return canonical source/revision entries for pinned store, authorization model, tenant policy, and any deployment policy source in `AuthorityRevisionSet`; every allow decision records its digest.
 
 - [ ] **Step 5: Run mock and container-backed tests**
 
@@ -369,7 +462,7 @@ Expected: PASS.
 
 Run: `rtk cargo test -p kiteframe-openfga --features container-tests --test openfga_container`
 
-Expected: PASS for actor/task/agent/session/resource relations, `ListObjects`, point-of-use `Check`, contextual tuples, expiry conditions, revocation after admission, model migration, unavailable service, and stale policy.
+Expected: PASS for human/workload/run/task/agent/session/admission/resource relations, `ListObjects`, point-of-use `Check`, canonical authority revisions, contextual tuples, expiry conditions, revocation after admission, model migration, unavailable service, and stale policy.
 
 - [ ] **Step 6: Commit the OpenFGA reference backend**
 
@@ -386,7 +479,7 @@ rtk git commit -m "feat: add openfga authorization backend"
 - Test: `crates/kiteframe-provider/tests/invocation_validation.rs`
 
 **Interfaces:**
-- Consumes: locked descriptor, `InvocationRequest`, `CapabilityGrantSet`, `AuthorizationBackend`, `CapabilityOperation`.
+- Consumes: `InvocationRequest` carrying admission ID plus canonical grant-set `grant_digest`; the provider-owned admission record containing each exact provider-validated `LockedCapability`, persisted `EffectiveCapabilityGrant`, and admission `AuthorityRevisionSet`; expanded `Suspension`; authenticated principal context; `AuthorizationBackend`; and `CapabilityOperation`.
 - Produces: `InvocationService::invoke` validation stages through the point immediately before effect execution.
 
 - [ ] **Step 1: Write failing ordered-validation tests**
@@ -414,6 +507,17 @@ async fn invalid_result_is_never_returned() {
     let error = service.invoke(valid_read_request()).await.unwrap_err();
     assert_eq!(error.code.as_str(), "KF-CAP-002");
 }
+
+#[tokio::test]
+async fn evidence_for_another_proposal_cannot_resume_effect() {
+    let service = provider_with_valid_approval();
+    let error = service
+        .resume(effect_resume_request("proposal-digest-other"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-AUTH-003");
+    assert!(!service.events().contains(&"execute"));
+}
 ```
 
 - [ ] **Step 2: Run invocation validation tests**
@@ -429,12 +533,37 @@ pub async fn invoke(
     &self,
     request: InvocationRequest,
 ) -> Result<InvocationOutcome, Diagnostic> {
-    let descriptor = self.locked_descriptor(&request.capability)?;
+    let admission = self
+        .admissions
+        .load(request.admission_id(), request.grant_digest())
+        .await?;
+    let locked = admission.locked_capability(request.capability())?;
+    let descriptor = locked.descriptor();
+    locked.validate_complete_semantics(
+        descriptor.stable_errors(),
+        descriptor.execution_modes(),
+        descriptor.effect(),
+        descriptor.evidence_requirements(),
+        descriptor.freshness(),
+        descriptor.preconditions(),
+    )?;
     validate_input_schema(descriptor, &request.arguments)?;
-    let grant = self.validate_grant(&request)?;
-    self.validate_freshness(grant, descriptor).await?;
+    let grant = admission.effective_grant(request.capability())?;
+    grant.validate_against_locked_capability(locked)?;
+    self.validate_authenticated_context(&request, grant)?;
+    let current_revisions = self.authorization.revisions().await?;
+    self.validate_freshness(
+        grant,
+        admission.authority_revisions(),
+        &current_revisions,
+        descriptor,
+    ).await?;
     self.validate_resource(grant, descriptor, &request.selected_resource)?;
-    self.validate_evidence(descriptor, &request.evidence)?;
+    self.validate_evidence(
+        descriptor,
+        &request.evidence_refs,
+        request.proposal_digest(),
+    )?;
     let operation = self.operations.resolve(&request.capability)?;
     operation.validate_preconditions(&self.context(&request), &request.preconditions).await?;
     let decision = self.authorization.check(&request.into_authorization()).await?;
@@ -444,15 +573,19 @@ pub async fn invoke(
 
 Denial maps to `KF-AUTH-003`; stale or unprovable current policy maps to `KF-AUTH-004`; missing/stale preconditions map to `KF-CAP-001`.
 
+The request never supplies `AuthorityRevisionSet` or revision entries. The provider resolves `admission_id` plus the canonical grant-set `grant_digest` through its persisted admission store, exact-matches actor/agent/task/session and authenticated principal context, and asks each authorization backend for a fresh canonical revision set. Current revision freshness and point-of-use authorization are independent checks; matching the admitted revision digest never authorizes execution.
+
+Invocation never consults client runtime assembly state and never re-resolves a capability from a mutable catalog. The exact `LockedCapability` persisted after provider-side admission validation is the descriptor and version authority for every invocation and resume.
+
 - [ ] **Step 4: Add confirmation, approval, and consent distinction**
 
-Validate evidence type, subject/approver identity, action/resource binding, issue/expiry times, and protected reference form independently. Return `Suspended` only for descriptors that permit `suspendable` mode; never treat prompt text as evidence.
+Validate evidence type, subject/approver identity, action/resource binding, issue/expiry times, protected reference form, and canonical proposal digest independently. Return `Suspended` only for descriptors whose embedded `LockedCapability` permits `suspendable` mode; never treat prompt text as evidence. Construct the Wave 3R `Suspension` with checkpoint reference, evidence kind, protected evidence-request reference, and proposal digest. Resume exact-matches all four and then revalidates authenticated principals, grant/catalog/descriptor/authority-revision digests, per-capability expiry, evidence, freshness, resource, preconditions, and point-of-use authorization before execution.
 
 - [ ] **Step 5: Run validation tests**
 
 Run: `rtk cargo test -p kiteframe-provider --test invocation_validation`
 
-Expected: PASS for request/result schemas, expiry, freshness, selector, evidence, preconditions, denial, suspension, and invalid output.
+Expected: PASS for embedded descriptor stable errors/modes/effect/evidence/freshness/preconditions, request/result schemas, per-capability expiry, principal correlation, selector, proposal-bound evidence, authority-revision change, resume revalidation, denial, suspension, and invalid stable-projection output.
 
 - [ ] **Step 6: Commit invocation validation**
 
@@ -472,8 +605,8 @@ rtk git commit -m "feat: validate capability invocations"
 - Test: `crates/kiteframe-provider-sqlite/tests/restart.rs`
 
 **Interfaces:**
-- Consumes: validated invocation and descriptor idempotency contract.
-- Produces: `InvocationStore`, `InvocationReservation`, `reserve_or_get`, `transition`, `status`.
+- Consumes: validated invocation, authenticated principal context, embedded descriptor idempotency contract, `StatusRequest { invocation_id, trace_context }`, grant/catalog/descriptor/authority-revision digests, and proposal/evidence references.
+- Produces: `InvocationStore`, `InvocationReservation`, `reserve_or_get`, `transition`, and `status(StatusRequest)`.
 
 - [ ] **Step 1: Write failing duplicate and restart tests**
 
@@ -501,7 +634,9 @@ async fn status_survives_store_restart() {
     let path = temporary_database();
     write_unknown_status(&path, "inv-1").await;
     let reopened = SqliteInvocationStore::open(&path).await.unwrap();
-    assert_eq!(reopened.status("inv-1").await.unwrap().state, StatusState::OutcomeUnknown);
+    let request = StatusRequest::try_new("inv-1", trace_context("00-restart")).unwrap();
+    assert_eq!(reopened.status(&request).await.unwrap().state, StatusState::OutcomeUnknown);
+    assert_eq!(reopened.last_traceparent(), "00-restart");
 }
 ```
 
@@ -532,7 +667,7 @@ pub trait InvocationStore: Send + Sync {
 
     async fn status(
         &self,
-        invocation_id: &InvocationId,
+        request: &StatusRequest,
     ) -> Result<InvocationStatus, Diagnostic>;
 }
 ```
@@ -541,7 +676,7 @@ The unique database key is `(actor, capability_name, capability_version, normali
 
 - [ ] **Step 4: Implement SQLite restart and retention behavior**
 
-Persist request digest, current state, safe terminal result/error, audit record IDs, policy revision, created/updated time, and retention deadline. Never persist raw credentials or evidence bodies.
+Persist request digest, current state, safe terminal result/error, admission ID, canonical grant-set `grant_digest`, catalog identity/digest, descriptor digest, authority-revision-set digest, authenticated human/workload/run references, task/session refs, invocation/status identifiers, idempotency scope/key, proposal digest, protected evidence references, audit authorization/outcome record IDs, created/updated time, and retention deadline. Never persist raw credentials, tokens, cookies, claims, evidence bodies, provider ACL rules, or legacy fields. Status authorization exact-matches the authenticated principal and portable context stored for the invocation before returning data.
 
 - [ ] **Step 5: Run idempotency and restart tests**
 
@@ -551,7 +686,7 @@ Expected: PASS.
 
 Run: `rtk cargo test -p kiteframe-provider-sqlite --test restart`
 
-Expected: PASS for deduplication, concurrent duplicate requests, restart, retention, status-first retry, and explicit abandonment authorization.
+Expected: PASS for deduplication, concurrent duplicate requests, traced `StatusRequest`, principal/context mismatch denial, digest preservation, restart, retention, status-first retry, and explicit abandonment authorization.
 
 - [ ] **Step 6: Commit durable invocation status**
 
@@ -572,7 +707,7 @@ rtk git commit -m "feat: persist capability invocation status"
 - Test: `crates/kiteframe-audit/tests/integrity.rs`
 
 **Interfaces:**
-- Consumes: current allow decision, invocation reservation, operation outcome, package/lock/binding/resolved digests, trace IDs.
+- Consumes: current allow decision, authenticated principal context, invocation reservation, operation outcome, package/lock/binding/resolved, admission, effective-grant, catalog, descriptor, and authority-revision digests, trace IDs.
 - Produces: `AuditSink`, `AuditRecord`, `DurableAuditReceipt`, `FileAuditLedger`.
 
 - [ ] **Step 1: Write failing effect-order and outage tests**
@@ -615,6 +750,10 @@ Expected: FAIL because audit interfaces and ordering are undefined.
 
 ```rust
 pub struct AuthorizationAuditRecord {
+    pub tenant_ref: TenantRef,
+    pub human_principal_ref: HumanPrincipalRef,
+    pub workload_principal_ref: WorkloadPrincipalRef,
+    pub run_ref: RunRef,
     pub actor: ActorRef,
     pub agent: AgentRef,
     pub task: TaskRef,
@@ -623,11 +762,16 @@ pub struct AuthorizationAuditRecord {
     pub resource: NormalizedResourceSelector,
     pub admission_id: AdmissionId,
     pub grant_digest: Sha256Digest,
-    pub policy_revision: PolicyRevision,
+    pub catalog_identity: CatalogIdentity,
+    pub catalog_digest: Sha256Digest,
+    pub descriptor_digest: Sha256Digest,
+    pub authority_revision_digest: Sha256Digest,
     pub decision_reference: DecisionRef,
+    pub invocation_id: InvocationId,
     pub idempotency_key: IdempotencyKey,
     pub precondition_refs: Vec<PreconditionRef>,
     pub evidence_refs: EvidenceReferences,
+    pub proposal_digest: Sha256Digest,
     pub portable_digest: Sha256Digest,
     pub lock_digest: Sha256Digest,
     pub binding_digest: Sha256Digest,
@@ -639,7 +783,7 @@ pub struct AuthorizationAuditRecord {
 }
 ```
 
-Outcome records are `completion`, `failure`, `suspension`, or `outcome_unknown` and contain the write-ahead record ID.
+Outcome records are `completion`, `failure`, `suspension`, or `outcome_unknown` and contain the write-ahead record ID plus the same admission, grant-set, catalog, descriptor, authority-revision, authenticated-principal, invocation/status state, idempotency, proposal, and trace correlation. Authorization and outcome records never contain credentials, raw claims, evidence bodies, provider ACL rules, legacy DTO fields, arguments, or results outside the approved safe-result contract.
 
 - [ ] **Step 4: Implement append-only partition chains**
 
@@ -653,7 +797,7 @@ Expected: PASS.
 
 Run: `rtk cargo test -p kiteframe-audit --test integrity`
 
-Expected: PASS for sequence, hash chain, concurrent partitions, tamper detection, trace correlation, and restart.
+Expected: PASS for sequence, hash chain, concurrent partitions, tamper detection, complete authorization/outcome linkage, digest and dual-principal correlation, credential absence, trace correlation, and restart.
 
 - [ ] **Step 6: Commit mandatory audit ordering**
 
@@ -669,6 +813,7 @@ rtk git commit -m "feat: audit effects before execution"
 - Create: `crates/kiteframe-provider-http/src/lib.rs`
 - Create: `crates/kiteframe-provider-http/src/routes.rs`
 - Create: `crates/kiteframe-provider-http/src/response.rs`
+- Create: `crates/kiteframe-provider-http/src/auth.rs`
 - Create: `crates/kiteframe-provider-http/src/trace.rs`
 - Create: `crates/kiteframe-provider-http/src/main.rs`
 - Create: `crates/kiteframe-provider-http/tests/http_profile.rs`
@@ -677,15 +822,15 @@ rtk git commit -m "feat: audit effects before execution"
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Consumes: catalog, admission, invocation, and status services.
-- Produces: `provider_router(...)` and `kiteframe-provider` TLS server binary.
+- Consumes: server-owned `ProviderPrincipalVerifier`, Wave 3R `StatusRequest`, and provider-owned catalog, admission, invocation, and status services.
+- Produces: `VerifiedProviderPrincipals`, `provider_router(...)`, and the `kiteframe-provider` TLS server binary.
 
 - [ ] **Step 1: Write failing route and transport tests**
 
 ```rust
 #[tokio::test]
 async fn exact_v1_routes_return_stable_contract_bodies() {
-    let app = provider_router(test_services());
+    let app = provider_router(test_services(), allowing_principal_verifier());
     assert_contract(app.clone(), Method::GET, "/v1/capability-catalog").await;
     assert_contract(app.clone(), Method::POST, "/v1/capability-admissions").await;
     assert_contract(app.clone(), Method::POST, "/v1/capability-invocations/cases.read").await;
@@ -694,11 +839,30 @@ async fn exact_v1_routes_return_stable_contract_bodies() {
 
 #[tokio::test]
 async fn catalog_etag_revalidation_returns_304() {
-    let app = provider_router(test_services());
+    let app = provider_router(test_services(), allowing_principal_verifier());
     let first = request(&app, "/v1/capability-catalog").await;
     let etag = first.headers()["etag"].clone();
     let second = request_with_header(&app, "/v1/capability-catalog", "if-none-match", etag).await;
     assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
+    assert_body_empty(second).await;
+    assert_eq!(catalog_events(), ["catalog_200", "catalog_304"]);
+}
+
+#[tokio::test]
+async fn every_route_authenticates_and_traces_before_service_logic() {
+    let app = provider_router(test_services(), recording_principal_verifier());
+    for request in all_four_route_requests("00-route-trace") {
+        request(&app, request).await;
+    }
+    assert_eq!(
+        app.events(),
+        [
+            "trace", "authenticate_human", "authenticate_workload", "catalog",
+            "trace", "authenticate_human", "authenticate_workload", "admit",
+            "trace", "authenticate_human", "authenticate_workload", "invoke",
+            "trace", "authenticate_human", "authenticate_workload", "status",
+        ]
+    );
 }
 ```
 
@@ -711,22 +875,40 @@ Expected: FAIL because the HTTP crate does not exist.
 - [ ] **Step 3: Implement exact routes and stable error envelopes**
 
 ```rust
-pub fn provider_router(state: ProviderHttpState) -> Router {
+#[async_trait::async_trait]
+pub trait ProviderPrincipalVerifier: Send + Sync {
+    async fn verify(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<VerifiedProviderPrincipals, Diagnostic>;
+}
+
+pub fn provider_router(
+    state: ProviderHttpState,
+    principal_verifier: Arc<dyn ProviderPrincipalVerifier>,
+) -> Router {
     Router::new()
         .route("/v1/capability-catalog", get(catalog))
         .route("/v1/capability-admissions", post(admit))
         .route("/v1/capability-invocations/{name}", post(invoke))
         .route("/v1/capability-invocations/{invocation_id}", get(status))
         .layer(DefaultBodyLimit::max(1_048_576))
+        .layer(from_fn_with_state(
+            ProviderAuthState::new(principal_verifier),
+            authenticate_provider_request,
+        ))
+        .layer(from_fn(extract_trace_context))
         .with_state(state)
 }
 ```
 
-Transport status codes distinguish malformed request, not found, conflict, timeout, and service failure, but every non-304 response body is a native success value or structured Kiteframe diagnostic envelope.
+`authenticate_provider_request` passes credential-bearing headers to the deployment's server-side `ProviderPrincipalVerifier`, which verifies human and workload credentials independently and returns `VerifiedProviderPrincipals`. The middleware then strips credential-bearing headers and exposes only opaque authenticated principal refs before calling any route logic. Catalog, admission, invocation, and status all use this boundary. The Wave 3R client-side `ProviderAuthenticator` only supplies the credential headers consumed by this verifier; the client hook and server verifier share neither an interface nor authority.
+
+After native request decoding, admission/invocation/status correlate the authenticated tenant/human/workload/run refs with all portable actor/agent/task/session/admission refs present before calling application services; status constructs native `StatusRequest` with the incoming trace context. Transport status codes distinguish malformed request, authentication failure, identity mismatch, not found, conflict, timeout, and service failure, but every non-304 response body is a native success value or structured Kiteframe diagnostic envelope. A matching `If-None-Match` causes the server to return a bodyless HTTP `304`; the server does not import or construct `CatalogFetchResult`. The Wave 3R native client alone interprets HTTP `200`/`304` as the corresponding typed catalog fetch result.
 
 - [ ] **Step 4: Add TLS, trace, baggage, and origin rules**
 
-The binary requires certificate/key paths and refuses plaintext non-loopback startup. A test-only `--insecure-loopback` flag binds only `127.0.0.1`. Parse and forward `traceparent`/`tracestate`; keep only deployment-allowlisted baggage keys and reject sensitive names.
+The binary requires certificate/key paths and refuses plaintext non-loopback startup. A test-only `--insecure-loopback` flag binds only `127.0.0.1`. Parse and forward `traceparent`/`tracestate` on all four routes, including status and typed catalog revalidation; keep only deployment-allowlisted baggage keys and reject sensitive names. Scan request extensions, logs, diagnostics, audit records, invocation rows, and trace attributes to prove bearer tokens, cookies, API keys, raw claims, prompts, arguments, results, and evidence bodies are absent.
 
 - [ ] **Step 5: Run full enforcement-plane verification**
 
@@ -746,21 +928,119 @@ Run: `rtk cargo test -p kiteframe-openfga --features container-tests`
 
 Expected: PASS with Docker available.
 
-- [ ] **Step 6: Commit the HTTP profile and Wave 5 gate**
+Run: `rtk cargo test -p kiteframe-provider-http --test http_profile`
+
+Expected: PASS for authentication-before-service ordering, independently verified human/workload identities, mismatch denial, traced status, typed catalog `304`, credential leakage scans, bounded bodies, redirect denial, and stable native responses.
+
+- [ ] **Step 6: Commit the authenticated HTTP profile**
 
 ```bash
 rtk git add crates/kiteframe-provider-http tests/provider .github/workflows/ci.yml
 rtk git commit -m "feat: serve capability provider profile"
 ```
 
+### Task 8: Prove a Crankshaft-shaped provider profile without coupling repositories
+
+**Files:**
+- Create: `tests/provider/fixtures/crankshaft-profile/catalog.json`
+- Create: `tests/provider/fixtures/crankshaft-profile/admission.json`
+- Create: `tests/provider/fixtures/crankshaft-profile/policy-revisions.json`
+- Create: `tests/provider/fixtures/crankshaft-profile/read-result.json`
+- Create: `tests/provider/fixtures/crankshaft-profile/effect-outcomes.json`
+- Create: `crates/kiteframe-provider/tests/crankshaft_profile.rs`
+- Create: `crates/kiteframe-provider-http/tests/crankshaft_profile.rs`
+
+**Interfaces:**
+- Consumes: provider-neutral JSON fixtures shaped like a workforce-management provider with separately verified human/workload principals, tenant-scoped resources, provider-internal field ACL projection, revision changes, and durable effect status.
+- Produces: cross-domain conformance evidence only; no dependency on Crankshaft crates and no claim that a Crankshaft Kiteframe provider is implemented.
+
+- [ ] **Step 1: Write the failing profile tests**
+
+```rust
+#[tokio::test]
+async fn workforce_profile_preserves_dual_principals_and_projection_scope() {
+    let profile = ProviderProfile::load("tests/provider/fixtures/crankshaft-profile").unwrap();
+    let admitted = profile
+        .admit(
+            verified_human("tenant-1", "employee-7"),
+            verified_workload("tenant-1", "harness-2", "run-9"),
+            requirement("workforce.absence.read@1", "tenant:tenant-1/employee:employee-7"),
+        )
+        .await
+        .unwrap();
+    let result = profile.invoke(admitted, read_request()).await.unwrap();
+    assert_eq!(
+        result.canonical_json(),
+        br#"{"employeeId":"employee-7","status":"approved"}"#
+    );
+    assert!(!result.canonical_json().windows(6).any(|bytes| bytes == b"salary"));
+    assert!(!result.canonical_json().windows(8).any(|bytes| bytes == b"coworker"));
+}
+
+#[tokio::test]
+async fn revision_change_revokes_then_restart_status_recovers_effect() {
+    let profile = restarted_profile_after_revision_change();
+    let denied = profile.invoke(stale_admission_request()).await.unwrap_err();
+    assert_eq!(denied.code.as_str(), "KF-AUTH-004");
+    let status = profile
+        .status(StatusRequest::try_new("inv-absence-1", trace_context("00-status")).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(status, InvocationStatus::OutcomeUnknown { .. }));
+}
+```
+
+- [ ] **Step 2: Run the profile tests**
+
+Run: `rtk cargo test -p kiteframe-provider --test crankshaft_profile`
+
+Expected: FAIL because the provider-neutral workforce fixture is absent.
+
+- [ ] **Step 3: Add the exact provider-neutral fixture corpus**
+
+The catalog declares `workforce.absence.read@1` and `workforce.absence.propose@1` with complete stable errors, modes, read/effect classes, idempotency, evidence, freshness, preconditions, and stable projection schemas. The admission fixture contains verified tenant/human/workload/run correlation, one employee-scoped resource, per-capability expiry, exact descriptor/catalog/grant digests, and canonical deployment/tenant/model `AuthorityRevisionSet`. The result fixture contains only the declared projection fields. The effect corpus covers allow, revocation, proposal-bound suspension, policy-revision change, unknown outcome, traced status-first lookup, and restart recovery.
+
+Fixtures use only Kiteframe JSON contracts and neutral workforce names. Tests must not add a Cargo/path/Git dependency on Crankshaft, import Crankshaft types, inspect a Crankshaft checkout, or state that Crankshaft already implements the profile.
+
+- [ ] **Step 4: Run provider and HTTP profile tests**
+
+Run: `rtk cargo test -p kiteframe-provider --test crankshaft_profile`
+
+Expected: PASS for dual-principal correlation, scoped resources, complete descriptors, field projection, authority revision change, revocation, proposal/evidence binding, restart, and status-first recovery.
+
+Run: `rtk cargo test -p kiteframe-provider-http --test crankshaft_profile`
+
+Expected: PASS for all-route authentication/trace propagation, bodyless catalog HTTP `304` for client-side typed interpretation, stable schemas/errors, and credential-free responses/audit/status records.
+
+- [ ] **Step 5: Verify repository independence**
+
+Run: `rtk cargo tree -p kiteframe-provider --edges normal`
+
+Expected: PASS and contain no `crankshaft-*` package or external Crankshaft path/Git dependency.
+
+- [ ] **Step 6: Commit the provider-neutral profile**
+
+```bash
+rtk git add tests/provider/fixtures/crankshaft-profile crates/kiteframe-provider/tests/crankshaft_profile.rs crates/kiteframe-provider-http/tests/crankshaft_profile.rs
+rtk git commit -m "test: add workforce provider conformance profile"
+```
+
 ## Wave 5 Exit Criteria
 
+- Wave 3R is merged, and Wave 5 consumes its applicable exact embedded `LockedCapability`, `EffectiveCapabilityGrant`, `AuthorityRevisionSet`, `StatusRequest`, and expanded `Suspension` contracts without shadow types or a runtime-assembly dependency.
+- Admission exact-matches expected catalog identity/digest and every resolved requirement against the provider-owned authoritative `CapabilityCatalog` and locked descriptor registry, then persists each exact provider-validated `LockedCapability`.
 - Authority intersection is monotonic across capability version, selector, effect, execution mode, expiry, freshness, and evidence.
+- Admission proves catalog identity/digest, complete required-capability coverage, optional-denial diagnostics, per-capability expiry, exact grant envelopes, and canonical authority-revision entries/digest.
+- Every route uses the server-owned `ProviderPrincipalVerifier` to verify human and workload identities separately before route/service logic; admission/invocation/status fail closed on tenant/human/workload/run versus actor/agent/task/session/admission mismatch.
+- The client-side `ProviderAuthenticator` supplies credential headers only; it is never imported, implemented, or treated as authority by the provider server.
+- Credentials establish transport identity only and are absent from portable authority, persistence, audit, diagnostics, telemetry, and responses.
 - Admission and point-of-use authorization are separate observable calls.
 - The OpenFGA backend uses `ListObjects` only for admission filtering and current higher-consistency `Check` for every invocation.
 - Revocation, model migration, stale policy, and OpenFGA outage fail closed.
-- Input and output schemas, grant expiry, resource selection, evidence, freshness, and preconditions are validated in a fixed order.
-- Idempotency reservations and status survive process restart and deduplicate concurrent duplicate effects.
+- Input and output schemas plus stable errors/modes come from the embedded locked descriptor; grant expiry, resource selection, proposal-bound evidence, freshness, authority revisions, and preconditions are validated in a fixed order and again on resume.
+- Idempotency reservations and traced `StatusRequest` lookup survive process restart, preserve complete digest/principal/audit correlation, and deduplicate concurrent duplicate effects.
 - Effect execution occurs only after a durable authorization audit receipt; audit outage blocks the effect.
-- Outcome append failure becomes `outcome_unknown`, and retry remains status-first with the same key.
-- The four standardized TLS routes return stable native bodies and propagate filtered W3C context.
+- Outcome append failure becomes `outcome_unknown`, and retry remains status-first with the same key and trace context.
+- The four standardized TLS routes authenticate and propagate filtered W3C context; matching catalog ETags produce bodyless HTTP `304`, which only the native client interprets as its typed not-modified result.
+- Provider-internal row/field ACL behavior is visible only through stable capability projection schemas and validated results.
+- The Crankshaft-shaped conformance profile passes dual-principal, scoped-resource, revision-freshness, stable-projection, revocation, restart/status, audit/outcome-linkage, and repository-independence gates without claiming a Crankshaft provider implementation.
