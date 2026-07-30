@@ -171,14 +171,14 @@ pub trait CapabilityOperation: Send + Sync {
 
 pub struct OperationRegistry {
     operations: BTreeMap<CapabilityIdentity, Arc<dyn CapabilityOperation>>,
-    frozen: bool,
+    authorization_backend: Option<Arc<dyn AuthorizationBackend>>,
 }
 
 impl OperationRegistry {
     pub fn new() -> Self {
         Self {
             operations: BTreeMap::new(),
-            frozen: false,
+            authorization_backend: None,
         }
     }
 
@@ -186,7 +186,7 @@ impl OperationRegistry {
     where
         O: CapabilityOperation + 'static,
     {
-        if self.frozen {
+        if self.authorization_backend.is_some() {
             return Err(runtime_error("operation registry is frozen"));
         }
         let identity = operation.identity().clone();
@@ -199,25 +199,29 @@ impl OperationRegistry {
         Ok(())
     }
 
-    pub fn freeze(mut self) -> Result<Self, Diagnostic> {
-        self.frozen = true;
+    pub fn freeze(
+        mut self,
+        authorization_backend: Arc<dyn AuthorizationBackend>,
+    ) -> Result<Self, Diagnostic> {
+        self.authorization_backend = Some(authorization_backend);
         Ok(self)
     }
 
     pub fn is_frozen(&self) -> bool {
-        self.frozen
+        self.authorization_backend.is_some()
     }
 
     pub async fn execute(
         &self,
-        backend: &dyn AuthorizationBackend,
         context: &InvocationContext,
         preconditions: &[Precondition],
         arguments: Value,
     ) -> Result<Value, OperationFailure> {
-        if !self.frozen {
-            return Err(runtime_error("operation registry must be frozen before use").into());
-        }
+        let authorization_backend = self.authorization_backend.as_deref().ok_or_else(|| {
+            OperationFailure::from(runtime_error(
+                "operation registry must be frozen with an authorization backend before use",
+            ))
+        })?;
         let operation = self.operations.get(context.capability()).ok_or_else(|| {
             OperationFailure::from(runtime_error(
                 "no trusted operation is registered for the exact capability identity",
@@ -237,9 +241,10 @@ impl OperationRegistry {
             *context.grant_digest(),
             context.loaded_authority_revisions().clone(),
         );
-        let authorization = require_current_authorization(backend, &authorization_request)
-            .await
-            .map_err(OperationFailure::from)?;
+        let authorization =
+            require_current_authorization(authorization_backend, &authorization_request)
+                .await
+                .map_err(OperationFailure::from)?;
         validate_current_authorization(context, &authorization, preconditions)
             .map_err(OperationFailure::from)?;
 

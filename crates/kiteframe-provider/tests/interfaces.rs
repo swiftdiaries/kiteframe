@@ -62,19 +62,20 @@ async fn invocation_uses_current_check_not_admission_decision() {
 async fn frozen_registry_uses_exact_version_and_validates_stable_projection() {
     let mut registry = OperationRegistry::new();
     registry.register(ReadOperation).unwrap();
-    let registry = registry.freeze().unwrap();
-    let backend = AllowAuthorizationBackend::new(vec![]);
+    let registry = registry
+        .freeze(Arc::new(AllowAuthorizationBackend::new(vec![])))
+        .unwrap();
     let context = invocation_context("1.0.0");
 
     let result = registry
-        .execute(&backend, &context, &[], json!({"caseId": "42"}))
+        .execute(&context, &[], json!({"caseId": "42"}))
         .await
         .unwrap();
     assert_eq!(result, json!({"caseId": "42", "summary": "stable"}));
 
     let wrong_version = invocation_context("2.0.0");
     let error = registry
-        .execute(&backend, &wrong_version, &[], json!({"caseId": "42"}))
+        .execute(&wrong_version, &[], json!({"caseId": "42"}))
         .await
         .unwrap_err();
     assert_eq!(error.diagnostic().code.as_str(), "KF-RUNTIME-001");
@@ -84,42 +85,38 @@ async fn frozen_registry_uses_exact_version_and_validates_stable_projection() {
 async fn output_with_deployment_internal_fields_is_rejected_by_locked_schema() {
     let mut registry = OperationRegistry::new();
     registry.register(LeakyReadOperation).unwrap();
-    let registry = registry.freeze().unwrap();
-    let backend = AllowAuthorizationBackend::new(vec![]);
+    let registry = registry
+        .freeze(Arc::new(AllowAuthorizationBackend::new(vec![])))
+        .unwrap();
 
     let error = registry
-        .execute(
-            &backend,
-            &invocation_context("1.0.0"),
-            &[],
-            json!({"caseId": "42"}),
-        )
+        .execute(&invocation_context("1.0.0"), &[], json!({"caseId": "42"}))
         .await
         .unwrap_err();
     assert_eq!(error.diagnostic().code.as_str(), "KF-CAP-002");
 }
 
 #[tokio::test]
-async fn current_deny_cannot_reach_operation_execution() {
+async fn deployment_bound_deny_cannot_be_replaced_at_execution() {
     let executions = Arc::new(AtomicUsize::new(0));
+    let authorization_checks = Arc::new(AtomicUsize::new(0));
     let mut registry = OperationRegistry::new();
     registry
         .register(CountingOperation::new(executions.clone()))
         .unwrap();
-    let registry = registry.freeze().unwrap();
-    let backend = FakeAuthorizationBackend::default();
+    let registry = registry
+        .freeze(Arc::new(FakeAuthorizationBackend::new(
+            authorization_checks.clone(),
+        )))
+        .unwrap();
 
     let error = registry
-        .execute(
-            &backend,
-            &invocation_context("1.0.0"),
-            &[],
-            json!({"caseId": "42"}),
-        )
+        .execute(&invocation_context("1.0.0"), &[], json!({"caseId": "42"}))
         .await
         .unwrap_err();
 
     assert_eq!(error.diagnostic().code.as_str(), "KF-AUTH-003");
+    assert_eq!(authorization_checks.load(Ordering::SeqCst), 1);
     assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
@@ -130,17 +127,14 @@ async fn decision_required_precondition_is_enforced_before_operation_dispatch() 
     registry
         .register(CountingOperation::new(executions.clone()))
         .unwrap();
-    let registry = registry.freeze().unwrap();
-    let backend =
-        AllowAuthorizationBackend::new(vec![required_precondition("etag", PreconditionKind::Etag)]);
+    let registry = registry
+        .freeze(Arc::new(AllowAuthorizationBackend::new(vec![
+            required_precondition("etag", PreconditionKind::Etag),
+        ])))
+        .unwrap();
 
     let error = registry
-        .execute(
-            &backend,
-            &invocation_context("1.0.0"),
-            &[],
-            json!({"caseId": "42"}),
-        )
+        .execute(&invocation_context("1.0.0"), &[], json!({"caseId": "42"}))
         .await
         .unwrap_err();
 
@@ -155,12 +149,12 @@ async fn grant_required_precondition_is_enforced_before_operation_dispatch() {
     registry
         .register(CountingOperation::new(executions.clone()))
         .unwrap();
-    let registry = registry.freeze().unwrap();
-    let backend = AllowAuthorizationBackend::new(vec![]);
+    let registry = registry
+        .freeze(Arc::new(AllowAuthorizationBackend::new(vec![])))
+        .unwrap();
 
     let error = registry
         .execute(
-            &backend,
             &invocation_context_with_grant_preconditions(
                 "1.0.0",
                 vec![required_precondition("etag", PreconditionKind::Etag)],
@@ -175,9 +169,20 @@ async fn grant_required_precondition_is_enforced_before_operation_dispatch() {
     assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
-#[derive(Default)]
 struct FakeAuthorizationBackend {
-    invocation_checks: AtomicUsize,
+    invocation_checks: Arc<AtomicUsize>,
+}
+
+impl FakeAuthorizationBackend {
+    fn new(invocation_checks: Arc<AtomicUsize>) -> Self {
+        Self { invocation_checks }
+    }
+}
+
+impl Default for FakeAuthorizationBackend {
+    fn default() -> Self {
+        Self::new(Arc::new(AtomicUsize::new(0)))
+    }
 }
 
 #[async_trait]
