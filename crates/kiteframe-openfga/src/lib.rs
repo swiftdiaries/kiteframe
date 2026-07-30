@@ -145,7 +145,7 @@ impl AuthorizationBackend for OpenFgaAuthorizationBackend {
         &self,
         request: &AdmissionAuthorizationRequest,
     ) -> Result<AdmissionAuthorizationResult, Diagnostic> {
-        let now = current_timestamp()?;
+        let now = current_timestamp(DiagnosticStage::Admit)?;
         require_fresh_authority(
             request.principals(),
             request.loaded_authority_revisions(),
@@ -170,7 +170,7 @@ impl AuthorizationBackend for OpenFgaAuthorizationBackend {
         &self,
         request: &InvocationAuthorizationRequest,
     ) -> Result<AuthorizationDecision, Diagnostic> {
-        let now = current_timestamp()?;
+        let now = current_timestamp(DiagnosticStage::Invoke)?;
         require_fresh_authority(
             request.principals(),
             request.loaded_authority_revisions(),

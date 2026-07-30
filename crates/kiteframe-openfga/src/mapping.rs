@@ -33,7 +33,7 @@ pub(crate) fn list_objects_request(
         "relation": "can_invoke",
         "user": actor_user(request.principals()),
         "context": condition_context(request.principals(), request.capability(), request.selected_resource().as_str(), None, now),
-        "contextual_tuples": contextual_tuples(request.principals(), request.capability(), request.selected_resource().as_str()),
+        "contextual_tuples": contextual_tuples(request.principals()),
         "consistency": "HIGHER_CONSISTENCY",
     })
 }
@@ -57,20 +57,9 @@ pub(crate) fn check_request(
             Some(request.grant_digest()),
             now
         ),
-        "contextual_tuples": contextual_tuples(request.principals(), request.capability(), request.selected_resource().as_str()),
+        "contextual_tuples": contextual_tuples(request.principals()),
         "consistency": "HIGHER_CONSISTENCY",
     })
-}
-
-pub(crate) fn capability_object(capability: &CapabilityIdentity) -> String {
-    typed_object(
-        "capability",
-        &format!(
-            "{}@{}",
-            capability.name().as_str(),
-            capability.version().as_str()
-        ),
-    )
 }
 
 pub(crate) fn resource_object(resource: &str) -> String {
@@ -118,21 +107,12 @@ fn condition_context(
     context
 }
 
-fn contextual_tuples(
-    principals: &AuthenticatedInvocationContext,
-    capability: &CapabilityIdentity,
-    resource: &str,
-) -> Value {
-    let actor = actor_user(principals);
+fn contextual_tuples(principals: &AuthenticatedInvocationContext) -> Value {
     let task = scoped_object(
         "task",
         &[
             principals.tenant_ref().as_str(),
             principals.task_ref().as_str(),
-            principals.workload_ref().as_str(),
-            principals.run_ref().as_str(),
-            principals.session_ref().as_str(),
-            principals.admission_ref().as_str(),
         ],
     );
     let agent = scoped_object(
@@ -140,9 +120,6 @@ fn contextual_tuples(
         &[
             principals.tenant_ref().as_str(),
             principals.agent_ref().as_str(),
-            principals.workload_ref().as_str(),
-            principals.run_ref().as_str(),
-            principals.admission_ref().as_str(),
         ],
     );
     let session = scoped_object(
@@ -150,22 +127,12 @@ fn contextual_tuples(
         &[
             principals.tenant_ref().as_str(),
             principals.session_ref().as_str(),
-            principals.task_ref().as_str(),
-            principals.workload_ref().as_str(),
-            principals.run_ref().as_str(),
-            principals.admission_ref().as_str(),
         ],
     );
-    let capability = capability_object(capability);
-    let resource = resource_object(resource);
     json!({
         "tuple_keys": [
-            tuple(&actor, "actor", &task),
             tuple(&task, "assigned_task", &agent),
             tuple(&task, "task", &session),
-            tuple(&actor, "allowed_actor", &capability),
-            tuple(&format!("{agent}#assigned_task"), "allowed_task", &capability),
-            tuple(&capability, "capability", &resource),
         ]
     })
 }

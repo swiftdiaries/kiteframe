@@ -3,6 +3,10 @@ model
 
 type actor
 
+type workload
+  relations
+    define actor: [actor]
+
 type task
   relations
     define actor: [actor]
@@ -10,16 +14,19 @@ type task
 type agent
   relations
     define assigned_task: [task]
+    define actor: actor from assigned_task
 
 type session
   relations
     define task: [task]
+    define actor: actor from task
 
 type capability
   relations
     define allowed_actor: [actor]
-    define allowed_task: [task, session#task, agent#assigned_task]
-    define can_invoke: allowed_actor and allowed_task
+    define allowed_task_actor: [task#actor, session#actor, agent#actor]
+    define allowed_workload_actor: [workload#actor]
+    define can_invoke: allowed_actor and allowed_task_actor and allowed_workload_actor
 
 type resource
   relations

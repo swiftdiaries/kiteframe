@@ -91,11 +91,19 @@ async fn requests_bind_correlated_principals_and_ephemeral_context() {
     );
     assert!(body["context"]["current_timestamp"].as_u64().is_some());
     assert_eq!(
-        body["contextual_tuples"]["tuple_keys"]
-            .as_array()
-            .unwrap()
-            .len(),
-        6
+        body["contextual_tuples"]["tuple_keys"],
+        json!([
+            {
+                "user": "task:74656e616e742d31007461736b2d31",
+                "relation": "assigned_task",
+                "object": "agent:74656e616e742d31006167656e742d31"
+            },
+            {
+                "user": "task:74656e616e742d31007461736b2d31",
+                "relation": "task",
+                "object": "session:74656e616e742d310073657373696f6e2d31"
+            }
+        ])
     );
 }
 

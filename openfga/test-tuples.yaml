@@ -2,29 +2,35 @@ name: kiteframe-agent-task-session-authorization
 model_file: authorization-model.fga
 
 tuples:
-  - user: actor:human-1
+  - user: actor:6163746f722d31
     relation: actor
-    object: task:task-1
-  - user: task:task-1
+    object: task:74656e616e742d31007461736b2d31
+  - user: task:74656e616e742d31007461736b2d31
     relation: assigned_task
-    object: agent:agent-1
-  - user: task:task-1
+    object: agent:74656e616e742d31006167656e742d31
+  - user: task:74656e616e742d31007461736b2d31
     relation: task
-    object: session:session-1
-  - user: actor:human-1
+    object: session:74656e616e742d310073657373696f6e2d31
+  - user: actor:6163746f722d31
+    relation: actor
+    object: workload:74656e616e742d3100776f726b6c6f61642d31
+  - user: actor:6163746f722d31
     relation: allowed_actor
-    object: capability:cases.read@1.0.0
-  - user: agent:agent-1#assigned_task
-    relation: allowed_task
-    object: capability:cases.read@1.0.0
-  - user: capability:cases.read@1.0.0
+    object: capability:63617365732e7265616440312e302e30
+  - user: agent:74656e616e742d31006167656e742d31#actor
+    relation: allowed_task_actor
+    object: capability:63617365732e7265616440312e302e30
+  - user: workload:74656e616e742d3100776f726b6c6f61642d31#actor
+    relation: allowed_workload_actor
+    object: capability:63617365732e7265616440312e302e30
+  - user: capability:63617365732e7265616440312e302e30
     relation: capability
-    object: resource:tenant-t1-case-7
+    object: resource:74656e616e743a74312f636173653a636173652d37
 
 tests:
-  - name: type-distinct actor and task relations fail closed
+  - name: actor task workload and resource policy intersect
     check:
-      - user: actor:human-1
-        object: resource:tenant-t1-case-7
+      - user: actor:6163746f722d31
+        object: resource:74656e616e743a74312f636173653a636173652d37
         assertions:
-          can_invoke: false
+          can_invoke: true

@@ -6,10 +6,14 @@ use kiteframe_contract::{
 };
 use kiteframe_provider::AuthenticatedInvocationContext;
 
-pub(crate) fn current_timestamp() -> Result<Timestamp, Diagnostic> {
-    let seconds = SystemTime::now()
+pub(crate) fn current_timestamp(stage: DiagnosticStage) -> Result<Timestamp, Diagnostic> {
+    timestamp_from(SystemTime::now(), stage)
+}
+
+fn timestamp_from(value: SystemTime, stage: DiagnosticStage) -> Result<Timestamp, Diagnostic> {
+    let seconds = value
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| stale(DiagnosticStage::Invoke, "deployment clock is invalid"))?
+        .map_err(|_| stale(stage, "deployment clock is invalid"))?
         .as_secs();
     Ok(Timestamp::new(seconds))
 }
@@ -37,4 +41,21 @@ fn stale(stage: DiagnosticStage, message: &'static str) -> Diagnostic {
         stage,
         message,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn deployment_clock_failure_preserves_admission_stage() {
+        let before_epoch = UNIX_EPOCH.checked_sub(Duration::from_secs(1)).unwrap();
+
+        let error = timestamp_from(before_epoch, DiagnosticStage::Admit).unwrap_err();
+
+        assert_eq!(error.stage, DiagnosticStage::Admit);
+        assert_eq!(error.code.as_str(), "KF-AUTH-004");
+    }
 }
