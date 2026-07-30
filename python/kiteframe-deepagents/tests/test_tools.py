@@ -35,6 +35,7 @@ from kiteframe_deepagents.tools import (
     IdempotencyCheckpointStore,
     IdempotencyScope,
     PersistedIdempotencyKey,
+    PersistedInvocationCorrelation,
     build_capability_tools,
 )
 
@@ -498,6 +499,7 @@ def suspended_status(
 class FakeCheckpointStore(IdempotencyCheckpointStore):
     events: list[str]
     records: list[PersistedIdempotencyKey]
+    invocations: dict[IdempotencyScope, PersistedInvocationCorrelation]
 
     async def persist_idempotency_key(
         self,
@@ -505,6 +507,20 @@ class FakeCheckpointStore(IdempotencyCheckpointStore):
     ) -> None:
         self.records.append(record)
         self.events.append(f"persist:{record.key}")
+
+    async def persist_invocation_correlation(
+        self,
+        record: PersistedInvocationCorrelation,
+    ) -> None:
+        existing = self.invocations.setdefault(record.scope, record)
+        if existing != record:
+            raise AssertionError("invocation correlation changed")
+
+    async def load_invocation_correlation(
+        self,
+        scope: IdempotencyScope,
+    ) -> PersistedInvocationCorrelation | None:
+        return self.invocations.get(scope)
 
 
 class SuspensionInterruptForTest(Exception):
@@ -642,7 +658,7 @@ def fake_invoker(events: list[str]) -> FakeInvoker:
 
 @pytest.fixture
 def checkpoint_store(events: list[str]) -> FakeCheckpointStore:
-    return FakeCheckpointStore(events=events, records=[])
+    return FakeCheckpointStore(events=events, records=[], invocations={})
 
 
 @pytest.fixture

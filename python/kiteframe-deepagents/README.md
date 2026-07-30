@@ -42,19 +42,39 @@ compilation only resolve and compare that token; they never register a profile
 or mutate process-global profile state.
 
 Suspendable capabilities additionally require a deployment-attested durable
-LangGraph checkpointer. For effectful restart safety it must implement
-`persist_idempotency_key(...)` and `load_idempotency_key(...)` from the adapter
-checkpoint protocols, in addition to the public LangGraph saver operations.
-The adapter writes the invocation correlation before the first provider call.
+LangGraph checkpointer. It must implement
+`persist_invocation_correlation(...)` and
+`load_invocation_correlation(...)` from the adapter checkpoint protocols, in
+addition to the public LangGraph saver operations. Effectful capabilities also
+require `persist_idempotency_key(...)`; restart-compatible legacy integrations
+may continue to expose `load_idempotency_key(...)`. The adapter writes the
+invocation correlation before the first provider call, including for
+read-only suspendable capabilities.
 
 On suspension, `SuspensionEnvelope` exposes only the native invocation and
 admission IDs, checkpoint reference, evidence kind, protected evidence-request
-reference, proposal digest, and traceparent. Resume callers must use
-`resume_command(evidence_ref)`, which accepts an opaque evidence reference and
-never raw evidence text. Resume rebuilds a native `InvocationRequest` with the
-same invocation ID, idempotency key, admission ID, canonical grant-set digest,
-arguments, preconditions, and trace context. The provider then validates the
-referenced evidence, reloads the admitted authority snapshot, obtains fresh
-authority revisions, checks expiry and preconditions, and authorizes the effect
-at point of use. `AuthorityRevisionSet` remains immutable local guard state and
-is never serialized into the provider request.
+reference, proposal digest, and traceparent. A deployment-owned
+`EvidenceReferenceResolver` must turn the untrusted external handle into a
+branded reference before a public LangGraph command can be built:
+
+```python
+from kiteframe_deepagents import (
+    resolve_protected_evidence_reference,
+    resume_command,
+)
+
+protected_reference = await resolve_protected_evidence_reference(
+    external_evidence_handle,
+    deployment_evidence_resolver,
+)
+command = resume_command(protected_reference)
+```
+
+Plain approval text, passwords, JWTs, and base64-like secret values are rejected
+before `Command` construction. Resume rebuilds a native `InvocationRequest`
+with the same invocation ID, idempotency key, admission ID, canonical grant-set
+digest, arguments, preconditions, and trace context. The provider then
+validates the referenced evidence, reloads the admitted authority snapshot,
+obtains fresh authority revisions, checks expiry and preconditions, and
+authorizes the effect at point of use. `AuthorityRevisionSet` remains immutable
+local guard state and is never serialized into the provider request.

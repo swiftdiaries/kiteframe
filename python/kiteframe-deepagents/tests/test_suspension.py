@@ -4,7 +4,9 @@ import ast
 import copy
 import hashlib
 import json
-from collections.abc import Iterable
+import pickle
+import re
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
@@ -21,6 +23,11 @@ from kiteframe import (
     load_resolved_agent,
 )
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import (
+    ChannelVersions,
+    Checkpoint,
+    CheckpointMetadata,
+)
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 
@@ -29,12 +36,17 @@ from kiteframe_deepagents.context import (
     KiteframeTraceContext,
 )
 from kiteframe_deepagents.suspension import (
+    EvidenceReferenceResolver,
     LangGraphSuspensionBridge,
+    ProtectedEvidenceReference,
+    resolve_protected_evidence_reference,
     resume_command,
 )
 from kiteframe_deepagents.tools import (
+    DurableInvocationCheckpointStore,
     IdempotencyScope,
     PersistedIdempotencyKey,
+    PersistedInvocationCorrelation,
     RestartableIdempotencyCheckpointStore,
     build_capability_tools,
 )
@@ -46,6 +58,26 @@ VALID_TRACEPARENT = (
 RESOURCE = "tenant:t1/case:case-1"
 RAW_EVIDENCE = "I approve this comment"
 EVIDENCE_REF = "evidence-ref-1"
+EVIDENCE_HANDLE = "approval-handle-1"
+
+
+class FakeEvidenceReferenceResolver(EvidenceReferenceResolver):
+    def __init__(self, references: dict[str, str]) -> None:
+        self.references = references
+
+    async def resolve_evidence_reference(self, handle: str) -> str:
+        try:
+            return self.references[handle]
+        except KeyError:
+            raise ValueError("evidence handle is unresolved") from None
+
+
+async def trusted_resume_command() -> Any:
+    reference = await resolve_protected_evidence_reference(
+        EVIDENCE_HANDLE,
+        FakeEvidenceReferenceResolver({EVIDENCE_HANDLE: EVIDENCE_REF}),
+    )
+    return resume_command(reference)
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -122,7 +154,10 @@ def _resolved_digest(resolved: dict[str, Any]) -> str:
     return _hash_domain(b"resolved-agent", components).hex()
 
 
-def comment_requirement() -> ResolvedCapabilityRequirement:
+def comment_requirement(
+    *,
+    read_only_suspendable: bool = False,
+) -> ResolvedCapabilityRequirement:
     resolved = json.loads(
         (WORKSPACE / "tests/fixtures/resolved/support-agent.json").read_bytes()
     )
@@ -131,18 +166,24 @@ def comment_requirement() -> ResolvedCapabilityRequirement:
         "approval": {"kind": "none"},
         "confirmation": {"kind": "none"},
         "consent": {"kind": "none"},
-        "effect": "reversible_write",
+        "effect": (
+            "read_only" if read_only_suspendable else "reversible_write"
+        ),
         "executionModes": ["immediate", "deferred", "suspendable"],
         "freshness": {
             "maxAdmissionAgeSeconds": None,
             "maxInputAgeSeconds": None,
             "policyRevisionRequired": False,
         },
-        "idempotency": {
-            "kind": "required",
-            "retention_seconds": 86400,
-            "scope": "actor_capability_resource_operation",
-        },
+        "idempotency": (
+            {"kind": "none"}
+            if read_only_suspendable
+            else {
+                "kind": "required",
+                "retention_seconds": 86400,
+                "scope": "actor_capability_resource_operation",
+            }
+        ),
         "identity": {"name": "cases.comment", "version": "1.0.0"},
         "inputSchema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -182,7 +223,10 @@ def comment_requirement() -> ResolvedCapabilityRequirement:
     ).capability_requirements[0]
 
 
-def grant_and_session() -> tuple[EffectiveCapabilityGrant, KiteframeSessionContext]:
+def grant_and_session(
+    *,
+    read_only_suspendable: bool = False,
+) -> tuple[EffectiveCapabilityGrant, KiteframeSessionContext]:
     authority_entries = [{"revision": "7", "source": "policy"}]
     authority_revisions = {
         "authorityRevisionDigest": canonical_digest(
@@ -216,7 +260,11 @@ def grant_and_session() -> tuple[EffectiveCapabilityGrant, KiteframeSessionConte
                     "maxInputAgeSeconds": None,
                     "policyRevisionRequired": False,
                 },
-                "maximumEffect": "reversible_write",
+                "maximumEffect": (
+                    "read_only"
+                    if read_only_suspendable
+                    else "reversible_write"
+                ),
                 "preconditions": [],
                 "requiredEvidence": {
                     "approval": {"kind": "none"},
@@ -254,7 +302,11 @@ def grant_and_session() -> tuple[EffectiveCapabilityGrant, KiteframeSessionConte
     return grant_set.grants[0], session
 
 
-def proposal_digest(request: InvocationRequest) -> str:
+def proposal_digest(
+    request: InvocationRequest,
+    *,
+    effect: str = "reversible_write",
+) -> str:
     return canonical_digest(
         b"kiteframe:effect-proposal:v1\0",
         {
@@ -267,7 +319,7 @@ def proposal_digest(request: InvocationRequest) -> str:
                 "name": request.capability_name,
                 "version": request.capability_version,
             },
-            "effect": "reversible_write",
+            "effect": effect,
             "grantDigest": request.grant_digest,
             "idempotencyKey": request.idempotency_key,
             "invocationId": request.invocation_id,
@@ -280,7 +332,11 @@ def proposal_digest(request: InvocationRequest) -> str:
     )
 
 
-def suspended(request: InvocationRequest) -> InvocationOutcome:
+def suspended(
+    request: InvocationRequest,
+    *,
+    effect: str = "reversible_write",
+) -> InvocationOutcome:
     return load_invocation_outcome(
         canonical_bytes(
             {
@@ -290,7 +346,10 @@ def suspended(request: InvocationRequest) -> InvocationOutcome:
                     "checkpointRef": "checkpoint-ref-1",
                     "evidenceKind": "approval",
                     "evidenceRequestRef": EVIDENCE_REF,
-                    "proposalDigest": proposal_digest(request),
+                    "proposalDigest": proposal_digest(
+                        request,
+                        effect=effect,
+                    ),
                 },
             }
         )
@@ -310,14 +369,15 @@ def succeeded(request: InvocationRequest) -> InvocationOutcome:
 
 
 class FakeInvoker:
-    def __init__(self) -> None:
+    def __init__(self, *, effect: str = "reversible_write") -> None:
         self.calls: list[str] = []
+        self.effect = effect
         self.requests: list[InvocationRequest] = []
 
     async def invoke(self, request: InvocationRequest) -> InvocationOutcome:
         self.requests.append(request)
         if request.evidence_refs == {}:
-            return suspended(request)
+            return suspended(request, effect=self.effect)
         self.calls.extend(
             [
                 "validate_evidence",
@@ -341,13 +401,73 @@ class FakeInvoker:
 
 class FakeDurableCheckpointer(
     InMemorySaver,
+    DurableInvocationCheckpointStore,
     RestartableIdempotencyCheckpointStore,
 ):
     kiteframe_durable = True
 
-    def __init__(self) -> None:
+    def __init__(self, durable_path: Path | None = None) -> None:
         super().__init__()
+        self.durable_path = durable_path
         self.correlations: dict[IdempotencyScope, PersistedIdempotencyKey] = {}
+        self.invocations: dict[
+            IdempotencyScope,
+            PersistedInvocationCorrelation,
+        ] = {}
+        if durable_path is not None and durable_path.exists():
+            state = pickle.loads(durable_path.read_bytes())
+            for thread_id, namespaces in state["storage"].items():
+                for checkpoint_ns, checkpoints in namespaces.items():
+                    self.storage[thread_id][checkpoint_ns].update(checkpoints)
+            self.writes.update(state["writes"])
+            self.blobs.update(state["blobs"])
+            self.correlations.update(state["correlations"])
+            self.invocations.update(state["invocations"])
+
+    def _flush(self) -> None:
+        if self.durable_path is None:
+            return
+        storage = {
+            thread_id: {
+                checkpoint_ns: dict(checkpoints)
+                for checkpoint_ns, checkpoints in namespaces.items()
+            }
+            for thread_id, namespaces in self.storage.items()
+        }
+        state = {
+            "blobs": dict(self.blobs),
+            "correlations": dict(self.correlations),
+            "invocations": dict(self.invocations),
+            "storage": storage,
+            "writes": dict(self.writes),
+        }
+        self.durable_path.write_bytes(pickle.dumps(state))
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        stored = await super().aput(
+            config,
+            checkpoint,
+            metadata,
+            new_versions,
+        )
+        self._flush()
+        return stored
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        await super().aput_writes(config, writes, task_id, task_path)
+        self._flush()
 
     async def persist_idempotency_key(
         self,
@@ -356,12 +476,28 @@ class FakeDurableCheckpointer(
         existing = self.correlations.setdefault(record.scope, record)
         if existing != record:
             raise AssertionError("idempotency correlation changed")
+        self._flush()
 
     async def load_idempotency_key(
         self,
         scope: IdempotencyScope,
     ) -> PersistedIdempotencyKey | None:
         return self.correlations.get(scope)
+
+    async def persist_invocation_correlation(
+        self,
+        record: PersistedInvocationCorrelation,
+    ) -> None:
+        existing = self.invocations.setdefault(record.scope, record)
+        if existing != record:
+            raise AssertionError("invocation correlation changed")
+        self._flush()
+
+    async def load_invocation_correlation(
+        self,
+        scope: IdempotencyScope,
+    ) -> PersistedInvocationCorrelation | None:
+        return self.invocations.get(scope)
 
     async def latest(self, config: RunnableConfig) -> object:
         checkpoint = await self.aget_tuple(config)
@@ -381,9 +517,14 @@ def compile_graph(
     *,
     checkpointer: FakeDurableCheckpointer,
     invoker: FakeInvoker,
+    read_only_suspendable: bool = False,
 ) -> Any:
-    requirement = comment_requirement()
-    grant, session = grant_and_session()
+    requirement = comment_requirement(
+        read_only_suspendable=read_only_suspendable
+    )
+    grant, session = grant_and_session(
+        read_only_suspendable=read_only_suspendable
+    )
     tool = build_capability_tools(
         (requirement,),
         (grant,),
@@ -465,7 +606,7 @@ async def test_process_restart_resume_reauthorizes_before_effect() -> None:
         invoker=restarted_invoker,
     )
     result = await restarted_graph.ainvoke(
-        resume_command(EVIDENCE_REF),
+        await trusted_resume_command(),
         config,
     )
 
@@ -532,9 +673,136 @@ async def test_distinct_graph_tasks_do_not_share_invocation_correlation() -> Non
     )
 
 
-def test_raw_evidence_is_rejected_before_resume_command_construction() -> None:
-    with pytest.raises(ValueError, match="opaque reference"):
-        resume_command(RAW_EVIDENCE)
+@pytest.mark.asyncio
+async def test_read_only_restart_uses_new_checkpointer_and_same_invocation(
+    tmp_path: Path,
+) -> None:
+    durable_path = tmp_path / "durable-checkpoint.bin"
+    first_checkpointer = FakeDurableCheckpointer(durable_path)
+    first_invoker = FakeInvoker(effect="read_only")
+    first_graph = compile_graph(
+        checkpointer=first_checkpointer,
+        invoker=first_invoker,
+        read_only_suspendable=True,
+    )
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "task-7-read-only-restart"}
+    }
+    await first_graph.ainvoke(
+        {
+            "arguments": {
+                "body": "read",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        config,
+    )
+    original = first_invoker.requests[-1]
+    assert original.idempotency_key is None
+
+    restarted_checkpointer = FakeDurableCheckpointer(durable_path)
+    assert restarted_checkpointer is not first_checkpointer
+    assert restarted_checkpointer.storage is not first_checkpointer.storage
+    restarted_invoker = FakeInvoker(effect="read_only")
+    restarted_graph = compile_graph(
+        checkpointer=restarted_checkpointer,
+        invoker=restarted_invoker,
+        read_only_suspendable=True,
+    )
+    result = await restarted_graph.ainvoke(
+        await trusted_resume_command(),
+        config,
+    )
+
+    resumed = restarted_invoker.requests[-1]
+    assert result["result"] == {"ok": True}
+    assert resumed.invocation_id == original.invocation_id
+    assert resumed.idempotency_key is None
+    assert resumed.evidence_refs == {"approval": EVIDENCE_REF}
+
+
+class PersistOnlyCheckpointStore:
+    async def persist_idempotency_key(
+        self,
+        record: PersistedIdempotencyKey,
+    ) -> None:
+        del record
+
+
+def test_suspendable_tool_requires_durable_invocation_load_and_persist() -> None:
+    requirement = comment_requirement()
+    grant, session = grant_and_session()
+
+    with pytest.raises(TypeError, match="durable invocation correlation"):
+        build_capability_tools(
+            (requirement,),
+            (grant,),
+            grant_digest=session.grant_digest,
+            invoker=FakeInvoker(),
+            session=session,
+            checkpoint_store=PersistOnlyCheckpointStore(),
+            suspension_bridge=LangGraphSuspensionBridge(),
+        )
+
+
+@pytest.mark.parametrize(
+    "untrusted_value",
+    [
+        "approved",
+        "hunter2",
+        "c2VjcmV0",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.signature",
+        RAW_EVIDENCE,
+    ],
+)
+def test_untrusted_evidence_cannot_construct_resume_command(
+    untrusted_value: str,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        resume_command(untrusted_value)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "untrusted_reference",
+    [
+        "approved",
+        "hunter2",
+        "c2VjcmV0",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhbGljZSJ9.signature",
+        RAW_EVIDENCE,
+    ],
+)
+async def test_resolver_rejects_non_reference_values(
+    untrusted_reference: str,
+) -> None:
+    resolver = FakeEvidenceReferenceResolver(
+        {EVIDENCE_HANDLE: untrusted_reference}
+    )
+
+    with pytest.raises(ValueError, match="protected reference"):
+        await resolve_protected_evidence_reference(
+            EVIDENCE_HANDLE,
+            resolver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolver_issues_branded_reference_before_command() -> None:
+    with pytest.raises(TypeError, match="must come from a resolver"):
+        ProtectedEvidenceReference(EVIDENCE_REF)
+
+    reference = await resolve_protected_evidence_reference(
+        EVIDENCE_HANDLE,
+        FakeEvidenceReferenceResolver({EVIDENCE_HANDLE: EVIDENCE_REF}),
+    )
+    command = resume_command(reference)
+    serialized = json.dumps(command.resume)
+
+    assert EVIDENCE_REF in serialized
+    assert EVIDENCE_HANDLE not in serialized
+    assert RAW_EVIDENCE not in serialized
 
 
 def test_adapter_source_is_closed_and_uses_only_public_deepagents_apis() -> None:
@@ -542,46 +810,188 @@ def test_adapter_source_is_closed_and_uses_only_public_deepagents_apis() -> None
         WORKSPACE
         / "python/kiteframe-deepagents/src/kiteframe_deepagents"
     )
-    forbidden_entrypoint_parameters = {
+    assert _adapter_tree_violations(source_root) == []
+
+
+def _adapter_source_violations(source: str, filename: str) -> list[str]:
+    tree = ast.parse(source, filename=filename)
+    violations: list[str] = []
+    forbidden_input_words = {
         "binding",
         "descriptor",
         "lock",
+        "lockfile",
+        "manifest",
         "package",
+        "pkg",
+        "schema",
         "target",
     }
-    for path in source_root.glob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                assert all(
-                    not alias.name.startswith("deepagents._")
+    json_modules = {"json"}
+    json_decoders: set[str] = set()
+    tainted_values: set[str] = set()
+
+    def attribute_path(expression: ast.AST) -> tuple[str, ...] | None:
+        if isinstance(expression, ast.Name):
+            return (expression.id,)
+        if isinstance(expression, ast.Attribute):
+            prefix = attribute_path(expression.value)
+            if prefix is not None:
+                return (*prefix, expression.attr)
+        return None
+
+    def assigned_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return {
+            target.id
+            for target in targets
+            if isinstance(target, ast.Name)
+        }
+
+    def contains_canonical_json(expression: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "canonical_json"
+            for child in ast.walk(expression)
+        )
+
+    def referenced_names(expression: ast.AST) -> set[str]:
+        return {
+            child.id
+            for child in ast.walk(expression)
+            if isinstance(child, ast.Name)
+        }
+
+    def is_json_decoder(expression: ast.AST) -> bool:
+        path = attribute_path(expression)
+        return (
+            path is not None
+            and (
+                (len(path) == 2 and path[0] in json_modules and path[1] == "loads")
+                or (len(path) == 1 and path[0] in json_decoders)
+            )
+        )
+
+    assignments: list[ast.Assign | ast.AnnAssign] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("deepagents._"):
+                    violations.append("private Deep Agents import")
+                if alias.name == "json":
+                    json_modules.add(alias.asname or alias.name)
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            if node.module.startswith("deepagents._") or (
+                node.module == "deepagents"
+                and any(alias.name.startswith("_") for alias in node.names)
+            ):
+                violations.append("private Deep Agents import")
+            if node.module == "json":
+                json_decoders.update(
+                    alias.asname or alias.name
                     for alias in node.names
+                    if alias.name == "loads"
                 )
-            if isinstance(node, ast.ImportFrom) and node.module is not None:
-                assert not node.module.startswith("deepagents._")
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "loads"
-                and node.args
-            ):
-                argument = node.args[0]
-                assert not (
-                    isinstance(argument, ast.Call)
-                    and isinstance(argument.func, ast.Attribute)
-                    and argument.func.attr == "canonical_json"
-                )
-            if (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name in {"compile", "validate"}
-            ):
-                parameter_names = {
-                    argument.arg
-                    for argument in (*node.args.args, *node.args.kwonlyargs)
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            assignments.append(node)
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in {"compile", "validate"}
+        ):
+            arguments = (*node.args.args, *node.args.kwonlyargs)
+            for argument in arguments:
+                identifiers = [argument.arg]
+                if argument.annotation is not None:
+                    identifiers.append(ast.unparse(argument.annotation))
+                words = {
+                    word
+                    for identifier in identifiers
+                    for word in re.sub(
+                        r"(?<=[a-z0-9])(?=[A-Z])",
+                        "_",
+                        identifier,
+                    )
+                    .lower()
+                    .split("_")
                 }
-                assert parameter_names.isdisjoint(
-                    forbidden_entrypoint_parameters
+                if not words.isdisjoint(forbidden_input_words):
+                    violations.append("open compilation input")
+
+    changed = True
+    while changed:
+        changed = False
+        for assignment in assignments:
+            value = assignment.value
+            if value is None:
+                continue
+            names = assigned_names(assignment)
+            if is_json_decoder(value):
+                new_decoders = names - json_decoders
+                json_decoders.update(new_decoders)
+                changed = changed or bool(new_decoders)
+            if contains_canonical_json(value) or not referenced_names(
+                value
+            ).isdisjoint(tainted_values):
+                new_tainted = names - tainted_values
+                tainted_values.update(new_tainted)
+                changed = changed or bool(new_tainted)
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and is_json_decoder(node.func)
+            and node.args
+            and (
+                contains_canonical_json(node.args[0])
+                or not referenced_names(node.args[0]).isdisjoint(
+                    tainted_values
                 )
+            )
+        ):
+            violations.append("canonical JSON reconstruction")
+    return violations
+
+
+def _adapter_tree_violations(source_root: Path) -> list[str]:
+    violations: list[str] = []
+    for path in source_root.rglob("*.py"):
+        violations.extend(
+            _adapter_source_violations(path.read_text(), str(path))
+        )
+    return violations
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from deepagents import _private as public\n",
+        (
+            "import json\n"
+            "payload = native.canonical_json()\n"
+            "shadow = payload\n"
+            "decode = json.loads\n"
+            "decode(shadow)\n"
+        ),
+        "def compile(runtime_inputs, *, binding_snapshot): pass\n",
+        (
+            "def validate(runtime_inputs, *, "
+            "candidate: RuntimeTarget): pass\n"
+        ),
+    ],
+)
+def test_adapter_source_gate_rejects_semantic_bypasses(source: str) -> None:
+    assert _adapter_source_violations(source, "<adversarial>") != []
+
+
+def test_adapter_source_gate_scans_nested_modules(tmp_path: Path) -> None:
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "bypass.py").write_text(
+        "from deepagents import _private\n"
+    )
+
+    assert _adapter_tree_violations(tmp_path) != []
 
 
 def test_locked_tool_schema_is_an_exact_read_only_byte_projection() -> None:

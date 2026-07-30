@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 from kiteframe import (
     InvocationOutcome,
@@ -18,6 +19,14 @@ from .context import KiteframeSessionContext
 SUSPENSION_TYPE = "kiteframe.capability.suspension"
 INVALID_SUSPENSION = "KF-CAP-002: invalid capability suspension"
 EvidenceKind = Literal["confirmation", "approval", "consent"]
+PROTECTED_EVIDENCE_REFERENCE_TYPE = (
+    "kiteframe.protected-evidence-reference"
+)
+_PROTECTED_REFERENCE_PATTERN = re.compile(
+    r"(?:evidence-ref-[A-Za-z0-9][A-Za-z0-9._~-]{0,127}"
+    r"|evidence://[A-Za-z0-9][A-Za-z0-9._~:/-]{0,255})"
+)
+_REFERENCE_ISSUER = object()
 
 
 def _exact_non_empty(value: object, name: str) -> str:
@@ -34,9 +43,56 @@ def _evidence_kind(value: object) -> EvidenceKind:
 
 def _protected_evidence_ref(value: object) -> str:
     reference = _exact_non_empty(value, "evidence_ref")
-    if any(character.isspace() for character in reference):
-        raise ValueError("evidence_ref must be an opaque reference")
+    if _PROTECTED_REFERENCE_PATTERN.fullmatch(reference) is None:
+        raise ValueError("evidence_ref must be a protected reference")
     return reference
+
+
+@runtime_checkable
+class EvidenceReferenceResolver(Protocol):
+    """Trusted resolver from an external handle to a protected reference."""
+
+    async def resolve_evidence_reference(self, handle: str) -> str: ...
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class ProtectedEvidenceReference:
+    """Resolver-issued reference brand required by the resume API."""
+
+    _reference: str
+
+    def __init__(
+        self,
+        reference: str,
+        *,
+        _issuer: object | None = None,
+    ) -> None:
+        if _issuer is not _REFERENCE_ISSUER:
+            raise TypeError(
+                "protected evidence references must come from a resolver"
+            )
+        object.__setattr__(
+            self,
+            "_reference",
+            _protected_evidence_ref(reference),
+        )
+
+
+async def resolve_protected_evidence_reference(
+    handle: str,
+    resolver: EvidenceReferenceResolver,
+) -> ProtectedEvidenceReference:
+    """Resolve an untrusted handle before any value enters a Command."""
+
+    if type(handle) is not str or not handle:
+        raise TypeError("evidence handle must be a non-empty exact string")
+    if not isinstance(resolver, EvidenceReferenceResolver):
+        raise TypeError("resolver must implement EvidenceReferenceResolver")
+    reference = await resolver.resolve_evidence_reference(handle)
+    return ProtectedEvidenceReference(
+        _protected_evidence_ref(reference),
+        _issuer=_REFERENCE_ISSUER,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,13 +168,30 @@ class LangGraphSuspensionBridge:
     ) -> str:
         envelope = SuspensionEnvelope.from_native(request, outcome)
         resumed = interrupt(asdict(envelope))
-        return _protected_evidence_ref(resumed)
+        if (
+            type(resumed) is not dict
+            or set(resumed) != {"reference", "type"}
+            or resumed.get("type") != PROTECTED_EVIDENCE_REFERENCE_TYPE
+        ):
+            raise TypeError(
+                "resume payload must be a protected evidence reference"
+            )
+        return _protected_evidence_ref(resumed.get("reference"))
 
 
-def resume_command(evidence_ref: str) -> Command:
+def resume_command(evidence_ref: ProtectedEvidenceReference) -> Command:
     """Create the only public resume command accepted by the adapter."""
 
-    return Command(resume=_protected_evidence_ref(evidence_ref))
+    if type(evidence_ref) is not ProtectedEvidenceReference:
+        raise TypeError(
+            "evidence_ref must be an exact ProtectedEvidenceReference"
+        )
+    return Command(
+        resume={
+            "reference": evidence_ref._reference,
+            "type": PROTECTED_EVIDENCE_REFERENCE_TYPE,
+        }
+    )
 
 
 def build_resumed_invocation_request(
@@ -171,7 +244,10 @@ def build_resumed_invocation_request(
 
 __all__ = [
     "LangGraphSuspensionBridge",
+    "EvidenceReferenceResolver",
+    "ProtectedEvidenceReference",
     "SuspensionEnvelope",
     "build_resumed_invocation_request",
+    "resolve_protected_evidence_reference",
     "resume_command",
 ]

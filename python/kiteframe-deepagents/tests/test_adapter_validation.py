@@ -15,6 +15,7 @@ from kiteframe import (
     FrozenComponentRegistry,
     KiteframeDiagnosticError,
     ResolvedRuntimeInputs,
+    load_capability_grant_set,
     resolve_package,
 )
 from langchain.agents.middleware import AgentMiddleware
@@ -32,6 +33,10 @@ from kiteframe_deepagents.compatibility import (
 )
 from kiteframe_deepagents.components import (
     DurableCheckpointer,
+)
+from kiteframe_deepagents.context import (
+    KiteframeSessionContext,
+    KiteframeTraceContext,
 )
 from kiteframe_deepagents.target import (
     DEEPAGENTS_UPSTREAM_COMMIT,
@@ -55,6 +60,74 @@ def canonical_bytes(value: object) -> bytes:
     ).encode()
 
 
+def granted_session_context() -> KiteframeSessionContext:
+    authority_entries = [{"revision": "7", "source": "policy"}]
+    authority_revisions = {
+        "authorityRevisionDigest": hashlib.sha256(
+            b"kiteframe:authority-revision-set:v1\0"
+            + canonical_bytes(authority_entries)
+        ).hexdigest(),
+        "entries": authority_entries,
+    }
+    values: dict[str, object] = {
+        "actor": "actor:alice",
+        "admissionId": "admission:compile-1",
+        "admissionRequestDigest": "09" * 32,
+        "agent": "agent:support",
+        "authorityRevisions": authority_revisions,
+        "catalogDigest": "01" * 32,
+        "catalogIdentity": {
+            "name": "provider.test",
+            "revision": "revision-1",
+        },
+        "expiresAt": 4_000_000_000,
+        "grants": [
+            {
+                "capability": {"name": "cases.read", "version": "1.2.0"},
+                "executionModes": ["immediate", "suspendable"],
+                "expiresAt": 4_000_000_000,
+                "freshness": {
+                    "maxAdmissionAgeSeconds": None,
+                    "maxInputAgeSeconds": None,
+                    "policyRevisionRequired": False,
+                },
+                "maximumEffect": "read_only",
+                "preconditions": [],
+                "requiredEvidence": {
+                    "approval": {"kind": "none"},
+                    "confirmation": {"kind": "none"},
+                    "consent": {"kind": "none"},
+                },
+                "resources": ["tenant:support"],
+            }
+        ],
+        "issuedAt": 1_900_000_000,
+        "optionalDenials": [],
+        "policyRevision": "policy:7",
+        "session": "session:compile-1",
+        "task": "task:compile",
+    }
+    values["grantDigest"] = hashlib.sha256(
+        b"kiteframe:capability-grant-set:v1\0" + canonical_bytes(values)
+    ).hexdigest()
+    grant_set = load_capability_grant_set(canonical_bytes(values))
+    return KiteframeSessionContext(
+        actor=grant_set.actor,
+        session=grant_set.session,
+        task=grant_set.task,
+        admission_id=grant_set.admission_id,
+        grant_digest=grant_set.grant_digest,
+        grants=grant_set.grants,
+        authority_revisions=grant_set.authority_revisions,
+        trace_context=KiteframeTraceContext(
+            traceparent=(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-"
+                "00f067aa0ba902b7-01"
+            )
+        ),
+    )
+
+
 class FirstMiddleware(AgentMiddleware):
     pass
 
@@ -75,6 +148,11 @@ class TestDurableCheckpointer:
 
     async def aget_tuple(self, config: object) -> None:
         del config
+
+
+class PersistOnlyDurableCheckpointer(TestDurableCheckpointer):
+    async def persist_idempotency_key(self, record: object) -> None:
+        del record
 
 
 class TestCapabilityInvoker:
@@ -374,6 +452,38 @@ def test_suspendable_capability_requires_durable_checkpointer(
 
     assert error.value.code == "KF-RUNTIME-001"
     assert "durable checkpointer" in str(error.value)
+
+
+def test_suspendable_compile_requires_restartable_invocation_correlation(
+    adapter: DeepAgentsAdapter,
+    suspendable_inputs: ResolvedRuntimeInputs,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def forbidden_constructor(*args: object, **kwargs: object) -> None:
+        nonlocal called
+        del args, kwargs
+        called = True
+
+    monkeypatch.setattr(
+        "kiteframe_deepagents.adapter.create_deep_agent",
+        forbidden_constructor,
+    )
+
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        adapter.compile(
+            suspendable_inputs,
+            registry_for(
+                suspendable_inputs,
+                checkpointer=PersistOnlyDurableCheckpointer(),
+            ),
+            granted_session_context(),
+        )
+
+    assert error.value.code == "KF-RUNTIME-001"
+    assert "runtime assembly validation failed" in str(error.value)
+    assert called is False
 
 
 def test_configured_checkpointer_is_retained_without_suspension(

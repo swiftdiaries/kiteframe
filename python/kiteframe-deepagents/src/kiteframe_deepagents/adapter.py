@@ -41,6 +41,7 @@ from .middleware import (
 from .suspension import LangGraphSuspensionBridge
 from .target import SUPPORTED_FEATURES, TARGET
 from .tools import (
+    DurableInvocationCheckpointStore,
     IdempotencyCheckpointStore,
     PersistedIdempotencyKey,
     build_capability_tools,
@@ -344,7 +345,10 @@ class DeepAgentsAdapter:
                 components.checkpointer
                 if isinstance(
                     components.checkpointer,
-                    IdempotencyCheckpointStore,
+                    (
+                        DurableInvocationCheckpointStore,
+                        IdempotencyCheckpointStore,
+                    ),
                 )
                 else _UnavailableCheckpointStore()
             )

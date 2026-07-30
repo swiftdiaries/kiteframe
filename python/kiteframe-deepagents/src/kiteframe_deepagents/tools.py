@@ -111,6 +111,15 @@ class PersistedIdempotencyKey:
         return self.scope.task
 
 
+@dataclass(frozen=True, slots=True)
+class PersistedInvocationCorrelation:
+    """Restart-safe invocation identity, independent of idempotency support."""
+
+    scope: IdempotencyScope
+    invocation_id: str
+    idempotency_key: str | None
+
+
 @runtime_checkable
 class IdempotencyCheckpointStore(Protocol):
     """Durable session-checkpoint boundary for caller-generated keys."""
@@ -119,6 +128,21 @@ class IdempotencyCheckpointStore(Protocol):
         self,
         record: PersistedIdempotencyKey,
     ) -> None: ...
+
+
+@runtime_checkable
+class DurableInvocationCheckpointStore(Protocol):
+    """Durable suspension correlation across checkpointer instances."""
+
+    async def persist_invocation_correlation(
+        self,
+        record: PersistedInvocationCorrelation,
+    ) -> None: ...
+
+    async def load_invocation_correlation(
+        self,
+        scope: IdempotencyScope,
+    ) -> PersistedInvocationCorrelation | None: ...
 
 
 @runtime_checkable
@@ -325,7 +349,9 @@ class CapabilityTool(BaseTool):
     description: str
     args_schema: ArgsSchema | None = None
     invoker: CapabilityInvoker
-    checkpoint_store: IdempotencyCheckpointStore
+    checkpoint_store: (
+        IdempotencyCheckpointStore | DurableInvocationCheckpointStore
+    )
     suspension_bridge: CapabilitySuspensionBridge
     authority_snapshot: _CapabilityAuthoritySnapshot = Field(
         exclude=True,
@@ -414,14 +440,52 @@ class CapabilityTool(BaseTool):
         self,
         resource: str,
         config: RunnableConfig,
-    ) -> PersistedIdempotencyKey | None:
+    ) -> PersistedInvocationCorrelation:
         key = self._new_idempotency_key()
-        if key is None:
-            return None
         scope = self._idempotency_scope(resource, config)
         store = self.checkpoint_store
+        suspendable = "suspendable" in self.requirement.descriptor.execution_modes
+        if suspendable:
+            if not isinstance(store, DurableInvocationCheckpointStore):
+                raise TypeError(
+                    "suspendable capability requires durable "
+                    "invocation correlation"
+                )
+            existing_invocation = (
+                await store.load_invocation_correlation(scope)
+                if scope.checkpoint_task is not None
+                else None
+            )
+            if existing_invocation is not None:
+                if (
+                    type(existing_invocation)
+                    is not PersistedInvocationCorrelation
+                    or existing_invocation.scope != scope
+                    or type(existing_invocation.invocation_id) is not str
+                    or not existing_invocation.invocation_id
+                    or (
+                        existing_invocation.idempotency_key is not None
+                        and (
+                            type(existing_invocation.idempotency_key) is not str
+                            or not existing_invocation.idempotency_key
+                        )
+                    )
+                    or (
+                        key is None
+                        and existing_invocation.idempotency_key is not None
+                    )
+                    or (
+                        key is not None
+                        and existing_invocation.idempotency_key is None
+                    )
+                ):
+                    raise TypeError(
+                        "persisted invocation correlation is invalid"
+                    )
+                return existing_invocation
         if (
-            scope.checkpoint_task is not None
+            key is not None
+            and scope.checkpoint_task is not None
             and isinstance(store, RestartableIdempotencyCheckpointStore)
         ):
             existing = await store.load_idempotency_key(scope)
@@ -437,19 +501,42 @@ class CapabilityTool(BaseTool):
                     raise TypeError(
                         "persisted idempotency correlation is invalid"
                     )
-                return existing
-        return PersistedIdempotencyKey(
+                return PersistedInvocationCorrelation(
+                    scope=existing.scope,
+                    invocation_id=existing.invocation_id,
+                    idempotency_key=existing.key,
+                )
+        return PersistedInvocationCorrelation(
             scope=scope,
             invocation_id=f"invocation:{_uuid7()}",
-            key=key,
+            idempotency_key=key,
         )
 
-    async def _persist_idempotency_key(
+    async def _persist_invocation_correlation(
         self,
-        record: PersistedIdempotencyKey | None,
+        record: PersistedInvocationCorrelation,
     ) -> None:
-        if record is not None:
-            await self.checkpoint_store.persist_idempotency_key(record)
+        store = self.checkpoint_store
+        if "suspendable" in self.requirement.descriptor.execution_modes:
+            if not isinstance(store, DurableInvocationCheckpointStore):
+                raise TypeError(
+                    "suspendable capability requires durable "
+                    "invocation correlation"
+                )
+            await store.persist_invocation_correlation(record)
+        key = record.idempotency_key
+        if key is not None:
+            if not isinstance(store, IdempotencyCheckpointStore):
+                raise TypeError(
+                    "effectful capability requires idempotency persistence"
+                )
+            await store.persist_idempotency_key(
+                PersistedIdempotencyKey(
+                    scope=record.scope,
+                    invocation_id=record.invocation_id,
+                    key=key,
+                )
+            )
 
     @staticmethod
     def _stable_failure(outcome: InvocationOutcome | InvocationStatus) -> str:
@@ -601,20 +688,14 @@ class CapabilityTool(BaseTool):
                 session=self.session,
                 resource=resource,
                 arguments=arguments,
-                idempotency_key=(
-                    correlation.key if correlation is not None else None
-                ),
-                invocation_id=(
-                    correlation.invocation_id
-                    if correlation is not None
-                    else None
-                ),
+                idempotency_key=correlation.idempotency_key,
+                invocation_id=correlation.invocation_id,
             )
         except Exception:
             raise ToolException(
                 "KF-CAP-002: invalid capability invocation"
             ) from None
-        await self._persist_idempotency_key(correlation)
+        await self._persist_invocation_correlation(correlation)
         try:
             outcome = await self.invoker.invoke(request)
         except Exception:
@@ -636,7 +717,9 @@ def build_capability_tools(
     grant_digest: str,
     invoker: CapabilityInvoker,
     session: KiteframeSessionContext,
-    checkpoint_store: IdempotencyCheckpointStore,
+    checkpoint_store: (
+        IdempotencyCheckpointStore | DurableInvocationCheckpointStore
+    ),
     suspension_bridge: CapabilitySuspensionBridge,
 ) -> tuple[CapabilityTool, ...]:
     """Map exact effective grants to exact embedded locked descriptors."""
@@ -666,8 +749,26 @@ def build_capability_tools(
         raise ValueError("effective grants do not match the session")
     if not isinstance(invoker, CapabilityInvoker):
         raise TypeError("invoker must implement native CapabilityInvoker")
-    if not isinstance(checkpoint_store, IdempotencyCheckpointStore):
+    requires_idempotency = any(
+        _requires_idempotency(requirement)
+        for requirement in requirements
+    )
+    requires_suspension = any(
+        "suspendable" in requirement.descriptor.execution_modes
+        for requirement in requirements
+    )
+    if requires_idempotency and not isinstance(
+        checkpoint_store,
+        IdempotencyCheckpointStore,
+    ):
         raise TypeError("checkpoint_store must persist idempotency keys")
+    if requires_suspension and not isinstance(
+        checkpoint_store,
+        DurableInvocationCheckpointStore,
+    ):
+        raise TypeError(
+            "suspendable capability requires durable invocation correlation"
+        )
     if not isinstance(suspension_bridge, CapabilitySuspensionBridge):
         raise TypeError("suspension_bridge must handle native suspension")
 
@@ -722,9 +823,11 @@ def build_capability_tools(
 __all__ = [
     "CapabilitySuspensionBridge",
     "CapabilityTool",
+    "DurableInvocationCheckpointStore",
     "IdempotencyScope",
     "IdempotencyCheckpointStore",
     "PersistedIdempotencyKey",
+    "PersistedInvocationCorrelation",
     "RestartableIdempotencyCheckpointStore",
     "build_capability_tools",
     "build_native_invocation_request",
