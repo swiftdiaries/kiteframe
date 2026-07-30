@@ -8,9 +8,10 @@ use kiteframe_contract::{
     ApprovalRequirement, AuthorityRevisionSet, CapabilityGrantSet, CapabilityIdentity,
     ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
     DiagnosticStage, EffectClassification, EffectProposal, EffectiveCapabilityGrant, EvidenceKind,
-    EvidenceRequirement, ExecutionMode, IdempotencyRequirement, InvocationOutcome,
-    InvocationRequest, LockedCapability, NormalizedResourceSelector, ProtectedEvidenceRequestRef,
-    RetryClass, Sha256Digest, Suspension, Timestamp, resource_selector_is_subset_of,
+    EvidenceReferences, EvidenceRequirement, ExecutionMode, IdempotencyRequirement,
+    InvocationOutcome, InvocationRequest, LockedCapability, NormalizedResourceSelector,
+    ProtectedEvidenceRequestRef, RetryClass, Sha256Digest, Suspension, Timestamp,
+    resource_selector_is_subset_of,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -673,6 +674,7 @@ impl InvocationService {
                     &context,
                     &proposal,
                     &decision,
+                    &verified_evidence,
                     operation.as_ref(),
                 )
                 .await;
@@ -712,6 +714,7 @@ impl InvocationService {
         context: &InvocationContext,
         proposal: &EffectProposal,
         decision: &AuthorizationDecision,
+        verified_evidence: &[VerifiedEvidence],
         operation: &dyn crate::CapabilityOperation,
     ) -> Result<InvocationOutcome, Diagnostic> {
         let descriptor = locked.descriptor();
@@ -724,8 +727,8 @@ impl InvocationService {
             canonical_audit_digest(b"kiteframe:authority-revisions:v1\0", current_revisions)?;
         let status_id = format!("status://{}", request.invocation_id().as_str());
         let retention_until = effect_retention_deadline(descriptor, self.clock.now())?;
-        let protected_evidence_refs = request
-            .evidence_refs()
+        let audit_evidence_refs = validated_audit_evidence_refs(request, verified_evidence)?;
+        let protected_evidence_refs = audit_evidence_refs
             .as_map()
             .values()
             .map(|reference| ProtectedEvidenceRequestRef::new(reference.clone()))
@@ -798,7 +801,7 @@ impl InvocationService {
             status_id: status_id.clone(),
             idempotency_key: idempotency_key.clone(),
             precondition_refs,
-            evidence_refs: request.evidence_refs().clone(),
+            evidence_refs: audit_evidence_refs,
             proposal_digest: *proposal.proposal_digest(),
             portable_digest: enforcement.digests.portable_digest,
             lock_digest: enforcement.digests.lock_digest,
@@ -1177,6 +1180,39 @@ fn effect_retention_deadline(
         .checked_add(retention_seconds.get())
         .map(Timestamp::new)
         .ok_or_else(|| capability_error("effect retention deadline overflows"))
+}
+
+fn validated_audit_evidence_refs(
+    request: &InvocationRequest,
+    verified_evidence: &[VerifiedEvidence],
+) -> Result<EvidenceReferences, Diagnostic> {
+    if request.evidence_refs().as_map().len() != verified_evidence.len() {
+        return Err(evidence_error(
+            "invocation contains unexpected or unverified evidence references",
+        ));
+    }
+    let mut filtered = BTreeMap::new();
+    for evidence in verified_evidence {
+        let reference = evidence.reference.as_str();
+        if !protected_evidence_reference(reference)
+            || request
+                .evidence_refs()
+                .as_map()
+                .get(&evidence.requirement_kind)
+                .is_none_or(|supplied| supplied != reference)
+            || filtered
+                .insert(
+                    evidence.requirement_kind.clone(),
+                    serde_json::Value::String(reference.to_owned()),
+                )
+                .is_some()
+        {
+            return Err(evidence_error(
+                "invocation evidence references do not exact-match verified requirements",
+            ));
+        }
+    }
+    EvidenceReferences::try_new(filtered).map_err(evidence_error)
 }
 
 fn trace_ids(request: &InvocationRequest) -> Result<(TraceId, SpanId), Diagnostic> {

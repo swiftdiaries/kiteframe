@@ -109,6 +109,48 @@ async fn outcome_append_failure_marks_status_unknown() {
             "terminal_status",
         ]
     );
+
+    let audit_calls = fixture.audit.call_count();
+    let execute_events = fixture
+        .events
+        .snapshot()
+        .into_iter()
+        .filter(|event| *event == "execute")
+        .count();
+    let retry = fixture.service.invoke(request).await.unwrap();
+    assert!(matches!(retry, InvocationOutcome::OutcomeUnknown { .. }));
+    assert_eq!(fixture.effect_count.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.audit.call_count(), audit_calls);
+    assert_eq!(
+        fixture
+            .events
+            .snapshot()
+            .into_iter()
+            .filter(|event| *event == "execute")
+            .count(),
+        execute_events
+    );
+}
+
+#[tokio::test]
+async fn unused_caller_evidence_cannot_reach_effect_status_or_audit() {
+    let fixture = fixture(None);
+    let evidence = EvidenceReferences::try_new(BTreeMap::from([(
+        "unused".to_owned(),
+        Value::String("vault://unused/bearer-secret-raw-claims-evidence-body".to_owned()),
+    )]))
+    .unwrap();
+
+    let error = fixture
+        .service
+        .invoke(fixture.request_with_evidence(evidence))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-AUTH-003");
+    assert_eq!(fixture.effect_count.load(Ordering::SeqCst), 0);
+    assert!(fixture.audit.records().is_empty());
+    assert_eq!(fixture.audit.call_count(), 0);
 }
 
 fn enforcement_events(events: &[&'static str]) -> Vec<&'static str> {
@@ -142,6 +184,10 @@ struct Fixture {
 
 impl Fixture {
     fn request(&self) -> InvocationRequest {
+        self.request_with_evidence(EvidenceReferences::default())
+    }
+
+    fn request_with_evidence(&self, evidence_refs: EvidenceReferences) -> InvocationRequest {
         InvocationRequest::try_new(
             InvocationId::new("invocation-audit-7").unwrap(),
             self.admission_id.clone(),
@@ -152,7 +198,7 @@ impl Fixture {
             json!({"caseId": "42"}),
             BTreeMap::new(),
             Some("idempotency-audit-7".to_owned()),
-            EvidenceReferences::default(),
+            evidence_refs,
             trace_context(),
         )
         .unwrap()
@@ -304,6 +350,10 @@ impl RecordingAudit {
 
     fn records(&self) -> Vec<AuditRecord> {
         self.records.lock().unwrap().clone()
+    }
+
+    fn call_count(&self) -> u64 {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 

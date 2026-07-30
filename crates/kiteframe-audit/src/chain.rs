@@ -97,6 +97,9 @@ impl FileAuditLedger {
             file.lock()
                 .map_err(|_| unavailable("audit partition cannot be locked for append"))?;
             let existing = read_and_verify(&mut file, &partition)?;
+            let record = serde_json::to_value(record)
+                .map_err(|_| unavailable("audit record cannot be serialized"))?;
+            validate_record_linkage(&record, &partition, &existing)?;
             let (sequence, previous_hash) = match existing.last() {
                 Some(entry) => (
                     entry
@@ -123,8 +126,7 @@ impl FileAuditLedger {
                 sequence,
                 previous_hash,
                 record_hash,
-                record: serde_json::to_value(record)
-                    .map_err(|_| unavailable("audit record cannot be serialized"))?,
+                record,
             };
             file.seek(SeekFrom::End(0))
                 .map_err(|_| unavailable("audit partition append position is unavailable"))?;
@@ -230,6 +232,7 @@ fn read_and_verify(
             persisted.record_hash,
         )
         .map_err(unavailable)?;
+        validate_record_linkage(&persisted.record, expected_partition, &verified)?;
         expected_sequence = expected_sequence
             .checked_add(1)
             .ok_or_else(|| unavailable("audit partition sequence exhausted"))?;
@@ -240,6 +243,94 @@ fn read_and_verify(
         });
     }
     Ok(verified)
+}
+
+fn validate_record_linkage(
+    record: &Value,
+    partition: &str,
+    prior: &[VerifiedAuditEntry],
+) -> Result<(), Diagnostic> {
+    let record_type = record
+        .get("recordType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unavailable("audit record type is missing"))?;
+    let body = record
+        .get("record")
+        .and_then(Value::as_object)
+        .ok_or_else(|| unavailable("audit record body is missing"))?;
+    if body.get("tenantRef").and_then(Value::as_str) != Some(partition) {
+        return Err(unavailable(
+            "audit record tenant does not match its partition",
+        ));
+    }
+    match record_type {
+        "authorization" => Ok(()),
+        "outcome" => {
+            let authorization_id = body
+                .get("writeAheadRecordId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| unavailable("outcome audit authorization link is missing"))?;
+            let authorization = prior
+                .iter()
+                .find(|entry| entry.receipt().record_id() == authorization_id)
+                .ok_or_else(|| {
+                    unavailable("outcome audit authorization link is not in this partition")
+                })?;
+            let authorization_body = authorization
+                .record()
+                .get("recordType")
+                .and_then(Value::as_str)
+                .filter(|kind| *kind == "authorization")
+                .and_then(|_| authorization.record().get("record"))
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    unavailable("outcome audit link does not reference an authorization record")
+                })?;
+            for field in [
+                "tenantRef",
+                "humanPrincipalRef",
+                "workloadPrincipalRef",
+                "runRef",
+                "actor",
+                "agent",
+                "task",
+                "session",
+                "capability",
+                "resource",
+                "admissionId",
+                "grantDigest",
+                "catalogIdentity",
+                "catalogDigest",
+                "descriptorDigest",
+                "authorityRevisionDigest",
+                "invocationId",
+                "statusId",
+                "idempotencyKey",
+                "proposalDigest",
+                "portableDigest",
+                "lockDigest",
+                "bindingDigest",
+                "resolvedDigest",
+                "traceId",
+                "spanId",
+                "intendedEffect",
+            ] {
+                let authorization_value = authorization_body
+                    .get(field)
+                    .ok_or_else(|| unavailable("authorization audit correlation is incomplete"))?;
+                let outcome_value = body
+                    .get(field)
+                    .ok_or_else(|| unavailable("outcome audit correlation is incomplete"))?;
+                if authorization_value != outcome_value {
+                    return Err(unavailable(format!(
+                        "outcome audit correlation does not match authorization field {field}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(unavailable("audit record type is unsupported")),
+    }
 }
 
 fn record_hash(
