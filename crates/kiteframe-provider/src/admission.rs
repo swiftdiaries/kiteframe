@@ -6,8 +6,9 @@ use std::{
 use kiteframe_contract::{
     AdmissionId, AdmissionRequest, AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog,
     CapabilityDenial, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, Diagnostic,
-    DiagnosticCategory, DiagnosticCode, DiagnosticStage, LockedCapability, PolicyRevision,
-    RequestedCapability, ResolvedCapabilityRequirement, Sha256Digest, Timestamp,
+    DiagnosticCategory, DiagnosticCode, DiagnosticStage, EffectiveCapabilityGrant,
+    EffectiveCapabilityGrantParts, LockedCapability, PolicyRevision, RequestedCapability,
+    RequiredEvidence, ResolvedCapabilityRequirement, Sha256Digest, Timestamp,
 };
 
 use crate::{AuthorityTerm, intersect_authority};
@@ -19,26 +20,40 @@ pub struct AdmissionServiceConfig {
     pub policy_revision: PolicyRevision,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AuthorityDomain {
+    Package,
+    Deployment,
+    Human,
+    Workload,
+    Task,
+    Session,
+}
+
+impl AuthorityDomain {
+    pub const ALL: [Self; 6] = [
+        Self::Package,
+        Self::Deployment,
+        Self::Human,
+        Self::Workload,
+        Self::Task,
+        Self::Session,
+    ];
+}
+
 #[derive(Clone, Debug)]
-pub struct AuthoritySource {
-    revision: AuthorityRevision,
+pub struct AuthorityPlane {
+    domain: AuthorityDomain,
     terms: Vec<AuthorityTerm>,
 }
 
-impl AuthoritySource {
-    pub fn try_new(
-        source: impl Into<String>,
-        revision: impl Into<String>,
-        terms: Vec<AuthorityTerm>,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            revision: AuthorityRevision::try_new(source, revision)?,
-            terms,
-        })
+impl AuthorityPlane {
+    pub fn new(domain: AuthorityDomain, terms: Vec<AuthorityTerm>) -> Self {
+        Self { domain, terms }
     }
 
-    pub fn revision(&self) -> &AuthorityRevision {
-        &self.revision
+    pub fn domain(&self) -> AuthorityDomain {
+        self.domain
     }
 
     pub fn terms(&self) -> &[AuthorityTerm] {
@@ -48,12 +63,47 @@ impl AuthoritySource {
     fn terms_for(&self, identity: &CapabilityIdentity) -> Vec<AuthorityTerm> {
         self.terms
             .iter()
-            .filter(|term| match term {
-                AuthorityTerm::Allow(grant) => grant.capability() == identity,
-                AuthorityTerm::Deny(name) => name == identity.name().as_str(),
-            })
+            .filter(|term| term_matches(term, identity))
             .cloned()
             .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthoritySource {
+    revision: AuthorityRevision,
+    planes: BTreeMap<AuthorityDomain, AuthorityPlane>,
+}
+
+impl AuthoritySource {
+    pub fn try_new(
+        source: impl Into<String>,
+        revision: impl Into<String>,
+        planes: Vec<AuthorityPlane>,
+    ) -> Result<Self, String> {
+        let mut indexed_planes = BTreeMap::new();
+        for plane in planes {
+            let domain = plane.domain();
+            if indexed_planes.insert(domain, plane).is_some() {
+                return Err("authority source contains a duplicate domain".to_owned());
+            }
+        }
+        Ok(Self {
+            revision: AuthorityRevision::try_new(source, revision)?,
+            planes: indexed_planes,
+        })
+    }
+
+    pub fn revision(&self) -> &AuthorityRevision {
+        &self.revision
+    }
+
+    pub fn planes(&self) -> impl Iterator<Item = &AuthorityPlane> {
+        self.planes.values()
+    }
+
+    fn plane(&self, domain: AuthorityDomain) -> Option<&AuthorityPlane> {
+        self.planes.get(&domain)
     }
 }
 
@@ -137,6 +187,16 @@ impl AdmissionService {
                 .collect(),
         )
         .map_err(|message| vec![authorization_error(message)])?;
+        let mut domain_owners = BTreeMap::new();
+        for (source_index, source) in sources.iter().enumerate() {
+            for domain in source.planes.keys() {
+                if domain_owners.insert(*domain, source_index).is_some() {
+                    return Err(vec![authorization_error(
+                        "mandatory authority domain has multiple owners",
+                    )]);
+                }
+            }
+        }
 
         Ok(Self {
             catalog,
@@ -156,26 +216,32 @@ impl AdmissionService {
         self.validate_catalog_binding(&request)?;
         let request_requirements = request_requirements(&request)?;
         let validated_locks = self.validate_request_locks(&request_requirements)?;
+        validate_requirement_mapping(&request, &request_requirements)?;
 
         let mut grants = Vec::new();
-        for requested in request.required_capabilities() {
-            let Some(grant) = self.admit_capability(requested, true, &request_requirements)? else {
-                return Err(authorization_error("required capability was not admitted"));
-            };
-            grants.push(grant);
-        }
-
         let mut optional_denials = Vec::new();
-        for requested in request.optional_capabilities() {
-            match self.admit_capability(requested, false, &request_requirements)? {
-                Some(grant) => grants.push(grant),
-                None => optional_denials.push(
-                    CapabilityDenial::try_new(
-                        requested.capability().clone(),
-                        authorization_error("optional capability was not admitted"),
-                    )
-                    .map_err(authorization_error)?,
-                ),
+        for requirement in &request_requirements {
+            let requested = request
+                .required_capabilities()
+                .iter()
+                .chain(request.optional_capabilities())
+                .find(|requested| requested.capability() == requirement.identity())
+                .expect("one-to-one requirement mapping was validated");
+            if requirement.required() {
+                let Some(grant) = self.admit_capability(requested, requirement)? else {
+                    return Err(authorization_error("required capability was not admitted"));
+                };
+                grants.push(grant);
+                continue;
+            }
+
+            match self.admit_capability(requested, requirement) {
+                Ok(Some(grant)) => grants.push(grant),
+                Ok(None) => optional_denials.push(optional_denial(requested)?),
+                Err(error) if error.code == DiagnosticCode::AdmissionDenied => {
+                    optional_denials.push(optional_denial(requested)?);
+                }
+                Err(error) => return Err(error),
             }
         }
 
@@ -266,48 +332,32 @@ impl AdmissionService {
     fn admit_capability(
         &self,
         requested: &RequestedCapability,
-        required: bool,
-        requirements: &[ResolvedCapabilityRequirement],
+        requirement: &ResolvedCapabilityRequirement,
     ) -> Result<Option<kiteframe_contract::EffectiveCapabilityGrant>, Diagnostic> {
-        let Some(client_requirement) = requirements
-            .iter()
-            .find(|requirement| requirement.identity() == requested.capability())
-        else {
+        if requirement.identity() != requested.capability() {
             return Err(capability_error(
-                "requested capability has no resolved locked descriptor",
-            ));
-        };
-        if client_requirement.required() != required {
-            return Err(capability_error(
-                "resolved capability requiredness does not match the admission request",
+                "resolved capability does not match the admission request entry",
             ));
         }
-        let authoritative = self
-            .registry
-            .get(requested.capability())
-            .expect("all request requirements were registry validated")
-            .clone();
-        let narrowed_requirement = ResolvedCapabilityRequirement::try_new(
-            authoritative,
-            required,
-            requested
-                .resources()
-                .iter()
-                .map(|resource| resource.as_str().to_owned())
-                .collect(),
-        )
-        .map_err(capability_error)?;
 
         let mut terms = Vec::new();
-        for source in &self.sources {
-            let source_terms = source.terms_for(requested.capability());
-            if source_terms.is_empty() {
+        for domain in AuthorityDomain::ALL {
+            let Some(plane) = self.sources.iter().find_map(|source| source.plane(domain)) else {
+                return Ok(None);
+            };
+            let plane_terms = plane.terms_for(requested.capability());
+            if plane_terms.is_empty() {
                 return Ok(None);
             }
-            terms.extend(source_terms);
+            terms.extend(plane_terms);
         }
+        terms.push(AuthorityTerm::allow(request_boundary(
+            requirement,
+            requested,
+            self.config.expires_at,
+        )?));
 
-        intersect_authority(&narrowed_requirement, &terms).map_err(first_diagnostic)
+        intersect_authority(requirement, &terms).map_err(first_diagnostic)
     }
 
     fn lock_admissions(&self) -> MutexGuard<'_, BTreeMap<(String, String), PersistedAdmission>> {
@@ -315,6 +365,80 @@ impl AdmissionService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+}
+
+fn term_matches(term: &AuthorityTerm, identity: &CapabilityIdentity) -> bool {
+    match term {
+        AuthorityTerm::Allow(grant) => grant.capability() == identity,
+        AuthorityTerm::Deny(name) => name == identity.name().as_str(),
+    }
+}
+
+fn validate_requirement_mapping(
+    request: &AdmissionRequest,
+    requirements: &[ResolvedCapabilityRequirement],
+) -> Result<(), Diagnostic> {
+    let requested = request
+        .required_capabilities()
+        .iter()
+        .map(|entry| (entry.capability(), true))
+        .chain(
+            request
+                .optional_capabilities()
+                .iter()
+                .map(|entry| (entry.capability(), false)),
+        )
+        .collect::<Vec<_>>();
+    if requirements.len() != requested.len() {
+        return Err(capability_error(
+            "resolved requirements must map one-to-one to admission entries",
+        ));
+    }
+    for requirement in requirements {
+        if requested
+            .iter()
+            .filter(|(identity, required)| {
+                *identity == requirement.identity() && *required == requirement.required()
+            })
+            .count()
+            != 1
+        {
+            return Err(capability_error(
+                "resolved requirement identity or requiredness does not map exactly",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn request_boundary(
+    requirement: &ResolvedCapabilityRequirement,
+    requested: &RequestedCapability,
+    session_expiry: Timestamp,
+) -> Result<EffectiveCapabilityGrant, Diagnostic> {
+    EffectiveCapabilityGrant::try_new(EffectiveCapabilityGrantParts {
+        capability: requirement.identity().clone(),
+        resources: requested.resources().to_vec(),
+        execution_modes: requirement.descriptor().execution_modes().clone(),
+        maximum_effect: requirement.descriptor().effect(),
+        expires_at: session_expiry,
+        required_evidence: RequiredEvidence::new(
+            requirement.descriptor().confirmation().clone(),
+            requirement.descriptor().approval().clone(),
+            requirement.descriptor().consent().clone(),
+        ),
+        freshness: requirement.descriptor().freshness().clone(),
+        preconditions: requirement.descriptor().preconditions().to_vec(),
+    })
+    .map_err(capability_error)
+}
+
+fn optional_denial(requested: &RequestedCapability) -> Result<CapabilityDenial, Diagnostic> {
+    CapabilityDenial::try_new(
+        requested.capability().clone(),
+        authorization_error("optional capability was not admitted"),
+    )
+    .map_err(authorization_error)
 }
 
 fn request_requirements(

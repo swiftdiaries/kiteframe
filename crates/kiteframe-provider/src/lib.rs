@@ -4,6 +4,7 @@ mod admission;
 mod authority;
 
 pub use admission::{
-    AdmissionService, AdmissionServiceConfig, AuthoritySource, PersistedAdmission,
+    AdmissionService, AdmissionServiceConfig, AuthorityDomain, AuthorityPlane, AuthoritySource,
+    PersistedAdmission,
 };
 pub use authority::{AuthorityTerm, EffectiveGrantSubset, intersect_authority};

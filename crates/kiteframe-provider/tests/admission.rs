@@ -5,13 +5,15 @@ use kiteframe_contract::{
     AuthorityRevision, CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts,
     CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
     ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
-    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, ExecutionMode, FreshnessRequirement,
-    IdempotencyRequirement, LockedCapability, NonEmptySet, NormalizedResourceSelector,
-    PolicyRevision, RequestedCapability, RequiredEvidence, ResolvedCapabilityRequirement,
-    ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceRequirement, ExecutionMode,
+    FreshnessRequirement, IdempotencyRequirement, LockedCapability, NonEmptySet,
+    NormalizedResourceSelector, PolicyRevision, RequestedCapability, RequiredEvidence,
+    ResolvedCapabilityRequirement, ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef,
+    Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    AdmissionService, AdmissionServiceConfig, AuthoritySource, AuthorityTerm,
+    AdmissionService, AdmissionServiceConfig, AuthorityDomain, AuthorityPlane, AuthoritySource,
+    AuthorityTerm,
 };
 use serde_json::json;
 
@@ -98,12 +100,12 @@ async fn catalog_identity_or_digest_drift_fails_before_authority_evaluation() {
 #[tokio::test]
 async fn missing_required_authority_fails_the_whole_admission() {
     let mut sources = authority_sources();
-    sources[0] = AuthoritySource::try_new(
+    sources[0] = authority_source(
         "tenant-policy",
         "tenant-42",
+        &[AuthorityDomain::Package, AuthorityDomain::Workload],
         allow_terms_for(&["cases.read"]),
-    )
-    .unwrap();
+    );
     let service = AdmissionService::try_new(
         authoritative_catalog(),
         authoritative_registry(),
@@ -168,6 +170,162 @@ async fn revision_source_order_does_not_change_the_canonical_grant_digest() {
     assert_eq!(first.grant_digest(), second.grant_digest());
 }
 
+#[tokio::test]
+async fn optional_unresolved_selector_becomes_a_stable_denial() {
+    let mut sources = authority_sources_with_optional();
+    sources[0] = authority_source(
+        "tenant-policy",
+        "tenant-42",
+        &[AuthorityDomain::Package, AuthorityDomain::Workload],
+        vec![
+            allow_term("cases.read"),
+            allow_term("cases.write"),
+            AuthorityTerm::allow(grant_for(
+                "cases.delete",
+                "tenant:${context.tenant}/case:case-9",
+                RequiredEvidence::new(
+                    ConfirmationRequirement::None,
+                    ApprovalRequirement::None,
+                    ConsentRequirement::None,
+                ),
+            )),
+        ],
+    );
+    let service = AdmissionService::try_new(
+        authoritative_catalog(),
+        authoritative_registry(),
+        sources,
+        service_config(),
+    )
+    .unwrap();
+
+    let result = service
+        .admit(admission_request(
+            authoritative_catalog().identity().clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_optional_denial(&result);
+}
+
+#[tokio::test]
+async fn optional_conflicting_evidence_becomes_a_stable_denial() {
+    let mut sources = authority_sources_with_optional();
+    sources[0] = authority_source(
+        "tenant-policy",
+        "tenant-42",
+        &[AuthorityDomain::Package, AuthorityDomain::Workload],
+        vec![
+            allow_term("cases.read"),
+            allow_term("cases.write"),
+            AuthorityTerm::allow(grant_for(
+                "cases.delete",
+                "tenant:t1/case:case-9",
+                confirmation("tenant_confirmation"),
+            )),
+        ],
+    );
+    sources[1] = authority_source(
+        "deployment-policy",
+        "deploy-7",
+        &[AuthorityDomain::Deployment],
+        vec![
+            allow_term("cases.read"),
+            allow_term("cases.write"),
+            AuthorityTerm::allow(grant_for(
+                "cases.delete",
+                "tenant:t1/case:case-9",
+                confirmation("deployment_confirmation"),
+            )),
+        ],
+    );
+    let service = AdmissionService::try_new(
+        authoritative_catalog(),
+        authoritative_registry(),
+        sources,
+        service_config(),
+    )
+    .unwrap();
+
+    let result = service
+        .admit(admission_request(
+            authoritative_catalog().identity().clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_optional_denial(&result);
+}
+
+#[tokio::test]
+async fn omitting_any_mandatory_authority_plane_denies_admission() {
+    for omitted in AuthorityDomain::ALL {
+        let service = AdmissionService::try_new(
+            authoritative_catalog(),
+            authoritative_registry(),
+            authority_sources_without(omitted),
+            service_config(),
+        )
+        .unwrap();
+
+        let error = service
+            .admit(admission_request(
+                authoritative_catalog().identity().clone(),
+                None,
+            ))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.code.as_str(),
+            "KF-AUTH-001",
+            "missing {omitted:?} must default deny"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_expiry_caps_each_capability_grant() {
+    let service = AdmissionService::try_new(
+        authoritative_catalog(),
+        authoritative_registry(),
+        authority_sources(),
+        AdmissionServiceConfig {
+            expires_at: Timestamp::new(5_000),
+            ..service_config()
+        },
+    )
+    .unwrap();
+
+    let result = service
+        .admit(admission_request(
+            authoritative_catalog().identity().clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert!(
+        result
+            .grants()
+            .iter()
+            .all(|grant| grant.expires_at() == Timestamp::new(5_000))
+    );
+}
+
+#[tokio::test]
+async fn every_resolved_requirement_must_map_to_exactly_one_request_entry() {
+    let error = service()
+        .admit(admission_request_without_optional_entry())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-CAP-001");
+}
+
 fn service() -> AdmissionService {
     AdmissionService::try_new(
         authoritative_catalog(),
@@ -187,42 +345,106 @@ fn service_config() -> AdmissionServiceConfig {
 }
 
 fn authority_sources() -> Vec<AuthoritySource> {
+    authority_sources_without_optional_omission(None)
+}
+
+fn authority_sources_without(omitted: AuthorityDomain) -> Vec<AuthoritySource> {
+    authority_sources_without_optional_omission(Some(omitted))
+}
+
+fn authority_sources_without_optional_omission(
+    omitted: Option<AuthorityDomain>,
+) -> Vec<AuthoritySource> {
+    let domains = |values: &[AuthorityDomain]| {
+        values
+            .iter()
+            .copied()
+            .filter(|domain| Some(*domain) != omitted)
+            .collect::<Vec<_>>()
+    };
     vec![
-        AuthoritySource::try_new(
+        authority_source(
             "tenant-policy",
             "tenant-42",
+            &domains(&[AuthorityDomain::Package, AuthorityDomain::Workload]),
             allow_terms_for(&["cases.read", "cases.write"]),
-        )
-        .unwrap(),
-        AuthoritySource::try_new(
+        ),
+        authority_source(
             "deployment-policy",
             "deploy-7",
+            &domains(&[AuthorityDomain::Deployment]),
             allow_terms_for(&["cases.read", "cases.write"]),
-        )
-        .unwrap(),
-        AuthoritySource::try_new(
+        ),
+        authority_source(
             "openfga-model",
             "model-3",
+            &domains(&[
+                AuthorityDomain::Human,
+                AuthorityDomain::Task,
+                AuthorityDomain::Session,
+            ]),
             allow_terms_for(&["cases.read", "cases.write"]),
-        )
-        .unwrap(),
+        ),
     ]
 }
 
+fn authority_sources_with_optional() -> Vec<AuthoritySource> {
+    vec![
+        authority_source(
+            "tenant-policy",
+            "tenant-42",
+            &[AuthorityDomain::Package, AuthorityDomain::Workload],
+            allow_terms_for(&["cases.read", "cases.write", "cases.delete"]),
+        ),
+        authority_source(
+            "deployment-policy",
+            "deploy-7",
+            &[AuthorityDomain::Deployment],
+            allow_terms_for(&["cases.read", "cases.write", "cases.delete"]),
+        ),
+        authority_source(
+            "openfga-model",
+            "model-3",
+            &[
+                AuthorityDomain::Human,
+                AuthorityDomain::Task,
+                AuthorityDomain::Session,
+            ],
+            allow_terms_for(&["cases.read", "cases.write", "cases.delete"]),
+        ),
+    ]
+}
+
+fn authority_source(
+    source: &str,
+    revision: &str,
+    domains: &[AuthorityDomain],
+    terms: Vec<AuthorityTerm>,
+) -> AuthoritySource {
+    AuthoritySource::try_new(
+        source,
+        revision,
+        domains
+            .iter()
+            .map(|domain| AuthorityPlane::new(*domain, terms.clone()))
+            .collect(),
+    )
+    .unwrap()
+}
+
 fn allow_terms_for(names: &[&str]) -> Vec<AuthorityTerm> {
-    names
-        .iter()
-        .map(|name| {
-            AuthorityTerm::allow(grant(
-                name,
-                if *name == "cases.read" {
-                    "tenant:t1/case:case-7"
-                } else {
-                    "tenant:t1/case:case-9"
-                },
-            ))
-        })
-        .collect()
+    names.iter().map(|name| allow_term(name)).collect()
+}
+
+fn allow_term(name: &str) -> AuthorityTerm {
+    AuthorityTerm::allow(grant(
+        name,
+        if name == "cases.read" {
+            "tenant:t1/case:case-7"
+        } else {
+            "tenant:t1/case:case-9"
+        },
+    ))
 }
 
 fn admission_request(
@@ -245,6 +467,24 @@ fn admission_request_with(
     catalog_identity: CatalogIdentity,
     catalog_digest: Sha256Digest,
     replacement_lock: Option<LockedCapability>,
+) -> AdmissionRequest {
+    admission_request_with_options(catalog_identity, catalog_digest, replacement_lock, true)
+}
+
+fn admission_request_without_optional_entry() -> AdmissionRequest {
+    admission_request_with_options(
+        authoritative_catalog().identity().clone(),
+        *authoritative_catalog().catalog_digest(),
+        None,
+        false,
+    )
+}
+
+fn admission_request_with_options(
+    catalog_identity: CatalogIdentity,
+    catalog_digest: Sha256Digest,
+    replacement_lock: Option<LockedCapability>,
+    include_optional_entry: bool,
 ) -> AdmissionRequest {
     let mut locks = authoritative_registry();
     if let Some(replacement) = replacement_lock {
@@ -286,7 +526,10 @@ fn admission_request_with(
             requested("cases.read", "tenant:t1/case:case-7"),
             requested("cases.write", "tenant:t1/case:case-9"),
         ],
-        optional_capabilities: vec![requested("cases.delete", "tenant:t1/case:case-9")],
+        optional_capabilities: include_optional_entry
+            .then(|| requested("cases.delete", "tenant:t1/case:case-9"))
+            .into_iter()
+            .collect(),
         resolved_requirements,
         delegation_ancestry: DelegationAncestry::try_new(vec![]).unwrap(),
         contextual_facts: Default::default(),
@@ -380,21 +623,59 @@ fn requested(name: &str, resource: &str) -> RequestedCapability {
 }
 
 fn grant(name: &str, resource: &str) -> EffectiveCapabilityGrant {
+    grant_for(
+        name,
+        resource,
+        RequiredEvidence::new(
+            ConfirmationRequirement::None,
+            ApprovalRequirement::None,
+            ConsentRequirement::None,
+        ),
+    )
+}
+
+fn grant_for(
+    name: &str,
+    resource: &str,
+    required_evidence: RequiredEvidence,
+) -> EffectiveCapabilityGrant {
     EffectiveCapabilityGrant::try_new(EffectiveCapabilityGrantParts {
         capability: identity(name),
         resources: vec![selector(resource)],
         execution_modes: modes(&[ExecutionMode::Immediate]),
         maximum_effect: EffectClassification::ReadOnly,
         expires_at: Timestamp::new(7_200),
-        required_evidence: RequiredEvidence::new(
-            ConfirmationRequirement::None,
-            ApprovalRequirement::None,
-            ConsentRequirement::None,
-        ),
+        required_evidence,
         freshness: FreshnessRequirement::default(),
         preconditions: vec![],
     })
     .unwrap()
+}
+
+fn confirmation(kind: &str) -> RequiredEvidence {
+    RequiredEvidence::new(
+        ConfirmationRequirement::Required {
+            evidence: EvidenceRequirement {
+                kind: kind.to_owned(),
+                issuer: None,
+            },
+        },
+        ApprovalRequirement::None,
+        ConsentRequirement::None,
+    )
+}
+
+fn assert_optional_denial(result: &kiteframe_contract::CapabilityGrantSet) {
+    assert_eq!(result.grants().len(), 2);
+    assert_eq!(result.optional_denials().len(), 1);
+    let denial = &result.optional_denials()[0];
+    assert_eq!(denial.capability(), &identity("cases.delete"));
+    assert_eq!(denial.diagnostic().code.as_str(), "KF-AUTH-001");
+    assert_eq!(
+        denial.diagnostic().message.as_str(),
+        "optional capability was not admitted"
+    );
+    assert!(denial.diagnostic().details.is_empty());
 }
 
 fn identity(name: &str) -> CapabilityIdentity {
