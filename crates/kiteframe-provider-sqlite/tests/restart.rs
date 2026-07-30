@@ -16,9 +16,10 @@ use kiteframe_contract::{
     Sha256Digest, StableCapabilityError, StatusRequest, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    AbandonmentAuthorization, IdempotencyScopeValue, InvocationReservationInput, InvocationState,
-    InvocationStatusContext, InvocationStore, InvocationStoreClock, InvocationTransition,
-    ReservationKind, StatusSafeError, StatusSafeResult, StatusState, TransitionAuditRecord,
+    AbandonmentAuthorization, IdempotencyScopeValue, InvocationAuditLinkKind,
+    InvocationReservationInput, InvocationState, InvocationStatusContext, InvocationStore,
+    InvocationStoreClock, InvocationTransition, ReservationKind, StatusSafeError, StatusSafeResult,
+    StatusState, TransitionAuditRecord,
 };
 use kiteframe_provider_sqlite::SqliteInvocationStore;
 use serde_json::json;
@@ -350,7 +351,7 @@ async fn audit_ids_attach_with_transitions_and_safe_terminal_data_survives_resta
     let InvocationState::Succeeded { result } = success_status.state() else {
         panic!("expected safe succeeded state")
     };
-    assert_eq!(result.value(), &json!({"caseId": "42"}));
+    assert_eq!(result.value(), &json!({}));
     assert_eq!(
         success_status.audit_authorization_record_id(),
         Some("audit-authz-success")
@@ -371,6 +372,98 @@ async fn audit_ids_attach_with_transitions_and_safe_terminal_data_survives_resta
 }
 
 #[tokio::test]
+async fn audit_history_survives_resume_unknown_and_terminal_resolution_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("audit-history.sqlite3");
+    let clock = Arc::new(FakeClock::new(100));
+    let store = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
+    let descriptor = descriptor(standard_output_schema(), 3_600);
+    let input = reservation("inv-history", "key-history", "human-7");
+    store
+        .reserve_or_get(input.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+
+    let transitions = [
+        (
+            InvocationState::Reserved,
+            InvocationState::Pending,
+            TransitionAuditRecord::Authorization("audit-authz-initial".to_owned()),
+        ),
+        (
+            InvocationState::Pending,
+            InvocationState::Suspended,
+            TransitionAuditRecord::None,
+        ),
+        (
+            InvocationState::Suspended,
+            InvocationState::Pending,
+            TransitionAuditRecord::Authorization("audit-authz-resumed".to_owned()),
+        ),
+        (
+            InvocationState::Pending,
+            InvocationState::OutcomeUnknown,
+            TransitionAuditRecord::Outcome("audit-outcome-unknown".to_owned()),
+        ),
+        (
+            InvocationState::OutcomeUnknown,
+            InvocationState::Succeeded {
+                result: StatusSafeResult::try_new(json!({"caseId": "42"}), &descriptor).unwrap(),
+            },
+            TransitionAuditRecord::Outcome("audit-outcome-final".to_owned()),
+        ),
+    ];
+    for (offset, (expected, next, audit)) in transitions.into_iter().enumerate() {
+        clock.set(101 + offset as u64);
+        store
+            .transition(
+                &input.invocation_id,
+                InvocationTransition::try_new(expected, next, audit).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+    drop(store);
+
+    let reopened = SqliteInvocationStore::open_with_clock(&path, clock)
+        .await
+        .unwrap();
+    let current = status(&reopened, &input.invocation_id, "7").await;
+    let links = current
+        .audit_links()
+        .iter()
+        .map(|link| (link.kind(), link.record_id(), link.attached_at()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        links,
+        vec![
+            (
+                InvocationAuditLinkKind::Authorization,
+                "audit-authz-initial",
+                Timestamp::new(101),
+            ),
+            (
+                InvocationAuditLinkKind::Authorization,
+                "audit-authz-resumed",
+                Timestamp::new(103),
+            ),
+            (
+                InvocationAuditLinkKind::Outcome,
+                "audit-outcome-unknown",
+                Timestamp::new(104),
+            ),
+            (
+                InvocationAuditLinkKind::Outcome,
+                "audit-outcome-final",
+                Timestamp::new(105),
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn sensitive_result_and_diagnostic_content_never_reaches_persistence_or_status() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sensitive.sqlite3");
@@ -382,8 +475,13 @@ async fn sensitive_result_and_diagnostic_content_never_reaches_persistence_or_st
         json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["accessToken"],
-            "properties": {"accessToken": {"type": "string"}}
+            "required": ["apiKey", "authorizationHeader", "note", "changed"],
+            "properties": {
+                "apiKey": {"type": "string"},
+                "authorizationHeader": {"type": "string"},
+                "note": {"type": "string"},
+                "changed": {"type": "boolean"}
+            }
         }),
         3_600,
     );
@@ -394,13 +492,17 @@ async fn sensitive_result_and_diagnostic_content_never_reaches_persistence_or_st
         .unwrap();
     attach_authorization(&store, &input.invocation_id, "audit-authz-sensitive").await;
 
-    assert!(
-        StatusSafeResult::try_new(
-            json!({"accessToken": "Bearer opaque-secret"}),
-            &sensitive_descriptor
-        )
-        .is_err()
-    );
+    let safe_result = StatusSafeResult::try_new(
+        json!({
+            "apiKey": "key-without-an-existing-marker",
+            "authorizationHeader": "signed opaque material",
+            "note": "sk_live_not-covered-by-the-old-denylist",
+            "changed": true
+        }),
+        &sensitive_descriptor,
+    )
+    .unwrap();
+    assert_eq!(safe_result.value(), &json!({"changed": true}));
     let mut diagnostic = Diagnostic::error(
         DiagnosticCode::InvocationDenied,
         DiagnosticCategory::Authorization,
@@ -411,25 +513,48 @@ async fn sensitive_result_and_diagnostic_content_never_reaches_persistence_or_st
         .details
         .insert("evidenceBody".to_owned(), json!("opaque-secret"));
     assert!(StatusSafeError::try_from_diagnostic(&diagnostic).is_err());
+    store
+        .transition(
+            &input.invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::Succeeded {
+                    result: safe_result,
+                },
+                TransitionAuditRecord::Outcome("audit-outcome-sensitive".to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
     let url = format!("sqlite://{}", path.display());
     let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
     let row = sqlx::query(
-        "SELECT state_kind, state_json, audit_outcome_record_id
-         FROM invocations WHERE invocation_id = 'inv-sensitive'",
+        "SELECT state_kind, state_json FROM invocations
+         WHERE invocation_id = 'inv-sensitive'",
     )
     .fetch_one(&mut connection)
     .await
     .unwrap();
-    assert_eq!(row.get::<String, _>("state_kind"), "pending");
-    assert!(!row.get::<String, _>("state_json").contains("opaque-secret"));
-    assert_eq!(
-        row.get::<Option<String>, _>("audit_outcome_record_id"),
-        None
-    );
+    assert_eq!(row.get::<String, _>("state_kind"), "succeeded");
+    let state_json = row.get::<String, _>("state_json");
+    for forbidden in [
+        "key-without-an-existing-marker",
+        "signed opaque material",
+        "sk_live_not-covered-by-the-old-denylist",
+    ] {
+        assert!(!state_json.contains(forbidden));
+    }
     let current = status(&store, &input.invocation_id, "1").await;
-    assert_eq!(current.status_state(), StatusState::Pending);
-    assert_eq!(current.audit_outcome_record_id(), None);
+    let InvocationState::Succeeded { result } = current.state() else {
+        panic!("expected safe succeeded state")
+    };
+    assert_eq!(result.value(), &json!({"changed": true}));
+    assert_eq!(
+        current.audit_outcome_record_id(),
+        Some("audit-outcome-sensitive")
+    );
 }
 
 #[tokio::test]
@@ -469,12 +594,31 @@ async fn migration_has_no_secret_evidence_or_provider_acl_columns() {
         "descriptor_digest",
         "authority_revision_digest",
         "protected_evidence_refs_json",
-        "audit_authorization_record_id",
-        "audit_outcome_record_id",
         "retention_until",
     ] {
         assert!(columns.iter().any(|column| column == required));
     }
+    for removed_singleton in ["audit_authorization_record_id", "audit_outcome_record_id"] {
+        assert!(!columns.iter().any(|column| column == removed_singleton));
+    }
+
+    let audit_link_columns = sqlx::query("PRAGMA table_info(invocation_audit_links)")
+        .fetch_all(&mut connection)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        audit_link_columns,
+        [
+            "invocation_id",
+            "sequence",
+            "kind",
+            "record_id",
+            "attached_at"
+        ]
+    );
 }
 
 async fn attach_authorization(

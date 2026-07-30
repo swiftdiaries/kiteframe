@@ -15,10 +15,10 @@ use kiteframe_contract::{
     ProtectedEvidenceRequestRef, Sha256Digest, StatusRequest, Timestamp,
 };
 use kiteframe_provider::{
-    AbandonmentAuthorization, IdempotencyScopeValue, InvocationReservation,
-    InvocationReservationInput, InvocationState, InvocationStatus, InvocationStatusContext,
-    InvocationStore, InvocationStoreClock, InvocationTransition, ReservationKind, StoredInvocation,
-    SystemInvocationStoreClock, TransitionAuditRecord,
+    AbandonmentAuthorization, IdempotencyScopeValue, InvocationAuditLink, InvocationAuditLinkKind,
+    InvocationReservation, InvocationReservationInput, InvocationState, InvocationStatus,
+    InvocationStatusContext, InvocationStore, InvocationStoreClock, InvocationTransition,
+    ReservationKind, StoredInvocation, SystemInvocationStoreClock, TransitionAuditRecord,
 };
 use sqlx::{
     Connection, Row, Sqlite, SqlitePool, Transaction,
@@ -100,7 +100,9 @@ impl InvocationStore for SqliteInvocationStore {
         .map_err(|_| storage_error())?;
 
         if let Some(row) = select_exact(&mut transaction, &invocation).await? {
-            let existing = decode_row(&row)?;
+            let mut existing = decode_row(&row)?;
+            existing.audit_links =
+                select_audit_links(&mut transaction, &existing.invocation_id).await?;
             if existing.status_context != invocation.status_context {
                 return Err(status_unavailable());
             }
@@ -136,11 +138,6 @@ impl InvocationStore for SqliteInvocationStore {
         let now = self.clock.now();
         let expected_json = encode_state(transition.expected())?;
         let next_json = encode_state(transition.next())?;
-        let (authorization_record, outcome_record) = match transition.audit_record() {
-            TransitionAuditRecord::None => (None, None),
-            TransitionAuditRecord::Authorization(record_id) => (Some(record_id.as_str()), None),
-            TransitionAuditRecord::Outcome(record_id) => (None, Some(record_id.as_str())),
-        };
         let mut connection = self.pool.acquire().await.map_err(|_| storage_error())?;
         let mut transaction = connection
             .begin_with("BEGIN IMMEDIATE")
@@ -150,33 +147,42 @@ impl InvocationStore for SqliteInvocationStore {
             "UPDATE invocations
              SET state_kind = ?,
                  state_json = ?,
-                 audit_authorization_record_id =
-                    COALESCE(?, audit_authorization_record_id),
-                 audit_outcome_record_id = COALESCE(?, audit_outcome_record_id),
                  updated_at = ?
              WHERE invocation_id = ?
                AND state_kind = ?
                AND state_json = ?
-               AND updated_at <= ?
-               AND (? IS NULL OR audit_authorization_record_id IS NULL)
-               AND (? IS NULL OR audit_outcome_record_id IS NULL)",
+               AND updated_at <= ?",
         )
         .bind(transition.next().wire_name())
         .bind(next_json)
-        .bind(authorization_record)
-        .bind(outcome_record)
         .bind(as_i64(now)?)
         .bind(invocation_id.as_str())
         .bind(transition.expected().wire_name())
         .bind(expected_json)
         .bind(as_i64(now)?)
-        .bind(authorization_record)
-        .bind(outcome_record)
         .execute(&mut *transaction)
         .await
         .map_err(|_| storage_error())?;
         if result.rows_affected() != 1 {
             return Err(invalid("invocation state compare-and-swap failed"));
+        }
+        if let Some((kind, record_id)) = audit_record_parts(transition.audit_record()) {
+            sqlx::query(
+                "INSERT INTO invocation_audit_links (
+                    invocation_id, sequence, kind, record_id, attached_at
+                 )
+                 SELECT ?, COALESCE(MAX(sequence), 0) + 1, ?, ?, ?
+                 FROM invocation_audit_links
+                 WHERE invocation_id = ?",
+            )
+            .bind(invocation_id.as_str())
+            .bind(kind)
+            .bind(record_id)
+            .bind(as_i64(now)?)
+            .bind(invocation_id.as_str())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| storage_error())?;
         }
         transaction.commit().await.map_err(|_| storage_error())?;
         Ok(())
@@ -194,7 +200,9 @@ impl InvocationStore for SqliteInvocationStore {
             .await
             .map_err(|_| storage_error())?
             .ok_or_else(status_unavailable)?;
-        let stored = decode_row(&row)?;
+        let mut stored = decode_row(&row)?;
+        stored.audit_links =
+            select_audit_links_from_pool(&self.pool, &stored.invocation_id).await?;
         if &stored.status_context != context {
             return Err(status_unavailable());
         }
@@ -277,6 +285,64 @@ async fn select_exact(
     .map_err(|_| storage_error())
 }
 
+async fn select_audit_links(
+    transaction: &mut Transaction<'_, Sqlite>,
+    invocation_id: &InvocationId,
+) -> Result<Vec<InvocationAuditLink>, Diagnostic> {
+    let rows = sqlx::query(
+        "SELECT kind, record_id, attached_at
+         FROM invocation_audit_links
+         WHERE invocation_id = ?
+         ORDER BY sequence",
+    )
+    .bind(invocation_id.as_str())
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| storage_error())?;
+    rows.iter().map(decode_audit_link).collect()
+}
+
+async fn select_audit_links_from_pool(
+    pool: &SqlitePool,
+    invocation_id: &InvocationId,
+) -> Result<Vec<InvocationAuditLink>, Diagnostic> {
+    let rows = sqlx::query(
+        "SELECT kind, record_id, attached_at
+         FROM invocation_audit_links
+         WHERE invocation_id = ?
+         ORDER BY sequence",
+    )
+    .bind(invocation_id.as_str())
+    .fetch_all(pool)
+    .await
+    .map_err(|_| storage_error())?;
+    rows.iter().map(decode_audit_link).collect()
+}
+
+fn decode_audit_link(row: &SqliteRow) -> Result<InvocationAuditLink, Diagnostic> {
+    let kind = match text(row, "kind")?.as_str() {
+        "authorization" => InvocationAuditLinkKind::Authorization,
+        "outcome" => InvocationAuditLinkKind::Outcome,
+        _ => return Err(storage_error()),
+    };
+    InvocationAuditLink::try_new(
+        kind,
+        text(row, "record_id")?,
+        timestamp(row, "attached_at")?,
+    )
+    .map_err(|_| storage_error())
+}
+
+fn audit_record_parts(record: &TransitionAuditRecord) -> Option<(&'static str, &str)> {
+    match record {
+        TransitionAuditRecord::None => None,
+        TransitionAuditRecord::Authorization(record_id) => {
+            Some(("authorization", record_id.as_str()))
+        }
+        TransitionAuditRecord::Outcome(record_id) => Some(("outcome", record_id.as_str())),
+    }
+}
+
 async fn has_unknown_in_scope(
     transaction: &mut Transaction<'_, Sqlite>,
     invocation: &StoredInvocation,
@@ -330,11 +396,10 @@ async fn insert(
             state_kind, state_json, admission_id, grant_digest, catalog_name, catalog_revision,
             catalog_digest, descriptor_digest, authority_revision_digest, tenant_ref, human_ref,
             workload_ref, run_ref, agent_ref, task_ref, session_ref, proposal_digest,
-            protected_evidence_refs_json, audit_authorization_record_id, audit_outcome_record_id,
-            created_at, updated_at, retention_until
+            protected_evidence_refs_json, created_at, updated_at, retention_until
          ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?
+            ?, ?, ?
          )",
     )
     .bind(invocation.invocation_id.as_str())
@@ -364,8 +429,6 @@ async fn insert(
     .bind(invocation.status_context.session_ref())
     .bind(invocation.proposal_digest.to_string())
     .bind(evidence_json)
-    .bind(&invocation.audit_authorization_record_id)
-    .bind(&invocation.audit_outcome_record_id)
     .bind(as_i64(invocation.created_at)?)
     .bind(as_i64(invocation.updated_at)?)
     .bind(as_i64(invocation.retention_until)?)
@@ -446,8 +509,7 @@ fn decode_row(row: &SqliteRow) -> Result<StoredInvocation, Diagnostic> {
             })
             .collect::<Result<_, _>>()?,
         state,
-        audit_authorization_record_id: optional_text(row, "audit_authorization_record_id")?,
-        audit_outcome_record_id: optional_text(row, "audit_outcome_record_id")?,
+        audit_links: Vec::new(),
         created_at: timestamp(row, "created_at")?,
         updated_at: timestamp(row, "updated_at")?,
         retention_until: timestamp(row, "retention_until")?,

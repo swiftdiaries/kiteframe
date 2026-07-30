@@ -17,41 +17,37 @@ use kiteframe_contract::{
 };
 use kiteframe_provider::{
     AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore,
-    InvocationReservationInput, InvocationState, InvocationStatusContext, InvocationStore,
-    InvocationStoreClock, InvocationTransition, ReservationKind, StatusSafeError, StatusSafeResult,
-    StatusState, TransitionAuditRecord,
+    InvocationAuditLinkKind, InvocationReservationInput, InvocationState, InvocationStatusContext,
+    InvocationStore, InvocationStoreClock, InvocationTransition, ReservationKind, StatusSafeError,
+    StatusSafeResult, StatusState, TransitionAuditRecord,
 };
 use serde_json::json;
 
 #[test]
-fn status_safe_result_rejects_sensitive_fields_and_values_even_when_schema_allows_them() {
-    let sensitive_field_descriptor = descriptor(json!({
+fn status_safe_result_projects_only_provider_owned_fields() {
+    let descriptor = descriptor(json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["accessToken"],
-        "properties": {"accessToken": {"type": "string"}}
+        "required": ["apiKey", "authorizationHeader", "note", "changed"],
+        "properties": {
+            "apiKey": {"type": "string"},
+            "authorizationHeader": {"type": "string"},
+            "note": {"type": "string"},
+            "changed": {"type": "boolean"}
+        }
     }));
-    assert!(
-        StatusSafeResult::try_new(
-            json!({"accessToken": "opaque-secret"}),
-            &sensitive_field_descriptor,
-        )
-        .is_err()
-    );
+    let result = StatusSafeResult::try_new(
+        json!({
+            "apiKey": "key-without-an-existing-marker",
+            "authorizationHeader": "signed opaque material",
+            "note": "sk_live_not-covered-by-the-old-denylist",
+            "changed": true
+        }),
+        &descriptor,
+    )
+    .unwrap();
 
-    let sensitive_value_descriptor = descriptor(json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["summary"],
-        "properties": {"summary": {"type": "string"}}
-    }));
-    assert!(
-        StatusSafeResult::try_new(
-            json!({"summary": "Bearer opaque-secret"}),
-            &sensitive_value_descriptor,
-        )
-        .is_err()
-    );
+    assert_eq!(result.value(), &json!({"changed": true}));
 }
 
 #[test]
@@ -175,6 +171,86 @@ async fn audit_record_ids_attach_atomically_with_corresponding_transitions() {
         Some("audit-authz-1")
     );
     assert_eq!(succeeded.audit_outcome_record_id(), Some("audit-outcome-1"));
+}
+
+#[tokio::test]
+async fn audit_history_appends_every_receipt_across_resume_and_unknown_resolution() {
+    let clock = Arc::new(FakeClock(AtomicU64::new(100)));
+    let store = InMemoryInvocationStore::with_clock(clock.clone());
+    let descriptor = descriptor(standard_output_schema());
+    let input = reservation("inv-history", "key-history", 0);
+    store
+        .reserve_or_get(input.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+
+    let transitions = [
+        (
+            InvocationState::Reserved,
+            InvocationState::Pending,
+            TransitionAuditRecord::Authorization("audit-authz-initial".to_owned()),
+        ),
+        (
+            InvocationState::Pending,
+            InvocationState::Suspended,
+            TransitionAuditRecord::None,
+        ),
+        (
+            InvocationState::Suspended,
+            InvocationState::Pending,
+            TransitionAuditRecord::Authorization("audit-authz-resumed".to_owned()),
+        ),
+        (
+            InvocationState::Pending,
+            InvocationState::OutcomeUnknown,
+            TransitionAuditRecord::Outcome("audit-outcome-unknown".to_owned()),
+        ),
+        (
+            InvocationState::OutcomeUnknown,
+            InvocationState::Succeeded {
+                result: StatusSafeResult::try_new(json!({"caseId": "42"}), &descriptor).unwrap(),
+            },
+            TransitionAuditRecord::Outcome("audit-outcome-final".to_owned()),
+        ),
+    ];
+    for (offset, (expected, next, audit)) in transitions.into_iter().enumerate() {
+        clock.0.store(101 + offset as u64, Ordering::SeqCst);
+        store
+            .transition(
+                &input.invocation_id,
+                InvocationTransition::try_new(expected, next, audit).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let status = store
+        .status(
+            &StatusRequest::new(input.invocation_id, trace_context("4")),
+            &status_context("human-7"),
+        )
+        .await
+        .unwrap();
+    let links = status
+        .audit_links()
+        .iter()
+        .map(|link| (link.kind(), link.record_id()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        links,
+        vec![
+            (
+                InvocationAuditLinkKind::Authorization,
+                "audit-authz-initial"
+            ),
+            (
+                InvocationAuditLinkKind::Authorization,
+                "audit-authz-resumed"
+            ),
+            (InvocationAuditLinkKind::Outcome, "audit-outcome-unknown"),
+            (InvocationAuditLinkKind::Outcome, "audit-outcome-final"),
+        ]
+    );
 }
 
 #[tokio::test]

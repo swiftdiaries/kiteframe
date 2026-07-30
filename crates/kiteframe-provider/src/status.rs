@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -162,7 +162,6 @@ impl InvocationStatusContext {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatusSafeResult {
-    allowed_fields: BTreeSet<String>,
     value: Value,
 }
 
@@ -171,34 +170,32 @@ impl StatusSafeResult {
         descriptor
             .validate_output(&value)
             .map_err(|_| "status result does not match the locked output projection".to_owned())?;
-        let allowed_fields = descriptor
-            .output_schema()
-            .as_value()
-            .as_object()
-            .and_then(|schema| schema.get("properties"))
-            .and_then(Value::as_object)
-            .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
-            .ok_or_else(|| {
-                "status results require an object schema with explicit properties".to_owned()
-            })?;
-        Self::from_parts(allowed_fields, value)
+        Self::project(value)
     }
 
-    fn from_parts(allowed_fields: BTreeSet<String>, value: Value) -> Result<Self, String> {
+    fn project(value: Value) -> Result<Self, String> {
         let fields = value
             .as_object()
             .ok_or_else(|| "status result must be an object projection".to_owned())?;
-        if fields.keys().any(|field| !allowed_fields.contains(field)) {
-            return Err("status result contains a field outside its locked projection".to_owned());
+        let mut projection = serde_json::Map::new();
+        if let Some(changed) = fields.get("changed") {
+            if !changed.is_boolean() {
+                return Err("status result field changed must be boolean".to_owned());
+            }
+            projection.insert("changed".to_owned(), changed.clone());
         }
-        if allowed_fields.iter().any(|field| sensitive_name(field)) {
-            return Err("status result projection contains a sensitive field".to_owned());
+        for field in ["affectedCount", "itemCount"] {
+            if let Some(count) = fields.get(field) {
+                if count.as_u64().is_none() {
+                    return Err(format!(
+                        "status result field {field} must be unsigned integer"
+                    ));
+                }
+                projection.insert(field.to_owned(), count.clone());
+            }
         }
-        let mut nodes = 0_usize;
-        validate_status_json(&value, 0, &mut nodes)?;
         Ok(Self {
-            allowed_fields,
-            value,
+            value: Value::Object(projection),
         })
     }
 
@@ -212,11 +209,16 @@ impl<'de> Deserialize<'de> for StatusSafeResult {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Raw {
-            allowed_fields: BTreeSet<String>,
             value: Value,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Self::from_parts(raw.allowed_fields, raw.value).map_err(D::Error::custom)
+        let projected = Self::project(raw.value.clone()).map_err(D::Error::custom)?;
+        if projected.value != raw.value {
+            return Err(D::Error::custom(
+                "serialized status result contains non-provider-owned fields",
+            ));
+        }
+        Ok(projected)
     }
 }
 
@@ -364,6 +366,83 @@ pub enum TransitionAuditRecord {
     Outcome(String),
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationAuditLinkKind {
+    Authorization,
+    Outcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InvocationAuditLink {
+    kind: InvocationAuditLinkKind,
+    record_id: String,
+    attached_at: Timestamp,
+}
+
+impl InvocationAuditLink {
+    pub fn try_new(
+        kind: InvocationAuditLinkKind,
+        record_id: impl Into<String>,
+        attached_at: Timestamp,
+    ) -> Result<Self, String> {
+        let record_id = record_id.into();
+        if record_id.trim().is_empty() {
+            return Err("audit record ID is required".to_owned());
+        }
+        Ok(Self {
+            kind,
+            record_id,
+            attached_at,
+        })
+    }
+
+    fn from_transition(
+        record: &TransitionAuditRecord,
+        attached_at: Timestamp,
+    ) -> Result<Option<Self>, Diagnostic> {
+        let (kind, record_id) = match record {
+            TransitionAuditRecord::None => return Ok(None),
+            TransitionAuditRecord::Authorization(record_id) => {
+                (InvocationAuditLinkKind::Authorization, record_id)
+            }
+            TransitionAuditRecord::Outcome(record_id) => {
+                (InvocationAuditLinkKind::Outcome, record_id)
+            }
+        };
+        Self::try_new(kind, record_id, attached_at)
+            .map(Some)
+            .map_err(|_| invalid("audit record is invalid"))
+    }
+
+    pub fn kind(&self) -> InvocationAuditLinkKind {
+        self.kind
+    }
+
+    pub fn record_id(&self) -> &str {
+        &self.record_id
+    }
+
+    pub fn attached_at(&self) -> Timestamp {
+        self.attached_at
+    }
+}
+
+impl<'de> Deserialize<'de> for InvocationAuditLink {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            kind: InvocationAuditLinkKind,
+            record_id: String,
+            attached_at: Timestamp,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(raw.kind, raw.record_id, raw.attached_at).map_err(D::Error::custom)
+    }
+}
+
 impl TransitionAuditRecord {
     fn validate(&self) -> Result<(), Diagnostic> {
         match self {
@@ -502,8 +581,7 @@ pub struct StoredInvocation {
     pub proposal_digest: Sha256Digest,
     pub protected_evidence_refs: Vec<ProtectedEvidenceRequestRef>,
     pub state: InvocationState,
-    pub audit_authorization_record_id: Option<String>,
-    pub audit_outcome_record_id: Option<String>,
+    pub audit_links: Vec<InvocationAuditLink>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub retention_until: Timestamp,
@@ -562,8 +640,7 @@ impl StoredInvocation {
             proposal_digest: input.proposal_digest,
             protected_evidence_refs: input.protected_evidence_refs,
             state: InvocationState::Reserved,
-            audit_authorization_record_id: None,
-            audit_outcome_record_id: None,
+            audit_links: Vec::new(),
             created_at,
             updated_at: created_at,
             retention_until,
@@ -584,8 +661,7 @@ pub struct InvocationStatus {
     descriptor_digest: Sha256Digest,
     authority_revision_digest: Sha256Digest,
     proposal_digest: Sha256Digest,
-    audit_authorization_record_id: Option<String>,
-    audit_outcome_record_id: Option<String>,
+    audit_links: Vec<InvocationAuditLink>,
     abandonment_authorization_record_id: Option<String>,
     abandoned_by: Option<String>,
     created_at: Timestamp,
@@ -606,8 +682,7 @@ impl InvocationStatus {
             descriptor_digest: stored.descriptor_digest,
             authority_revision_digest: stored.authority_revision_digest,
             proposal_digest: stored.proposal_digest,
-            audit_authorization_record_id: stored.audit_authorization_record_id.clone(),
-            audit_outcome_record_id: stored.audit_outcome_record_id.clone(),
+            audit_links: stored.audit_links.clone(),
             abandonment_authorization_record_id: stored
                 .abandonment
                 .as_ref()
@@ -655,11 +730,22 @@ impl InvocationStatus {
     pub fn proposal_digest(&self) -> &Sha256Digest {
         &self.proposal_digest
     }
+    pub fn audit_links(&self) -> &[InvocationAuditLink] {
+        &self.audit_links
+    }
     pub fn audit_authorization_record_id(&self) -> Option<&str> {
-        self.audit_authorization_record_id.as_deref()
+        self.audit_links
+            .iter()
+            .rev()
+            .find(|link| link.kind == InvocationAuditLinkKind::Authorization)
+            .map(InvocationAuditLink::record_id)
     }
     pub fn audit_outcome_record_id(&self) -> Option<&str> {
-        self.audit_outcome_record_id.as_deref()
+        self.audit_links
+            .iter()
+            .rev()
+            .find(|link| link.kind == InvocationAuditLinkKind::Outcome)
+            .map(InvocationAuditLink::record_id)
     }
     pub fn abandonment_authorization_record_id(&self) -> Option<&str> {
         self.abandonment_authorization_record_id.as_deref()
@@ -883,20 +969,15 @@ impl InvocationStore for InMemoryInvocationStore {
         if now < stored.updated_at {
             return Err(invalid("trusted invocation-store clock moved backwards"));
         }
-        match &transition.audit_record {
-            TransitionAuditRecord::None => {}
-            TransitionAuditRecord::Authorization(record_id) => {
-                if stored.audit_authorization_record_id.is_some() {
-                    return Err(invalid("authorization audit record is already attached"));
-                }
-                stored.audit_authorization_record_id = Some(record_id.clone());
+        if let Some(link) = InvocationAuditLink::from_transition(&transition.audit_record, now)? {
+            if stored
+                .audit_links
+                .iter()
+                .any(|existing| existing.kind == link.kind && existing.record_id == link.record_id)
+            {
+                return Err(invalid("audit record is already linked to this invocation"));
             }
-            TransitionAuditRecord::Outcome(record_id) => {
-                if stored.audit_outcome_record_id.is_some() {
-                    return Err(invalid("outcome audit record is already attached"));
-                }
-                stored.audit_outcome_record_id = Some(record_id.clone());
-            }
+            stored.audit_links.push(link);
         }
         stored.state = transition.next;
         stored.updated_at = now;

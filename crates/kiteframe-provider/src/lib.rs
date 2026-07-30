@@ -33,9 +33,9 @@ pub use principal::{
     correlate_principals,
 };
 pub use status::{
-    AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore,
-    InvocationReservation, InvocationReservationInput, InvocationState, InvocationStatus,
-    InvocationStatusContext, InvocationStore, InvocationStoreClock, InvocationTransition,
-    ReservationKind, StatusSafeError, StatusSafeResult, StatusState, StoredInvocation,
-    SystemInvocationStoreClock, TransitionAuditRecord,
+    AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore, InvocationAuditLink,
+    InvocationAuditLinkKind, InvocationReservation, InvocationReservationInput, InvocationState,
+    InvocationStatus, InvocationStatusContext, InvocationStore, InvocationStoreClock,
+    InvocationTransition, ReservationKind, StatusSafeError, StatusSafeResult, StatusState,
+    StoredInvocation, SystemInvocationStoreClock, TransitionAuditRecord,
 };
