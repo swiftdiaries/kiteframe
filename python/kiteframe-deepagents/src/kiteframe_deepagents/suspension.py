@@ -80,6 +80,11 @@ def _protected_evidence_ref(value: object) -> str:
     return reference
 
 
+def _parent_checkpoint_ns(task_checkpoint_ns: str) -> str:
+    parent, separator, _task = task_checkpoint_ns.rpartition("|")
+    return parent if separator else ""
+
+
 @runtime_checkable
 class EvidenceReferenceResolver(Protocol):
     """Deployment issuer from an external handle to an opaque credential."""
@@ -427,6 +432,7 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
     ) -> None:
         configurable = config.get("configurable", {})
         thread_id = configurable.get("thread_id")
+        checkpoint_ns = configurable.get("checkpoint_ns", "")
         checkpoint_id = configurable.get("checkpoint_id")
 
         def valid_reference(value: object) -> bool:
@@ -442,6 +448,10 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
             suspension = claims.suspension
             return (
                 suspension.graph_thread_id == thread_id
+                and _parent_checkpoint_ns(
+                    suspension.graph_checkpoint_ns
+                )
+                == checkpoint_ns
                 and suspension.graph_checkpoint_id == checkpoint_id
                 and (
                     task_id == _NULL_TASK_ID

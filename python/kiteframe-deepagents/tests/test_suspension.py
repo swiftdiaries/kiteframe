@@ -956,6 +956,81 @@ async def test_resume_credential_cannot_cross_graph_suspensions() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_credential_cannot_cross_checkpoint_namespaces() -> None:
+    checkpointer = FakeDurableCheckpointer()
+    invoker = FakeInvoker()
+    graph = compile_graph(checkpointer=checkpointer, invoker=invoker)
+    thread_id = "task-7-checkpoint-namespace"
+    source_namespace = ""
+    target_namespace = "forked-scope"
+    source_config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id}
+    }
+    interrupted = await graph.ainvoke(
+        {
+            "arguments": {
+                "body": "hello",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        source_config,
+    )
+    latest = await checkpointer.aget_tuple(source_config)
+    assert latest is not None
+    latest_configurable = latest.config.get("configurable")
+    assert latest_configurable is not None
+
+    checkpointer.storage[thread_id][target_namespace].update(
+        checkpointer.storage[thread_id][source_namespace]
+    )
+    for (stored_thread, namespace, checkpoint_id), writes in tuple(
+        checkpointer.writes.items()
+    ):
+        if stored_thread == thread_id and namespace == source_namespace:
+            checkpointer.writes[
+                (stored_thread, target_namespace, checkpoint_id)
+            ].update(writes)
+    for (stored_thread, namespace, channel, version), blob in tuple(
+        checkpointer.blobs.items()
+    ):
+        if stored_thread == thread_id and namespace == source_namespace:
+            checkpointer.blobs[
+                (stored_thread, target_namespace, channel, version)
+            ] = blob
+
+    target_config: RunnableConfig = {
+        "configurable": {
+            **latest_configurable,
+            "checkpoint_ns": target_namespace,
+        }
+    }
+    reference = await trusted_reference(
+        suspension_payload(interrupted),
+        checkpointer,
+    )
+    command = resume_command(reference, checkpointer)
+    protected = protect_resume_checkpointer(
+        checkpointer,
+        checkpointer,
+    )
+    before = checkpointer_snapshot(checkpointer)
+
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        await protected.aput_writes(
+            target_config,
+            [("__resume__", command.resume)],
+            "00000000-0000-0000-0000-000000000000",
+        )
+
+    assert checkpointer_snapshot(checkpointer) == before
+    assert all(request.evidence_refs == {} for request in invoker.requests)
+
+
+@pytest.mark.asyncio
 async def test_native_scope_mismatch_fails_before_saver_write() -> None:
     checkpointer = FakeDurableCheckpointer()
     invoker = FakeInvoker()
