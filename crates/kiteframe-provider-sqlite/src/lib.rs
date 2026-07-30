@@ -3,20 +3,22 @@
 use std::{
     path::Path,
     str::FromStr,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use kiteframe_contract::{
-    ActorRef, AdmissionId, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CatalogIdentity, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage,
-    IdempotencyKey, InvocationId, NormalizedResourceSelector, ProtectedEvidenceRequestRef,
-    Sha256Digest, StatusRequest, Timestamp,
+    ActorRef, AdmissionId, CapabilityDescriptor, CapabilityIdentity, CapabilityName,
+    CapabilityReleaseVersion, CatalogIdentity, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticStage, IdempotencyKey, InvocationId, NormalizedResourceSelector,
+    ProtectedEvidenceRequestRef, Sha256Digest, StatusRequest, Timestamp,
 };
 use kiteframe_provider::{
-    AbandonmentAuthorization, IdempotencyScopeValue, InvocationReservation, InvocationState,
-    InvocationStatus, InvocationStatusContext, InvocationStore, ReservationKind, StoredInvocation,
+    AbandonmentAuthorization, IdempotencyScopeValue, InvocationReservation,
+    InvocationReservationInput, InvocationState, InvocationStatus, InvocationStatusContext,
+    InvocationStore, InvocationStoreClock, InvocationTransition, ReservationKind, StoredInvocation,
+    SystemInvocationStoreClock, TransitionAuditRecord,
 };
 use sqlx::{
     Connection, Row, Sqlite, SqlitePool, Transaction,
@@ -27,11 +29,19 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 pub struct SqliteInvocationStore {
     pool: SqlitePool,
+    clock: Arc<dyn InvocationStoreClock>,
     last_traceparent: Mutex<Option<String>>,
 }
 
 impl SqliteInvocationStore {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, Diagnostic> {
+        Self::open_with_clock(path, Arc::new(SystemInvocationStoreClock)).await
+    }
+
+    pub async fn open_with_clock(
+        path: impl AsRef<Path>,
+        clock: Arc<dyn InvocationStoreClock>,
+    ) -> Result<Self, Diagnostic> {
         let options = SqliteConnectOptions::from_str("sqlite://")
             .map_err(|_| storage_error())?
             .filename(path)
@@ -46,6 +56,7 @@ impl SqliteInvocationStore {
         MIGRATOR.run(&pool).await.map_err(|_| storage_error())?;
         Ok(Self {
             pool,
+            clock,
             last_traceparent: Mutex::new(None),
         })
     }
@@ -65,9 +76,13 @@ impl SqliteInvocationStore {
 impl InvocationStore for SqliteInvocationStore {
     async fn reserve_or_get(
         &self,
-        invocation: StoredInvocation,
+        invocation: InvocationReservationInput,
+        descriptor: &CapabilityDescriptor,
+        retention_until: Timestamp,
     ) -> Result<InvocationReservation, Diagnostic> {
-        invocation.validate_for_storage()?;
+        let now = self.clock.now();
+        let invocation =
+            StoredInvocation::try_reserve(invocation, descriptor, now, retention_until)?;
         validate_sqlite_timestamps(&invocation)?;
         let mut connection = self.pool.acquire().await.map_err(|_| storage_error())?;
         let mut transaction = connection
@@ -79,7 +94,7 @@ impl InvocationStore for SqliteInvocationStore {
             "DELETE FROM invocations
              WHERE retention_until <= ? AND state_kind != 'outcome_unknown'",
         )
-        .bind(as_i64(invocation.created_at)?)
+        .bind(as_i64(now)?)
         .execute(&mut *transaction)
         .await
         .map_err(|_| storage_error())?;
@@ -116,14 +131,16 @@ impl InvocationStore for SqliteInvocationStore {
     async fn transition(
         &self,
         invocation_id: &InvocationId,
-        expected: InvocationState,
-        next: InvocationState,
+        transition: InvocationTransition,
     ) -> Result<(), Diagnostic> {
-        if !expected.permits_transition_to(&next) {
-            return Err(invalid("invocation state transition is not permitted"));
-        }
-        let expected_json = encode_state(&expected)?;
-        let next_json = encode_state(&next)?;
+        let now = self.clock.now();
+        let expected_json = encode_state(transition.expected())?;
+        let next_json = encode_state(transition.next())?;
+        let (authorization_record, outcome_record) = match transition.audit_record() {
+            TransitionAuditRecord::None => (None, None),
+            TransitionAuditRecord::Authorization(record_id) => (Some(record_id.as_str()), None),
+            TransitionAuditRecord::Outcome(record_id) => (None, Some(record_id.as_str())),
+        };
         let mut connection = self.pool.acquire().await.map_err(|_| storage_error())?;
         let mut transaction = connection
             .begin_with("BEGIN IMMEDIATE")
@@ -131,14 +148,30 @@ impl InvocationStore for SqliteInvocationStore {
             .map_err(|_| storage_error())?;
         let result = sqlx::query(
             "UPDATE invocations
-             SET state_kind = ?, state_json = ?, updated_at = updated_at + 1
-             WHERE invocation_id = ? AND state_kind = ? AND state_json = ?",
+             SET state_kind = ?,
+                 state_json = ?,
+                 audit_authorization_record_id =
+                    COALESCE(?, audit_authorization_record_id),
+                 audit_outcome_record_id = COALESCE(?, audit_outcome_record_id),
+                 updated_at = ?
+             WHERE invocation_id = ?
+               AND state_kind = ?
+               AND state_json = ?
+               AND updated_at <= ?
+               AND (? IS NULL OR audit_authorization_record_id IS NULL)
+               AND (? IS NULL OR audit_outcome_record_id IS NULL)",
         )
-        .bind(next.wire_name())
+        .bind(transition.next().wire_name())
         .bind(next_json)
+        .bind(authorization_record)
+        .bind(outcome_record)
+        .bind(as_i64(now)?)
         .bind(invocation_id.as_str())
-        .bind(expected.wire_name())
+        .bind(transition.expected().wire_name())
         .bind(expected_json)
+        .bind(as_i64(now)?)
+        .bind(authorization_record)
+        .bind(outcome_record)
         .execute(&mut *transaction)
         .await
         .map_err(|_| storage_error())?;
@@ -174,15 +207,17 @@ impl InvocationStore for SqliteInvocationStore {
         context: &InvocationStatusContext,
         authorization: AbandonmentAuthorization,
     ) -> Result<(), Diagnostic> {
+        let now = self.clock.now();
         let result = sqlx::query(
             "UPDATE invocations
              SET state_kind = 'abandoned',
                  state_json = ?,
                  abandonment_authorization_record_id = ?,
                  abandoned_by = ?,
-                 updated_at = updated_at + 1
+                 updated_at = ?
              WHERE invocation_id = ?
                AND state_kind = 'outcome_unknown'
+               AND updated_at <= ?
                AND tenant_ref = ?
                AND human_ref = ?
                AND workload_ref = ?
@@ -196,7 +231,9 @@ impl InvocationStore for SqliteInvocationStore {
         .bind(encode_state(&InvocationState::Abandoned)?)
         .bind(authorization.authorization_record_id())
         .bind(authorization.authorized_by())
+        .bind(as_i64(now)?)
         .bind(invocation_id.as_str())
+        .bind(as_i64(now)?)
         .bind(context.tenant_ref())
         .bind(context.human_ref())
         .bind(context.workload_ref())

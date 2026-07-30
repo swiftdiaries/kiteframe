@@ -1,14 +1,181 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+};
 
 use kiteframe_contract::{
-    ActorRef, AdmissionId, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CatalogIdentity, IdempotencyKey, InvocationId, NormalizedResourceSelector,
-    ProtectedEvidenceRequestRef, Sha256Digest, StatusRequest, Timestamp, TraceContext,
+    ActorRef, AdmissionId, ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
+    ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticStage, EffectClassification, ExecutionMode, FreshnessRequirement, IdempotencyKey,
+    IdempotencyRequirement, IdempotencyScope, InvocationId, NonEmptySet,
+    NormalizedResourceSelector, ProtectedEvidenceRequestRef, ResourceSelectorSchema, Sha256Digest,
+    StatusRequest, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore, InvocationState,
-    InvocationStatusContext, InvocationStore, ReservationKind, StatusState, StoredInvocation,
+    AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore,
+    InvocationReservationInput, InvocationState, InvocationStatusContext, InvocationStore,
+    InvocationStoreClock, InvocationTransition, ReservationKind, StatusSafeError, StatusSafeResult,
+    StatusState, TransitionAuditRecord,
 };
+use serde_json::json;
+
+#[test]
+fn status_safe_result_rejects_sensitive_fields_and_values_even_when_schema_allows_them() {
+    let sensitive_field_descriptor = descriptor(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["accessToken"],
+        "properties": {"accessToken": {"type": "string"}}
+    }));
+    assert!(
+        StatusSafeResult::try_new(
+            json!({"accessToken": "opaque-secret"}),
+            &sensitive_field_descriptor,
+        )
+        .is_err()
+    );
+
+    let sensitive_value_descriptor = descriptor(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary"],
+        "properties": {"summary": {"type": "string"}}
+    }));
+    assert!(
+        StatusSafeResult::try_new(
+            json!({"summary": "Bearer opaque-secret"}),
+            &sensitive_value_descriptor,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn status_safe_error_rejects_secret_bearing_diagnostics() {
+    let mut diagnostic = Diagnostic::error(
+        DiagnosticCode::InvocationDenied,
+        DiagnosticCategory::Authorization,
+        DiagnosticStage::Invoke,
+        "Bearer opaque-secret",
+    );
+    diagnostic
+        .details
+        .insert("evidenceBody".to_owned(), json!({"approval": "secret"}));
+
+    assert!(StatusSafeError::try_from_diagnostic(&diagnostic).is_err());
+}
+
+#[tokio::test]
+async fn descriptor_retention_window_is_enforced_from_trusted_store_time() {
+    let clock = Arc::new(FakeClock(AtomicU64::new(100)));
+    let store = InMemoryInvocationStore::with_clock(clock.clone());
+    let descriptor = descriptor(standard_output_schema());
+
+    let short = store
+        .reserve_or_get(
+            reservation("inv-1", "key-1", 1),
+            &descriptor,
+            Timestamp::new(3_699),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(short.code.as_str(), "KF-CAP-002");
+
+    clock.0.store(5_000, Ordering::SeqCst);
+    let stale_future_deadline = store
+        .reserve_or_get(
+            reservation("inv-2", "key-2", u64::MAX - 3_600),
+            &descriptor,
+            Timestamp::new(6_000),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stale_future_deadline.code.as_str(), "KF-CAP-002");
+}
+
+#[tokio::test]
+async fn audit_record_ids_attach_atomically_with_corresponding_transitions() {
+    let clock = Arc::new(FakeClock(AtomicU64::new(100)));
+    let store = InMemoryInvocationStore::with_clock(clock.clone());
+    let descriptor = descriptor(standard_output_schema());
+    let reserved = store
+        .reserve_or_get(
+            reservation("inv-1", "key-1", 99_999),
+            &descriptor,
+            Timestamp::new(3_700),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reserved.status().audit_authorization_record_id(),
+        None,
+        "write-ahead authorization does not exist at reservation"
+    );
+    assert_eq!(reserved.status().audit_outcome_record_id(), None);
+
+    clock.0.store(101, Ordering::SeqCst);
+    store
+        .transition(
+            reserved.status().invocation_id(),
+            InvocationTransition::try_new(
+                InvocationState::Reserved,
+                InvocationState::Pending,
+                TransitionAuditRecord::Authorization("audit-authz-1".to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let pending = store
+        .status(
+            &StatusRequest::new(
+                reserved.status().invocation_id().clone(),
+                trace_context("2"),
+            ),
+            &status_context("human-7"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pending.audit_authorization_record_id(),
+        Some("audit-authz-1")
+    );
+    assert_eq!(pending.audit_outcome_record_id(), None);
+
+    clock.0.store(102, Ordering::SeqCst);
+    let result = StatusSafeResult::try_new(json!({"caseId": "42"}), &descriptor).unwrap();
+    store
+        .transition(
+            reserved.status().invocation_id(),
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::Succeeded { result },
+                TransitionAuditRecord::Outcome("audit-outcome-1".to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let succeeded = store
+        .status(
+            &StatusRequest::new(
+                reserved.status().invocation_id().clone(),
+                trace_context("3"),
+            ),
+            &status_context("human-7"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        succeeded.audit_authorization_record_id(),
+        Some("audit-authz-1")
+    );
+    assert_eq!(succeeded.audit_outcome_record_id(), Some("audit-outcome-1"));
+}
 
 #[tokio::test]
 async fn same_scope_and_key_deduplicates_effect() {
@@ -29,8 +196,7 @@ async fn same_scope_and_key_deduplicates_effect() {
 async fn a_durable_reservation_is_publicly_pending() {
     let store = InMemoryInvocationStore::new();
 
-    let reservation = store
-        .reserve_or_get(reservation("inv-1", "key-1", 100))
+    let reservation = reserve_default(&store, reservation("inv-1", "key-1", 100))
         .await
         .unwrap();
 
@@ -40,14 +206,13 @@ async fn a_durable_reservation_is_publicly_pending() {
 #[tokio::test]
 async fn same_key_with_different_request_is_rejected() {
     let store = InMemoryInvocationStore::new();
-    store
-        .reserve_or_get(reservation("inv-1", "key-1", 100))
+    reserve_default(&store, reservation("inv-1", "key-1", 100))
         .await
         .unwrap();
     let mut conflicting = reservation("inv-2", "key-1", 101);
     conflicting.request_digest = digest(99);
 
-    let error = store.reserve_or_get(conflicting).await.unwrap_err();
+    let error = reserve_default(&store, conflicting).await.unwrap_err();
 
     assert_eq!(error.code.as_str(), "KF-CAP-002");
 }
@@ -55,14 +220,13 @@ async fn same_key_with_different_request_is_rejected() {
 #[tokio::test]
 async fn duplicate_reservation_does_not_bypass_status_context_authorization() {
     let store = InMemoryInvocationStore::new();
-    store
-        .reserve_or_get(reservation("inv-1", "key-1", 100))
+    reserve_default(&store, reservation("inv-1", "key-1", 100))
         .await
         .unwrap();
     let mut other_principal = reservation("inv-2", "key-1", 101);
     other_principal.status_context = status_context("human-8");
 
-    let error = store.reserve_or_get(other_principal).await.unwrap_err();
+    let error = reserve_default(&store, other_principal).await.unwrap_err();
 
     assert_eq!(error.code.as_str(), "KF-AUTH-003");
 }
@@ -70,21 +234,12 @@ async fn duplicate_reservation_does_not_bypass_status_context_authorization() {
 #[tokio::test]
 async fn unknown_outcome_rejects_new_key_until_resolved() {
     let store = InMemoryInvocationStore::new();
-    let reserved = store
-        .reserve_or_get(reservation("inv-1", "key-1", 100))
+    let reserved = reserve_default(&store, reservation("inv-1", "key-1", 100))
         .await
         .unwrap();
-    store
-        .transition(
-            reserved.status().invocation_id(),
-            InvocationState::Reserved,
-            InvocationState::OutcomeUnknown,
-        )
-        .await
-        .unwrap();
+    mark_unknown(&store, reserved.status().invocation_id()).await;
 
-    let error = store
-        .reserve_or_get(reservation("inv-2", "key-2", 101))
+    let error = reserve_default(&store, reservation("inv-2", "key-2", 101))
         .await
         .unwrap_err();
 
@@ -94,21 +249,26 @@ async fn unknown_outcome_rejects_new_key_until_resolved() {
 
 #[tokio::test]
 async fn unknown_outcome_remains_blocking_after_its_retention_deadline() {
-    let store = InMemoryInvocationStore::new();
-    let mut first = reservation("inv-1", "key-1", 1);
-    first.retention_until = Timestamp::new(2);
-    store.reserve_or_get(first).await.unwrap();
+    let clock = Arc::new(FakeClock(AtomicU64::new(1)));
+    let store = InMemoryInvocationStore::with_clock(clock.clone());
+    let descriptor = descriptor_with_retention(standard_output_schema(), 1);
     store
-        .transition(
-            &InvocationId::new("inv-1").unwrap(),
-            InvocationState::Reserved,
-            InvocationState::OutcomeUnknown,
+        .reserve_or_get(
+            reservation("inv-1", "key-1", 1),
+            &descriptor,
+            Timestamp::new(2),
         )
         .await
         .unwrap();
+    mark_unknown(&store, &InvocationId::new("inv-1").unwrap()).await;
 
+    clock.0.store(3, Ordering::SeqCst);
     let error = store
-        .reserve_or_get(reservation("inv-2", "key-2", 3))
+        .reserve_or_get(
+            reservation("inv-2", "key-2", 3),
+            &descriptor,
+            Timestamp::new(4),
+        )
         .await
         .unwrap_err();
 
@@ -118,8 +278,7 @@ async fn unknown_outcome_remains_blocking_after_its_retention_deadline() {
 #[tokio::test]
 async fn exact_status_context_is_required() {
     let store = InMemoryInvocationStore::new();
-    store
-        .reserve_or_get(reservation("inv-1", "key-1", 100))
+    reserve_default(&store, reservation("inv-1", "key-1", 100))
         .await
         .unwrap();
     let request = StatusRequest::new(InvocationId::new("inv-1").unwrap(), trace_context("1"));
@@ -140,27 +299,32 @@ async fn exact_status_context_is_required() {
 #[tokio::test]
 async fn transitions_compare_and_swap_and_abandonment_is_explicit() {
     let store = InMemoryInvocationStore::new();
-    store
-        .reserve_or_get(reservation("inv-1", "key-1", 100))
+    reserve_default(&store, reservation("inv-1", "key-1", 100))
         .await
         .unwrap();
     let invocation_id = InvocationId::new("inv-1").unwrap();
-    store
-        .transition(
-            &invocation_id,
-            InvocationState::Reserved,
-            InvocationState::OutcomeUnknown,
-        )
-        .await
-        .unwrap();
+    mark_unknown(&store, &invocation_id).await;
 
     let stale = store
         .transition(
             &invocation_id,
-            InvocationState::Reserved,
-            InvocationState::Succeeded {
-                result: serde_json::json!({"ok": true}),
-            },
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::Succeeded {
+                    result: StatusSafeResult::try_new(
+                        json!({"ok": true}),
+                        &descriptor(json!({
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["ok"],
+                            "properties": {"ok": {"type": "boolean"}}
+                        })),
+                    )
+                    .unwrap(),
+                },
+                TransitionAuditRecord::Outcome("audit-outcome-stale".to_owned()),
+            )
+            .unwrap(),
         )
         .await
         .unwrap_err();
@@ -174,8 +338,7 @@ async fn transitions_compare_and_swap_and_abandonment_is_explicit() {
         )
         .await
         .unwrap();
-    let replacement = store
-        .reserve_or_get(reservation("inv-2", "key-2", 102))
+    let replacement = reserve_default(&store, reservation("inv-2", "key-2", 102))
         .await
         .unwrap();
     assert_eq!(replacement.kind(), ReservationKind::Reserved);
@@ -183,18 +346,58 @@ async fn transitions_compare_and_swap_and_abandonment_is_explicit() {
 
 async fn execute_if_reserved(
     store: &InMemoryInvocationStore,
-    input: StoredInvocation,
+    input: InvocationReservationInput,
     effect_count: &AtomicUsize,
 ) -> kiteframe_provider::InvocationStatus {
-    let reservation = store.reserve_or_get(input).await.unwrap();
+    let reservation = reserve_default(store, input).await.unwrap();
     if reservation.kind() == ReservationKind::Reserved {
         effect_count.fetch_add(1, Ordering::SeqCst);
     }
     reservation.status().clone()
 }
 
-fn reservation(invocation_id: &str, key: &str, now: u64) -> StoredInvocation {
-    StoredInvocation {
+async fn mark_unknown(store: &InMemoryInvocationStore, invocation_id: &InvocationId) {
+    store
+        .transition(
+            invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Reserved,
+                InvocationState::Pending,
+                TransitionAuditRecord::Authorization("audit-authz-unknown".to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    store
+        .transition(
+            invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::OutcomeUnknown,
+                TransitionAuditRecord::None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn reserve_default(
+    store: &InMemoryInvocationStore,
+    input: InvocationReservationInput,
+) -> Result<kiteframe_provider::InvocationReservation, Diagnostic> {
+    store
+        .reserve_or_get(
+            input,
+            &descriptor(standard_output_schema()),
+            Timestamp::new(u64::MAX),
+        )
+        .await
+}
+
+fn reservation(invocation_id: &str, key: &str, _untrusted_now: u64) -> InvocationReservationInput {
+    InvocationReservationInput {
         invocation_id: InvocationId::new(invocation_id).unwrap(),
         status_id: format!("status-{invocation_id}"),
         scope: IdempotencyScopeValue::try_new(
@@ -213,20 +416,12 @@ fn reservation(invocation_id: &str, key: &str, now: u64) -> StoredInvocation {
             revision: "1.0.0".to_owned(),
         },
         catalog_digest: digest(3),
-        descriptor_digest: digest(4),
         authority_revision_digest: digest(5),
         status_context: status_context("human-7"),
         proposal_digest: digest(6),
         protected_evidence_refs: vec![
             ProtectedEvidenceRequestRef::new("evidence://approval-1").unwrap(),
         ],
-        state: InvocationState::Reserved,
-        audit_authorization_record_id: None,
-        audit_outcome_record_id: None,
-        created_at: Timestamp::new(now),
-        updated_at: Timestamp::new(now),
-        retention_until: Timestamp::new(now + 3600),
-        abandonment: None,
     }
 }
 
@@ -251,6 +446,62 @@ fn capability() -> CapabilityIdentity {
         CapabilityReleaseVersion::new("1.0.0").unwrap(),
     )
     .unwrap()
+}
+
+fn descriptor(output_schema: serde_json::Value) -> CapabilityDescriptor {
+    descriptor_with_retention(output_schema, 3_600)
+}
+
+fn descriptor_with_retention(
+    output_schema: serde_json::Value,
+    retention_seconds: u64,
+) -> CapabilityDescriptor {
+    CapabilityDescriptor::try_new(CapabilityDescriptorParts {
+        identity: capability(),
+        summary: "Update a case".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["caseId"],
+            "properties": {"caseId": {"type": "string"}}
+        }),
+        output_schema,
+        stable_errors: vec![],
+        execution_modes: NonEmptySet::try_new(BTreeSet::from([ExecutionMode::Deferred])).unwrap(),
+        resource_selector_schema: ResourceSelectorSchema::try_new(json!({
+            "type": "string",
+            "pattern": "^case:[A-Za-z0-9-]+$"
+        }))
+        .unwrap(),
+        effect: EffectClassification::ReversibleWrite,
+        idempotency: IdempotencyRequirement::Required {
+            scope: IdempotencyScope::ActorCapabilityResourceOperation,
+            retention_seconds: std::num::NonZeroU64::new(retention_seconds).unwrap(),
+        },
+        freshness: FreshnessRequirement::default(),
+        preconditions: vec![],
+        confirmation: ConfirmationRequirement::None,
+        approval: ApprovalRequirement::None,
+        consent: ConsentRequirement::None,
+    })
+    .unwrap()
+}
+
+fn standard_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["caseId"],
+        "properties": {"caseId": {"type": "string"}}
+    })
+}
+
+struct FakeClock(AtomicU64);
+
+impl InvocationStoreClock for FakeClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::new(self.0.load(Ordering::SeqCst))
+    }
 }
 
 fn digest(byte: u8) -> Sha256Digest {

@@ -1,15 +1,17 @@
 use std::{
-    collections::BTreeMap,
-    sync::{Mutex, MutexGuard},
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex, MutexGuard},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
 use kiteframe_contract::{
-    ActorRef, AdmissionId, CapabilityIdentity, CatalogIdentity, Diagnostic, DiagnosticCategory,
-    DiagnosticCode, DiagnosticStage, IdempotencyKey, InvocationId, NormalizedResourceSelector,
-    ProtectedEvidenceRequestRef, Sha256Digest, StableCapabilityError, StatusRequest, Timestamp,
+    ActorRef, AdmissionId, CapabilityDescriptor, CapabilityIdentity, CatalogIdentity, Diagnostic,
+    DiagnosticCategory, DiagnosticCode, DiagnosticStage, IdempotencyKey, InvocationId,
+    NormalizedResourceSelector, ProtectedEvidenceRequestRef, RetryClass, Sha256Digest,
+    StableCapabilityError, StatusRequest, Timestamp,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use serde_json::Value;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -157,15 +159,158 @@ impl InvocationStatusContext {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StatusSafeResult {
+    allowed_fields: BTreeSet<String>,
+    value: Value,
+}
+
+impl StatusSafeResult {
+    pub fn try_new(value: Value, descriptor: &CapabilityDescriptor) -> Result<Self, String> {
+        descriptor
+            .validate_output(&value)
+            .map_err(|_| "status result does not match the locked output projection".to_owned())?;
+        let allowed_fields = descriptor
+            .output_schema()
+            .as_value()
+            .as_object()
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .map(|properties| properties.keys().cloned().collect::<BTreeSet<_>>())
+            .ok_or_else(|| {
+                "status results require an object schema with explicit properties".to_owned()
+            })?;
+        Self::from_parts(allowed_fields, value)
+    }
+
+    fn from_parts(allowed_fields: BTreeSet<String>, value: Value) -> Result<Self, String> {
+        let fields = value
+            .as_object()
+            .ok_or_else(|| "status result must be an object projection".to_owned())?;
+        if fields.keys().any(|field| !allowed_fields.contains(field)) {
+            return Err("status result contains a field outside its locked projection".to_owned());
+        }
+        if allowed_fields.iter().any(|field| sensitive_name(field)) {
+            return Err("status result projection contains a sensitive field".to_owned());
+        }
+        let mut nodes = 0_usize;
+        validate_status_json(&value, 0, &mut nodes)?;
+        Ok(Self {
+            allowed_fields,
+            value,
+        })
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusSafeResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            allowed_fields: BTreeSet<String>,
+            value: Value,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::from_parts(raw.allowed_fields, raw.value).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StatusSafeError {
+    code: String,
+    category: String,
+    retry: RetryClass,
+    message: String,
+}
+
+impl StatusSafeError {
+    pub fn try_from_stable(error: &StableCapabilityError) -> Result<Self, String> {
+        Self::try_new(
+            error.code(),
+            error.category(),
+            error.retry(),
+            error.message().as_str(),
+        )
+    }
+
+    pub fn try_from_diagnostic(diagnostic: &Diagnostic) -> Result<Self, String> {
+        let wire = serde_json::to_value(diagnostic)
+            .map_err(|_| "diagnostic cannot be projected into status".to_owned())?;
+        let mut nodes = 0_usize;
+        validate_status_json(&wire, 0, &mut nodes)?;
+        Self::try_new(
+            diagnostic.code.as_str(),
+            diagnostic_category_name(diagnostic.category),
+            diagnostic.retry,
+            diagnostic.message.as_str(),
+        )
+    }
+
+    fn try_new(
+        code: impl Into<String>,
+        category: impl Into<String>,
+        retry: RetryClass,
+        message: impl Into<String>,
+    ) -> Result<Self, String> {
+        let value = Self {
+            code: code.into(),
+            category: category.into(),
+            retry,
+            message: message.into(),
+        };
+        if value.code.trim().is_empty()
+            || value.category.trim().is_empty()
+            || !safe_status_text(&value.message)
+        {
+            return Err("status error projection contains unsafe content".to_owned());
+        }
+        Ok(value)
+    }
+
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+    pub fn retry(&self) -> RetryClass {
+        self.retry
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl<'de> Deserialize<'de> for StatusSafeError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            code: String,
+            category: String,
+            retry: RetryClass,
+            message: String,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::try_new(raw.code, raw.category, raw.retry, raw.message).map_err(D::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", deny_unknown_fields)]
 pub enum InvocationState {
     Reserved,
     Pending,
     Suspended,
-    Succeeded { result: Value },
-    Failed { error: StableCapabilityError },
-    Denied { diagnostic: Diagnostic },
+    Succeeded { result: StatusSafeResult },
+    Failed { error: StatusSafeError },
+    Denied { error: StatusSafeError },
     OutcomeUnknown,
     Abandoned,
 }
@@ -213,6 +358,68 @@ pub enum StatusState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransitionAuditRecord {
+    None,
+    Authorization(String),
+    Outcome(String),
+}
+
+impl TransitionAuditRecord {
+    fn validate(&self) -> Result<(), Diagnostic> {
+        match self {
+            Self::None => Ok(()),
+            Self::Authorization(record_id) | Self::Outcome(record_id)
+                if !record_id.trim().is_empty() =>
+            {
+                Ok(())
+            }
+            Self::Authorization(_) | Self::Outcome(_) => {
+                Err(invalid("audit record ID is required for state transition"))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvocationTransition {
+    expected: InvocationState,
+    next: InvocationState,
+    audit_record: TransitionAuditRecord,
+}
+
+impl InvocationTransition {
+    pub fn try_new(
+        expected: InvocationState,
+        next: InvocationState,
+        audit_record: TransitionAuditRecord,
+    ) -> Result<Self, Diagnostic> {
+        audit_record.validate()?;
+        if !allowed_transition(&expected, &next)
+            || !audit_matches_transition(&expected, &next, &audit_record)
+        {
+            return Err(invalid(
+                "invocation state transition and audit record do not correspond",
+            ));
+        }
+        Ok(Self {
+            expected,
+            next,
+            audit_record,
+        })
+    }
+
+    pub fn expected(&self) -> &InvocationState {
+        &self.expected
+    }
+    pub fn next(&self) -> &InvocationState {
+        &self.next
+    }
+    pub fn audit_record(&self) -> &TransitionAuditRecord {
+        &self.audit_record
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AbandonmentAuthorization {
     authorization_record_id: String,
     authorized_by: String,
@@ -244,6 +451,41 @@ impl AbandonmentAuthorization {
 }
 
 #[derive(Clone, Debug)]
+pub struct InvocationReservationInput {
+    pub invocation_id: InvocationId,
+    pub status_id: String,
+    pub scope: IdempotencyScopeValue,
+    pub idempotency_key: IdempotencyKey,
+    pub request_digest: Sha256Digest,
+    pub admission_id: AdmissionId,
+    pub grant_digest: Sha256Digest,
+    pub catalog_identity: CatalogIdentity,
+    pub catalog_digest: Sha256Digest,
+    pub authority_revision_digest: Sha256Digest,
+    pub status_context: InvocationStatusContext,
+    pub proposal_digest: Sha256Digest,
+    pub protected_evidence_refs: Vec<ProtectedEvidenceRequestRef>,
+}
+
+impl InvocationReservationInput {
+    fn validate(&self) -> Result<(), Diagnostic> {
+        if self.status_id.trim().is_empty()
+            || self.catalog_identity.name.trim().is_empty()
+            || self.catalog_identity.revision.trim().is_empty()
+            || self.scope.actor().as_str() != self.status_context.actor_ref()
+            || self.admission_id.as_str() != self.status_context.admission_ref()
+            || self
+                .protected_evidence_refs
+                .iter()
+                .any(|reference| !protected_reference(reference.as_str()))
+        {
+            return Err(invalid("invalid durable invocation reservation"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct StoredInvocation {
     pub invocation_id: InvocationId,
     pub status_id: String,
@@ -269,32 +511,64 @@ pub struct StoredInvocation {
 }
 
 impl StoredInvocation {
-    pub fn validate_for_storage(&self) -> Result<(), Diagnostic> {
-        if self.status_id.trim().is_empty()
-            || self.catalog_identity.name.trim().is_empty()
-            || self.catalog_identity.revision.trim().is_empty()
-            || self.retention_until <= self.created_at
-            || self.updated_at < self.created_at
-            || self.scope.actor().as_str() != self.status_context.actor_ref()
-            || self.admission_id.as_str() != self.status_context.admission_ref()
-            || self.state != InvocationState::Reserved
-            || self
-                .protected_evidence_refs
-                .iter()
-                .any(|reference| !protected_reference(reference.as_str()))
-            || self
-                .audit_authorization_record_id
-                .as_deref()
-                .is_some_and(|value| value.trim().is_empty())
-            || self
-                .audit_outcome_record_id
-                .as_deref()
-                .is_some_and(|value| value.trim().is_empty())
-            || self.abandonment.is_some()
+    pub fn try_reserve(
+        input: InvocationReservationInput,
+        descriptor: &CapabilityDescriptor,
+        created_at: Timestamp,
+        retention_until: Timestamp,
+    ) -> Result<Self, Diagnostic> {
+        input.validate()?;
+        let required_seconds = match descriptor.idempotency() {
+            kiteframe_contract::IdempotencyRequirement::Required {
+                scope: kiteframe_contract::IdempotencyScope::ActorCapabilityResourceOperation,
+                retention_seconds,
+            } => retention_seconds.get(),
+            kiteframe_contract::IdempotencyRequirement::None => {
+                return Err(invalid(
+                    "durable effect reservation requires a locked idempotency contract",
+                ));
+            }
+        };
+        if descriptor.identity() != input.scope.capability()
+            || input.scope.semantic_operation() != descriptor.identity().name().as_str()
         {
-            return Err(invalid("invalid durable invocation reservation"));
+            return Err(invalid(
+                "idempotency scope does not match the locked capability descriptor",
+            ));
         }
-        Ok(())
+        let minimum_retention = created_at
+            .unix_seconds()
+            .checked_add(required_seconds)
+            .map(Timestamp::new)
+            .ok_or_else(|| invalid("idempotency retention deadline overflows"))?;
+        if retention_until < minimum_retention {
+            return Err(invalid(
+                "retention deadline is shorter than the locked descriptor contract",
+            ));
+        }
+        Ok(Self {
+            invocation_id: input.invocation_id,
+            status_id: input.status_id,
+            scope: input.scope,
+            idempotency_key: input.idempotency_key,
+            request_digest: input.request_digest,
+            admission_id: input.admission_id,
+            grant_digest: input.grant_digest,
+            catalog_identity: input.catalog_identity,
+            catalog_digest: input.catalog_digest,
+            descriptor_digest: *descriptor.descriptor_digest(),
+            authority_revision_digest: input.authority_revision_digest,
+            status_context: input.status_context,
+            proposal_digest: input.proposal_digest,
+            protected_evidence_refs: input.protected_evidence_refs,
+            state: InvocationState::Reserved,
+            audit_authorization_record_id: None,
+            audit_outcome_record_id: None,
+            created_at,
+            updated_at: created_at,
+            retention_until,
+            abandonment: None,
+        })
     }
 }
 
@@ -445,14 +719,15 @@ impl InvocationReservation {
 pub trait InvocationStore: Send + Sync {
     async fn reserve_or_get(
         &self,
-        invocation: StoredInvocation,
+        invocation: InvocationReservationInput,
+        descriptor: &CapabilityDescriptor,
+        retention_until: Timestamp,
     ) -> Result<InvocationReservation, Diagnostic>;
 
     async fn transition(
         &self,
         invocation_id: &InvocationId,
-        expected: InvocationState,
-        next: InvocationState,
+        transition: InvocationTransition,
     ) -> Result<(), Diagnostic>;
 
     async fn status(
@@ -469,20 +744,49 @@ pub trait InvocationStore: Send + Sync {
     ) -> Result<(), Diagnostic>;
 }
 
-#[derive(Default)]
 pub struct InMemoryInvocationStore {
     records: Mutex<BTreeMap<ReservationKey, StoredInvocation>>,
+    clock: Arc<dyn InvocationStoreClock>,
 }
 
 impl InMemoryInvocationStore {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_clock(Arc::new(SystemInvocationStoreClock))
+    }
+
+    pub fn with_clock(clock: Arc<dyn InvocationStoreClock>) -> Self {
+        Self {
+            records: Mutex::new(BTreeMap::new()),
+            clock,
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, BTreeMap<ReservationKey, StoredInvocation>> {
         self.records
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for InMemoryInvocationStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub trait InvocationStoreClock: Send + Sync {
+    fn now(&self) -> Timestamp;
+}
+
+pub struct SystemInvocationStoreClock;
+
+impl InvocationStoreClock for SystemInvocationStoreClock {
+    fn now(&self) -> Timestamp {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Timestamp::new(seconds)
     }
 }
 
@@ -521,13 +825,17 @@ impl ReservationKey {
 impl InvocationStore for InMemoryInvocationStore {
     async fn reserve_or_get(
         &self,
-        invocation: StoredInvocation,
+        invocation: InvocationReservationInput,
+        descriptor: &CapabilityDescriptor,
+        retention_until: Timestamp,
     ) -> Result<InvocationReservation, Diagnostic> {
-        invocation.validate_for_storage()?;
+        let now = self.clock.now();
+        let invocation =
+            StoredInvocation::try_reserve(invocation, descriptor, now, retention_until)?;
         let key = ReservationKey::from_invocation(&invocation);
         let mut records = self.lock();
         records.retain(|_, stored| {
-            stored.retention_until > invocation.created_at
+            stored.retention_until > now
                 || stored.state.status_state() == StatusState::OutcomeUnknown
         });
 
@@ -561,22 +869,37 @@ impl InvocationStore for InMemoryInvocationStore {
     async fn transition(
         &self,
         invocation_id: &InvocationId,
-        expected: InvocationState,
-        next: InvocationState,
+        transition: InvocationTransition,
     ) -> Result<(), Diagnostic> {
-        if !allowed_transition(&expected, &next) {
-            return Err(invalid("invocation state transition is not permitted"));
-        }
+        let now = self.clock.now();
         let mut records = self.lock();
         let stored = records
             .values_mut()
             .find(|stored| &stored.invocation_id == invocation_id)
             .ok_or_else(not_found)?;
-        if stored.state != expected {
+        if stored.state != transition.expected {
             return Err(invalid("invocation state compare-and-swap failed"));
         }
-        stored.state = next;
-        stored.updated_at = Timestamp::new(stored.updated_at.unix_seconds().saturating_add(1));
+        if now < stored.updated_at {
+            return Err(invalid("trusted invocation-store clock moved backwards"));
+        }
+        match &transition.audit_record {
+            TransitionAuditRecord::None => {}
+            TransitionAuditRecord::Authorization(record_id) => {
+                if stored.audit_authorization_record_id.is_some() {
+                    return Err(invalid("authorization audit record is already attached"));
+                }
+                stored.audit_authorization_record_id = Some(record_id.clone());
+            }
+            TransitionAuditRecord::Outcome(record_id) => {
+                if stored.audit_outcome_record_id.is_some() {
+                    return Err(invalid("outcome audit record is already attached"));
+                }
+                stored.audit_outcome_record_id = Some(record_id.clone());
+            }
+        }
+        stored.state = transition.next;
+        stored.updated_at = now;
         Ok(())
     }
 
@@ -628,7 +951,6 @@ fn allowed_transition(expected: &InvocationState, next: &InvocationState) -> boo
         (InvocationState::Reserved, InvocationState::Pending)
             | (InvocationState::Reserved, InvocationState::Suspended)
             | (InvocationState::Reserved, InvocationState::Denied { .. })
-            | (InvocationState::Reserved, InvocationState::OutcomeUnknown)
             | (InvocationState::Pending, InvocationState::Suspended)
             | (InvocationState::Pending, InvocationState::Succeeded { .. })
             | (InvocationState::Pending, InvocationState::Failed { .. })
@@ -651,6 +973,45 @@ fn allowed_transition(expected: &InvocationState, next: &InvocationState) -> boo
     )
 }
 
+fn audit_matches_transition(
+    expected: &InvocationState,
+    next: &InvocationState,
+    audit: &TransitionAuditRecord,
+) -> bool {
+    matches!(
+        (expected, next, audit),
+        (
+            InvocationState::Reserved | InvocationState::Suspended,
+            InvocationState::Pending,
+            TransitionAuditRecord::Authorization(_)
+        ) | (
+            InvocationState::Pending | InvocationState::OutcomeUnknown,
+            InvocationState::Succeeded { .. } | InvocationState::Failed { .. },
+            TransitionAuditRecord::Outcome(_)
+        ) | (
+            InvocationState::Pending,
+            InvocationState::OutcomeUnknown,
+            TransitionAuditRecord::None | TransitionAuditRecord::Outcome(_)
+        ) | (
+            InvocationState::Reserved,
+            InvocationState::Suspended | InvocationState::Denied { .. },
+            TransitionAuditRecord::None
+        ) | (
+            InvocationState::Pending,
+            InvocationState::Suspended | InvocationState::Denied { .. },
+            TransitionAuditRecord::None
+        ) | (
+            InvocationState::Suspended,
+            InvocationState::Denied { .. },
+            TransitionAuditRecord::None
+        ) | (
+            InvocationState::OutcomeUnknown,
+            InvocationState::Denied { .. },
+            TransitionAuditRecord::None
+        )
+    )
+}
+
 fn protected_reference(reference: &str) -> bool {
     reference.split_once("://").is_some_and(|(scheme, opaque)| {
         matches!(scheme, "evidence" | "vault")
@@ -659,6 +1020,93 @@ fn protected_reference(reference: &str) -> bool {
                 .bytes()
                 .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
     })
+}
+
+fn validate_status_json(value: &Value, depth: usize, nodes: &mut usize) -> Result<(), String> {
+    *nodes = nodes.saturating_add(1);
+    if depth > 16 || *nodes > 1024 {
+        return Err("status projection exceeds its structural limit".to_owned());
+    }
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+        Value::String(value) if safe_status_text(value) => Ok(()),
+        Value::String(_) => Err("status projection contains unsafe text".to_owned()),
+        Value::Array(values) if values.len() <= 256 => {
+            for value in values {
+                validate_status_json(value, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        Value::Array(_) => Err("status projection array is too large".to_owned()),
+        Value::Object(values) if values.len() <= 128 => {
+            for (field, value) in values {
+                if sensitive_name(field) {
+                    return Err("status projection contains a sensitive field".to_owned());
+                }
+                validate_status_json(value, depth + 1, nodes)?;
+            }
+            Ok(())
+        }
+        Value::Object(_) => Err("status projection object is too large".to_owned()),
+    }
+}
+
+fn sensitive_name(value: &str) -> bool {
+    let normalized = value
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .map(|byte| byte.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let normalized = String::from_utf8(normalized).expect("ASCII normalization is valid UTF-8");
+    [
+        "credential",
+        "password",
+        "secret",
+        "token",
+        "cookie",
+        "claim",
+        "evidence",
+        "provideracl",
+        "aclrule",
+        "legacy",
+    ]
+    .into_iter()
+    .any(|fragment| normalized.contains(fragment))
+}
+
+fn safe_status_text(value: &str) -> bool {
+    if value.len() > 4096 || value.bytes().any(|byte| byte.is_ascii_control()) {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    ![
+        "bearer ",
+        "basic ",
+        "password=",
+        "secret=",
+        "token=",
+        "cookie=",
+        "credential=",
+        "evidence_body",
+        "provider_acl",
+        "acl_rule",
+        "legacy_field",
+    ]
+    .into_iter()
+    .any(|marker| lower.contains(marker))
+}
+
+const fn diagnostic_category_name(category: DiagnosticCategory) -> &'static str {
+    match category {
+        DiagnosticCategory::Package => "package",
+        DiagnosticCategory::Lock => "lock",
+        DiagnosticCategory::Catalog => "catalog",
+        DiagnosticCategory::Feature => "feature",
+        DiagnosticCategory::Authorization => "authorization",
+        DiagnosticCategory::Capability => "capability",
+        DiagnosticCategory::Audit => "audit",
+        DiagnosticCategory::Runtime => "runtime",
+    }
 }
 
 fn invalid(message: &'static str) -> Diagnostic {

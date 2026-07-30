@@ -34,6 +34,8 @@ pub use principal::{
 };
 pub use status::{
     AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore,
-    InvocationReservation, InvocationState, InvocationStatus, InvocationStatusContext,
-    InvocationStore, ReservationKind, StatusState, StoredInvocation,
+    InvocationReservation, InvocationReservationInput, InvocationState, InvocationStatus,
+    InvocationStatusContext, InvocationStore, InvocationStoreClock, InvocationTransition,
+    ReservationKind, StatusSafeError, StatusSafeResult, StatusState, StoredInvocation,
+    SystemInvocationStoreClock, TransitionAuditRecord,
 };

@@ -1,39 +1,52 @@
-use std::sync::Arc;
+use std::{
+    collections::BTreeSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use kiteframe_contract::{
-    ActorRef, AdmissionId, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CatalogIdentity, IdempotencyKey, InvocationId, NormalizedResourceSelector,
-    ProtectedEvidenceRequestRef, RetryClass, Sha256Digest, StableCapabilityError, StatusRequest,
-    Timestamp, TraceContext,
+    ActorRef, AdmissionId, ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
+    ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticStage, EffectClassification, ExecutionMode, FreshnessRequirement, IdempotencyKey,
+    IdempotencyRequirement, IdempotencyScope, InvocationId, NonEmptySet,
+    NormalizedResourceSelector, ProtectedEvidenceRequestRef, ResourceSelectorSchema, RetryClass,
+    Sha256Digest, StableCapabilityError, StatusRequest, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    AbandonmentAuthorization, IdempotencyScopeValue, InvocationState, InvocationStatusContext,
-    InvocationStore, ReservationKind, StatusState, StoredInvocation,
+    AbandonmentAuthorization, IdempotencyScopeValue, InvocationReservationInput, InvocationState,
+    InvocationStatusContext, InvocationStore, InvocationStoreClock, InvocationTransition,
+    ReservationKind, StatusSafeError, StatusSafeResult, StatusState, TransitionAuditRecord,
 };
 use kiteframe_provider_sqlite::SqliteInvocationStore;
+use serde_json::json;
 use sqlx::{Connection, Row};
 
 #[tokio::test]
-async fn status_survives_store_restart_with_digests_and_trace() {
+async fn status_survives_restart_with_digests_trace_and_unknown_state() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("invocations.sqlite3");
-    let store = SqliteInvocationStore::open(&path).await.unwrap();
-    let input = reservation("inv-1", "key-1", 100);
-    store.reserve_or_get(input.clone()).await.unwrap();
-    store
-        .transition(
-            &input.invocation_id,
-            InvocationState::Reserved,
-            InvocationState::OutcomeUnknown,
-        )
+    let clock = Arc::new(FakeClock::new(100));
+    let store = SqliteInvocationStore::open_with_clock(&path, clock)
         .await
         .unwrap();
+    let descriptor = descriptor(standard_output_schema(), 3_600);
+    let input = reservation("inv-1", "key-1", "human-7");
+    store
+        .reserve_or_get(input.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+    mark_unknown(&store, &input.invocation_id).await;
     drop(store);
 
     let reopened = SqliteInvocationStore::open(&path).await.unwrap();
-    let request = StatusRequest::new(input.invocation_id.clone(), trace_context("a"));
     let status = reopened
-        .status(&request, &status_context("human-7"))
+        .status(
+            &StatusRequest::new(input.invocation_id, trace_context("a")),
+            &status_context("human-7"),
+        )
         .await
         .unwrap();
 
@@ -42,7 +55,7 @@ async fn status_survives_store_restart_with_digests_and_trace() {
     assert_eq!(status.grant_digest(), &digest(2));
     assert_eq!(status.catalog_identity(), &input.catalog_identity);
     assert_eq!(status.catalog_digest(), &digest(3));
-    assert_eq!(status.descriptor_digest(), &digest(4));
+    assert_eq!(status.descriptor_digest(), descriptor.descriptor_digest());
     assert_eq!(status.authority_revision_digest(), &digest(5));
     assert_eq!(status.proposal_digest(), &digest(6));
     assert_eq!(
@@ -54,8 +67,9 @@ async fn status_survives_store_restart_with_digests_and_trace() {
 #[tokio::test]
 async fn concurrent_duplicate_reservation_has_one_owner() {
     let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(FakeClock::new(100));
     let store = Arc::new(
-        SqliteInvocationStore::open(directory.path().join("concurrent.sqlite3"))
+        SqliteInvocationStore::open_with_clock(directory.path().join("concurrent.sqlite3"), clock)
             .await
             .unwrap(),
     );
@@ -63,13 +77,21 @@ async fn concurrent_duplicate_reservation_has_one_owner() {
     let right_store = store.clone();
     let left = tokio::spawn(async move {
         left_store
-            .reserve_or_get(reservation("inv-1", "key-1", 100))
+            .reserve_or_get(
+                reservation("inv-1", "key-1", "human-7"),
+                &descriptor(standard_output_schema(), 3_600),
+                Timestamp::new(3_700),
+            )
             .await
             .unwrap()
     });
     let right = tokio::spawn(async move {
         right_store
-            .reserve_or_get(reservation("inv-2", "key-1", 100))
+            .reserve_or_get(
+                reservation("inv-2", "key-1", "human-7"),
+                &descriptor(standard_output_schema(), 3_600),
+                Timestamp::new(3_700),
+            )
             .await
             .unwrap()
     });
@@ -85,205 +107,129 @@ async fn concurrent_duplicate_reservation_has_one_owner() {
 }
 
 #[tokio::test]
-async fn status_denies_any_principal_or_portable_context_mismatch() {
+async fn status_and_duplicate_dedupe_require_the_original_exact_context() {
     let directory = tempfile::tempdir().unwrap();
-    let store = SqliteInvocationStore::open(directory.path().join("auth.sqlite3"))
+    let clock = Arc::new(FakeClock::new(100));
+    let store =
+        SqliteInvocationStore::open_with_clock(directory.path().join("auth.sqlite3"), clock)
+            .await
+            .unwrap();
+    let descriptor = descriptor(standard_output_schema(), 3_600);
+    let input = reservation("inv-1", "key-1", "human-7");
+    store
+        .reserve_or_get(input.clone(), &descriptor, Timestamp::new(3_700))
         .await
         .unwrap();
-    let input = reservation("inv-1", "key-1", 100);
-    store.reserve_or_get(input.clone()).await.unwrap();
     let request = StatusRequest::new(input.invocation_id, trace_context("b"));
 
-    let mismatches = [
-        context([
-            "tenant-2",
-            "human-7",
-            "workload-2",
-            "run-9",
-            "actor-7",
-            "agent-2",
-            "task-4",
-            "session-3",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-8",
-            "workload-2",
-            "run-9",
-            "actor-7",
-            "agent-2",
-            "task-4",
-            "session-3",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-7",
-            "workload-3",
-            "run-9",
-            "actor-7",
-            "agent-2",
-            "task-4",
-            "session-3",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-7",
-            "workload-2",
-            "run-8",
-            "actor-7",
-            "agent-2",
-            "task-4",
-            "session-3",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-7",
-            "workload-2",
-            "run-9",
-            "actor-8",
-            "agent-2",
-            "task-4",
-            "session-3",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-7",
-            "workload-2",
-            "run-9",
-            "actor-7",
-            "agent-3",
-            "task-4",
-            "session-3",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-7",
-            "workload-2",
-            "run-9",
-            "actor-7",
-            "agent-2",
-            "task-5",
-            "session-3",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-7",
-            "workload-2",
-            "run-9",
-            "actor-7",
-            "agent-2",
-            "task-4",
-            "session-4",
-            "admission-5",
-        ]),
-        context([
-            "tenant-1",
-            "human-7",
-            "workload-2",
-            "run-9",
-            "actor-7",
-            "agent-2",
-            "task-4",
-            "session-3",
-            "admission-6",
-        ]),
-    ];
-    for mismatch in mismatches {
+    for mismatch in mismatched_contexts() {
         let error = store.status(&request, &mismatch).await.unwrap_err();
         assert_eq!(error.code.as_str(), "KF-AUTH-003");
     }
-}
 
-#[tokio::test]
-async fn duplicate_reservation_requires_the_original_exact_context() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = SqliteInvocationStore::open(directory.path().join("duplicate-auth.sqlite3"))
+    let error = store
+        .reserve_or_get(
+            reservation("inv-2", "key-1", "human-8"),
+            &descriptor,
+            Timestamp::new(3_700),
+        )
         .await
-        .unwrap();
-    store
-        .reserve_or_get(reservation("inv-1", "key-1", 100))
-        .await
-        .unwrap();
-    let mut other_principal = reservation("inv-2", "key-1", 101);
-    other_principal.status_context = status_context("human-8");
-
-    let error = store.reserve_or_get(other_principal).await.unwrap_err();
-
+        .unwrap_err();
     assert_eq!(error.code.as_str(), "KF-AUTH-003");
 }
 
 #[tokio::test]
-async fn expired_reservation_releases_the_exact_key() {
+async fn descriptor_retention_and_cleanup_use_only_trusted_store_time() {
     let directory = tempfile::tempdir().unwrap();
-    let store = SqliteInvocationStore::open(directory.path().join("retention.sqlite3"))
-        .await
-        .unwrap();
-    let mut expired = reservation("inv-1", "key-1", 1);
-    expired.retention_until = Timestamp::new(2);
-    store.reserve_or_get(expired).await.unwrap();
+    let clock = Arc::new(FakeClock::new(100));
+    let store = SqliteInvocationStore::open_with_clock(
+        directory.path().join("retention.sqlite3"),
+        clock.clone(),
+    )
+    .await
+    .unwrap();
+    let descriptor = descriptor(standard_output_schema(), 3_600);
 
-    let replacement = store
-        .reserve_or_get(reservation("inv-2", "key-1", 3))
-        .await
-        .unwrap();
-
-    assert_eq!(replacement.kind(), ReservationKind::Reserved);
-    assert_eq!(replacement.status().invocation_id().as_str(), "inv-2");
-}
-
-#[tokio::test]
-async fn unresolved_unknown_outcome_is_not_purged_at_retention_deadline() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = SqliteInvocationStore::open(directory.path().join("unknown-retention.sqlite3"))
-        .await
-        .unwrap();
-    let mut first = reservation("inv-1", "key-1", 1);
-    first.retention_until = Timestamp::new(2);
-    store.reserve_or_get(first.clone()).await.unwrap();
-    store
-        .transition(
-            &first.invocation_id,
-            InvocationState::Reserved,
-            InvocationState::OutcomeUnknown,
+    let short = store
+        .reserve_or_get(
+            reservation("inv-short", "key-short", "human-7"),
+            &descriptor,
+            Timestamp::new(3_699),
         )
-        .await
-        .unwrap();
-
-    let error = store
-        .reserve_or_get(reservation("inv-2", "key-2", 3))
         .await
         .unwrap_err();
+    assert_eq!(short.code.as_str(), "KF-CAP-002");
 
-    assert_eq!(error.code.as_str(), "KF-CAP-003");
-}
-
-#[tokio::test]
-async fn unknown_outcome_blocks_new_key_across_restart_until_authorized_abandonment() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("abandon.sqlite3");
-    let store = SqliteInvocationStore::open(&path).await.unwrap();
-    let first = reservation("inv-1", "key-1", 100);
-    store.reserve_or_get(first.clone()).await.unwrap();
+    let first = reservation("inv-1", "key-1", "human-7");
     store
-        .transition(
-            &first.invocation_id,
-            InvocationState::Reserved,
-            InvocationState::OutcomeUnknown,
+        .reserve_or_get(first.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+    complete_success(&store, &first.invocation_id, &descriptor).await;
+
+    clock.set(3_699);
+    let retained = store
+        .reserve_or_get(
+            reservation("inv-2", "key-1", "human-7"),
+            &descriptor,
+            Timestamp::new(7_299),
         )
         .await
         .unwrap();
-    drop(store);
-    let reopened = SqliteInvocationStore::open(&path).await.unwrap();
+    assert_eq!(retained.kind(), ReservationKind::Existing);
+    assert_eq!(retained.status().invocation_id().as_str(), "inv-1");
 
+    clock.set(3_700);
+    let replacement = store
+        .reserve_or_get(
+            reservation("inv-3", "key-1", "human-7"),
+            &descriptor,
+            Timestamp::new(7_300),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.kind(), ReservationKind::Reserved);
+    assert_eq!(replacement.status().created_at(), Timestamp::new(3_700));
+
+    clock.set(5_000);
+    let stale_future_deadline = store
+        .reserve_or_get(
+            reservation("inv-4", "key-4", "human-7"),
+            &descriptor,
+            Timestamp::new(6_000),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stale_future_deadline.code.as_str(), "KF-CAP-002");
+}
+
+#[tokio::test]
+async fn unknown_outcome_survives_retention_and_restart_until_authorized_abandonment() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("abandon.sqlite3");
+    let clock = Arc::new(FakeClock::new(1));
+    let store = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
+    let descriptor = descriptor(standard_output_schema(), 1);
+    let first = reservation("inv-1", "key-1", "human-7");
+    store
+        .reserve_or_get(first.clone(), &descriptor, Timestamp::new(2))
+        .await
+        .unwrap();
+    mark_unknown(&store, &first.invocation_id).await;
+    clock.set(3);
+    drop(store);
+
+    let reopened = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
     let error = reopened
-        .reserve_or_get(reservation("inv-2", "key-2", 101))
+        .reserve_or_get(
+            reservation("inv-2", "key-2", "human-7"),
+            &descriptor,
+            Timestamp::new(4),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.code.as_str(), "KF-CAP-003");
@@ -292,72 +238,88 @@ async fn unknown_outcome_blocks_new_key_across_restart_until_authorized_abandonm
         .abandon(
             &first.invocation_id,
             &status_context("human-7"),
-            AbandonmentAuthorization::try_new("audit-authz-9", "operator-3").unwrap(),
+            AbandonmentAuthorization::try_new("audit-abandon-9", "operator-3").unwrap(),
         )
         .await
         .unwrap();
-    let replacement = reopened
-        .reserve_or_get(reservation("inv-2", "key-2", 102))
-        .await
-        .unwrap();
-    assert_eq!(replacement.kind(), ReservationKind::Reserved);
     drop(reopened);
 
-    let reopened = SqliteInvocationStore::open(&path).await.unwrap();
+    let reopened = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
     let status = reopened
         .status(
-            &StatusRequest::new(first.invocation_id, trace_context("c")),
+            &StatusRequest::new(first.invocation_id.clone(), trace_context("c")),
             &status_context("human-7"),
         )
         .await
         .unwrap();
     assert_eq!(
         status.abandonment_authorization_record_id(),
-        Some("audit-authz-9")
+        Some("audit-abandon-9")
     );
     assert_eq!(status.abandoned_by(), Some("operator-3"));
+
+    let replacement = reopened
+        .reserve_or_get(
+            reservation("inv-2", "key-2", "human-7"),
+            &descriptor,
+            Timestamp::new(4),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.kind(), ReservationKind::Reserved);
 }
 
 #[tokio::test]
-async fn safe_terminal_result_error_and_audit_refs_survive_restart() {
+async fn audit_ids_attach_with_transitions_and_safe_terminal_data_survives_restart() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("terminal.sqlite3");
-    let store = SqliteInvocationStore::open(&path).await.unwrap();
-    let mut success = reservation("inv-success", "key-success", 100);
-    success.audit_authorization_record_id = Some("audit-authz-success".to_owned());
-    success.audit_outcome_record_id = Some("audit-outcome-success".to_owned());
-    store.reserve_or_get(success.clone()).await.unwrap();
-    store
-        .transition(
-            &success.invocation_id,
-            InvocationState::Reserved,
-            InvocationState::Pending,
-        )
+    let clock = Arc::new(FakeClock::new(100));
+    let store = SqliteInvocationStore::open_with_clock(&path, clock.clone())
         .await
         .unwrap();
+    let descriptor = descriptor(standard_output_schema(), 3_600);
+    let success = reservation("inv-success", "key-success", "human-7");
+    let reserved = store
+        .reserve_or_get(success.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+    assert_eq!(reserved.status().audit_authorization_record_id(), None);
+    assert_eq!(reserved.status().audit_outcome_record_id(), None);
+
+    clock.set(101);
+    attach_authorization(&store, &success.invocation_id, "audit-authz-success").await;
+    let pending = status(&store, &success.invocation_id, "d").await;
+    assert_eq!(
+        pending.audit_authorization_record_id(),
+        Some("audit-authz-success")
+    );
+    assert_eq!(pending.audit_outcome_record_id(), None);
+
+    clock.set(102);
     store
         .transition(
             &success.invocation_id,
-            InvocationState::Pending,
-            InvocationState::Succeeded {
-                result: serde_json::json!({"caseId": "42"}),
-            },
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::Succeeded {
+                    result: StatusSafeResult::try_new(json!({"caseId": "42"}), &descriptor)
+                        .unwrap(),
+                },
+                TransitionAuditRecord::Outcome("audit-outcome-success".to_owned()),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
 
-    let mut failure = reservation("inv-failure", "key-failure", 101);
-    failure.audit_authorization_record_id = Some("audit-authz-failure".to_owned());
-    failure.audit_outcome_record_id = Some("audit-outcome-failure".to_owned());
-    store.reserve_or_get(failure.clone()).await.unwrap();
+    let failure = reservation("inv-failure", "key-failure", "human-7");
     store
-        .transition(
-            &failure.invocation_id,
-            InvocationState::Reserved,
-            InvocationState::Pending,
-        )
+        .reserve_or_get(failure.clone(), &descriptor, Timestamp::new(3_702))
         .await
         .unwrap();
+    attach_authorization(&store, &failure.invocation_id, "audit-authz-failure").await;
     let stable_error = StableCapabilityError::try_new(
         "CASE_CONFLICT",
         "conflict",
@@ -368,29 +330,27 @@ async fn safe_terminal_result_error_and_audit_refs_survive_restart() {
     store
         .transition(
             &failure.invocation_id,
-            InvocationState::Pending,
-            InvocationState::Failed {
-                error: stable_error.clone(),
-            },
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::Failed {
+                    error: StatusSafeError::try_from_stable(&stable_error).unwrap(),
+                },
+                TransitionAuditRecord::Outcome("audit-outcome-failure".to_owned()),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
     drop(store);
 
-    let reopened = SqliteInvocationStore::open(&path).await.unwrap();
-    let success_status = reopened
-        .status(
-            &StatusRequest::new(success.invocation_id, trace_context("d")),
-            &status_context("human-7"),
-        )
+    let reopened = SqliteInvocationStore::open_with_clock(&path, clock)
         .await
         .unwrap();
-    assert_eq!(
-        success_status.state(),
-        &InvocationState::Succeeded {
-            result: serde_json::json!({"caseId": "42"})
-        }
-    );
+    let success_status = status(&reopened, &success.invocation_id, "e").await;
+    let InvocationState::Succeeded { result } = success_status.state() else {
+        panic!("expected safe succeeded state")
+    };
+    assert_eq!(result.value(), &json!({"caseId": "42"}));
     assert_eq!(
         success_status.audit_authorization_record_id(),
         Some("audit-authz-success")
@@ -399,19 +359,77 @@ async fn safe_terminal_result_error_and_audit_refs_survive_restart() {
         success_status.audit_outcome_record_id(),
         Some("audit-outcome-success")
     );
-    let failure_status = reopened
-        .status(
-            &StatusRequest::new(failure.invocation_id, trace_context("e")),
-            &status_context("human-7"),
-        )
+    let failure_status = status(&reopened, &failure.invocation_id, "f").await;
+    let InvocationState::Failed { error } = failure_status.state() else {
+        panic!("expected safe failed state")
+    };
+    assert_eq!(error.code(), "CASE_CONFLICT");
+    assert_eq!(
+        failure_status.audit_outcome_record_id(),
+        Some("audit-outcome-failure")
+    );
+}
+
+#[tokio::test]
+async fn sensitive_result_and_diagnostic_content_never_reaches_persistence_or_status() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sensitive.sqlite3");
+    let clock = Arc::new(FakeClock::new(100));
+    let store = SqliteInvocationStore::open_with_clock(&path, clock)
         .await
         .unwrap();
-    assert_eq!(
-        failure_status.state(),
-        &InvocationState::Failed {
-            error: stable_error
-        }
+    let sensitive_descriptor = descriptor(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["accessToken"],
+            "properties": {"accessToken": {"type": "string"}}
+        }),
+        3_600,
     );
+    let input = reservation("inv-sensitive", "key-sensitive", "human-7");
+    store
+        .reserve_or_get(input.clone(), &sensitive_descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+    attach_authorization(&store, &input.invocation_id, "audit-authz-sensitive").await;
+
+    assert!(
+        StatusSafeResult::try_new(
+            json!({"accessToken": "Bearer opaque-secret"}),
+            &sensitive_descriptor
+        )
+        .is_err()
+    );
+    let mut diagnostic = Diagnostic::error(
+        DiagnosticCode::InvocationDenied,
+        DiagnosticCategory::Authorization,
+        DiagnosticStage::Invoke,
+        "provider_acl=internal-rule",
+    );
+    diagnostic
+        .details
+        .insert("evidenceBody".to_owned(), json!("opaque-secret"));
+    assert!(StatusSafeError::try_from_diagnostic(&diagnostic).is_err());
+
+    let url = format!("sqlite://{}", path.display());
+    let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+    let row = sqlx::query(
+        "SELECT state_kind, state_json, audit_outcome_record_id
+         FROM invocations WHERE invocation_id = 'inv-sensitive'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state_kind"), "pending");
+    assert!(!row.get::<String, _>("state_json").contains("opaque-secret"));
+    assert_eq!(
+        row.get::<Option<String>, _>("audit_outcome_record_id"),
+        None
+    );
+    let current = status(&store, &input.invocation_id, "1").await;
+    assert_eq!(current.status_state(), StatusState::Pending);
+    assert_eq!(current.audit_outcome_record_id(), None);
 }
 
 #[tokio::test]
@@ -459,8 +477,79 @@ async fn migration_has_no_secret_evidence_or_provider_acl_columns() {
     }
 }
 
-fn reservation(invocation_id: &str, key: &str, now: u64) -> StoredInvocation {
-    StoredInvocation {
+async fn attach_authorization(
+    store: &SqliteInvocationStore,
+    invocation_id: &InvocationId,
+    record_id: &str,
+) {
+    store
+        .transition(
+            invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Reserved,
+                InvocationState::Pending,
+                TransitionAuditRecord::Authorization(record_id.to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn complete_success(
+    store: &SqliteInvocationStore,
+    invocation_id: &InvocationId,
+    descriptor: &CapabilityDescriptor,
+) {
+    attach_authorization(store, invocation_id, "audit-authz-complete").await;
+    store
+        .transition(
+            invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::Succeeded {
+                    result: StatusSafeResult::try_new(json!({"caseId": "42"}), descriptor).unwrap(),
+                },
+                TransitionAuditRecord::Outcome("audit-outcome-complete".to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn mark_unknown(store: &SqliteInvocationStore, invocation_id: &InvocationId) {
+    attach_authorization(store, invocation_id, "audit-authz-unknown").await;
+    store
+        .transition(
+            invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Pending,
+                InvocationState::OutcomeUnknown,
+                TransitionAuditRecord::None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn status(
+    store: &SqliteInvocationStore,
+    invocation_id: &InvocationId,
+    trace_nibble: &str,
+) -> kiteframe_provider::InvocationStatus {
+    store
+        .status(
+            &StatusRequest::new(invocation_id.clone(), trace_context(trace_nibble)),
+            &status_context("human-7"),
+        )
+        .await
+        .unwrap()
+}
+
+fn reservation(invocation_id: &str, key: &str, human: &str) -> InvocationReservationInput {
+    InvocationReservationInput {
         invocation_id: InvocationId::new(invocation_id).unwrap(),
         status_id: format!("status-{invocation_id}"),
         scope: IdempotencyScopeValue::try_new(
@@ -479,20 +568,12 @@ fn reservation(invocation_id: &str, key: &str, now: u64) -> StoredInvocation {
             revision: "1.0.0".to_owned(),
         },
         catalog_digest: digest(3),
-        descriptor_digest: digest(4),
         authority_revision_digest: digest(5),
-        status_context: status_context("human-7"),
+        status_context: status_context(human),
         proposal_digest: digest(6),
         protected_evidence_refs: vec![
             ProtectedEvidenceRequestRef::new("evidence://approval-1").unwrap(),
         ],
-        state: InvocationState::Reserved,
-        audit_authorization_record_id: None,
-        audit_outcome_record_id: None,
-        created_at: Timestamp::new(now),
-        updated_at: Timestamp::new(now),
-        retention_until: Timestamp::new(now + 3600),
-        abandonment: None,
     }
 }
 
@@ -508,6 +589,36 @@ fn status_context(human: &str) -> InvocationStatusContext {
         "session-3",
         "admission-5",
     ])
+}
+
+fn mismatched_contexts() -> Vec<InvocationStatusContext> {
+    (0..9)
+        .map(|index| {
+            let mut values = [
+                "tenant-1",
+                "human-7",
+                "workload-2",
+                "run-9",
+                "actor-7",
+                "agent-2",
+                "task-4",
+                "session-3",
+                "admission-5",
+            ];
+            values[index] = [
+                "tenant-2",
+                "human-8",
+                "workload-3",
+                "run-8",
+                "actor-8",
+                "agent-3",
+                "task-5",
+                "session-4",
+                "admission-6",
+            ][index];
+            context(values)
+        })
+        .collect()
 }
 
 fn context(values: [&str; 9]) -> InvocationStatusContext {
@@ -526,6 +637,47 @@ fn capability() -> CapabilityIdentity {
     .unwrap()
 }
 
+fn descriptor(output_schema: serde_json::Value, retention_seconds: u64) -> CapabilityDescriptor {
+    CapabilityDescriptor::try_new(CapabilityDescriptorParts {
+        identity: capability(),
+        summary: "Update a case".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["caseId"],
+            "properties": {"caseId": {"type": "string"}}
+        }),
+        output_schema,
+        stable_errors: vec![],
+        execution_modes: NonEmptySet::try_new(BTreeSet::from([ExecutionMode::Deferred])).unwrap(),
+        resource_selector_schema: ResourceSelectorSchema::try_new(json!({
+            "type": "string",
+            "pattern": "^case:[A-Za-z0-9-]+$"
+        }))
+        .unwrap(),
+        effect: EffectClassification::ReversibleWrite,
+        idempotency: IdempotencyRequirement::Required {
+            scope: IdempotencyScope::ActorCapabilityResourceOperation,
+            retention_seconds: std::num::NonZeroU64::new(retention_seconds).unwrap(),
+        },
+        freshness: FreshnessRequirement::default(),
+        preconditions: vec![],
+        confirmation: ConfirmationRequirement::None,
+        approval: ApprovalRequirement::None,
+        consent: ConsentRequirement::None,
+    })
+    .unwrap()
+}
+
+fn standard_output_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["caseId"],
+        "properties": {"caseId": {"type": "string"}}
+    })
+}
+
 fn digest(byte: u8) -> Sha256Digest {
     Sha256Digest::from_bytes([byte; 32])
 }
@@ -540,4 +692,22 @@ fn trace_context(parent_nibble: &str) -> TraceContext {
         Default::default(),
     )
     .unwrap()
+}
+
+struct FakeClock(AtomicU64);
+
+impl FakeClock {
+    fn new(now: u64) -> Self {
+        Self(AtomicU64::new(now))
+    }
+
+    fn set(&self, now: u64) {
+        self.0.store(now, Ordering::SeqCst);
+    }
+}
+
+impl InvocationStoreClock for FakeClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::new(self.0.load(Ordering::SeqCst))
+    }
 }
