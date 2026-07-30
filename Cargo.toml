@@ -5,6 +5,7 @@ members = [
     "crates/kiteframe-contract",
     "crates/kiteframe-core",
     "crates/kiteframe-openfga",
+    "crates/kiteframe-audit",
     "crates/kiteframe-provider",
     "crates/kiteframe-provider-sqlite",
     "crates/kiteframe-py",

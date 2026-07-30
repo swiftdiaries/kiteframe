@@ -8,16 +8,22 @@ use kiteframe_contract::{
     ApprovalRequirement, AuthorityRevisionSet, CapabilityGrantSet, CapabilityIdentity,
     ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
     DiagnosticStage, EffectClassification, EffectProposal, EffectiveCapabilityGrant, EvidenceKind,
-    EvidenceRequirement, ExecutionMode, InvocationOutcome, InvocationRequest, LockedCapability,
-    NormalizedResourceSelector, ProtectedEvidenceRequestRef, RetryClass, Sha256Digest, Suspension,
-    Timestamp, resource_selector_is_subset_of,
+    EvidenceRequirement, ExecutionMode, IdempotencyRequirement, InvocationOutcome,
+    InvocationRequest, LockedCapability, NormalizedResourceSelector, ProtectedEvidenceRequestRef,
+    RetryClass, Sha256Digest, Suspension, Timestamp, resource_selector_is_subset_of,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AuthenticatedInvocationContext, AuthorizationDecision, InvocationAuthorizationRequest,
-    InvocationContext, NarrowedAuthorizationConditions, OperationFailure, OperationRegistry,
-    PortableInvocationRefs, Precondition, ProviderPrincipalVerifier, correlate_principals,
+    AuditRecord, AuditSink, AuthenticatedInvocationContext, AuthorizationAuditRecord,
+    AuthorizationDecision, IdempotencyScopeValue, InvocationAuthorizationRequest,
+    InvocationContext, InvocationReservationInput, InvocationState, InvocationStatusContext,
+    InvocationStore, InvocationTransition, NarrowedAuthorizationConditions, OperationFailure,
+    OperationRegistry, OutcomeAuditKind, OutcomeAuditRecord, PortableInvocationRefs, Precondition,
+    PreconditionRef, ProviderPrincipalVerifier, ReservationKind, SpanId, StatusSafeError,
+    StatusSafeResult, TraceId, TransitionAuditRecord, audit::audit_unavailable,
+    correlate_principals,
 };
 
 #[derive(Clone, Debug)]
@@ -286,6 +292,51 @@ impl AdmissionSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EffectAuditDigests {
+    portable_digest: Sha256Digest,
+    lock_digest: Sha256Digest,
+    binding_digest: Sha256Digest,
+    resolved_digest: Sha256Digest,
+}
+
+impl EffectAuditDigests {
+    pub fn new(
+        portable_digest: Sha256Digest,
+        lock_digest: Sha256Digest,
+        binding_digest: Sha256Digest,
+        resolved_digest: Sha256Digest,
+    ) -> Self {
+        Self {
+            portable_digest,
+            lock_digest,
+            binding_digest,
+            resolved_digest,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct EffectEnforcementPlane {
+    store: Arc<dyn InvocationStore>,
+    audit: Arc<dyn AuditSink>,
+    digests: EffectAuditDigests,
+}
+
+impl EffectEnforcementPlane {
+    pub fn new(
+        store: Arc<dyn InvocationStore>,
+        audit: Arc<dyn AuditSink>,
+        digests: EffectAuditDigests,
+    ) -> Self {
+        Self {
+            store,
+            audit,
+            digests,
+        }
+    }
+}
+
 pub struct InvocationService {
     admissions: Arc<dyn InvocationAdmissionStore>,
     principal_verifier: Arc<dyn ProviderPrincipalVerifier>,
@@ -294,6 +345,7 @@ pub struct InvocationService {
     clock: Arc<dyn InvocationClock>,
     checkpoint_issuer: Arc<dyn InvocationCheckpointIssuer>,
     events: Arc<dyn InvocationEventSink>,
+    effect_enforcement: Option<EffectEnforcementPlane>,
     pending: Mutex<BTreeMap<String, SuspensionState>>,
 }
 
@@ -354,12 +406,18 @@ impl InvocationService {
             clock,
             checkpoint_issuer,
             events: Arc::new(NoopEventSink),
+            effect_enforcement: None,
             pending: Mutex::new(BTreeMap::new()),
         })
     }
 
     pub fn with_event_sink(mut self, events: Arc<dyn InvocationEventSink>) -> Self {
         self.events = events;
+        self
+    }
+
+    pub fn with_effect_enforcement(mut self, enforcement: EffectEnforcementPlane) -> Self {
+        self.effect_enforcement = Some(enforcement);
         self
     }
 
@@ -600,9 +658,24 @@ impl InvocationService {
                     "effect invocation reached the pre-execution handoff without deferred mode",
                 ));
             }
-            return Ok(InvocationOutcome::Deferred {
-                invocation_id: request.invocation_id().clone(),
-            });
+            let Some(enforcement) = &self.effect_enforcement else {
+                return Ok(InvocationOutcome::Deferred {
+                    invocation_id: request.invocation_id().clone(),
+                });
+            };
+            return self
+                .execute_effect(
+                    enforcement,
+                    &request,
+                    &admission,
+                    locked,
+                    &current_revisions,
+                    &context,
+                    &proposal,
+                    &decision,
+                    operation.as_ref(),
+                )
+                .await;
         }
 
         self.events.record("execute");
@@ -626,6 +699,232 @@ impl InvocationService {
             }
             Err(OperationFailure::Diagnostic(diagnostic)) => Err(diagnostic),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_effect(
+        &self,
+        enforcement: &EffectEnforcementPlane,
+        request: &InvocationRequest,
+        admission: &InvocationAdmission,
+        locked: &LockedCapability,
+        current_revisions: &AuthorityRevisionSet,
+        context: &InvocationContext,
+        proposal: &EffectProposal,
+        decision: &AuthorizationDecision,
+        operation: &dyn crate::CapabilityOperation,
+    ) -> Result<InvocationOutcome, Diagnostic> {
+        let descriptor = locked.descriptor();
+        let idempotency_key = request.idempotency_key().cloned().ok_or_else(|| {
+            capability_error("effect invocation is missing its required idempotency key")
+        })?;
+        let status_context = InvocationStatusContext::from_authenticated(context.principals())
+            .map_err(capability_error)?;
+        let authority_revision_digest =
+            canonical_audit_digest(b"kiteframe:authority-revisions:v1\0", current_revisions)?;
+        let status_id = format!("status://{}", request.invocation_id().as_str());
+        let retention_until = effect_retention_deadline(descriptor, self.clock.now())?;
+        let protected_evidence_refs = request
+            .evidence_refs()
+            .as_map()
+            .values()
+            .map(|reference| ProtectedEvidenceRequestRef::new(reference.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(capability_error)?;
+        let reservation_input = InvocationReservationInput {
+            invocation_id: request.invocation_id().clone(),
+            status_id: status_id.clone(),
+            scope: IdempotencyScopeValue::try_new(
+                context.principals().actor_ref().clone(),
+                request.capability().clone(),
+                request.selected_resource().clone(),
+                descriptor.identity().name().as_str(),
+            )
+            .map_err(capability_error)?,
+            idempotency_key: idempotency_key.clone(),
+            request_digest: *proposal.proposal_digest(),
+            admission_id: request.admission_id().clone(),
+            grant_digest: *request.grant_digest(),
+            catalog_identity: admission.grant_set().catalog_identity().clone(),
+            catalog_digest: *admission.grant_set().catalog_digest(),
+            authority_revision_digest,
+            status_context,
+            proposal_digest: *proposal.proposal_digest(),
+            protected_evidence_refs,
+        };
+
+        self.events.record("reserve");
+        let reservation = enforcement
+            .store
+            .reserve_or_get(reservation_input, descriptor, retention_until)
+            .await?;
+        if reservation.kind() == ReservationKind::Existing {
+            return existing_invocation_outcome(
+                request.invocation_id().clone(),
+                reservation.status().state(),
+            );
+        }
+
+        let (trace_id, span_id) = trace_ids(request)?;
+        let AuthorizationDecision::Allow { decision_ref, .. } = decision else {
+            return Err(authorization_error(
+                "validated effect authorization is not an allow decision",
+            ));
+        };
+        let precondition_refs = request
+            .preconditions()
+            .keys()
+            .map(|name| PreconditionRef::new(name.clone()).map_err(capability_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let authorization_record = AuthorizationAuditRecord {
+            tenant_ref: context.principals().tenant_ref().clone(),
+            human_principal_ref: context.principals().human_ref().clone(),
+            workload_principal_ref: context.principals().workload_ref().clone(),
+            run_ref: context.principals().run_ref().clone(),
+            actor: context.principals().actor_ref().clone(),
+            agent: context.principals().agent_ref().clone(),
+            task: context.principals().task_ref().clone(),
+            session: context.principals().session_ref().clone(),
+            capability: request.capability().clone(),
+            resource: request.selected_resource().clone(),
+            admission_id: request.admission_id().clone(),
+            grant_digest: *request.grant_digest(),
+            catalog_identity: admission.grant_set().catalog_identity().clone(),
+            catalog_digest: *admission.grant_set().catalog_digest(),
+            descriptor_digest: *locked.descriptor_digest(),
+            authority_revision_digest,
+            decision_reference: decision_ref.clone(),
+            invocation_id: request.invocation_id().clone(),
+            status_id: status_id.clone(),
+            idempotency_key: idempotency_key.clone(),
+            precondition_refs,
+            evidence_refs: request.evidence_refs().clone(),
+            proposal_digest: *proposal.proposal_digest(),
+            portable_digest: enforcement.digests.portable_digest,
+            lock_digest: enforcement.digests.lock_digest,
+            binding_digest: enforcement.digests.binding_digest,
+            resolved_digest: enforcement.digests.resolved_digest,
+            trace_id: trace_id.clone(),
+            span_id: span_id.clone(),
+            intended_effect: descriptor.effect(),
+            timestamp: self.clock.now(),
+        };
+        let authorization_receipt = enforcement
+            .audit
+            .append(AuditRecord::Authorization(authorization_record))
+            .await
+            .map_err(|_| audit_unavailable("durable authorization audit append failed"))?;
+        self.events.record("audit_authorization");
+        enforcement
+            .store
+            .transition(
+                request.invocation_id(),
+                InvocationTransition::try_new(
+                    InvocationState::Reserved,
+                    InvocationState::Pending,
+                    TransitionAuditRecord::Authorization(
+                        authorization_receipt.record_id().to_owned(),
+                    ),
+                )?,
+            )
+            .await?;
+
+        self.events.record("execute");
+        let execution = operation
+            .execute(context, request.arguments().clone())
+            .await;
+        let prepared = prepare_effect_outcome(request.invocation_id(), descriptor, execution);
+        let outcome_record = OutcomeAuditRecord {
+            write_ahead_record_id: authorization_receipt.record_id().to_owned(),
+            outcome: prepared.audit_kind,
+            tenant_ref: context.principals().tenant_ref().clone(),
+            human_principal_ref: context.principals().human_ref().clone(),
+            workload_principal_ref: context.principals().workload_ref().clone(),
+            run_ref: context.principals().run_ref().clone(),
+            actor: context.principals().actor_ref().clone(),
+            agent: context.principals().agent_ref().clone(),
+            task: context.principals().task_ref().clone(),
+            session: context.principals().session_ref().clone(),
+            capability: request.capability().clone(),
+            resource: request.selected_resource().clone(),
+            admission_id: request.admission_id().clone(),
+            grant_digest: *request.grant_digest(),
+            catalog_identity: admission.grant_set().catalog_identity().clone(),
+            catalog_digest: *admission.grant_set().catalog_digest(),
+            descriptor_digest: *locked.descriptor_digest(),
+            authority_revision_digest,
+            invocation_id: request.invocation_id().clone(),
+            status_id,
+            idempotency_key,
+            proposal_digest: *proposal.proposal_digest(),
+            portable_digest: enforcement.digests.portable_digest,
+            lock_digest: enforcement.digests.lock_digest,
+            binding_digest: enforcement.digests.binding_digest,
+            resolved_digest: enforcement.digests.resolved_digest,
+            trace_id,
+            span_id,
+            intended_effect: descriptor.effect(),
+            safe_result: prepared.safe_result.clone(),
+            safe_error: prepared.safe_error.clone(),
+            timestamp: self.clock.now(),
+        };
+        let outcome_receipt = match enforcement
+            .audit
+            .append(AuditRecord::Outcome(outcome_record))
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                let _ = enforcement
+                    .store
+                    .transition(
+                        request.invocation_id(),
+                        InvocationTransition::try_new(
+                            InvocationState::Pending,
+                            InvocationState::OutcomeUnknown,
+                            TransitionAuditRecord::None,
+                        )?,
+                    )
+                    .await;
+                self.events.record("terminal_status");
+                return outcome_unknown(
+                    request.invocation_id().clone(),
+                    "effect outcome audit append failed; query status before retrying",
+                );
+            }
+        };
+        self.events.record("audit_outcome");
+
+        let transition = InvocationTransition::try_new(
+            InvocationState::Pending,
+            prepared.state.clone(),
+            TransitionAuditRecord::Outcome(outcome_receipt.record_id().to_owned()),
+        )?;
+        if enforcement
+            .store
+            .transition(request.invocation_id(), transition)
+            .await
+            .is_err()
+        {
+            let _ = enforcement
+                .store
+                .transition(
+                    request.invocation_id(),
+                    InvocationTransition::try_new(
+                        InvocationState::Pending,
+                        InvocationState::OutcomeUnknown,
+                        TransitionAuditRecord::Outcome(outcome_receipt.record_id().to_owned()),
+                    )?,
+                )
+                .await;
+            self.events.record("terminal_status");
+            return outcome_unknown(
+                request.invocation_id().clone(),
+                "effect status transition failed; query status before retrying",
+            );
+        }
+        self.events.record("terminal_status");
+        prepared.outcome
     }
 
     async fn validate_evidence(
@@ -757,6 +1056,153 @@ impl InvocationService {
 enum EvidenceStatus {
     Complete(Vec<VerifiedEvidence>),
     Missing(EvidenceKind),
+}
+
+struct PreparedEffectOutcome {
+    audit_kind: OutcomeAuditKind,
+    state: InvocationState,
+    safe_result: Option<StatusSafeResult>,
+    safe_error: Option<StatusSafeError>,
+    outcome: Result<InvocationOutcome, Diagnostic>,
+}
+
+fn prepare_effect_outcome(
+    invocation_id: &kiteframe_contract::InvocationId,
+    descriptor: &kiteframe_contract::CapabilityDescriptor,
+    execution: Result<serde_json::Value, OperationFailure>,
+) -> PreparedEffectOutcome {
+    match execution {
+        Ok(result) => match StatusSafeResult::try_new(result.clone(), descriptor) {
+            Ok(safe_result) => PreparedEffectOutcome {
+                audit_kind: OutcomeAuditKind::Completion,
+                state: InvocationState::Succeeded {
+                    result: safe_result.clone(),
+                },
+                safe_result: Some(safe_result),
+                safe_error: None,
+                outcome: Ok(InvocationOutcome::Succeeded {
+                    invocation_id: invocation_id.clone(),
+                    result,
+                }),
+            },
+            Err(_) => prepared_unknown(
+                invocation_id,
+                capability_error("effect result failed its locked output contract"),
+            ),
+        },
+        Err(OperationFailure::Stable(error)) => {
+            if descriptor.validate_stable_error(&error).is_err() {
+                return prepared_unknown(
+                    invocation_id,
+                    capability_error("effect returned an undeclared stable error"),
+                );
+            }
+            match StatusSafeError::try_from_stable(&error) {
+                Ok(safe_error) => PreparedEffectOutcome {
+                    audit_kind: OutcomeAuditKind::Failure,
+                    state: InvocationState::Failed {
+                        error: safe_error.clone(),
+                    },
+                    safe_result: None,
+                    safe_error: Some(safe_error),
+                    outcome: Ok(InvocationOutcome::Failed {
+                        invocation_id: invocation_id.clone(),
+                        error,
+                    }),
+                },
+                Err(_) => prepared_unknown(
+                    invocation_id,
+                    capability_error("effect error could not be projected safely"),
+                ),
+            }
+        }
+        Err(OperationFailure::Diagnostic(diagnostic)) => {
+            prepared_unknown(invocation_id, diagnostic)
+        }
+    }
+}
+
+fn prepared_unknown(
+    invocation_id: &kiteframe_contract::InvocationId,
+    diagnostic: Diagnostic,
+) -> PreparedEffectOutcome {
+    let safe_error = StatusSafeError::try_from_diagnostic(&diagnostic).ok();
+    PreparedEffectOutcome {
+        audit_kind: OutcomeAuditKind::OutcomeUnknown,
+        state: InvocationState::OutcomeUnknown,
+        safe_result: None,
+        safe_error,
+        outcome: outcome_unknown(
+            invocation_id.clone(),
+            "effect outcome is uncertain; query status before retrying",
+        ),
+    }
+}
+
+fn existing_invocation_outcome(
+    invocation_id: kiteframe_contract::InvocationId,
+    state: &InvocationState,
+) -> Result<InvocationOutcome, Diagnostic> {
+    if matches!(state, InvocationState::OutcomeUnknown) {
+        outcome_unknown(
+            invocation_id,
+            "effect outcome is uncertain; query status before retrying",
+        )
+    } else {
+        Ok(InvocationOutcome::Deferred { invocation_id })
+    }
+}
+
+fn outcome_unknown(
+    invocation_id: kiteframe_contract::InvocationId,
+    message: &'static str,
+) -> Result<InvocationOutcome, Diagnostic> {
+    InvocationOutcome::outcome_unknown(invocation_id, Diagnostic::outcome_unknown(message))
+        .map_err(capability_error)
+}
+
+fn effect_retention_deadline(
+    descriptor: &kiteframe_contract::CapabilityDescriptor,
+    now: Timestamp,
+) -> Result<Timestamp, Diagnostic> {
+    let IdempotencyRequirement::Required {
+        retention_seconds, ..
+    } = descriptor.idempotency()
+    else {
+        return Err(capability_error(
+            "effect descriptor has no durable idempotency contract",
+        ));
+    };
+    now.unix_seconds()
+        .checked_add(retention_seconds.get())
+        .map(Timestamp::new)
+        .ok_or_else(|| capability_error("effect retention deadline overflows"))
+}
+
+fn trace_ids(request: &InvocationRequest) -> Result<(TraceId, SpanId), Diagnostic> {
+    let mut fields = request.trace_context().traceparent().split('-');
+    let _version = fields.next();
+    let trace = fields.next().ok_or_else(|| {
+        audit_unavailable("validated invocation trace context omitted its trace ID")
+    })?;
+    let span = fields.next().ok_or_else(|| {
+        audit_unavailable("validated invocation trace context omitted its span ID")
+    })?;
+    let trace_id = TraceId::new(trace).map_err(audit_unavailable)?;
+    let span_id = SpanId::new(span).map_err(audit_unavailable)?;
+    Ok((trace_id, span_id))
+}
+
+fn canonical_audit_digest<T: Serialize>(
+    domain: &[u8],
+    value: &T,
+) -> Result<Sha256Digest, Diagnostic> {
+    let canonical = serde_json_canonicalizer::to_vec(value)
+        .map_err(|_| audit_unavailable("audit correlation value cannot be canonicalized"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(canonical);
+    Ok(Sha256Digest::from_bytes(hasher.finalize().into()))
 }
 
 fn validate_checkpoint_reference(

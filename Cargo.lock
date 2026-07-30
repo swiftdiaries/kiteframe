@@ -1162,6 +1162,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiteframe-audit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "kiteframe-contract",
+ "kiteframe-provider",
+ "serde",
+ "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "kiteframe-cli"
 version = "0.1.0"
 dependencies = [

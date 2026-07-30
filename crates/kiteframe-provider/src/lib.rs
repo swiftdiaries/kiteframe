@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod audit;
 mod authority;
 mod authorization;
 mod invocation;
@@ -12,6 +13,10 @@ pub use admission::{
     AdmissionService, AdmissionServiceConfig, AuthorityDomain, AuthorityPlane, AuthoritySource,
     PersistedAdmission,
 };
+pub use audit::{
+    AuditRecord, AuditSink, AuthorizationAuditRecord, DurableAuditReceipt, OutcomeAuditKind,
+    OutcomeAuditRecord, PreconditionRef, SpanId, TraceId,
+};
 pub use authority::{AuthorityTerm, EffectiveGrantSubset, intersect_authority};
 pub use authorization::{
     AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AuthorizationBackend,
@@ -19,9 +24,10 @@ pub use authorization::{
     NarrowedAuthorizationConditions, SafeDenialReason, require_current_authorization,
 };
 pub use invocation::{
-    InMemoryInvocationAdmissionStore, InvocationAdmission, InvocationAdmissionStore,
-    InvocationCheckpointIssuer, InvocationClock, InvocationEventSink, InvocationEvidenceProvider,
-    InvocationService, ResumeRequest, VerifiedEvidence,
+    EffectAuditDigests, EffectEnforcementPlane, InMemoryInvocationAdmissionStore,
+    InvocationAdmission, InvocationAdmissionStore, InvocationCheckpointIssuer, InvocationClock,
+    InvocationEventSink, InvocationEvidenceProvider, InvocationService, ResumeRequest,
+    VerifiedEvidence,
 };
 pub use operation::{
     CapabilityOperation, InvocationContext, OperationFailure, OperationRegistry, Precondition,
