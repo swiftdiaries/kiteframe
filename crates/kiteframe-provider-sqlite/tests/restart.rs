@@ -325,7 +325,7 @@ async fn audit_ids_attach_with_transitions_and_safe_terminal_data_survives_resta
         "CASE_CONFLICT",
         "conflict",
         RetryClass::AfterRefresh,
-        "case changed",
+        "authorizationHeader: signed opaque material",
     )
     .unwrap();
     store
@@ -365,6 +365,12 @@ async fn audit_ids_attach_with_transitions_and_safe_terminal_data_survives_resta
         panic!("expected safe failed state")
     };
     assert_eq!(error.code(), "CASE_CONFLICT");
+    assert_eq!(error.message(), "capability invocation failed");
+    assert!(
+        !serde_json::to_string(error)
+            .unwrap()
+            .contains("signed opaque material")
+    );
     assert_eq!(
         failure_status.audit_outcome_record_id(),
         Some("audit-outcome-failure")
@@ -507,12 +513,17 @@ async fn sensitive_result_and_diagnostic_content_never_reaches_persistence_or_st
         DiagnosticCode::InvocationDenied,
         DiagnosticCategory::Authorization,
         DiagnosticStage::Invoke,
-        "provider_acl=internal-rule",
+        "sk_live_not-covered-by-the-old-denylist",
     );
-    diagnostic
-        .details
-        .insert("evidenceBody".to_owned(), json!("opaque-secret"));
-    assert!(StatusSafeError::try_from_diagnostic(&diagnostic).is_err());
+    diagnostic.details.insert(
+        "authorizationHeader".to_owned(),
+        json!("signed opaque material"),
+    );
+    let safe_error = StatusSafeError::try_from_diagnostic(&diagnostic).unwrap();
+    assert_eq!(safe_error.message(), "invocation was denied");
+    let error_wire = serde_json::to_string(&safe_error).unwrap();
+    assert!(!error_wire.contains("sk_live"));
+    assert!(!error_wire.contains("signed opaque material"));
     store
         .transition(
             &input.invocation_id,

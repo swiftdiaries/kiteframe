@@ -51,18 +51,37 @@ fn status_safe_result_projects_only_provider_owned_fields() {
 }
 
 #[test]
-fn status_safe_error_rejects_secret_bearing_diagnostics() {
+fn status_safe_error_never_projects_arbitrary_diagnostic_or_stable_messages() {
     let mut diagnostic = Diagnostic::error(
         DiagnosticCode::InvocationDenied,
         DiagnosticCategory::Authorization,
         DiagnosticStage::Invoke,
-        "Bearer opaque-secret",
+        "sk_live_not-covered-by-the-old-denylist",
     );
-    diagnostic
-        .details
-        .insert("evidenceBody".to_owned(), json!({"approval": "secret"}));
+    diagnostic.details.insert(
+        "authorizationHeader".to_owned(),
+        json!("signed opaque material"),
+    );
+    let projected_diagnostic = StatusSafeError::try_from_diagnostic(&diagnostic).unwrap();
+    assert_eq!(projected_diagnostic.message(), "invocation was denied");
+    let diagnostic_wire = serde_json::to_string(&projected_diagnostic).unwrap();
+    assert!(!diagnostic_wire.contains("sk_live"));
+    assert!(!diagnostic_wire.contains("signed opaque material"));
 
-    assert!(StatusSafeError::try_from_diagnostic(&diagnostic).is_err());
+    let stable = kiteframe_contract::StableCapabilityError::try_new(
+        "CASE_CONFLICT",
+        "conflict",
+        kiteframe_contract::RetryClass::AfterRefresh,
+        "authorizationHeader: signed opaque material",
+    )
+    .unwrap();
+    let projected_stable = StatusSafeError::try_from_stable(&stable).unwrap();
+    assert_eq!(projected_stable.message(), "capability invocation failed");
+    assert!(
+        !serde_json::to_string(&projected_stable)
+            .unwrap()
+            .contains("signed opaque material")
+    );
 }
 
 #[tokio::test]

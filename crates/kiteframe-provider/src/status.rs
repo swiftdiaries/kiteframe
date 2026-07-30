@@ -233,24 +233,14 @@ pub struct StatusSafeError {
 
 impl StatusSafeError {
     pub fn try_from_stable(error: &StableCapabilityError) -> Result<Self, String> {
-        Self::try_new(
-            error.code(),
-            error.category(),
-            error.retry(),
-            error.message().as_str(),
-        )
+        Self::try_new(error.code(), error.category(), error.retry())
     }
 
     pub fn try_from_diagnostic(diagnostic: &Diagnostic) -> Result<Self, String> {
-        let wire = serde_json::to_value(diagnostic)
-            .map_err(|_| "diagnostic cannot be projected into status".to_owned())?;
-        let mut nodes = 0_usize;
-        validate_status_json(&wire, 0, &mut nodes)?;
         Self::try_new(
             diagnostic.code.as_str(),
             diagnostic_category_name(diagnostic.category),
             diagnostic.retry,
-            diagnostic.message.as_str(),
         )
     }
 
@@ -258,18 +248,16 @@ impl StatusSafeError {
         code: impl Into<String>,
         category: impl Into<String>,
         retry: RetryClass,
-        message: impl Into<String>,
     ) -> Result<Self, String> {
+        let code = code.into();
+        let category = category.into();
         let value = Self {
-            code: code.into(),
-            category: category.into(),
+            message: canonical_status_error_message(&category).to_owned(),
+            code,
+            category,
             retry,
-            message: message.into(),
         };
-        if value.code.trim().is_empty()
-            || value.category.trim().is_empty()
-            || !safe_status_text(&value.message)
-        {
+        if !safe_status_error_code(&value.code) || !safe_status_error_category(&value.category) {
             return Err("status error projection contains unsafe content".to_owned());
         }
         Ok(value)
@@ -300,7 +288,14 @@ impl<'de> Deserialize<'de> for StatusSafeError {
             message: String,
         }
         let raw = Raw::deserialize(deserializer)?;
-        Self::try_new(raw.code, raw.category, raw.retry, raw.message).map_err(D::Error::custom)
+        let projected =
+            Self::try_new(raw.code, raw.category, raw.retry).map_err(D::Error::custom)?;
+        if projected.message != raw.message {
+            return Err(D::Error::custom(
+                "serialized status error contains a non-canonical message",
+            ));
+        }
+        Ok(projected)
     }
 }
 
@@ -1103,78 +1098,28 @@ fn protected_reference(reference: &str) -> bool {
     })
 }
 
-fn validate_status_json(value: &Value, depth: usize, nodes: &mut usize) -> Result<(), String> {
-    *nodes = nodes.saturating_add(1);
-    if depth > 16 || *nodes > 1024 {
-        return Err("status projection exceeds its structural limit".to_owned());
-    }
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
-        Value::String(value) if safe_status_text(value) => Ok(()),
-        Value::String(_) => Err("status projection contains unsafe text".to_owned()),
-        Value::Array(values) if values.len() <= 256 => {
-            for value in values {
-                validate_status_json(value, depth + 1, nodes)?;
-            }
-            Ok(())
-        }
-        Value::Array(_) => Err("status projection array is too large".to_owned()),
-        Value::Object(values) if values.len() <= 128 => {
-            for (field, value) in values {
-                if sensitive_name(field) {
-                    return Err("status projection contains a sensitive field".to_owned());
-                }
-                validate_status_json(value, depth + 1, nodes)?;
-            }
-            Ok(())
-        }
-        Value::Object(_) => Err("status projection object is too large".to_owned()),
-    }
+fn safe_status_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_uppercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
-fn sensitive_name(value: &str) -> bool {
-    let normalized = value
-        .bytes()
-        .filter(|byte| byte.is_ascii_alphanumeric())
-        .map(|byte| byte.to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let normalized = String::from_utf8(normalized).expect("ASCII normalization is valid UTF-8");
-    [
-        "credential",
-        "password",
-        "secret",
-        "token",
-        "cookie",
-        "claim",
-        "evidence",
-        "provideracl",
-        "aclrule",
-        "legacy",
-    ]
-    .into_iter()
-    .any(|fragment| normalized.contains(fragment))
+fn safe_status_error_category(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
 }
 
-fn safe_status_text(value: &str) -> bool {
-    if value.len() > 4096 || value.bytes().any(|byte| byte.is_ascii_control()) {
-        return false;
+fn canonical_status_error_message(category: &str) -> &'static str {
+    match category {
+        "authorization" => "invocation was denied",
+        "runtime" | "audit" => "invocation status is unavailable",
+        _ => "capability invocation failed",
     }
-    let lower = value.to_ascii_lowercase();
-    ![
-        "bearer ",
-        "basic ",
-        "password=",
-        "secret=",
-        "token=",
-        "cookie=",
-        "credential=",
-        "evidence_body",
-        "provider_acl",
-        "acl_rule",
-        "legacy_field",
-    ]
-    .into_iter()
-    .any(|marker| lower.contains(marker))
 }
 
 const fn diagnostic_category_name(category: DiagnosticCategory) -> &'static str {

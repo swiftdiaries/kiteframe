@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::Barrier;
+
 use async_trait::async_trait;
 use kiteframe_contract::{
     ActorRef, AdmissionId, CapabilityDescriptor, CapabilityIdentity, CapabilityName,
@@ -31,6 +34,8 @@ pub struct SqliteInvocationStore {
     pool: SqlitePool,
     clock: Arc<dyn InvocationStoreClock>,
     last_traceparent: Mutex<Option<String>>,
+    #[cfg(test)]
+    status_read_interlock: Mutex<Option<(Arc<Barrier>, Arc<Barrier>)>>,
 }
 
 impl SqliteInvocationStore {
@@ -58,6 +63,8 @@ impl SqliteInvocationStore {
             pool,
             clock,
             last_traceparent: Mutex::new(None),
+            #[cfg(test)]
+            status_read_interlock: Mutex::new(None),
         })
     }
 
@@ -69,6 +76,27 @@ impl SqliteInvocationStore {
         self.last_traceparent
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(test)]
+    fn install_status_read_interlock(
+        &self,
+        invocation_read: Arc<Barrier>,
+        writer_commit_attempted: Arc<Barrier>,
+    ) {
+        *self
+            .status_read_interlock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((invocation_read, writer_commit_attempted));
+    }
+
+    #[cfg(test)]
+    fn take_status_read_interlock(&self) -> Option<(Arc<Barrier>, Arc<Barrier>)> {
+        self.status_read_interlock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
@@ -194,18 +222,26 @@ impl InvocationStore for SqliteInvocationStore {
         context: &InvocationStatusContext,
     ) -> Result<InvocationStatus, Diagnostic> {
         *self.lock_traceparent() = Some(request.trace_context().traceparent().to_owned());
+        let mut connection = self.pool.acquire().await.map_err(|_| storage_error())?;
+        let mut transaction = connection.begin().await.map_err(|_| storage_error())?;
         let row = sqlx::query("SELECT * FROM invocations WHERE invocation_id = ?")
             .bind(request.invocation_id().as_str())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|_| storage_error())?
             .ok_or_else(status_unavailable)?;
         let mut stored = decode_row(&row)?;
-        stored.audit_links =
-            select_audit_links_from_pool(&self.pool, &stored.invocation_id).await?;
         if &stored.status_context != context {
             return Err(status_unavailable());
         }
+        #[cfg(test)]
+        if let Some((invocation_read, writer_commit_attempted)) = self.take_status_read_interlock()
+        {
+            invocation_read.wait();
+            writer_commit_attempted.wait();
+        }
+        stored.audit_links = select_audit_links(&mut transaction, &stored.invocation_id).await?;
+        transaction.commit().await.map_err(|_| storage_error())?;
         Ok(status_from_existing(&stored))
     }
 
@@ -297,23 +333,6 @@ async fn select_audit_links(
     )
     .bind(invocation_id.as_str())
     .fetch_all(&mut **transaction)
-    .await
-    .map_err(|_| storage_error())?;
-    rows.iter().map(decode_audit_link).collect()
-}
-
-async fn select_audit_links_from_pool(
-    pool: &SqlitePool,
-    invocation_id: &InvocationId,
-) -> Result<Vec<InvocationAuditLink>, Diagnostic> {
-    let rows = sqlx::query(
-        "SELECT kind, record_id, attached_at
-         FROM invocation_audit_links
-         WHERE invocation_id = ?
-         ORDER BY sequence",
-    )
-    .bind(invocation_id.as_str())
-    .fetch_all(pool)
     .await
     .map_err(|_| storage_error())?;
     rows.iter().map(decode_audit_link).collect()
@@ -588,4 +607,183 @@ fn storage_error() -> Diagnostic {
         DiagnosticStage::Runtime,
         "durable invocation storage is unavailable",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use kiteframe_contract::{CatalogIdentity, TraceContext};
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn status_reads_state_and_audit_links_from_one_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status-snapshot.sqlite3");
+        let store = Arc::new(SqliteInvocationStore::open(&path).await.unwrap());
+        let invocation_id = InvocationId::new("inv-snapshot").unwrap();
+        let context = InvocationStatusContext::try_new(
+            "tenant-1",
+            "human-1",
+            "workload-1",
+            "run-1",
+            "actor-1",
+            "agent-1",
+            "task-1",
+            "session-1",
+            "admission-1",
+        )
+        .unwrap();
+        let stored = StoredInvocation {
+            invocation_id: invocation_id.clone(),
+            status_id: "status-snapshot".to_owned(),
+            scope: IdempotencyScopeValue::try_new(
+                ActorRef::new("actor-1").unwrap(),
+                CapabilityIdentity::try_new(
+                    CapabilityName::new("cases.update").unwrap(),
+                    CapabilityReleaseVersion::new("1.0.0").unwrap(),
+                )
+                .unwrap(),
+                NormalizedResourceSelector::new("case:42").unwrap(),
+                "cases.update",
+            )
+            .unwrap(),
+            idempotency_key: IdempotencyKey::new("key-snapshot").unwrap(),
+            request_digest: Sha256Digest::from_bytes([1; 32]),
+            admission_id: AdmissionId::new("admission-1").unwrap(),
+            grant_digest: Sha256Digest::from_bytes([2; 32]),
+            catalog_identity: CatalogIdentity {
+                name: "provider.catalog".to_owned(),
+                revision: "1.0.0".to_owned(),
+            },
+            catalog_digest: Sha256Digest::from_bytes([3; 32]),
+            descriptor_digest: Sha256Digest::from_bytes([4; 32]),
+            authority_revision_digest: Sha256Digest::from_bytes([5; 32]),
+            status_context: context.clone(),
+            proposal_digest: Sha256Digest::from_bytes([6; 32]),
+            protected_evidence_refs: Vec::new(),
+            state: InvocationState::Pending,
+            audit_links: Vec::new(),
+            created_at: Timestamp::new(100),
+            updated_at: Timestamp::new(101),
+            retention_until: Timestamp::new(3_700),
+            abandonment: None,
+        };
+        let mut connection = store.pool.acquire().await.unwrap();
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        insert(&mut transaction, &stored).await.unwrap();
+        sqlx::query(
+            "INSERT INTO invocation_audit_links
+             (invocation_id, sequence, kind, record_id, attached_at)
+             VALUES (?, 1, 'authorization', 'audit-authz-initial', 101)",
+        )
+        .bind(invocation_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        drop(connection);
+
+        let invocation_read = Arc::new(Barrier::new(2));
+        let writer_commit_attempted = Arc::new(Barrier::new(2));
+        store.install_status_read_interlock(
+            invocation_read.clone(),
+            writer_commit_attempted.clone(),
+        );
+
+        let writer_path = path.clone();
+        let writer_invocation_id = invocation_id.clone();
+        let writer = tokio::spawn(async move {
+            invocation_read.wait();
+            let url = format!("sqlite://{}", writer_path.display());
+            let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            sqlx::query("PRAGMA busy_timeout = 0")
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            let committed = write_unknown_outcome(&mut connection, &writer_invocation_id)
+                .await
+                .is_ok();
+            drop(connection);
+            writer_commit_attempted.wait();
+            if !committed {
+                let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+                sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut connection)
+                    .await
+                    .unwrap();
+                write_unknown_outcome(&mut connection, &writer_invocation_id)
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let status_store = store.clone();
+        let status_invocation_id = invocation_id.clone();
+        let status_context = context.clone();
+        let status_task = tokio::spawn(async move {
+            status_store
+                .status(
+                    &StatusRequest::new(status_invocation_id, trace_context()),
+                    &status_context,
+                )
+                .await
+                .unwrap()
+        });
+
+        let snapshot = status_task.await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(snapshot.state(), &InvocationState::Pending);
+        assert_eq!(snapshot.audit_links().len(), 1);
+        assert_eq!(snapshot.audit_links()[0].record_id(), "audit-authz-initial");
+
+        let current = store
+            .status(
+                &StatusRequest::new(invocation_id, trace_context()),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.state(), &InvocationState::OutcomeUnknown);
+        assert_eq!(current.audit_links().len(), 2);
+        assert_eq!(
+            current.audit_links()[1].record_id(),
+            "audit-outcome-unknown"
+        );
+    }
+
+    fn trace_context() -> TraceContext {
+        TraceContext::try_new(
+            "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            None,
+            Default::default(),
+        )
+        .unwrap()
+    }
+
+    async fn write_unknown_outcome(
+        connection: &mut sqlx::SqliteConnection,
+        invocation_id: &InvocationId,
+    ) -> Result<(), sqlx::Error> {
+        let mut transaction = connection.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "UPDATE invocations
+             SET state_kind = 'outcome_unknown', state_json = ?, updated_at = 102
+             WHERE invocation_id = ?",
+        )
+        .bind(encode_state(&InvocationState::OutcomeUnknown).unwrap())
+        .bind(invocation_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO invocation_audit_links
+             (invocation_id, sequence, kind, record_id, attached_at)
+             VALUES (?, 2, 'outcome', 'audit-outcome-unknown', 102)",
+        )
+        .bind(invocation_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await
+    }
 }
