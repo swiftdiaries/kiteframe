@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -952,6 +953,54 @@ async fn concurrent_resume_allows_exactly_one_in_flight_continuation() {
     }
     assert_eq!(succeeded, 1);
     assert_eq!(rejected, 1);
+    assert!(!fixture.events.snapshot().contains(&"execute"));
+}
+
+#[tokio::test]
+async fn dropped_resume_future_restores_pending_checkpoint_for_retry() {
+    let fixture = fixture(FixtureOptions {
+        yield_authorization_check: true,
+        ..FixtureOptions::approval()
+    });
+    let missing = fixture.request(EvidenceReferences::default());
+    let outcome = fixture.service.invoke(missing.clone()).await.unwrap();
+    let InvocationOutcome::Suspended { suspension, .. } = outcome else {
+        panic!("approval-gated effect must suspend")
+    };
+    let proposal = EffectProposal::try_new(&missing, fixture.descriptor()).unwrap();
+    let evidence_ref = ProtectedEvidenceRequestRef::new("evidence://approval/cancelled").unwrap();
+    fixture.evidence.insert(
+        VerifiedEvidence::try_new(
+            evidence_ref.clone(),
+            EvidenceKind::Approval,
+            "approval-token",
+            "approver-cancelled",
+            Some("change-board"),
+            fixture.identity(),
+            selector("case:42"),
+            Timestamp::new(190),
+            Timestamp::new(250),
+            *proposal.proposal_digest(),
+        )
+        .unwrap(),
+    );
+    let resume = ResumeRequest::new(
+        fixture.request(evidence_refs("approval-token", evidence_ref.as_str())),
+        suspension,
+    );
+
+    let mut abandoned = Box::pin(fixture.service.resume(resume.clone()));
+    std::future::poll_fn(|context| match abandoned.as_mut().poll(context) {
+        std::task::Poll::Pending => std::task::Poll::Ready(()),
+        std::task::Poll::Ready(result) => {
+            panic!("resume must yield before it is abandoned: {result:?}")
+        }
+    })
+    .await;
+    drop(abandoned);
+
+    let retried = fixture.service.resume(resume).await.unwrap();
+    assert!(matches!(retried, InvocationOutcome::Deferred { .. }));
     assert!(!fixture.events.snapshot().contains(&"execute"));
 }
 

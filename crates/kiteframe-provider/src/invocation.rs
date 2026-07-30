@@ -297,6 +297,41 @@ pub struct InvocationService {
     pending: Mutex<BTreeMap<String, SuspensionState>>,
 }
 
+struct ResumeLease<'a> {
+    service: &'a InvocationService,
+    checkpoint: String,
+    pending: Option<PendingSuspension>,
+}
+
+impl ResumeLease<'_> {
+    fn pending(&self) -> &PendingSuspension {
+        self.pending
+            .as_ref()
+            .expect("resume lease must own its pending suspension until finalized")
+    }
+
+    fn finish(
+        mut self,
+        outcome: Result<InvocationOutcome, Diagnostic>,
+    ) -> Result<InvocationOutcome, Diagnostic> {
+        let pending = self
+            .pending
+            .take()
+            .expect("resume lease must own its pending suspension until finalized");
+        self.service
+            .finish_resume(&self.checkpoint, pending, outcome)
+    }
+}
+
+impl Drop for ResumeLease<'_> {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.service
+                .restore_cancelled_resume(&self.checkpoint, pending);
+        }
+    }
+}
+
 impl InvocationService {
     pub fn try_new(
         admissions: Arc<dyn InvocationAdmissionStore>,
@@ -337,9 +372,10 @@ impl InvocationService {
 
     pub async fn resume(&self, resume: ResumeRequest) -> Result<InvocationOutcome, Diagnostic> {
         let checkpoint = resume.suspension.checkpoint_ref().as_str().to_owned();
-        let pending = self.begin_resume(&checkpoint, &resume.suspension)?;
+        let lease = self.begin_resume(&checkpoint, &resume.suspension)?;
+        let pending = lease.pending().clone();
         let outcome = self.validate(resume.request, Some(&pending)).await;
-        self.finish_resume(&checkpoint, pending, outcome)
+        lease.finish(outcome)
     }
 
     async fn validate(
@@ -650,7 +686,7 @@ impl InvocationService {
         &self,
         checkpoint: &str,
         suspension: &Suspension,
-    ) -> Result<PendingSuspension, Diagnostic> {
+    ) -> Result<ResumeLease<'_>, Diagnostic> {
         let mut states = self.lock_pending();
         let state = states
             .get_mut(checkpoint)
@@ -664,7 +700,12 @@ impl InvocationService {
                 }
                 let owned = (**pending).clone();
                 *state = SuspensionState::InFlight;
-                Ok(owned)
+                drop(states);
+                Ok(ResumeLease {
+                    service: self,
+                    checkpoint: checkpoint.to_owned(),
+                    pending: Some(owned),
+                })
             }
             SuspensionState::InFlight => Err(authorization_error(
                 "suspension checkpoint already has an in-flight resume",
@@ -694,6 +735,16 @@ impl InvocationService {
             }
         }
         outcome
+    }
+
+    fn restore_cancelled_resume(&self, checkpoint: &str, pending: PendingSuspension) {
+        let mut states = self.lock_pending();
+        if matches!(states.get(checkpoint), Some(SuspensionState::InFlight)) {
+            states.insert(
+                checkpoint.to_owned(),
+                SuspensionState::Pending(Box::new(pending)),
+            );
+        }
     }
 
     fn lock_pending(&self) -> MutexGuard<'_, BTreeMap<String, SuspensionState>> {
