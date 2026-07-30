@@ -330,11 +330,9 @@ impl<'de> Deserialize<'de> for EvidenceReferences {
 pub struct DelegationAncestry(#[schemars(extend("uniqueItems" = true))] Vec<AgentRef>);
 
 impl DelegationAncestry {
-    pub fn try_new(mut agents: Vec<AgentRef>) -> Result<Self, String> {
-        let original = agents.len();
-        agents.sort();
-        agents.dedup();
-        if agents.len() != original {
+    pub fn try_new(agents: Vec<AgentRef>) -> Result<Self, String> {
+        let unique_agents: BTreeSet<_> = agents.iter().collect();
+        if unique_agents.len() != agents.len() {
             return Err("delegation ancestry must not contain duplicate agents".to_owned());
         }
         Ok(Self(agents))

@@ -76,7 +76,7 @@ class ChildAdmissionCorrelation:
             self.request,
         )
         expected_native_ancestry = tuple(
-            sorted({entry.parent_agent for entry in self.ancestry})
+            entry.parent_agent for entry in self.ancestry
         )
         if self.request.delegation_ancestry != expected_native_ancestry:
             raise ValueError("child admission delegation ancestry does not match")

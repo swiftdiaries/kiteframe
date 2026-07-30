@@ -712,6 +712,53 @@ def test_child_invocation_rechecks_bound_native_admission_correlation(
         )
 
 
+def test_three_level_reverse_lexical_ancestry_preserves_native_digest_order(
+    tmp_path: Path,
+) -> None:
+    _parent, child = resolved_parent_and_child(tmp_path)
+    path = ("agent:z-root", "agent:a-parent")
+    request, admission, session = child_admission(
+        child,
+        native_ancestry=path,
+    )
+    reordered_request, reordered_admission, _ = child_admission(
+        child,
+        native_ancestry=tuple(reversed(path)),
+    )
+    correlated = bind_child_admission(
+        session,
+        request,
+        admission,
+        (
+            DelegationAncestryEntry(
+                parent_agent="agent:z-root",
+                child_agent="agent:a-parent",
+                delegated_capabilities=("cases.read",),
+            ),
+            DelegationAncestryEntry(
+                parent_agent="agent:a-parent",
+                child_agent="agent:case-child",
+                delegated_capabilities=("cases.read",),
+            ),
+        ),
+    )
+    invocation = build_native_invocation_request(
+        requirement=child.resolved_agent.capability_requirements[0],
+        grant=correlated.grants[0],
+        grant_digest=correlated.grant_digest,
+        session=correlated,
+        resource=RESOURCE,
+        arguments={},
+        idempotency_key=None,
+    )
+
+    assert request.delegation_ancestry == path
+    assert request.request_digest != reordered_request.request_digest
+    assert admission.grant_digest != reordered_admission.grant_digest
+    assert invocation.admission_id == admission.admission_id
+    assert invocation.grant_digest == admission.grant_digest
+
+
 def test_recursive_compile_builds_real_public_child_before_parent_task_tool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

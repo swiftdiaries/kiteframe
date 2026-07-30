@@ -427,6 +427,38 @@ fn wire_deserialization_cannot_bypass_service_value_invariants() {
 }
 
 #[test]
+fn delegation_ancestry_preserves_path_order_in_the_admission_digest() {
+    let ordered_agents = vec![
+        AgentRef::new("agent:z-root").unwrap(),
+        AgentRef::new("agent:a-parent").unwrap(),
+    ];
+    let ordered_ancestry = DelegationAncestry::try_new(ordered_agents).unwrap();
+    assert_eq!(
+        ordered_ancestry
+            .agents()
+            .iter()
+            .map(AgentRef::as_str)
+            .collect::<Vec<_>>(),
+        vec!["agent:z-root", "agent:a-parent"]
+    );
+
+    let ordered = valid_admission_request_with_ancestry(ordered_ancestry);
+    let reversed = valid_admission_request_with_ancestry(
+        DelegationAncestry::try_new(vec![
+            AgentRef::new("agent:a-parent").unwrap(),
+            AgentRef::new("agent:z-root").unwrap(),
+        ])
+        .unwrap(),
+    );
+
+    assert_ne!(ordered.request_digest(), reversed.request_digest());
+    assert_eq!(
+        serde_json::to_value(ordered).unwrap()["delegationAncestry"],
+        json!(["agent:z-root", "agent:a-parent"])
+    );
+}
+
+#[test]
 fn service_schemas_express_non_bypassable_collection_and_text_invariants() {
     let admission = serde_json::to_value(schemars::schema_for!(AdmissionRequest)).unwrap();
     assert_eq!(
@@ -1096,6 +1128,12 @@ fn valid_traceparent() -> String {
 }
 
 fn valid_admission_request() -> AdmissionRequest {
+    valid_admission_request_with_ancestry(DelegationAncestry::default())
+}
+
+fn valid_admission_request_with_ancestry(
+    delegation_ancestry: DelegationAncestry,
+) -> AdmissionRequest {
     AdmissionRequest::try_new(AdmissionRequestParts {
         actor: ActorRef::new("actor:alice").unwrap(),
         agent: AgentRef::new("agent:case-worker").unwrap(),
@@ -1115,7 +1153,7 @@ fn valid_admission_request() -> AdmissionRequest {
         ],
         optional_capabilities: Vec::new(),
         resolved_requirements: vec![resolved_requirement()],
-        delegation_ancestry: DelegationAncestry::default(),
+        delegation_ancestry,
         contextual_facts: BTreeMap::new(),
         trace_context: TraceContext::try_new(valid_traceparent(), None, BTreeMap::new()).unwrap(),
     })
