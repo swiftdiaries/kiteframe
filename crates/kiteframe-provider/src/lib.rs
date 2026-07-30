@@ -6,6 +6,7 @@ mod authorization;
 mod invocation;
 mod operation;
 mod principal;
+mod status;
 
 pub use admission::{
     AdmissionService, AdmissionServiceConfig, AuthorityDomain, AuthorityPlane, AuthoritySource,
@@ -30,4 +31,9 @@ pub use principal::{
     ProviderPrincipalVerifier, RunRef, TenantRef, VerifiedHumanPrincipal,
     VerifiedProviderPrincipals, VerifiedWorkloadPrincipal, WorkloadPrincipalRef,
     correlate_principals,
+};
+pub use status::{
+    AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore,
+    InvocationReservation, InvocationState, InvocationStatus, InvocationStatusContext,
+    InvocationStore, ReservationKind, StatusState, StoredInvocation,
 };
