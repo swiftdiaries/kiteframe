@@ -15,6 +15,11 @@ from .components import (
     ValidatedComponents,
 )
 from .context import KiteframeSessionContext, KiteframeTraceContext
+from .suspension import (
+    LangGraphSuspensionBridge,
+    SuspensionEnvelope,
+    resume_command,
+)
 
 __all__ = [
     "AuditSink",
@@ -25,8 +30,11 @@ __all__ = [
     "KiteframeSessionContext",
     "KiteframeHarnessProfileToken",
     "KiteframeTraceContext",
+    "LangGraphSuspensionBridge",
+    "SuspensionEnvelope",
     "ValidatedComponents",
     "bootstrap_deepagents_deployment",
     "deny_only_profile",
+    "resume_command",
     "verify_compatibility",
 ]

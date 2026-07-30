@@ -33,6 +33,7 @@ from kiteframe_deepagents.tools import (
     CapabilitySuspensionBridge,
     CapabilityTool,
     IdempotencyCheckpointStore,
+    IdempotencyScope,
     PersistedIdempotencyKey,
     build_capability_tools,
 )
@@ -835,14 +836,17 @@ async def test_effectful_key_is_uuidv7_scoped_and_persisted_before_invoke(
     assert events == [f"persist:{key}", f"invoke:{key}"]
     assert checkpoint_store.records == [
         PersistedIdempotencyKey(
-            actor="actor:alice",
-            capability_name="cases.comment",
-            capability_version="1.0.0",
+            scope=IdempotencyScope(
+                actor="actor:alice",
+                capability_name="cases.comment",
+                capability_version="1.0.0",
+                resource=RESOURCE,
+                semantic_operation="cases.comment",
+                session="session:1",
+                task="task:triage",
+            ),
+            invocation_id=request.invocation_id,
             key=key,
-            resource=RESOURCE,
-            semantic_operation="cases.comment",
-            session="session:1",
-            task="task:triage",
         )
     ]
 

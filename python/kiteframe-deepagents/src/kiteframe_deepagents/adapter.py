@@ -19,6 +19,7 @@ from langgraph.graph.state import CompiledStateGraph
 from .compatibility import verify_compatibility
 from .components import (
     RUNTIME_COMPONENT_UNRESOLVED,
+    DurableCheckpointer,
     ValidatedComponents,
     _construction_error,
     _runtime_error,
@@ -37,9 +38,9 @@ from .middleware import (
     KiteframeGuardMiddleware,
     build_declared_child_task_tool,
 )
+from .suspension import LangGraphSuspensionBridge
 from .target import SUPPORTED_FEATURES, TARGET
 from .tools import (
-    CapabilitySuspensionBridge,
     IdempotencyCheckpointStore,
     PersistedIdempotencyKey,
     build_capability_tools,
@@ -348,10 +349,10 @@ class DeepAgentsAdapter:
                 else _UnavailableCheckpointStore()
             )
             suspension_bridge = (
-                components.checkpointer
+                LangGraphSuspensionBridge()
                 if isinstance(
                     components.checkpointer,
-                    CapabilitySuspensionBridge,
+                    DurableCheckpointer,
                 )
                 else _UnavailableSuspensionBridge()
             )

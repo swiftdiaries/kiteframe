@@ -108,6 +108,50 @@ jobs:
           tests/test_wave5_consumer_gate.py
           tests/conformance/test_crankshaft_profile.py
 
+  wave-4:
+    name: Wave 4 Deep Agents adapter gate
+    runs-on: ubuntu-latest
+    env:
+      PYO3_PYTHON: python
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8
+
+      - name: Build Python native extension
+        working-directory: python/kiteframe
+        run: uv run --project . maturin develop
+
+      - name: Verify Wave 3R native contracts
+        run: >-
+          uv run --project python/kiteframe
+          python scripts/verify_wave3r.py
+
+      - name: Test Deep Agents adapter
+        working-directory: python/kiteframe-deepagents
+        run: uv run --project . pytest -q
+
+      - name: Lint Deep Agents adapter
+        working-directory: python/kiteframe-deepagents
+        run: uv run --project . ruff check src tests
+
+      - name: Type-check Deep Agents adapter
+        working-directory: python/kiteframe-deepagents
+        run: uv run --project . pyright
+
+      - name: Check Deep Agents target metadata drift
+        working-directory: python/kiteframe-deepagents
+        run: >-
+          uv run --project . python -m kiteframe_deepagents.target
+          --check ../../runtime-targets/deepagents-0.6.12.json
+
   fuzz:
     name: Strict YAML invariant and fuzz gates
     runs-on: ubuntu-latest

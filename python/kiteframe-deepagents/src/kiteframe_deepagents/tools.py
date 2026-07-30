@@ -22,10 +22,12 @@ from kiteframe import (
     load_invocation_status_for_request,
 )
 from kiteframe.provider import CapabilityInvoker
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import ArgsSchema, BaseTool, ToolException
 from pydantic import ConfigDict, Field
 
 from .context import KiteframeSessionContext, _snapshot_session_context
+from .suspension import build_resumed_invocation_request
 
 INVALID_PROVIDER_RESULT = "KF-CAP-002: invalid capability provider result"
 PROVIDER_UNAVAILABLE = "KF-CAP-004: capability provider unavailable"
@@ -59,17 +61,54 @@ def _uuid7() -> uuid.UUID:
 
 
 @dataclass(frozen=True, slots=True)
-class PersistedIdempotencyKey:
-    """The durable scope written before an effectful provider call."""
+class IdempotencyScope:
+    """The exact semantic scope used to recover a replayed invocation."""
 
     actor: str
     capability_name: str
     capability_version: str
-    key: str
     resource: str
     semantic_operation: str
     session: str
     task: str
+    checkpoint_task: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PersistedIdempotencyKey:
+    """The durable invocation correlation written before an effectful call."""
+
+    scope: IdempotencyScope
+    invocation_id: str
+    key: str
+
+    @property
+    def actor(self) -> str:
+        return self.scope.actor
+
+    @property
+    def capability_name(self) -> str:
+        return self.scope.capability_name
+
+    @property
+    def capability_version(self) -> str:
+        return self.scope.capability_version
+
+    @property
+    def resource(self) -> str:
+        return self.scope.resource
+
+    @property
+    def semantic_operation(self) -> str:
+        return self.scope.semantic_operation
+
+    @property
+    def session(self) -> str:
+        return self.scope.session
+
+    @property
+    def task(self) -> str:
+        return self.scope.task
 
 
 @runtime_checkable
@@ -83,6 +122,19 @@ class IdempotencyCheckpointStore(Protocol):
 
 
 @runtime_checkable
+class RestartableIdempotencyCheckpointStore(
+    IdempotencyCheckpointStore,
+    Protocol,
+):
+    """Durable lookup required to replay the same suspended invocation."""
+
+    async def load_idempotency_key(
+        self,
+        scope: IdempotencyScope,
+    ) -> PersistedIdempotencyKey | None: ...
+
+
+@runtime_checkable
 class CapabilitySuspensionBridge(Protocol):
     """Bridge from a validated native suspension to runtime interruption."""
 
@@ -90,7 +142,7 @@ class CapabilitySuspensionBridge(Protocol):
         self,
         request: InvocationRequest,
         outcome: InvocationOutcome,
-    ) -> NoReturn: ...
+    ) -> str: ...
 
 
 class _FrozenDict(dict[str, Any]):
@@ -189,6 +241,7 @@ def build_native_invocation_request(
     resource: str,
     arguments: dict[str, Any],
     idempotency_key: str | None,
+    invocation_id: str | None = None,
 ) -> InvocationRequest:
     """Build one immutable native request from closed Wave 3R inputs."""
 
@@ -222,7 +275,11 @@ def build_native_invocation_request(
 
     trace = _trace_context_wire(session)
     return build_invocation_request_for_requirement(
-        invocation_id=f"invocation:{_uuid7()}",
+        invocation_id=(
+            invocation_id
+            if invocation_id is not None
+            else f"invocation:{_uuid7()}"
+        ),
         admission_id=session.admission_id,
         grant_digest=grant_digest,
         requirement=requirement,
@@ -320,25 +377,79 @@ class CapabilityTool(BaseTool):
             return None
         return str(_uuid7())
 
+    @staticmethod
+    def _checkpoint_task(config: RunnableConfig) -> str | None:
+        configurable = config.get("configurable", {})
+        metadata = config.get("metadata", {})
+        thread_id = configurable.get("thread_id")
+        checkpoint_ns = configurable.get("checkpoint_ns")
+        if checkpoint_ns is None and metadata is not None:
+            checkpoint_ns = metadata.get("checkpoint_ns")
+        if (
+            type(thread_id) is not str
+            or not thread_id
+            or type(checkpoint_ns) is not str
+            or not checkpoint_ns
+        ):
+            return None
+        return f"{thread_id}\0{checkpoint_ns}"
+
+    def _idempotency_scope(
+        self,
+        resource: str,
+        config: RunnableConfig,
+    ) -> IdempotencyScope:
+        return IdempotencyScope(
+            actor=self.session.actor,
+            capability_name=self.requirement.name,
+            capability_version=self.requirement.version,
+            resource=resource,
+            semantic_operation=self.requirement.name,
+            session=self.session.session,
+            task=self.session.task,
+            checkpoint_task=self._checkpoint_task(config),
+        )
+
+    async def _invocation_correlation(
+        self,
+        resource: str,
+        config: RunnableConfig,
+    ) -> PersistedIdempotencyKey | None:
+        key = self._new_idempotency_key()
+        if key is None:
+            return None
+        scope = self._idempotency_scope(resource, config)
+        store = self.checkpoint_store
+        if (
+            scope.checkpoint_task is not None
+            and isinstance(store, RestartableIdempotencyCheckpointStore)
+        ):
+            existing = await store.load_idempotency_key(scope)
+            if existing is not None:
+                if (
+                    type(existing) is not PersistedIdempotencyKey
+                    or existing.scope != scope
+                    or type(existing.invocation_id) is not str
+                    or not existing.invocation_id
+                    or type(existing.key) is not str
+                    or not existing.key
+                ):
+                    raise TypeError(
+                        "persisted idempotency correlation is invalid"
+                    )
+                return existing
+        return PersistedIdempotencyKey(
+            scope=scope,
+            invocation_id=f"invocation:{_uuid7()}",
+            key=key,
+        )
+
     async def _persist_idempotency_key(
         self,
-        key: str | None,
-        resource: str,
+        record: PersistedIdempotencyKey | None,
     ) -> None:
-        if key is None:
-            return
-        await self.checkpoint_store.persist_idempotency_key(
-            PersistedIdempotencyKey(
-                actor=self.session.actor,
-                capability_name=self.requirement.name,
-                capability_version=self.requirement.version,
-                key=key,
-                resource=resource,
-                semantic_operation=self.requirement.name,
-                session=self.session.session,
-                task=self.session.task,
-            )
-        )
+        if record is not None:
+            await self.checkpoint_store.persist_idempotency_key(record)
 
     @staticmethod
     def _stable_failure(outcome: InvocationOutcome | InvocationStatus) -> str:
@@ -409,9 +520,31 @@ class CapabilityTool(BaseTool):
         self,
         invocation: InvocationRequest,
         outcome: InvocationOutcome,
-    ) -> NoReturn:
-        await self.suspension_bridge.suspend(invocation, outcome)
-        raise ToolException(SUSPENSION_DID_NOT_INTERRUPT)
+    ) -> Any:
+        evidence_ref = await self.suspension_bridge.suspend(
+            invocation,
+            outcome,
+        )
+        if type(evidence_ref) is not str:
+            raise ToolException(SUSPENSION_DID_NOT_INTERRUPT)
+        try:
+            resumed = build_resumed_invocation_request(
+                request=invocation,
+                outcome=outcome,
+                requirement=self.requirement,
+                session=self.session,
+                evidence_ref=evidence_ref,
+            )
+        except Exception:
+            raise ToolException(INVALID_PROVIDER_RESULT) from None
+        try:
+            resumed_outcome = await self.invoker.invoke(resumed)
+        except Exception:
+            raise ToolException(PROVIDER_UNAVAILABLE) from None
+        return await self._resolve_outcome(
+            resumed,
+            self._validated_outcome(resumed, resumed_outcome),
+        )
 
     async def _resolve_status(
         self,
@@ -429,7 +562,7 @@ class CapabilityTool(BaseTool):
             }
         if status.status == "suspended":
             outcome = load_invocation_outcome(status.canonical_json())
-            await self._suspend(invocation, outcome)
+            return await self._suspend(invocation, outcome)
         raise ToolException(INVALID_PROVIDER_RESULT)
 
     async def _resolve_outcome(
@@ -442,15 +575,24 @@ class CapabilityTool(BaseTool):
         if outcome.status in {"failed", "denied"}:
             raise ToolException(self._stable_failure(outcome))
         if outcome.status == "suspended":
-            await self._suspend(request, outcome)
+            return await self._suspend(request, outcome)
         if outcome.status in {"deferred", "outcome_unknown"}:
             status = await self._status(request)
             return await self._resolve_status(request, status)
         raise ToolException(INVALID_PROVIDER_RESULT)
 
-    async def _arun(self, **arguments: Any) -> Any:
+    async def _arun(
+        self,
+        config: RunnableConfig,
+        **arguments: Any,
+    ) -> Any:
         resource = self._select_resource(arguments.pop("_resource", None))
-        idempotency_key = self._new_idempotency_key()
+        try:
+            correlation = await self._invocation_correlation(resource, config)
+        except Exception:
+            raise ToolException(
+                "KF-CAP-002: invalid capability invocation"
+            ) from None
         try:
             request = build_native_invocation_request(
                 requirement=self.requirement,
@@ -459,13 +601,20 @@ class CapabilityTool(BaseTool):
                 session=self.session,
                 resource=resource,
                 arguments=arguments,
-                idempotency_key=idempotency_key,
+                idempotency_key=(
+                    correlation.key if correlation is not None else None
+                ),
+                invocation_id=(
+                    correlation.invocation_id
+                    if correlation is not None
+                    else None
+                ),
             )
         except Exception:
             raise ToolException(
                 "KF-CAP-002: invalid capability invocation"
             ) from None
-        await self._persist_idempotency_key(idempotency_key, resource)
+        await self._persist_idempotency_key(correlation)
         try:
             outcome = await self.invoker.invoke(request)
         except Exception:
@@ -573,8 +722,10 @@ def build_capability_tools(
 __all__ = [
     "CapabilitySuspensionBridge",
     "CapabilityTool",
+    "IdempotencyScope",
     "IdempotencyCheckpointStore",
     "PersistedIdempotencyKey",
+    "RestartableIdempotencyCheckpointStore",
     "build_capability_tools",
     "build_native_invocation_request",
 ]
