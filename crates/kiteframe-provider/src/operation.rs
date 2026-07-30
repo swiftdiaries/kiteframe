@@ -211,6 +211,28 @@ impl OperationRegistry {
         self.authorization_backend.is_some()
     }
 
+    pub(crate) fn resolve(
+        &self,
+        identity: &CapabilityIdentity,
+    ) -> Result<Arc<dyn CapabilityOperation>, Diagnostic> {
+        if self.authorization_backend.is_none() {
+            return Err(runtime_error(
+                "operation registry must be frozen before invocation",
+            ));
+        }
+        self.operations.get(identity).cloned().ok_or_else(|| {
+            runtime_error("no trusted operation is registered for the exact capability identity")
+        })
+    }
+
+    pub(crate) fn authorization_backend(
+        &self,
+    ) -> Result<Arc<dyn AuthorizationBackend>, Diagnostic> {
+        self.authorization_backend
+            .clone()
+            .ok_or_else(|| runtime_error("operation registry must be frozen before invocation"))
+    }
+
     pub async fn execute(
         &self,
         context: &InvocationContext,

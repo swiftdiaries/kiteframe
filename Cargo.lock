@@ -1039,9 +1039,12 @@ name = "kiteframe-provider"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "jsonschema",
  "kiteframe-contract",
  "proptest",
  "serde_json",
+ "serde_json_canonicalizer",
+ "sha2",
  "tokio",
 ]
 
