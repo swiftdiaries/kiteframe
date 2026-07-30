@@ -1,0 +1,422 @@
+use std::collections::BTreeSet;
+
+use kiteframe_contract::{
+    ActorRef, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
+    AuthorityRevision, CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
+    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
+    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, ExecutionMode, FreshnessRequirement,
+    IdempotencyRequirement, LockedCapability, NonEmptySet, NormalizedResourceSelector,
+    PolicyRevision, RequestedCapability, RequiredEvidence, ResolvedCapabilityRequirement,
+    ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+};
+use kiteframe_provider::{
+    AdmissionService, AdmissionServiceConfig, AuthoritySource, AuthorityTerm,
+};
+use serde_json::json;
+
+#[tokio::test]
+async fn admission_proves_catalog_and_all_required_capabilities() {
+    let service = service();
+    let request = admission_request(authoritative_catalog().identity().clone(), None);
+    let result = service.admit(request).await.unwrap();
+
+    assert_eq!(
+        result.catalog_identity(),
+        authoritative_catalog().identity()
+    );
+    assert_eq!(
+        result.catalog_digest(),
+        authoritative_catalog().catalog_digest()
+    );
+    assert_eq!(result.grants().len(), 2);
+    assert_eq!(result.optional_denials().len(), 1);
+    assert_eq!(
+        result.optional_denials()[0].diagnostic().code.as_str(),
+        "KF-AUTH-001"
+    );
+    assert_eq!(
+        result.authority_revisions().entries(),
+        [
+            revision("deployment-policy", "deploy-7"),
+            revision("openfga-model", "model-3"),
+            revision("tenant-policy", "tenant-42"),
+        ]
+    );
+    assert_eq!(
+        result.authority_revisions().authority_revision_digest(),
+        service.authority_revisions().authority_revision_digest()
+    );
+
+    let persisted = service
+        .load_admission(result.admission_id(), result.grant_digest())
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted.locked_capability(&identity("cases.read")),
+        authoritative_registry()
+            .iter()
+            .find(|locked| locked.identity() == &identity("cases.read"))
+    );
+    assert_eq!(
+        persisted.locked_capabilities().len(),
+        3,
+        "every provider-validated request lock is persisted, including optional denials"
+    );
+}
+
+#[tokio::test]
+async fn client_lock_drift_from_provider_registry_fails_closed() {
+    let request = admission_request(
+        authoritative_catalog().identity().clone(),
+        Some(tampered_lock()),
+    );
+    let error = service().admit(request).await.unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-CAP-001");
+}
+
+#[tokio::test]
+async fn catalog_identity_or_digest_drift_fails_before_authority_evaluation() {
+    let wrong_identity = CatalogIdentity {
+        name: "different-catalog".to_owned(),
+        revision: "catalog-7".to_owned(),
+    };
+    let identity_error = service()
+        .admit(admission_request(wrong_identity, None))
+        .await
+        .unwrap_err();
+    assert_eq!(identity_error.code.as_str(), "KF-CAT-001");
+
+    let digest_error = service()
+        .admit(admission_request_with_catalog_digest(digest(99)))
+        .await
+        .unwrap_err();
+    assert_eq!(digest_error.code.as_str(), "KF-CAT-001");
+}
+
+#[tokio::test]
+async fn missing_required_authority_fails_the_whole_admission() {
+    let mut sources = authority_sources();
+    sources[0] = AuthoritySource::try_new(
+        "tenant-policy",
+        "tenant-42",
+        allow_terms_for(&["cases.read"]),
+    )
+    .unwrap();
+    let service = AdmissionService::try_new(
+        authoritative_catalog(),
+        authoritative_registry(),
+        sources,
+        service_config(),
+    )
+    .unwrap();
+
+    let error = service
+        .admit(admission_request(
+            authoritative_catalog().identity().clone(),
+            None,
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-AUTH-001");
+}
+
+#[tokio::test]
+async fn optional_authority_miss_is_safe_stable_and_creates_no_grant() {
+    let result = service()
+        .admit(admission_request(
+            authoritative_catalog().identity().clone(),
+            None,
+        ))
+        .await
+        .unwrap();
+    let denied = identity("cases.delete");
+
+    assert!(
+        result
+            .grants()
+            .iter()
+            .all(|grant| grant.capability() != &denied)
+    );
+    let diagnostic = result.optional_denials()[0].diagnostic();
+    assert_eq!(diagnostic.code.as_str(), "KF-AUTH-001");
+    assert_eq!(
+        diagnostic.message.as_str(),
+        "optional capability was not admitted"
+    );
+    assert!(diagnostic.details.is_empty());
+}
+
+#[tokio::test]
+async fn revision_source_order_does_not_change_the_canonical_grant_digest() {
+    let request = admission_request(authoritative_catalog().identity().clone(), None);
+    let first = service().admit(request.clone()).await.unwrap();
+    let mut reversed = authority_sources();
+    reversed.reverse();
+    let second_service = AdmissionService::try_new(
+        authoritative_catalog(),
+        authoritative_registry(),
+        reversed,
+        service_config(),
+    )
+    .unwrap();
+    let second = second_service.admit(request).await.unwrap();
+
+    assert_eq!(first.authority_revisions(), second.authority_revisions());
+    assert_eq!(first.grant_digest(), second.grant_digest());
+}
+
+fn service() -> AdmissionService {
+    AdmissionService::try_new(
+        authoritative_catalog(),
+        authoritative_registry(),
+        authority_sources(),
+        service_config(),
+    )
+    .unwrap()
+}
+
+fn service_config() -> AdmissionServiceConfig {
+    AdmissionServiceConfig {
+        issued_at: Timestamp::new(1_000),
+        expires_at: Timestamp::new(8_000),
+        policy_revision: PolicyRevision::new("policy-9").unwrap(),
+    }
+}
+
+fn authority_sources() -> Vec<AuthoritySource> {
+    vec![
+        AuthoritySource::try_new(
+            "tenant-policy",
+            "tenant-42",
+            allow_terms_for(&["cases.read", "cases.write"]),
+        )
+        .unwrap(),
+        AuthoritySource::try_new(
+            "deployment-policy",
+            "deploy-7",
+            allow_terms_for(&["cases.read", "cases.write"]),
+        )
+        .unwrap(),
+        AuthoritySource::try_new(
+            "openfga-model",
+            "model-3",
+            allow_terms_for(&["cases.read", "cases.write"]),
+        )
+        .unwrap(),
+    ]
+}
+
+fn allow_terms_for(names: &[&str]) -> Vec<AuthorityTerm> {
+    names
+        .iter()
+        .map(|name| {
+            AuthorityTerm::allow(grant(
+                name,
+                if *name == "cases.read" {
+                    "tenant:t1/case:case-7"
+                } else {
+                    "tenant:t1/case:case-9"
+                },
+            ))
+        })
+        .collect()
+}
+
+fn admission_request(
+    catalog_identity: CatalogIdentity,
+    replacement_lock: Option<LockedCapability>,
+) -> AdmissionRequest {
+    let catalog_digest = *authoritative_catalog().catalog_digest();
+    admission_request_with(catalog_identity, catalog_digest, replacement_lock)
+}
+
+fn admission_request_with_catalog_digest(catalog_digest: Sha256Digest) -> AdmissionRequest {
+    admission_request_with(
+        authoritative_catalog().identity().clone(),
+        catalog_digest,
+        None,
+    )
+}
+
+fn admission_request_with(
+    catalog_identity: CatalogIdentity,
+    catalog_digest: Sha256Digest,
+    replacement_lock: Option<LockedCapability>,
+) -> AdmissionRequest {
+    let mut locks = authoritative_registry();
+    if let Some(replacement) = replacement_lock {
+        let position = locks
+            .iter()
+            .position(|lock| lock.identity() == replacement.identity())
+            .unwrap();
+        locks[position] = replacement;
+    }
+    let resolved_requirements = locks
+        .into_iter()
+        .map(|lock| {
+            let name = lock.identity().name().as_str().to_owned();
+            let resource = if name == "cases.read" {
+                "tenant:t1/case:*"
+            } else {
+                "tenant:t1/case:case-9"
+            };
+            ResolvedCapabilityRequirement::try_new(
+                lock,
+                name != "cases.delete",
+                vec![resource.to_owned()],
+            )
+            .unwrap()
+        })
+        .collect();
+
+    AdmissionRequest::try_new(AdmissionRequestParts {
+        actor: ActorRef::new("actor-1").unwrap(),
+        agent: AgentRef::new("agent-1").unwrap(),
+        task: TaskRef::new("task-1").unwrap(),
+        session: SessionRef::new("session-1").unwrap(),
+        portable_digest: digest(11),
+        lock_digest: digest(12),
+        resolved_digest: digest(13),
+        catalog_identity,
+        catalog_digest,
+        required_capabilities: vec![
+            requested("cases.read", "tenant:t1/case:case-7"),
+            requested("cases.write", "tenant:t1/case:case-9"),
+        ],
+        optional_capabilities: vec![requested("cases.delete", "tenant:t1/case:case-9")],
+        resolved_requirements,
+        delegation_ancestry: DelegationAncestry::try_new(vec![]).unwrap(),
+        contextual_facts: Default::default(),
+        trace_context: TraceContext::try_new(
+            "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+            None,
+            Default::default(),
+        )
+        .unwrap(),
+    })
+    .unwrap()
+}
+
+fn authoritative_catalog() -> CapabilityCatalog {
+    CapabilityCatalog::try_new(
+        CatalogIdentity {
+            name: "test-catalog".to_owned(),
+            revision: "catalog-7".to_owned(),
+        },
+        Timestamp::new(100),
+        Some(Timestamp::new(10_000)),
+        ["cases.read", "cases.write", "cases.delete"]
+            .into_iter()
+            .map(descriptor)
+            .collect(),
+    )
+    .unwrap()
+}
+
+fn authoritative_registry() -> Vec<LockedCapability> {
+    ["cases.read", "cases.write", "cases.delete"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| locked(descriptor(name), index as u8 + 1))
+        .collect()
+}
+
+fn tampered_lock() -> LockedCapability {
+    let mut descriptor = descriptor("cases.read");
+    let serialized = serde_json::to_value(&descriptor).unwrap();
+    let mut parts = descriptor_parts("cases.read");
+    parts.summary = "Tampered client descriptor".to_owned();
+    descriptor = CapabilityDescriptor::try_new(parts).unwrap();
+    assert_ne!(
+        serialized,
+        serde_json::to_value(&descriptor).unwrap(),
+        "fixture must alter the embedded locked descriptor"
+    );
+    locked(descriptor, 1)
+}
+
+fn locked(descriptor: CapabilityDescriptor, salt: u8) -> LockedCapability {
+    LockedCapability::try_new(
+        descriptor.identity().clone(),
+        descriptor.clone(),
+        *descriptor.descriptor_digest(),
+        digest(salt + 20),
+        digest(salt + 30),
+        digest(salt + 40),
+        digest(salt + 50),
+    )
+    .unwrap()
+}
+
+fn descriptor(name: &str) -> CapabilityDescriptor {
+    CapabilityDescriptor::try_new(descriptor_parts(name)).unwrap()
+}
+
+fn descriptor_parts(name: &str) -> CapabilityDescriptorParts {
+    CapabilityDescriptorParts {
+        identity: identity(name),
+        summary: format!("Capability {name}"),
+        input_schema: json!({"type": "object"}),
+        output_schema: json!({"type": "object"}),
+        stable_errors: vec![],
+        execution_modes: modes(&[ExecutionMode::Immediate]),
+        resource_selector_schema: ResourceSelectorSchema::try_new(json!({"type": "string"}))
+            .unwrap(),
+        effect: EffectClassification::ReadOnly,
+        idempotency: IdempotencyRequirement::None,
+        freshness: FreshnessRequirement::default(),
+        preconditions: vec![],
+        confirmation: ConfirmationRequirement::None,
+        approval: ApprovalRequirement::None,
+        consent: ConsentRequirement::None,
+    }
+}
+
+fn requested(name: &str, resource: &str) -> RequestedCapability {
+    RequestedCapability::try_new(identity(name), vec![selector(resource)]).unwrap()
+}
+
+fn grant(name: &str, resource: &str) -> EffectiveCapabilityGrant {
+    EffectiveCapabilityGrant::try_new(EffectiveCapabilityGrantParts {
+        capability: identity(name),
+        resources: vec![selector(resource)],
+        execution_modes: modes(&[ExecutionMode::Immediate]),
+        maximum_effect: EffectClassification::ReadOnly,
+        expires_at: Timestamp::new(7_200),
+        required_evidence: RequiredEvidence::new(
+            ConfirmationRequirement::None,
+            ApprovalRequirement::None,
+            ConsentRequirement::None,
+        ),
+        freshness: FreshnessRequirement::default(),
+        preconditions: vec![],
+    })
+    .unwrap()
+}
+
+fn identity(name: &str) -> CapabilityIdentity {
+    CapabilityIdentity::try_new(
+        CapabilityName::new(name).unwrap(),
+        CapabilityReleaseVersion::new("1.0.0").unwrap(),
+    )
+    .unwrap()
+}
+
+fn modes(values: &[ExecutionMode]) -> NonEmptySet<ExecutionMode> {
+    NonEmptySet::try_new(BTreeSet::from_iter(values.iter().copied())).unwrap()
+}
+
+fn selector(value: &str) -> NormalizedResourceSelector {
+    NormalizedResourceSelector::new(value).unwrap()
+}
+
+fn revision(source: &str, value: &str) -> AuthorityRevision {
+    AuthorityRevision::try_new(source, value).unwrap()
+}
+
+fn digest(byte: u8) -> Sha256Digest {
+    Sha256Digest::from_bytes([byte; 32])
+}

@@ -1,0 +1,16 @@
+[package]
+name = "kiteframe-provider"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+kiteframe-contract = { path = "../kiteframe-contract" }
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+serde_json.workspace = true
+tokio = { version = "1", features = ["macros", "rt"] }

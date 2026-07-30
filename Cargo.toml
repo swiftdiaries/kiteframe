@@ -4,6 +4,7 @@ members = [
     "crates/kiteframe-cli",
     "crates/kiteframe-contract",
     "crates/kiteframe-core",
+    "crates/kiteframe-provider",
     "crates/kiteframe-py",
     "crates/kiteframe-resolver",
     "crates/kiteframe-schema",
