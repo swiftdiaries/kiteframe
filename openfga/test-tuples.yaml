@@ -1,0 +1,30 @@
+name: kiteframe-agent-task-session-authorization
+model_file: authorization-model.fga
+
+tuples:
+  - user: actor:human-1
+    relation: actor
+    object: task:task-1
+  - user: task:task-1
+    relation: assigned_task
+    object: agent:agent-1
+  - user: task:task-1
+    relation: task
+    object: session:session-1
+  - user: actor:human-1
+    relation: allowed_actor
+    object: capability:cases.read@1.0.0
+  - user: agent:agent-1#assigned_task
+    relation: allowed_task
+    object: capability:cases.read@1.0.0
+  - user: capability:cases.read@1.0.0
+    relation: capability
+    object: resource:tenant-t1-case-7
+
+tests:
+  - name: type-distinct actor and task relations fail closed
+    check:
+      - user: actor:human-1
+        object: resource:tenant-t1-case-7
+        assertions:
+          can_invoke: false

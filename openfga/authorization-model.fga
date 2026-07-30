@@ -1,0 +1,27 @@
+model
+  schema 1.1
+
+type actor
+
+type task
+  relations
+    define actor: [actor]
+
+type agent
+  relations
+    define assigned_task: [task]
+
+type session
+  relations
+    define task: [task]
+
+type capability
+  relations
+    define allowed_actor: [actor]
+    define allowed_task: [task, session#task, agent#assigned_task]
+    define can_invoke: allowed_actor and allowed_task
+
+type resource
+  relations
+    define capability: [capability]
+    define can_invoke: can_invoke from capability
