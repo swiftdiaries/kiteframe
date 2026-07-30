@@ -24,6 +24,7 @@ from kiteframe import (
     InvocationStatus,
     ResolvedCapabilityRequirement,
     StatusRequest,
+    delegation_ancestry_digest,
     load_capability_grant_set,
     load_invocation_outcome,
     load_resolved_agent,
@@ -397,6 +398,7 @@ def grant_and_session(
         "session": "session:1",
         "task": "task:triage",
     }
+    values["delegationAncestryDigest"] = delegation_ancestry_digest([])
     values["grantDigest"] = canonical_digest(
         b"kiteframe:capability-grant-set:v1\0",
         values,
@@ -408,6 +410,7 @@ def grant_and_session(
         task=grant_set.task,
         admission_id=grant_set.admission_id,
         grant_digest=grant_set.grant_digest,
+        delegation_ancestry_digest=grant_set.delegation_ancestry_digest,
         grants=grant_set.grants,
         authority_revisions=grant_set.authority_revisions,
         trace_context=KiteframeTraceContext(
@@ -436,6 +439,7 @@ def proposal_digest(
                 "name": request.capability_name,
                 "version": request.capability_version,
             },
+            "delegationAncestryDigest": request.delegation_ancestry_digest,
             "effect": effect,
             "grantDigest": request.grant_digest,
             "idempotencyKey": request.idempotency_key,

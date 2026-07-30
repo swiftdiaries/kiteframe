@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,10 +13,13 @@ from deepagents import CompiledSubAgent, create_deep_agent
 from kiteframe import (
     AdmissionRequest,
     CapabilityGrantSet,
+    DelegationEdge,
     EffectiveCapabilityGrant,
     KiteframeDiagnosticError,
     ResolvedCapabilityRequirement,
     ResolvedRuntimeInputs,
+    build_delegation_edge,
+    delegation_ancestry_digest,
     load_admission_request,
     load_capability_grant_set,
     load_resolved_agent,
@@ -38,7 +40,6 @@ from kiteframe_deepagents.context import (
 )
 from kiteframe_deepagents.delegation import (
     DeclaredSubAgentInput,
-    DelegationAncestryEntry,
     bind_child_admission,
     intersect_child_envelope,
 )
@@ -65,6 +66,34 @@ def canonical_bytes(value: object) -> bytes:
 
 def canonical_digest(domain: bytes, value: object) -> str:
     return hashlib.sha256(domain + canonical_bytes(value)).hexdigest()
+
+
+def delegation_edge(
+    parent_agent: str,
+    child_agent: str,
+    capabilities: tuple[str, ...] = ("cases.read",),
+) -> DelegationEdge:
+    return build_delegation_edge(
+        parent_agent,
+        child_agent,
+        list(capabilities),
+    )
+
+
+def edge_wire(edge: DelegationEdge) -> dict[str, object]:
+    return {
+        "parentAgent": edge.parent_agent,
+        "childAgent": edge.child_agent,
+        "delegatedCapabilities": list(edge.delegated_capabilities),
+    }
+
+
+def edge_projection(edge: DelegationEdge) -> tuple[str, str, tuple[str, ...]]:
+    return (
+        edge.parent_agent,
+        edge.child_agent,
+        edge.delegated_capabilities,
+    )
 
 
 def evidence(
@@ -133,6 +162,7 @@ def grant(
         "session": "session:child",
         "task": "task:delegated",
     }
+    values["delegationAncestryDigest"] = delegation_ancestry_digest([])
     values["grantDigest"] = canonical_digest(
         b"kiteframe:capability-grant-set:v1\0",
         values,
@@ -320,10 +350,9 @@ def test_explicit_delegation_absence_removes_the_grant(
 def test_child_ancestry_is_extended_as_an_immutable_snapshot(
     requirement: ResolvedCapabilityRequirement,
 ) -> None:
-    root = DelegationAncestryEntry(
-        parent_agent="agent:root",
-        child_agent="agent:parent",
-        delegated_capabilities=("cases.read",),
+    root = delegation_edge(
+        "agent:root",
+        "agent:parent",
     )
 
     child = intersect_child_envelope(
@@ -336,25 +365,20 @@ def test_child_ancestry_is_extended_as_an_immutable_snapshot(
         child_agent="agent:child",
     )
 
-    assert child.ancestry == (
-        root,
-        DelegationAncestryEntry(
-            parent_agent="agent:parent",
-            child_agent="agent:child",
-            delegated_capabilities=("cases.read",),
-        ),
+    assert tuple(map(edge_projection, child.ancestry)) == (
+        edge_projection(root),
+        ("agent:parent", "agent:child", ("cases.read",)),
     )
-    with pytest.raises(FrozenInstanceError):
+    with pytest.raises(AttributeError):
         child.ancestry[-1].child_agent = "agent:forged"  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_delegation_ancestry_rejects_cycles_and_duplicate_edges(
     requirement: ResolvedCapabilityRequirement,
 ) -> None:
-    root = DelegationAncestryEntry(
-        parent_agent="agent:root",
-        child_agent="agent:parent",
-        delegated_capabilities=("cases.read",),
+    root = delegation_edge(
+        "agent:root",
+        "agent:parent",
     )
 
     for parent_agent, child_agent in (
@@ -441,6 +465,8 @@ spec:
   components:
     backend: backends.workspace
     middleware: [middleware.tenant-context]
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
     harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
@@ -482,9 +508,16 @@ def child_admission(
     child: ResolvedRuntimeInputs,
     *,
     revisions: tuple[tuple[str, str], ...] = (("policy", "7"),),
-    native_ancestry: tuple[str, ...] = ("agent:support-agent",),
+    native_ancestry: tuple[DelegationEdge, ...] | None = None,
     resolved_digest: str | None = None,
 ) -> tuple[AdmissionRequest, CapabilityGrantSet, KiteframeSessionContext]:
+    if native_ancestry is None:
+        native_ancestry = (
+            delegation_edge(
+                "agent:support-agent",
+                f"agent:{child.resolved_agent.package_name}",
+            ),
+        )
     resolved_wire = json.loads(child.resolved_agent.canonical_json())
     requirements = resolved_wire["capabilityRequirements"]
     required = [
@@ -519,7 +552,8 @@ def child_admission(
         "requiredCapabilities": required,
         "optionalCapabilities": optional,
         "resolvedRequirements": requirements,
-        "delegationAncestry": list(native_ancestry),
+        "delegationAncestry": list(map(edge_wire, native_ancestry)),
+        "delegationAncestryDigest": delegation_ancestry_digest(list(native_ancestry)),
         "contextualFacts": {},
         "traceContext": {
             "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -574,6 +608,7 @@ def child_admission(
         "session": request.session,
         "task": request.task,
     }
+    admission_values["delegationAncestryDigest"] = request.delegation_ancestry_digest
     admission_values["grantDigest"] = canonical_digest(
         b"kiteframe:capability-grant-set:v1\0",
         admission_values,
@@ -585,6 +620,7 @@ def child_admission(
         task=admission.task,
         admission_id=admission.admission_id,
         grant_digest=admission.grant_digest,
+        delegation_ancestry_digest=admission.delegation_ancestry_digest,
         grants=admission.grants,
         authority_revisions=admission.authority_revisions,
         trace_context=KiteframeTraceContext(
@@ -623,7 +659,12 @@ def test_recursive_compile_rejects_forged_native_child_ancestry_preflight(
     parent, child = resolved_parent_and_child(tmp_path)
     request, admission, session = child_admission(
         child,
-        native_ancestry=("agent:forged",),
+        native_ancestry=(
+            delegation_edge(
+                "agent:forged",
+                f"agent:{child.resolved_agent.package_name}",
+            ),
+        ),
     )
     declared = DeclaredSubAgentInput(
         declaration=parent.resolved_agent.subagents[0],
@@ -688,10 +729,9 @@ def test_child_invocation_rechecks_bound_native_admission_correlation(
         request,
         admission,
         (
-            DelegationAncestryEntry(
-                parent_agent="agent:support-agent",
-                child_agent="agent:case-child",
-                delegated_capabilities=("cases.read",),
+            delegation_edge(
+                "agent:support-agent",
+                "agent:case-child",
             ),
         ),
     )
@@ -716,31 +756,24 @@ def test_three_level_reverse_lexical_ancestry_preserves_native_digest_order(
     tmp_path: Path,
 ) -> None:
     _parent, child = resolved_parent_and_child(tmp_path)
-    path = ("agent:z-root", "agent:a-parent")
+    path = (
+        delegation_edge("agent:z-root", "agent:a-parent"),
+        delegation_edge("agent:a-parent", "agent:case-child"),
+    )
     request, admission, session = child_admission(
         child,
         native_ancestry=path,
     )
-    reordered_request, reordered_admission, _ = child_admission(
-        child,
-        native_ancestry=tuple(reversed(path)),
-    )
+    with pytest.raises(ValueError, match="invalid delegation ancestry"):
+        child_admission(
+            child,
+            native_ancestry=tuple(reversed(path)),
+        )
     correlated = bind_child_admission(
         session,
         request,
         admission,
-        (
-            DelegationAncestryEntry(
-                parent_agent="agent:z-root",
-                child_agent="agent:a-parent",
-                delegated_capabilities=("cases.read",),
-            ),
-            DelegationAncestryEntry(
-                parent_agent="agent:a-parent",
-                child_agent="agent:case-child",
-                delegated_capabilities=("cases.read",),
-            ),
-        ),
+        path,
     )
     invocation = build_native_invocation_request(
         requirement=child.resolved_agent.capability_requirements[0],
@@ -752,11 +785,16 @@ def test_three_level_reverse_lexical_ancestry_preserves_native_digest_order(
         idempotency_key=None,
     )
 
-    assert request.delegation_ancestry == path
-    assert request.request_digest != reordered_request.request_digest
-    assert admission.grant_digest != reordered_admission.grant_digest
+    assert tuple(map(edge_projection, request.delegation_ancestry)) == tuple(
+        map(edge_projection, path)
+    )
     assert invocation.admission_id == admission.admission_id
     assert invocation.grant_digest == admission.grant_digest
+    assert (
+        invocation.delegation_ancestry_digest
+        == admission.delegation_ancestry_digest
+        == request.delegation_ancestry_digest
+    )
 
 
 def test_recursive_compile_builds_real_public_child_before_parent_task_tool(

@@ -17,6 +17,7 @@ from kiteframe import (
     InvocationStatus,
     ResolvedCapabilityRequirement,
     StatusRequest,
+    delegation_ancestry_digest,
     load_capability_grant_set,
     load_invocation_outcome,
     load_invocation_status,
@@ -40,9 +41,7 @@ from kiteframe_deepagents.tools import (
 )
 
 WORKSPACE = Path(__file__).resolve().parents[3]
-VALID_TRACEPARENT = (
-    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-)
+VALID_TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 RESOURCE = "tenant:t1/case:case-1"
 OutcomeFactory = Callable[[InvocationRequest], InvocationOutcome]
 StatusFactory = Callable[
@@ -184,23 +183,24 @@ def comment_requirement() -> ResolvedCapabilityRequirement:
     locked["identity"] = copy.deepcopy(descriptor["identity"])
     resolved["capabilityRequirements"][0]["resources"] = [RESOURCE]
     resolved["resolvedDigest"] = _resolved_digest(resolved)
-    return load_resolved_agent(
-        canonical_bytes(resolved)
-    ).capability_requirements[0]
+    return load_resolved_agent(canonical_bytes(resolved)).capability_requirements[0]
 
 
-def case_read_requirement() -> ResolvedCapabilityRequirement:
+def case_read_requirement(
+    resources: tuple[str, ...] = (RESOURCE,),
+) -> ResolvedCapabilityRequirement:
     resolved = json.loads(
         (WORKSPACE / "tests/fixtures/resolved/support-agent.json").read_bytes()
     )
-    resolved["capabilityRequirements"][0]["resources"] = [RESOURCE]
+    resolved["capabilityRequirements"][0]["resources"] = list(resources)
     resolved["resolvedDigest"] = _resolved_digest(resolved)
-    return load_resolved_agent(
-        canonical_bytes(resolved)
-    ).capability_requirements[0]
+    return load_resolved_agent(canonical_bytes(resolved)).capability_requirements[0]
 
 
-def grant_set_values() -> dict[str, Any]:
+def grant_set_values(
+    *,
+    read_resources: tuple[str, ...] = (RESOURCE,),
+) -> dict[str, Any]:
     authority_entries = [{"revision": "7", "source": "policy"}]
     authority_revisions = {
         "authorityRevisionDigest": canonical_digest(
@@ -238,7 +238,7 @@ def grant_set_values() -> dict[str, Any]:
                     "confirmation": {"kind": "none"},
                     "consent": {"kind": "none"},
                 },
-                "resources": [RESOURCE],
+                "resources": list(read_resources),
             },
             {
                 "capability": {
@@ -274,11 +274,45 @@ def grant_set_values() -> dict[str, Any]:
             grant["capability"]["version"],
         )
     )
+    values["delegationAncestryDigest"] = delegation_ancestry_digest([])
     values["grantDigest"] = canonical_digest(
         b"kiteframe:capability-grant-set:v1\0",
         values,
     )
     return values
+
+
+def read_only_session_and_grant(
+    resources: tuple[str, ...],
+) -> tuple[KiteframeSessionContext, EffectiveCapabilityGrant]:
+    values = grant_set_values(read_resources=resources)
+    values["grants"] = [
+        grant
+        for grant in values["grants"]
+        if grant["capability"]["name"] == "cases.read"
+    ]
+    values.pop("grantDigest")
+    values["grantDigest"] = canonical_digest(
+        b"kiteframe:capability-grant-set:v1\0",
+        values,
+    )
+    grant_set = load_capability_grant_set(canonical_bytes(values))
+    return (
+        KiteframeSessionContext(
+            actor=grant_set.actor,
+            session=grant_set.session,
+            task=grant_set.task,
+            admission_id=grant_set.admission_id,
+            grant_digest=grant_set.grant_digest,
+            delegation_ancestry_digest=grant_set.delegation_ancestry_digest,
+            grants=grant_set.grants,
+            authority_revisions=grant_set.authority_revisions,
+            trace_context=KiteframeTraceContext(
+                traceparent=VALID_TRACEPARENT,
+            ),
+        ),
+        grant_set.grants[0],
+    )
 
 
 def succeeded(result: object) -> OutcomeFactory:
@@ -459,6 +493,7 @@ def effect_proposal_digest(request: InvocationRequest) -> str:
                 "name": request.capability_name,
                 "version": request.capability_version,
             },
+            "delegationAncestryDigest": request.delegation_ancestry_digest,
             "effect": "reversible_write",
             "grantDigest": request.grant_digest,
             "idempotencyKey": request.idempotency_key,
@@ -597,9 +632,7 @@ def write_requirement() -> ResolvedCapabilityRequirement:
 
 @pytest.fixture
 def native_grants() -> tuple[EffectiveCapabilityGrant, ...]:
-    return load_capability_grant_set(
-        canonical_bytes(grant_set_values())
-    ).grants
+    return load_capability_grant_set(canonical_bytes(grant_set_values())).grants
 
 
 @pytest.fixture
@@ -611,6 +644,7 @@ def session() -> KiteframeSessionContext:
         task=grant_set.task,
         admission_id=grant_set.admission_id,
         grant_digest=grant_set.grant_digest,
+        delegation_ancestry_digest=grant_set.delegation_ancestry_digest,
         grants=grant_set.grants,
         authority_revisions=grant_set.authority_revisions,
         trace_context=KiteframeTraceContext(
@@ -639,6 +673,7 @@ def subclassed_session(
         task=source.task,
         admission_id=source.admission_id,
         grant_digest=source.grant_digest,
+        delegation_ancestry_digest=source.delegation_ancestry_digest,
         grants=source.grants,
         authority_revisions=source.authority_revisions,
         trace_context=source.trace_context,
@@ -735,8 +770,7 @@ async def test_capability_tools_detach_retained_session_from_caller_mutation(
     object.__setattr__(
         session.trace_context,
         "traceparent",
-        "00-ffffffffffffffffffffffffffffffff"
-        "-eeeeeeeeeeeeeeee-01",
+        "00-ffffffffffffffffffffffffffffffff-eeeeeeeeeeeeeeee-01",
     )
 
     result = await read_tool.ainvoke({"case_id": "case-1"})
@@ -774,12 +808,8 @@ def test_build_tools_matches_exact_effective_grants_and_canonical_digest(
     assert tuple(tool.name for tool in tools) == ("cases.read", "cases.comment")
     assert all(tool.grant_digest == session.grant_digest for tool in tools)
     assert {
-        (tool.grant.name, tool.grant.version, tool.grant.resources)
-        for tool in tools
-    } == {
-        (grant.name, grant.version, grant.resources)
-        for grant in session.grants
-    }
+        (tool.grant.name, tool.grant.version, tool.grant.resources) for tool in tools
+    } == {(grant.name, grant.version, grant.resources) for grant in session.grants}
     assert all(
         tool.session.authority_revisions is session.authority_revisions
         for tool in tools
@@ -791,9 +821,7 @@ async def test_tool_invokes_provider_with_session_and_trace_context(
     read_tool: CapabilityTool,
     fake_invoker: FakeInvoker,
 ) -> None:
-    result = await read_tool.ainvoke(
-        {"case_id": "case-1", "_resource": RESOURCE}
-    )
+    result = await read_tool.ainvoke({"case_id": "case-1", "_resource": RESOURCE})
 
     request = fake_invoker.requests[-1]
     assert result == {"ok": True}
@@ -835,6 +863,58 @@ async def test_ungranted_resource_fails_closed_before_provider_invocation(
 
 
 @pytest.mark.asyncio
+async def test_native_resource_selection_accepts_wildcard_requirement_to_exact_grant(
+    fake_invoker: FakeInvoker,
+    checkpoint_store: FakeCheckpointStore,
+    suspension_bridge: FakeSuspensionBridge,
+) -> None:
+    requirement = case_read_requirement(("tenant:t1/case:*",))
+    session, grant = read_only_session_and_grant(("tenant:t1/case:case-1",))
+    tool = build_capability_tools(
+        (requirement,),
+        (grant,),
+        grant_digest=session.grant_digest,
+        invoker=fake_invoker,
+        session=session,
+        checkpoint_store=checkpoint_store,
+        suspension_bridge=suspension_bridge,
+    )[0]
+
+    await tool.ainvoke(
+        {
+            "case_id": "case-1",
+            "_resource": "tenant:t1/case:case-1",
+        }
+    )
+
+    assert fake_invoker.requests[-1].selected_resource == ("tenant:t1/case:case-1")
+
+
+@pytest.mark.asyncio
+async def test_omitted_resource_never_selects_a_wildcard(
+    fake_invoker: FakeInvoker,
+    checkpoint_store: FakeCheckpointStore,
+    suspension_bridge: FakeSuspensionBridge,
+) -> None:
+    requirement = case_read_requirement(("tenant:t1/case:*",))
+    session, grant = read_only_session_and_grant(("tenant:t1/case:*",))
+    tool = build_capability_tools(
+        (requirement,),
+        (grant,),
+        grant_digest=session.grant_digest,
+        invoker=fake_invoker,
+        session=session,
+        checkpoint_store=checkpoint_store,
+        suspension_bridge=suspension_bridge,
+    )[0]
+
+    result = await tool.ainvoke({"case_id": "case-1"})
+
+    assert result == "KF-AUTH-003: capability resource is not granted"
+    assert fake_invoker.requests == []
+
+
+@pytest.mark.asyncio
 async def test_effectful_key_is_uuidv7_scoped_and_persisted_before_invoke(
     comment_tool: CapabilityTool,
     fake_invoker: FakeInvoker,
@@ -868,6 +948,34 @@ async def test_effectful_key_is_uuidv7_scoped_and_persisted_before_invoke(
 
 
 @pytest.mark.asyncio
+async def test_persistence_failure_is_stable_and_redacted(
+    monkeypatch: pytest.MonkeyPatch,
+    comment_tool: CapabilityTool,
+    fake_invoker: FakeInvoker,
+    checkpoint_store: FakeCheckpointStore,
+) -> None:
+    secret = "deployment-checkpoint-secret"
+
+    async def fail_persistence(record: PersistedIdempotencyKey) -> None:
+        del record
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        checkpoint_store,
+        "persist_idempotency_key",
+        fail_persistence,
+    )
+
+    result = await comment_tool.ainvoke(
+        {"case_id": "case-1", "body": "hello", "_resource": RESOURCE}
+    )
+
+    assert result == "KF-CAP-002: capability persistence failed"
+    assert secret not in result
+    assert fake_invoker.requests == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid_arguments",
     [
@@ -882,9 +990,7 @@ async def test_locked_input_schema_rejects_invalid_arguments_before_effect(
     checkpoint_store: FakeCheckpointStore,
     invalid_arguments: dict[str, object],
 ) -> None:
-    result = await comment_tool.ainvoke(
-        {**invalid_arguments, "_resource": RESOURCE}
-    )
+    result = await comment_tool.ainvoke({**invalid_arguments, "_resource": RESOURCE})
 
     assert result == "KF-CAP-002: invalid capability invocation"
     assert checkpoint_store.records == []

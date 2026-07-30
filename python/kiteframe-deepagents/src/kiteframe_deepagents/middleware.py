@@ -187,6 +187,8 @@ def _same_authority_session(
         and left.task == right.task
         and left.admission_id == right.admission_id
         and left.grant_digest == right.grant_digest
+        and left.delegation_ancestry_digest
+        == right.delegation_ancestry_digest
         and (
             left.authority_revisions.authority_revision_digest
             == right.authority_revisions.authority_revision_digest
@@ -579,6 +581,8 @@ class KiteframeGuardMiddleware(AgentMiddleware):
             or tool_session.task != session.task
             or tool_session.admission_id != session.admission_id
             or tool_session.grant_digest != session.grant_digest
+            or tool_session.delegation_ancestry_digest
+            != session.delegation_ancestry_digest
             or (
                 tool_session.authority_revisions.authority_revision_digest
                 != session.authority_revisions.authority_revision_digest

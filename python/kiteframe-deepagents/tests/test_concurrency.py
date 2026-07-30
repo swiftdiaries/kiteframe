@@ -10,6 +10,7 @@ import pytest
 from deepagents import CompiledSubAgent
 from deepagents.backends import StateBackend
 from kiteframe import KiteframeDiagnosticError
+from langchain.agents.middleware import AgentMiddleware
 from langgraph.graph.state import CompiledStateGraph
 from test_compile import frozen_registry, session_context
 from test_delegation import (
@@ -39,6 +40,18 @@ class MutableStateBackend(StateBackend):
 
 class NonIsolatableStateBackend(StateBackend):
     def __deepcopy__(self, memo: dict[int, object]) -> NonIsolatableStateBackend:
+        del memo
+        return self
+
+
+class IdentityPreservingMutableMiddleware(AgentMiddleware):
+    def __init__(self) -> None:
+        self.session_state: list[str] = []
+
+    def __deepcopy__(
+        self,
+        memo: dict[int, object],
+    ) -> IdentityPreservingMutableMiddleware:
         del memo
         return self
 
@@ -157,6 +170,37 @@ def test_configured_backend_that_cannot_be_isolated_fails_before_construction(
             declared_children=(child_spec(parent, child),),
         )
 
+    create_spy.assert_not_called()
+
+
+def test_concurrent_identity_preserving_mutable_middleware_is_rejected(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, child = resolved_parent_and_child(tmp_path)
+    configured_middleware = IdentityPreservingMutableMiddleware()
+    registry = frozen_registry(parent, middleware=configured_middleware)
+    create_spy = Mock(return_value=compiled_graph())
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+
+    def compile_session(_index: int) -> str:
+        with pytest.raises(
+            KiteframeDiagnosticError,
+            match="runtime session isolation is unresolved",
+        ) as caught:
+            DeepAgentsAdapter().compile(
+                parent,
+                registry,
+                session_context(with_case_grant=True),
+                declared_children=(child_spec(parent, child),),
+            )
+        return caught.value.code
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        codes = tuple(executor.map(compile_session, range(SESSION_COUNT)))
+
+    assert codes == ("KF-RUNTIME-001",) * SESSION_COUNT
+    assert configured_middleware.session_state == []
     create_spy.assert_not_called()
 
 

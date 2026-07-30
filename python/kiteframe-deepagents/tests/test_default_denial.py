@@ -18,6 +18,7 @@ from kiteframe import (
     KiteframeDiagnosticError,
     ResolvedSubagent,
     StatusRequest,
+    delegation_ancestry_digest,
     load_capability_grant_set,
     load_invocation_outcome,
     load_resolved_agent,
@@ -218,6 +219,7 @@ def grant_set_values(*, revision: str = "7") -> dict[str, Any]:
         "session": "session:1",
         "task": "task:triage",
     }
+    values["delegationAncestryDigest"] = delegation_ancestry_digest([])
     values["grantDigest"] = canonical_digest(
         b"kiteframe:capability-grant-set:v1\0",
         values,
@@ -235,6 +237,7 @@ def session_context(*, revision: str = "7") -> KiteframeSessionContext:
         task=grant_set.task,
         admission_id=grant_set.admission_id,
         grant_digest=grant_set.grant_digest,
+        delegation_ancestry_digest=grant_set.delegation_ancestry_digest,
         grants=grant_set.grants,
         authority_revisions=grant_set.authority_revisions,
         trace_context=KiteframeTraceContext(traceparent=VALID_TRACEPARENT),
@@ -254,6 +257,7 @@ def subclassed_session(
         task=source.task,
         admission_id=source.admission_id,
         grant_digest=source.grant_digest,
+        delegation_ancestry_digest=source.delegation_ancestry_digest,
         grants=source.grants,
         authority_revisions=source.authority_revisions,
         trace_context=source.trace_context,

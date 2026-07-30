@@ -17,6 +17,7 @@ from kiteframe import (
     FrozenComponentRegistry,
     KiteframeDiagnosticError,
     ResolvedRuntimeInputs,
+    delegation_ancestry_digest,
     load_capability_grant_set,
     resolve_package,
 )
@@ -44,9 +45,7 @@ from kiteframe_deepagents.tools import CapabilityTool
 
 WORKSPACE = Path(__file__).resolve().parents[3]
 MODEL_KEY = "anthropic:claude-3-5-haiku-latest"
-TRACEPARENT = (
-    "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-)
+TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 ISSUED_AT = 1_900_000_000
 EXPIRES_AT = 4_000_000_000
 
@@ -114,6 +113,7 @@ def session_context(*, with_case_grant: bool) -> KiteframeSessionContext:
         "session": "session:compile-1",
         "task": "task:compile",
     }
+    values["delegationAncestryDigest"] = delegation_ancestry_digest([])
     values["grantDigest"] = canonical_digest(
         b"kiteframe:capability-grant-set:v1\0",
         values,
@@ -125,6 +125,7 @@ def session_context(*, with_case_grant: bool) -> KiteframeSessionContext:
         task=grant_set.task,
         admission_id=grant_set.admission_id,
         grant_digest=grant_set.grant_digest,
+        delegation_ancestry_digest=grant_set.delegation_ancestry_digest,
         grants=grant_set.grants,
         authority_revisions=grant_set.authority_revisions,
         trace_context=KiteframeTraceContext(traceparent=TRACEPARENT),
@@ -154,6 +155,42 @@ class TestAuditSink:
         return record
 
 
+class IdentityAuthorityProvider:
+    async def current(
+        self,
+        session: KiteframeSessionContext,
+        now: int,
+    ) -> KiteframeSessionContext:
+        del now
+        return session
+
+
+class RevocableAuthorityProvider:
+    def __init__(self, revoked_session: KiteframeSessionContext) -> None:
+        self.revoked = False
+        self.revoked_session = revoked_session
+
+    async def current(
+        self,
+        session: KiteframeSessionContext,
+        now: int,
+    ) -> KiteframeSessionContext:
+        del now
+        return self.revoked_session if self.revoked else session
+
+
+class EmptyAdmittedToolRegistry:
+    def __init__(self) -> None:
+        self.tools: tuple[CapabilityTool, ...] = ()
+
+    async def admitted_tools(
+        self,
+        session: KiteframeSessionContext,
+    ) -> tuple[CapabilityTool, ...]:
+        del session
+        return self.tools
+
+
 class ChangingSessionContext(KiteframeSessionContext):
     """Adversarial subclass whose authority changes between property reads."""
 
@@ -163,9 +200,7 @@ class ChangingSessionContext(KiteframeSessionContext):
                 "_grant_reads",
                 0,
             )
-            object.__getattribute__(self, "__dict__")["_grant_reads"] = (
-                reads + 1
-            )
+            object.__getattribute__(self, "__dict__")["_grant_reads"] = reads + 1
             if reads % 2:
                 return "ff" * 32
         return super().__getattribute__(name)
@@ -180,6 +215,7 @@ def changing_session_context(
         task=source.task,
         admission_id=source.admission_id,
         grant_digest=source.grant_digest,
+        delegation_ancestry_digest=source.delegation_ancestry_digest,
         grants=source.grants,
         authority_revisions=source.authority_revisions,
         trace_context=source.trace_context,
@@ -206,6 +242,8 @@ spec:
   models: { primary: models.anthropic.sonnet }
   components:
     middleware: [middleware.tenant-context]
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
     harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
@@ -235,9 +273,7 @@ spec:
     primary: { capabilities: [text] }
 """
     )
-    (package / "prompts/system.md").write_text(
-        "You are the support agent.\n"
-    )
+    (package / "prompts/system.md").write_text("You are the support agent.\n")
     (package / "skills/rules.md").unlink()
     (package / "skills/case-summary.md").write_text(
         "---\n"
@@ -252,8 +288,7 @@ spec:
         "catalogIdentity": "support",
         "catalogRevision": "v1",
         "packagePortableDigest": (
-            "fb298b91e7d806e392ad53902c54747a"
-            "5804bbe1820ebfe73bd757d310793916"
+            "fb298b91e7d806e392ad53902c54747a5804bbe1820ebfe73bd757d310793916"
         ),
         "resolvedFeatures": [],
         "resolverVersion": "0.1.0",
@@ -270,7 +305,10 @@ kind: RuntimeBinding
 metadata: { runtime: deepagents }
 spec:
   models: { primary: models.anthropic.haiku }
-  components: { harnessProfile: profiles.deepagents }
+  components:
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
+    harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
 """
@@ -318,28 +356,22 @@ spec:
     - { name: cases.read, version: "^1.0", required: true, resources: [tenant:support] }
 """
     )
-    (child / "prompts/system.md").write_text(
-        "Read support cases safely.\n"
-    )
+    (child / "prompts/system.md").write_text("Read support cases safely.\n")
     lock_path = package / "capability.lock"
     lock = json.loads(lock_path.read_bytes())
     lock["packagePortableDigest"] = (
-        "c9d348731150757463bb3f7926f0016a"
-        "ded8141a9ea3d4a95897fb939a703025"
+        "c9d348731150757463bb3f7926f0016aded8141a9ea3d4a95897fb939a703025"
     )
     lock["lockDigest"] = (
-        "b1d0fbd64d25b0abc323185027e2bdef"
-        "e4bbcca88ca1594fa52bae01f89d0a81"
+        "b1d0fbd64d25b0abc323185027e2bdefe4bbcca88ca1594fa52bae01f89d0a81"
     )
     lock_path.write_bytes(canonical_bytes(lock))
     child_lock = dict(lock)
     child_lock["packagePortableDigest"] = (
-        "506a229f8ddf397c0caa044b0fce344e"
-        "a0e92214b69e6ff209d17b5e1f73b069"
+        "506a229f8ddf397c0caa044b0fce344ea0e92214b69e6ff209d17b5e1f73b069"
     )
     child_lock["lockDigest"] = (
-        "4545be62393b2d55e643202f61f2b6f5"
-        "8c9ae62752855db3974dea4ad587ebc1"
+        "4545be62393b2d55e643202f61f2b6f58c9ae62752855db3974dea4ad587ebc1"
     )
     (child / "capability.lock").write_bytes(canonical_bytes(child_lock))
     binding = package / "bindings/deepagents.yaml"
@@ -355,6 +387,9 @@ def frozen_registry(
     *,
     install_profile: bool = False,
     backend: BackendProtocol | None = None,
+    middleware: AgentMiddleware | None = None,
+    authority_provider: object | None = None,
+    tool_registry: object | None = None,
 ) -> FrozenComponentRegistry:
     registry = ComponentRegistry()
     primary_symbol = dict(inputs.runtime_binding.model_symbols)["primary"]
@@ -369,11 +404,29 @@ def frozen_registry(
         inputs.runtime_binding.audit_sink,
         TestAuditSink(),
     )
+    authority_symbol = inputs.runtime_binding.authority_provider
+    assert authority_symbol is not None
+    registry.register(
+        ComponentKind.AUTHORITY_PROVIDER,
+        authority_symbol,
+        (
+            authority_provider
+            if authority_provider is not None
+            else IdentityAuthorityProvider()
+        ),
+    )
+    tool_registry_symbol = inputs.runtime_binding.admitted_tool_registry
+    assert tool_registry_symbol is not None
+    registry.register(
+        ComponentKind.ADMITTED_TOOL_REGISTRY,
+        tool_registry_symbol,
+        (tool_registry if tool_registry is not None else EmptyAdmittedToolRegistry()),
+    )
     for symbol in inputs.runtime_binding.middleware_symbols:
         registry.register(
             ComponentKind.MIDDLEWARE,
             symbol,
-            TenantMiddleware(),
+            middleware if middleware is not None else TenantMiddleware(),
         )
     backend_symbol = inputs.runtime_binding.backend
     if backend_symbol is not None:
@@ -407,9 +460,7 @@ def frozen_registry(
 @pytest.fixture
 def compiled_graph() -> CompiledStateGraph:
     return create_deep_agent(
-        model=FakeMessagesListChatModel(
-            responses=[AIMessage(content="done")]
-        ),
+        model=FakeMessagesListChatModel(responses=[AIMessage(content="done")]),
         subagents=[],
     )
 
@@ -449,9 +500,7 @@ def test_constructor_receives_only_resolved_and_registered_values(
     assert graph is compiled_graph
     create_spy.assert_called_once()
     kwargs = create_spy.call_args.kwargs
-    assert kwargs["system_prompt"] == (
-        "Help support agents read cases safely.\n"
-    )
+    assert kwargs["system_prompt"] == ("Help support agents read cases safely.\n")
     model = registry.resolve(
         ComponentKind.MODEL,
         "models.anthropic.sonnet",
@@ -482,6 +531,41 @@ def test_constructor_receives_only_resolved_and_registered_values(
     assert kwargs["middleware"][-1].admitted_tools == kwargs["tools"]
 
 
+@pytest.mark.asyncio
+async def test_compiled_adapter_applies_post_construction_revocation(
+    monkeypatch: pytest.MonkeyPatch,
+    compiled_graph: CompiledStateGraph,
+    adapter: DeepAgentsAdapter,
+    runtime_inputs: ResolvedRuntimeInputs,
+) -> None:
+    revoked_session = session_context(with_case_grant=False)
+    authority_provider = RevocableAuthorityProvider(revoked_session)
+    tool_registry = EmptyAdmittedToolRegistry()
+    registry = frozen_registry(
+        runtime_inputs,
+        authority_provider=authority_provider,
+        tool_registry=tool_registry,
+    )
+    create_spy = Mock(return_value=compiled_graph)
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+
+    adapter.compile(
+        runtime_inputs,
+        registry,
+        session_context(with_case_grant=True),
+    )
+    guard = create_spy.call_args.kwargs["middleware"][-1]
+    assert isinstance(guard, KiteframeGuardMiddleware)
+    assert guard.authority_provider is authority_provider
+    assert guard.tool_registry is tool_registry
+    tool_registry.tools = guard.admitted_tools
+    assert len(await guard.visible_tools(now=ISSUED_AT)) == 1
+
+    authority_provider.revoked = True
+
+    assert await guard.visible_tools(now=ISSUED_AT) == ()
+
+
 def test_compile_snapshots_the_exact_immutable_session(
     monkeypatch: pytest.MonkeyPatch,
     compiled_graph: CompiledStateGraph,
@@ -506,10 +590,7 @@ def test_compile_snapshots_the_exact_immutable_session(
     assert guard.session.grants is not original.grants
     assert kwargs["tools"][0].session is not guard.session
     assert kwargs["tools"][0].session is not original
-    assert (
-        kwargs["tools"][0].session.grant_digest
-        == guard.session.grant_digest
-    )
+    assert kwargs["tools"][0].session.grant_digest == guard.session.grant_digest
 
     object.__setattr__(original, "grant_digest", "ff" * 32)
     object.__setattr__(original.trace_context, "traceparent", "00-mutated")
@@ -525,9 +606,7 @@ def test_session_subclass_is_rejected_before_public_construction(
 ) -> None:
     create_spy = Mock(return_value=compiled_graph)
     monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
-    forged = changing_session_context(
-        session_context(with_case_grant=True)
-    )
+    forged = changing_session_context(session_context(with_case_grant=True))
     assert forged.grant_digest != forged.grant_digest
 
     with pytest.raises(TypeError, match="exact KiteframeSessionContext"):
@@ -590,9 +669,7 @@ def test_validated_skills_are_exposed_only_by_the_virtual_package_backend(
             "size": 0,
         }
     ]
-    response = backend.download_files(
-        [f"{source}/case-summary/SKILL.md"]
-    )[0]
+    response = backend.download_files([f"{source}/case-summary/SKILL.md"])[0]
     assert response.error is None
     assert response.content == (
         b"---\n"
@@ -601,9 +678,7 @@ def test_validated_skills_are_exposed_only_by_the_virtual_package_backend(
         b"---\n"
         b"Use only admitted case data.\n"
     )
-    prompt = backend.download_files(
-        ["/__kiteframe__/prompts/system.md"]
-    )[0]
+    prompt = backend.download_files(["/__kiteframe__/prompts/system.md"])[0]
     assert prompt.error is None
     assert prompt.content == b"You are the support agent.\n"
     denied = backend.write(

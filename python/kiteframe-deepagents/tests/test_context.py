@@ -41,6 +41,7 @@ def native_session_values() -> dict[str, Any]:
         "task": "task:change-shift",
         "admission_id": grant_set.admission_id,
         "grant_digest": grant_set.grant_digest,
+        "delegation_ancestry_digest": grant_set.delegation_ancestry_digest,
         "grants": grant_set.grants,
         "authority_revisions": grant_set.authority_revisions,
         "trace_context": context_module.KiteframeTraceContext(

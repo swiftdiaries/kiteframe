@@ -886,6 +886,8 @@ def build_resumed_invocation_request(
     if (
         request.admission_id != session.admission_id
         or request.grant_digest != session.grant_digest
+        or request.delegation_ancestry_digest
+        != session.delegation_ancestry_digest
         or request.capability_name != requirement.name
         or request.capability_version != requirement.version
         or envelope.admission_id != session.admission_id
@@ -898,6 +900,7 @@ def build_resumed_invocation_request(
         invocation_id=envelope.invocation_id,
         admission_id=envelope.admission_id,
         grant_digest=session.grant_digest,
+        delegation_ancestry_digest=session.delegation_ancestry_digest,
         requirement=requirement,
         selected_resource=request.selected_resource,
         arguments=request.arguments,

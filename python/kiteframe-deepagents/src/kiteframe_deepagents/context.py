@@ -8,6 +8,7 @@ from kiteframe import (
     AdmissionRequest,
     AuthorityRevisionSet,
     CapabilityGrantSet,
+    DelegationEdge,
     EffectiveCapabilityGrant,
     Suspension,
     load_capability_grant_set_for_request,
@@ -28,28 +29,12 @@ def _grant_projection(grant: EffectiveCapabilityGrant) -> tuple[object, ...]:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class DelegationAncestryEntry:
-    """One immutable declared authority edge."""
-
-    parent_agent: str
-    child_agent: str
-    delegated_capabilities: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if type(self.parent_agent) is not str or not self.parent_agent:
-            raise TypeError("parent_agent must be a non-empty exact string")
-        if type(self.child_agent) is not str or not self.child_agent:
-            raise TypeError("child_agent must be a non-empty exact string")
-        if (
-            type(self.delegated_capabilities) is not tuple
-            or not all(
-                type(capability) is str and capability
-                for capability in self.delegated_capabilities
-            )
-            or len(self.delegated_capabilities) != len(set(self.delegated_capabilities))
-        ):
-            raise TypeError("delegated_capabilities must be unique exact strings")
+def _edge_projection(edge: DelegationEdge) -> tuple[object, ...]:
+    return (
+        edge.parent_agent,
+        edge.child_agent,
+        edge.delegated_capabilities,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +43,7 @@ class ChildAdmissionCorrelation:
 
     request: AdmissionRequest
     admission: CapabilityGrantSet
-    ancestry: tuple[DelegationAncestryEntry, ...]
+    ancestry: tuple[DelegationEdge, ...]
 
     def __post_init__(self) -> None:
         if type(self.request) is not AdmissionRequest:
@@ -66,19 +51,21 @@ class ChildAdmissionCorrelation:
         if type(self.admission) is not CapabilityGrantSet:
             raise TypeError("admission must be exact native CapabilityGrantSet")
         if type(self.ancestry) is not tuple or not all(
-            type(entry) is DelegationAncestryEntry for entry in self.ancestry
+            type(entry) is DelegationEdge for entry in self.ancestry
         ):
             raise TypeError(
-                "ancestry must be exact immutable DelegationAncestryEntry values"
+                "ancestry must be exact immutable native DelegationEdge values"
             )
         load_capability_grant_set_for_request(
             self.admission.canonical_json(),
             self.request,
         )
-        expected_native_ancestry = tuple(
-            entry.parent_agent for entry in self.ancestry
-        )
-        if self.request.delegation_ancestry != expected_native_ancestry:
+        if (
+            tuple(_edge_projection(edge) for edge in self.request.delegation_ancestry)
+            != tuple(_edge_projection(edge) for edge in self.ancestry)
+            or self.admission.delegation_ancestry_digest
+            != self.request.delegation_ancestry_digest
+        ):
             raise ValueError("child admission delegation ancestry does not match")
 
 
@@ -113,6 +100,7 @@ class KiteframeSessionContext:
     task: str
     admission_id: str
     grant_digest: str
+    delegation_ancestry_digest: str
     grants: tuple[EffectiveCapabilityGrant, ...]
     authority_revisions: AuthorityRevisionSet
     trace_context: KiteframeTraceContext
@@ -126,6 +114,10 @@ class KiteframeSessionContext:
             (self.task, "task"),
             (self.admission_id, "admission_id"),
             (self.grant_digest, "grant_digest"),
+            (
+                self.delegation_ancestry_digest,
+                "delegation_ancestry_digest",
+            ),
         ):
             if type(value) is not str or not value:
                 raise TypeError(f"{name} must be a non-empty exact string")
@@ -156,6 +148,9 @@ class KiteframeSessionContext:
                 or admission.session != self.session
                 or admission.admission_id != self.admission_id
                 or admission.grant_digest != self.grant_digest
+                or request.delegation_ancestry_digest != self.delegation_ancestry_digest
+                or admission.delegation_ancestry_digest
+                != self.delegation_ancestry_digest
                 or admission.authority_revisions.authority_revision_digest
                 != self.authority_revisions.authority_revision_digest
                 or tuple(_grant_projection(grant) for grant in admission.grants)
@@ -185,6 +180,7 @@ def _snapshot_session_context(
         task=session.task,
         admission_id=session.admission_id,
         grant_digest=session.grant_digest,
+        delegation_ancestry_digest=session.delegation_ancestry_digest,
         grants=tuple(grant for grant in session.grants),
         authority_revisions=session.authority_revisions,
         trace_context=trace_snapshot,
@@ -195,7 +191,6 @@ def _snapshot_session_context(
 
 __all__ = [
     "ChildAdmissionCorrelation",
-    "DelegationAncestryEntry",
     "KiteframeSessionContext",
     "KiteframeTraceContext",
 ]

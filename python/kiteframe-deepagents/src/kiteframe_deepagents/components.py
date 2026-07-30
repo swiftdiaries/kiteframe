@@ -40,6 +40,7 @@ from .compatibility import (
     DEEPAGENTS_VERSION,
     KiteframeHarnessProfileToken,
 )
+from .middleware import AdmittedToolRegistry, AuthorityProvider
 from .suspension import EvidenceResumeCredentialVerifier
 
 RUNTIME_COMPONENT_UNRESOLVED = "KF-RUNTIME-001"
@@ -90,10 +91,7 @@ class ValidatedPackageBackend(BackendProtocol):
         paths = tuple(path for path, _text in self._assets)
         if len(paths) != len(set(paths)):
             raise ValueError("validated package asset paths must be unique")
-        if any(
-            not path.startswith(f"{PACKAGE_PREFIX}/")
-            for path in paths
-        ):
+        if any(not path.startswith(f"{PACKAGE_PREFIX}/") for path in paths):
             raise ValueError("validated package assets must use virtual paths")
 
     def skill_sources(
@@ -102,9 +100,7 @@ class ValidatedPackageBackend(BackendProtocol):
     ) -> list[str]:
         """Return virtual sources only for the exact validated skill snapshot."""
 
-        if tuple((asset.path, asset.text) for asset in skills) != (
-            self._skill_assets
-        ):
+        if tuple((asset.path, asset.text) for asset in skills) != (self._skill_assets):
             raise ValueError("skill assets do not match the validated snapshot")
         return list(self._skill_sources)
 
@@ -147,9 +143,7 @@ class ValidatedPackageBackend(BackendProtocol):
                     size=len(content.encode()),
                     modified_at="",
                 )
-        return LsResult(
-            entries=[entries[key] for key in sorted(entries)]
-        )
+        return LsResult(entries=[entries[key] for key in sorted(entries)])
 
     def read(
         self,
@@ -164,9 +158,7 @@ class ValidatedPackageBackend(BackendProtocol):
             return ReadResult(error="file_not_found")
         lines = content.splitlines(keepends=True)
         sliced = "".join(lines[offset : offset + limit])
-        return ReadResult(
-            file_data={"content": sliced, "encoding": "utf-8"}
-        )
+        return ReadResult(file_data={"content": sliced, "encoding": "utf-8"})
 
     def grep(
         self,
@@ -223,9 +215,7 @@ class ValidatedPackageBackend(BackendProtocol):
                     FileUploadResponse(path=path, error="permission_denied")
                 )
             else:
-                responses.extend(
-                    self.runtime_backend.upload_files([(path, content)])
-                )
+                responses.extend(self.runtime_backend.upload_files([(path, content)]))
         return responses
 
     def download_files(
@@ -266,6 +256,8 @@ class ValidatedComponents:
     package_backend: BackendProtocol | None
     checkpointer: CheckpointerProtocol | None
     store: BaseStore | None
+    authority_provider: AuthorityProvider
+    admitted_tool_registry: AdmittedToolRegistry
     capability_provider: CapabilityInvoker
     audit_sink: AuditSink
     harness_profile: KiteframeHarnessProfileToken
@@ -313,10 +305,7 @@ def _construction_error(
     component_symbol: str,
     exception_class: str,
 ) -> KiteframeDiagnosticError:
-    message = (
-        f"component {component_symbol} construction failed "
-        f"({exception_class})"
-    )
+    message = f"component {component_symbol} construction failed ({exception_class})"
     error = KiteframeDiagnosticError(message)
     setattr(error, "code", RUNTIME_CONSTRUCTION_FAILED)  # noqa: B010
     setattr(  # noqa: B010
@@ -377,15 +366,11 @@ def build_package_backend(
         skill_names.add(skill_name)
         source = f"{PACKAGE_PREFIX}/skills/{skill_name}"
         skill_sources.append(source)
-        assets.append(
-            (f"{source}/{skill_name}/SKILL.md", asset.text)
-        )
+        assets.append((f"{source}/{skill_name}/SKILL.md", asset.text))
 
     return ValidatedPackageBackend(
         runtime_backend=(
-            runtime_backend
-            if runtime_backend is not None
-            else StateBackend()
+            runtime_backend if runtime_backend is not None else StateBackend()
         ),
         _assets=tuple(assets),
         _skill_assets=tuple((asset.path, asset.text) for asset in skills),
@@ -423,15 +408,8 @@ def _resolve(
 
 def _provider_qualified_model_key(value: str) -> str:
     provider, separator, model_name = value.partition(":")
-    if (
-        separator != ":"
-        or not provider
-        or not model_name
-        or ":" in model_name
-    ):
-        raise _runtime_error(
-            "model component must use the exact provider:model form"
-        )
+    if separator != ":" or not provider or not model_name or ":" in model_name:
+        raise _runtime_error("model component must use the exact provider:model form")
     return value
 
 
@@ -456,9 +434,7 @@ def validate_components(
         _require_descriptor(descriptors, symbol, ComponentKind.MODEL)
         model = _resolve(registry, ComponentKind.MODEL, symbol)
         if not isinstance(model, str):
-            raise _runtime_error(
-                "model component must be a provider:model string"
-            )
+            raise _runtime_error("model component must be a provider:model string")
         model = _provider_qualified_model_key(model)
         models.append((role, model))
 
@@ -492,9 +468,7 @@ def validate_components(
             binding.checkpointer,
         )
         if not isinstance(candidate, CheckpointerProtocol):
-            raise _runtime_error(
-                "checkpointer component has an invalid public type"
-            )
+            raise _runtime_error("checkpointer component has an invalid public type")
         checkpointer = candidate
 
     requires_durable = _requires_durable_checkpoint(inputs)
@@ -508,9 +482,7 @@ def validate_components(
         or checkpointer.kiteframe_durable is not True
         or not descriptor_is_durable
     ):
-        raise _runtime_error(
-            "suspendable capability requires a durable checkpointer"
-        )
+        raise _runtime_error("suspendable capability requires a durable checkpointer")
 
     store: BaseStore | None = None
     capture = binding.content_capture
@@ -530,6 +502,40 @@ def validate_components(
             raise _runtime_error("store component has an invalid public type")
         store = candidate
 
+    authority_symbol = binding.authority_provider
+    if authority_symbol is None:
+        raise _runtime_error("authority provider component metadata is unresolved")
+    _require_descriptor(
+        descriptors,
+        authority_symbol,
+        ComponentKind.AUTHORITY_PROVIDER,
+    )
+    authority_provider = _resolve(
+        registry,
+        ComponentKind.AUTHORITY_PROVIDER,
+        authority_symbol,
+    )
+    if not isinstance(authority_provider, AuthorityProvider):
+        raise _runtime_error("authority provider component has an invalid public type")
+
+    tool_registry_symbol = binding.admitted_tool_registry
+    if tool_registry_symbol is None:
+        raise _runtime_error("admitted tool registry component metadata is unresolved")
+    _require_descriptor(
+        descriptors,
+        tool_registry_symbol,
+        ComponentKind.ADMITTED_TOOL_REGISTRY,
+    )
+    admitted_tool_registry = _resolve(
+        registry,
+        ComponentKind.ADMITTED_TOOL_REGISTRY,
+        tool_registry_symbol,
+    )
+    if not isinstance(admitted_tool_registry, AdmittedToolRegistry):
+        raise _runtime_error(
+            "admitted tool registry component has an invalid public type"
+        )
+
     _require_descriptor(
         descriptors,
         binding.capability_provider,
@@ -541,9 +547,7 @@ def validate_components(
         binding.capability_provider,
     )
     if not isinstance(capability_provider, CapabilityInvoker):
-        raise _runtime_error(
-            "capability provider component has an invalid public type"
-        )
+        raise _runtime_error("capability provider component has an invalid public type")
     _require_descriptor(
         descriptors,
         binding.audit_sink,
@@ -594,6 +598,8 @@ def validate_components(
         package_backend=package_backend,
         checkpointer=checkpointer,
         store=store,
+        authority_provider=authority_provider,
+        admitted_tool_registry=admitted_tool_registry,
         capability_provider=capability_provider,
         audit_sink=audit_sink,
         harness_profile=harness_profile,

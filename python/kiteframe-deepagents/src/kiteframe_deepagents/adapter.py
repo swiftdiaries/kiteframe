@@ -9,6 +9,7 @@ from typing import Any, NoReturn, cast
 
 from deepagents import CompiledSubAgent, create_deep_agent
 from kiteframe import (
+    DelegationEdge,
     FrozenComponentRegistry,
     KiteframeDiagnosticError,
     ResolvedRuntimeInputs,
@@ -29,7 +30,6 @@ from .components import (
 from .context import KiteframeSessionContext, _snapshot_session_context
 from .delegation import (
     DeclaredSubAgentInput,
-    DelegationAncestryEntry,
     _admission_denied,
     bind_child_admission,
     intersect_child_envelope,
@@ -80,7 +80,7 @@ class _PreparedAgent:
     components: ValidatedComponents
     session: KiteframeSessionContext
     declaration: ResolvedSubagent | None
-    ancestry: tuple[DelegationAncestryEntry, ...]
+    ancestry: tuple[DelegationEdge, ...]
     children: tuple[_PreparedAgent, ...]
 
 
@@ -173,7 +173,7 @@ class DeepAgentsAdapter:
         declared_children: tuple[DeclaredSubAgentInput, ...],
         *,
         declaration: ResolvedSubagent | None,
-        ancestry: tuple[DelegationAncestryEntry, ...],
+        ancestry: tuple[DelegationEdge, ...],
         identities: tuple[tuple[str, str], ...],
     ) -> _PreparedAgent:
         """Validate a complete declared tree before constructing any graph."""
@@ -187,11 +187,17 @@ class DeepAgentsAdapter:
                     raise TypeError(
                         "package backend did not create an isolated copy"
                     )
+            isolated_middleware = []
+            for component in validated.middleware:
+                isolated_component = deepcopy(component)
+                if isolated_component is component:
+                    raise TypeError(
+                        "middleware did not create an isolated copy"
+                    )
+                isolated_middleware.append(isolated_component)
             components = replace(
                 validated,
-                middleware=tuple(
-                    deepcopy(component) for component in validated.middleware
-                ),
+                middleware=tuple(isolated_middleware),
                 package_backend=isolated_backend,
             )
         except Exception:
@@ -410,6 +416,8 @@ class DeepAgentsAdapter:
                 admitted_tools=capability_tools,
                 clock=_SystemClock(),
                 declared_child_tool=declared_child_tool,
+                authority_provider=components.authority_provider,
+                tool_registry=components.admitted_tool_registry,
             )
             system_prompt = _system_prompt(runtime_inputs)
             skills = package_backend.skill_sources(resolved.skills)

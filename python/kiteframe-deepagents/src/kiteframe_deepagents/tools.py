@@ -20,6 +20,7 @@ from kiteframe import (
     load_invocation_outcome,
     load_invocation_outcome_for_request,
     load_invocation_status_for_request,
+    select_resource_for_requirement,
 )
 from kiteframe.provider import CapabilityInvoker
 from langchain_core.runnables import RunnableConfig
@@ -39,6 +40,7 @@ OUTCOME_RECONCILIATION_REQUIRED = (
 SUSPENSION_DID_NOT_INTERRUPT = (
     "KF-CAP-005: suspension bridge did not interrupt"
 )
+PERSISTENCE_FAILED = "KF-CAP-002: capability persistence failed"
 
 
 def _uuid7() -> uuid.UUID:
@@ -290,6 +292,10 @@ def build_native_invocation_request(
         if (
             admission.admission_id != session.admission_id
             or admission.grant_digest != grant_digest
+            or admission.delegation_ancestry_digest
+            != session.delegation_ancestry_digest
+            or correlation.request.delegation_ancestry_digest
+            != session.delegation_ancestry_digest
             or admission.admission_request_digest
             != correlation.request.request_digest
             or admission.authority_revisions.authority_revision_digest
@@ -306,6 +312,7 @@ def build_native_invocation_request(
         ),
         admission_id=session.admission_id,
         grant_digest=grant_digest,
+        delegation_ancestry_digest=session.delegation_ancestry_digest,
         requirement=requirement,
         selected_resource=resource,
         arguments=arguments,
@@ -385,18 +392,16 @@ class CapabilityTool(BaseTool):
         return self.requirement.descriptor_digest
 
     def _select_resource(self, selected: object) -> str:
-        allowed = tuple(
-            resource
-            for resource in self.requirement.resources
-            if resource in self.grant.resources
-        )
-        if selected is None:
-            if len(allowed) != 1:
-                raise ToolException(RESOURCE_DENIED)
-            return allowed[0]
-        if not isinstance(selected, str) or selected not in allowed:
+        if selected is not None and not isinstance(selected, str):
             raise ToolException(RESOURCE_DENIED)
-        return selected
+        try:
+            return select_resource_for_requirement(
+                requirement=self.requirement,
+                grant=self.grant,
+                selected_resource=selected,
+            )
+        except Exception:
+            raise ToolException(RESOURCE_DENIED) from None
 
     def _new_idempotency_key(self) -> str | None:
         if not _requires_idempotency(self.requirement):
@@ -695,7 +700,10 @@ class CapabilityTool(BaseTool):
             raise ToolException(
                 "KF-CAP-002: invalid capability invocation"
             ) from None
-        await self._persist_invocation_correlation(correlation)
+        try:
+            await self._persist_invocation_correlation(correlation)
+        except Exception:
+            raise ToolException(PERSISTENCE_FAILED) from None
         try:
             outcome = await self.invoker.invoke(request)
         except Exception:

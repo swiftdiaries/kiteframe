@@ -10,16 +10,18 @@ from kiteframe import (
     AdmissionRequest,
     AuthorityRevisionSet,
     CapabilityGrantSet,
+    DelegationEdge,
     EffectiveCapabilityGrant,
     KiteframeDiagnosticError,
     ResolvedCapabilityRequirement,
     ResolvedRuntimeInputs,
     ResolvedSubagent,
+    build_delegation_edge,
+    resource_selector_is_within,
 )
 
 from .context import (
     ChildAdmissionCorrelation,
-    DelegationAncestryEntry,
     KiteframeSessionContext,
     _snapshot_session_context,
 )
@@ -40,7 +42,7 @@ class ChildAuthorityEnvelope:
     grants: tuple[EffectiveCapabilityGrant, ...]
     expires_at: int
     authority_revisions: AuthorityRevisionSet | None
-    ancestry: tuple[DelegationAncestryEntry, ...]
+    ancestry: tuple[DelegationEdge, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,19 +142,12 @@ def _requirements(
     return tuple(values)
 
 
-def _selector_is_subset_of(requested: str, allowed: str) -> bool:
-    if requested == allowed:
-        return True
-    prefix = allowed.removesuffix(":*")
-    return prefix != allowed and requested.startswith(f"{prefix}:")
-
-
 def _resources_narrow(
     effective: tuple[str, ...],
     allowed: tuple[str, ...],
 ) -> bool:
     return bool(effective) and all(
-        any(_selector_is_subset_of(resource, candidate) for candidate in allowed)
+        any(resource_selector_is_within(resource, candidate) for candidate in allowed)
         for resource in effective
     )
 
@@ -331,7 +326,7 @@ def intersect_child_envelope(
     child_admission: KiteframeSessionContext
     | EffectiveCapabilityGrant
     | tuple[EffectiveCapabilityGrant, ...],
-    ancestry: tuple[DelegationAncestryEntry, ...] = (),
+    ancestry: tuple[DelegationEdge, ...] = (),
     parent_authority_revisions: AuthorityRevisionSet | None = None,
     parent_agent: str | None = None,
     child_agent: str | None = None,
@@ -379,11 +374,9 @@ def intersect_child_envelope(
         delegated_names = tuple(grant.name for grant in delegation_grants)
 
     if type(ancestry) is not tuple or not all(
-        type(entry) is DelegationAncestryEntry for entry in ancestry
+        type(entry) is DelegationEdge for entry in ancestry
     ):
-        raise TypeError(
-            "ancestry must be exact immutable DelegationAncestryEntry values"
-        )
+        raise TypeError("ancestry must be exact immutable native DelegationEdge values")
     if (parent_agent is None) != (child_agent is None):
         raise TypeError("parent_agent and child_agent must be supplied together")
     seen_agents: set[str] = set()
@@ -440,10 +433,10 @@ def intersect_child_envelope(
     child_ancestry = tuple(ancestry)
     if parent_agent is not None and child_agent is not None:
         child_ancestry += (
-            DelegationAncestryEntry(
-                parent_agent=parent_agent,
-                child_agent=child_agent,
-                delegated_capabilities=tuple(sorted(grant.name for grant in admitted)),
+            build_delegation_edge(
+                parent_agent,
+                child_agent,
+                sorted(grant.name for grant in admitted),
             ),
         )
     return ChildAuthorityEnvelope(
@@ -461,7 +454,7 @@ def bind_child_admission(
     session: KiteframeSessionContext,
     request: AdmissionRequest,
     admission: CapabilityGrantSet,
-    ancestry: tuple[DelegationAncestryEntry, ...],
+    ancestry: tuple[DelegationEdge, ...],
 ) -> KiteframeSessionContext:
     """Bind an already narrowed child session to native admission evidence."""
 
@@ -477,6 +470,7 @@ def bind_child_admission(
             task=session.task,
             admission_id=session.admission_id,
             grant_digest=session.grant_digest,
+            delegation_ancestry_digest=session.delegation_ancestry_digest,
             grants=session.grants,
             authority_revisions=session.authority_revisions,
             trace_context=session.trace_context,
@@ -490,7 +484,7 @@ def bind_child_admission(
 __all__ = [
     "ChildAuthorityEnvelope",
     "DeclaredSubAgentInput",
-    "DelegationAncestryEntry",
+    "DelegationEdge",
     "bind_child_admission",
     "intersect_child_envelope",
 ]

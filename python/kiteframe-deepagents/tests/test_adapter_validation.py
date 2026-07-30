@@ -17,6 +17,7 @@ from kiteframe import (
     FrozenComponentRegistry,
     KiteframeDiagnosticError,
     ResolvedRuntimeInputs,
+    delegation_ancestry_digest,
     load_capability_grant_set,
     resolve_package,
 )
@@ -116,6 +117,7 @@ def granted_session_context() -> KiteframeSessionContext:
         "session": "session:compile-1",
         "task": "task:compile",
     }
+    values["delegationAncestryDigest"] = delegation_ancestry_digest([])
     values["grantDigest"] = hashlib.sha256(
         b"kiteframe:capability-grant-set:v1\0" + canonical_bytes(values)
     ).hexdigest()
@@ -126,13 +128,11 @@ def granted_session_context() -> KiteframeSessionContext:
         task=grant_set.task,
         admission_id=grant_set.admission_id,
         grant_digest=grant_set.grant_digest,
+        delegation_ancestry_digest=grant_set.delegation_ancestry_digest,
         grants=grant_set.grants,
         authority_revisions=grant_set.authority_revisions,
         trace_context=KiteframeTraceContext(
-            traceparent=(
-                "00-4bf92f3577b34da6a3ce929d0e0e4736-"
-                "00f067aa0ba902b7-01"
-            )
+            traceparent=("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         ),
     )
 
@@ -224,6 +224,25 @@ class TestAuditSink:
         return record
 
 
+class IdentityAuthorityProvider:
+    async def current(
+        self,
+        session: KiteframeSessionContext,
+        now: int,
+    ) -> KiteframeSessionContext:
+        del now
+        return session
+
+
+class EmptyAdmittedToolRegistry:
+    async def admitted_tools(
+        self,
+        session: KiteframeSessionContext,
+    ) -> tuple[object, ...]:
+        del session
+        return ()
+
+
 @pytest.fixture
 def adapter() -> DeepAgentsAdapter:
     return DeepAgentsAdapter()
@@ -232,9 +251,7 @@ def adapter() -> DeepAgentsAdapter:
 @pytest.fixture
 def compiled_graph() -> CompiledStateGraph:
     return create_deep_agent(
-        model=FakeMessagesListChatModel(
-            responses=[AIMessage(content="done")]
-        ),
+        model=FakeMessagesListChatModel(responses=[AIMessage(content="done")]),
         subagents=[],
     )
 
@@ -295,6 +312,8 @@ spec:
   models: { primary: models.anthropic.sonnet }
   components:
     checkpointer: checkpointers.durable
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
     harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
@@ -322,6 +341,8 @@ spec:
   models: { primary: models.anthropic.sonnet }
   components:
     backend: backends.workspace
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
     harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
@@ -348,6 +369,8 @@ spec:
   models: { primary: models.anthropic.sonnet }
   components:
     checkpointer: checkpointers.durable
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
     harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
@@ -369,7 +392,10 @@ def content_capture_inputs(tmp_path: Path) -> ResolvedRuntimeInputs:
     binding.write_text(
         binding.read_text().replace(
             "  capabilityProvider:",
-            "  components: { harnessProfile: profiles.deepagents }\n"
+            "  components:\n"
+            "    authorityProvider: authority.current\n"
+            "    admittedToolRegistry: admitted-tools.dynamic\n"
+            "    harnessProfile: profiles.deepagents\n"
             "  capabilityProvider:",
         )
     )
@@ -399,6 +425,8 @@ def registry_for(
     store: object | None = None,
     capability_provider: object | None = None,
     audit_sink: object | None = None,
+    authority_provider: object | None = None,
+    tool_registry: object | None = None,
     profile: KiteframeHarnessProfileToken | None = None,
 ) -> FrozenComponentRegistry:
     registry = ComponentRegistry()
@@ -419,6 +447,20 @@ def registry_for(
         ComponentKind.AUDIT_SINK,
         inputs.runtime_binding.audit_sink,
         audit_sink or TestAuditSink(),
+    )
+    authority_symbol = inputs.runtime_binding.authority_provider
+    assert authority_symbol is not None
+    registry.register(
+        ComponentKind.AUTHORITY_PROVIDER,
+        authority_symbol,
+        authority_provider or IdentityAuthorityProvider(),
+    )
+    tool_registry_symbol = inputs.runtime_binding.admitted_tool_registry
+    assert tool_registry_symbol is not None
+    registry.register(
+        ComponentKind.ADMITTED_TOOL_REGISTRY,
+        tool_registry_symbol,
+        tool_registry or EmptyAdmittedToolRegistry(),
     )
     if inputs.runtime_binding.backend is not None:
         registry.register(
@@ -701,22 +743,17 @@ def test_preconstruction_fail_closed_matrix_never_calls_constructor(
                 registry_for(runtime_inputs, capability_provider=object()),
             )
         else:
-            source = (
-                WORKSPACE
-                / (
-                    "python/kiteframe-deepagents/tests/fixtures/"
-                    "unsupported-feature-agent"
-                    if failure == "feature"
-                    else "tests/fixtures/packages/support-agent"
-                )
+            source = WORKSPACE / (
+                "python/kiteframe-deepagents/tests/fixtures/unsupported-feature-agent"
+                if failure == "feature"
+                else "tests/fixtures/packages/support-agent"
             )
             package = tmp_path / source.name
             shutil.copytree(source, package)
             binding = package / "bindings/deepagents.yaml"
             target_data = json.loads(
                 (
-                    WORKSPACE
-                    / "tests/fixtures/components/deepagents-test.json"
+                    WORKSPACE / "tests/fixtures/components/deepagents-test.json"
                 ).read_bytes()
             )
             if failure == "target":
@@ -762,6 +799,8 @@ spec:
   components:
     middleware: [middleware.tenant-context, middleware.second]
     backend: backends.workspace
+    authorityProvider: authority.current
+    admittedToolRegistry: admitted-tools.dynamic
     harnessProfile: profiles.bound-deepagents
   capabilityProvider: capability-providers.primary
   auditSink: audit-sinks.ledger
@@ -769,14 +808,10 @@ spec:
     )
     target = tmp_path / "target.json"
     metadata = json.loads(
-        (
-            WORKSPACE / "tests/fixtures/components/deepagents-test.json"
-        ).read_bytes()
+        (WORKSPACE / "tests/fixtures/components/deepagents-test.json").read_bytes()
     )
     metadata["components"]["middleware.second"] = {"kind": "middleware"}
-    metadata["components"]["profiles.bound-deepagents"] = {
-        "kind": "harness_profile"
-    }
+    metadata["components"]["profiles.bound-deepagents"] = {"kind": "harness_profile"}
     target.write_bytes(canonical_bytes(metadata))
     inputs = resolve_package(package, binding, target)
     registry = ComponentRegistry()
@@ -786,6 +821,8 @@ spec:
     backend = StateBackend()
     provider = TestCapabilityInvoker()
     audit_sink = TestAuditSink()
+    authority_provider = IdentityAuthorityProvider()
+    tool_registry = EmptyAdmittedToolRegistry()
     registry.register(ComponentKind.MODEL, MODEL_SYMBOL, model)
     registry.register(
         ComponentKind.MIDDLEWARE,
@@ -801,6 +838,16 @@ spec:
     )
     registry.register(ComponentKind.AUDIT_SINK, "audit-sinks.ledger", audit_sink)
     registry.register(
+        ComponentKind.AUTHORITY_PROVIDER,
+        "authority.current",
+        authority_provider,
+    )
+    registry.register(
+        ComponentKind.ADMITTED_TOOL_REGISTRY,
+        "admitted-tools.dynamic",
+        tool_registry,
+    )
+    registry.register(
         ComponentKind.HARNESS_PROFILE,
         "profiles.bound-deepagents",
         profile_token(),
@@ -814,6 +861,8 @@ spec:
     assert components.package_backend is backend
     assert components.capability_provider is provider
     assert components.audit_sink is audit_sink
+    assert components.authority_provider is authority_provider
+    assert components.admitted_tool_registry is tool_registry
     assert components.checkpointer is None
     assert components.store is None
     assert components.compilation_report.decisions == (
@@ -876,6 +925,20 @@ def test_bootstrap_registration_key_matches_validated_constructor_model_string(
         runtime_inputs.runtime_binding.audit_sink,
         TestAuditSink(),
     )
+    authority_symbol = runtime_inputs.runtime_binding.authority_provider
+    tool_registry_symbol = runtime_inputs.runtime_binding.admitted_tool_registry
+    assert authority_symbol is not None
+    assert tool_registry_symbol is not None
+    registry.register(
+        ComponentKind.AUTHORITY_PROVIDER,
+        authority_symbol,
+        IdentityAuthorityProvider(),
+    )
+    registry.register(
+        ComponentKind.ADMITTED_TOOL_REGISTRY,
+        tool_registry_symbol,
+        EmptyAdmittedToolRegistry(),
+    )
     profile_symbol = runtime_inputs.runtime_binding.harness_profile
     assert profile_symbol is not None
     token = bootstrap_deepagents_deployment(
@@ -907,9 +970,7 @@ def test_prebuilt_model_is_rejected_before_public_constructor(
         "kiteframe_deepagents.compatibility.create_deep_agent",
         forbidden_constructor,
     )
-    prebuilt_model = FakeMessagesListChatModel(
-        responses=[AIMessage(content="done")]
-    )
+    prebuilt_model = FakeMessagesListChatModel(responses=[AIMessage(content="done")])
 
     with pytest.raises(KiteframeDiagnosticError) as error:
         adapter.validate(
