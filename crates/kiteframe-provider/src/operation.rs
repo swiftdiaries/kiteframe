@@ -9,7 +9,8 @@ use kiteframe_contract::{
 use serde_json::Value;
 
 use crate::{
-    AuthenticatedInvocationContext, AuthorizationDecision, NarrowedAuthorizationConditions,
+    AuthenticatedInvocationContext, AuthorizationBackend, AuthorizationDecision,
+    InvocationAuthorizationRequest, NarrowedAuthorizationConditions, require_current_authorization,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,7 +47,6 @@ pub struct InvocationContext {
     effective_grant: EffectiveCapabilityGrant,
     grant_digest: Sha256Digest,
     loaded_authority_revisions: AuthorityRevisionSet,
-    authorization: AuthorizationDecision,
 }
 
 impl InvocationContext {
@@ -60,7 +60,6 @@ impl InvocationContext {
         effective_grant: EffectiveCapabilityGrant,
         grant_digest: Sha256Digest,
         loaded_authority_revisions: AuthorityRevisionSet,
-        authorization: AuthorizationDecision,
     ) -> Result<Self, Diagnostic> {
         if locked_capability.identity() != &capability
             || effective_grant.capability() != &capability
@@ -73,28 +72,6 @@ impl InvocationContext {
             ));
         }
 
-        let AuthorizationDecision::Allow {
-            authority_revisions,
-            decided_at,
-            narrowed_conditions,
-            ..
-        } = &authorization
-        else {
-            return Err(authorization_error(
-                "invocation has no current authorization",
-            ));
-        };
-        if authority_revisions != &loaded_authority_revisions
-            || principals.expires_at() <= *decided_at
-            || effective_grant.expires_at() <= *decided_at
-            || narrowed_conditions.expires_at() <= *decided_at
-            || !condition_allows_resource(narrowed_conditions, &selected_resource)
-        {
-            return Err(authorization_error(
-                "current authorization does not match persisted invocation state",
-            ));
-        }
-
         Ok(Self {
             principals,
             capability,
@@ -104,7 +81,6 @@ impl InvocationContext {
             effective_grant,
             grant_digest,
             loaded_authority_revisions,
-            authorization,
         })
     }
 
@@ -138,10 +114,6 @@ impl InvocationContext {
 
     pub fn loaded_authority_revisions(&self) -> &AuthorityRevisionSet {
         &self.loaded_authority_revisions
-    }
-
-    pub fn authorization(&self) -> &AuthorizationDecision {
-        &self.authorization
     }
 }
 
@@ -238,6 +210,7 @@ impl OperationRegistry {
 
     pub async fn execute(
         &self,
+        backend: &dyn AuthorizationBackend,
         context: &InvocationContext,
         preconditions: &[Precondition],
         arguments: Value,
@@ -256,6 +229,19 @@ impl OperationRegistry {
             )
             .into());
         }
+
+        let authorization_request = InvocationAuthorizationRequest::new(
+            context.principals().clone(),
+            context.capability().clone(),
+            context.selected_resource().clone(),
+            *context.grant_digest(),
+            context.loaded_authority_revisions().clone(),
+        );
+        let authorization = require_current_authorization(backend, &authorization_request)
+            .await
+            .map_err(OperationFailure::from)?;
+        validate_current_authorization(context, &authorization, preconditions)
+            .map_err(OperationFailure::from)?;
 
         context
             .locked_capability()
@@ -288,6 +274,50 @@ impl OperationRegistry {
     }
 }
 
+fn validate_current_authorization(
+    context: &InvocationContext,
+    authorization: &AuthorizationDecision,
+    supplied_preconditions: &[Precondition],
+) -> Result<(), Diagnostic> {
+    let AuthorizationDecision::Allow {
+        decided_at,
+        narrowed_conditions,
+        ..
+    } = authorization
+    else {
+        return Err(authorization_error(
+            "invocation has no current authorization",
+        ));
+    };
+    if context.principals().expires_at() <= *decided_at
+        || context.effective_grant().expires_at() <= *decided_at
+        || narrowed_conditions.expires_at() <= *decided_at
+        || !condition_allows_resource(narrowed_conditions, context.selected_resource())
+    {
+        return Err(authorization_error(
+            "current authorization does not match persisted invocation state",
+        ));
+    }
+
+    let all_required_present = context
+        .effective_grant()
+        .preconditions()
+        .iter()
+        .chain(narrowed_conditions.required_preconditions())
+        .filter(|required| required.required)
+        .all(|required| {
+            supplied_preconditions
+                .iter()
+                .any(|supplied| supplied.name() == required.name)
+        });
+    if !all_required_present {
+        return Err(precondition_error(
+            "required authorization or grant precondition is missing",
+        ));
+    }
+    Ok(())
+}
+
 impl Default for OperationRegistry {
     fn default() -> Self {
         Self::new()
@@ -306,6 +336,15 @@ fn runtime_error(message: impl Into<String>) -> Diagnostic {
 fn capability_error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(
         DiagnosticCode::ResultInvalid,
+        DiagnosticCategory::Capability,
+        DiagnosticStage::Invoke,
+        message.into(),
+    )
+}
+
+fn precondition_error(message: impl Into<String>) -> Diagnostic {
+    Diagnostic::error(
+        DiagnosticCode::PreconditionMissing,
         DiagnosticCategory::Capability,
         DiagnosticStage::Invoke,
         message.into(),

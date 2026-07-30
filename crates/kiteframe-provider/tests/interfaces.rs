@@ -1,6 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -10,15 +13,15 @@ use kiteframe_contract::{
     CapabilityReleaseVersion, ConfirmationRequirement, ConsentRequirement, EffectClassification,
     EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, ExecutionMode, FreshnessRequirement,
     IdempotencyRequirement, LockedCapability, NonEmptySet, NormalizedResourceSelector,
-    RequiredEvidence, ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef, Timestamp,
-    TraceContext,
+    PreconditionDescriptor, PreconditionKind, RequiredEvidence, ResourceSelectorSchema, SessionRef,
+    Sha256Digest, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AuthenticatedInvocationContext,
     AuthorizationBackend, AuthorizationDecision, CapabilityOperation,
     InvocationAuthorizationRequest, InvocationContext, NarrowedAuthorizationConditions,
-    OperationFailure, OperationRegistry, PortableInvocationRefs, Precondition, SafeDenialReason,
-    VerifiedHumanPrincipal, VerifiedWorkloadPrincipal, correlate_principals,
+    OperationFailure, OperationRegistry, PortableInvocationRefs, Precondition, RunRef,
+    SafeDenialReason, VerifiedHumanPrincipal, VerifiedWorkloadPrincipal, correlate_principals,
     require_current_authorization,
 };
 use serde_json::{Value, json};
@@ -60,17 +63,18 @@ async fn frozen_registry_uses_exact_version_and_validates_stable_projection() {
     let mut registry = OperationRegistry::new();
     registry.register(ReadOperation).unwrap();
     let registry = registry.freeze().unwrap();
+    let backend = AllowAuthorizationBackend::new(vec![]);
     let context = invocation_context("1.0.0");
 
     let result = registry
-        .execute(&context, &[], json!({"caseId": "42"}))
+        .execute(&backend, &context, &[], json!({"caseId": "42"}))
         .await
         .unwrap();
     assert_eq!(result, json!({"caseId": "42", "summary": "stable"}));
 
     let wrong_version = invocation_context("2.0.0");
     let error = registry
-        .execute(&wrong_version, &[], json!({"caseId": "42"}))
+        .execute(&backend, &wrong_version, &[], json!({"caseId": "42"}))
         .await
         .unwrap_err();
     assert_eq!(error.diagnostic().code.as_str(), "KF-RUNTIME-001");
@@ -81,12 +85,94 @@ async fn output_with_deployment_internal_fields_is_rejected_by_locked_schema() {
     let mut registry = OperationRegistry::new();
     registry.register(LeakyReadOperation).unwrap();
     let registry = registry.freeze().unwrap();
+    let backend = AllowAuthorizationBackend::new(vec![]);
 
     let error = registry
-        .execute(&invocation_context("1.0.0"), &[], json!({"caseId": "42"}))
+        .execute(
+            &backend,
+            &invocation_context("1.0.0"),
+            &[],
+            json!({"caseId": "42"}),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.diagnostic().code.as_str(), "KF-CAP-002");
+}
+
+#[tokio::test]
+async fn current_deny_cannot_reach_operation_execution() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = OperationRegistry::new();
+    registry
+        .register(CountingOperation::new(executions.clone()))
+        .unwrap();
+    let registry = registry.freeze().unwrap();
+    let backend = FakeAuthorizationBackend::default();
+
+    let error = registry
+        .execute(
+            &backend,
+            &invocation_context("1.0.0"),
+            &[],
+            json!({"caseId": "42"}),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.diagnostic().code.as_str(), "KF-AUTH-003");
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn decision_required_precondition_is_enforced_before_operation_dispatch() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = OperationRegistry::new();
+    registry
+        .register(CountingOperation::new(executions.clone()))
+        .unwrap();
+    let registry = registry.freeze().unwrap();
+    let backend =
+        AllowAuthorizationBackend::new(vec![required_precondition("etag", PreconditionKind::Etag)]);
+
+    let error = registry
+        .execute(
+            &backend,
+            &invocation_context("1.0.0"),
+            &[],
+            json!({"caseId": "42"}),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.diagnostic().code.as_str(), "KF-CAP-001");
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn grant_required_precondition_is_enforced_before_operation_dispatch() {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut registry = OperationRegistry::new();
+    registry
+        .register(CountingOperation::new(executions.clone()))
+        .unwrap();
+    let registry = registry.freeze().unwrap();
+    let backend = AllowAuthorizationBackend::new(vec![]);
+
+    let error = registry
+        .execute(
+            &backend,
+            &invocation_context_with_grant_preconditions(
+                "1.0.0",
+                vec![required_precondition("etag", PreconditionKind::Etag)],
+            ),
+            &[],
+            json!({"caseId": "42"}),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.diagnostic().code.as_str(), "KF-CAP-001");
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
 #[derive(Default)]
@@ -121,6 +207,52 @@ impl AuthorizationBackend for FakeAuthorizationBackend {
     }
 }
 
+struct AllowAuthorizationBackend {
+    required_preconditions: Vec<PreconditionDescriptor>,
+}
+
+impl AllowAuthorizationBackend {
+    fn new(required_preconditions: Vec<PreconditionDescriptor>) -> Self {
+        Self {
+            required_preconditions,
+        }
+    }
+}
+
+#[async_trait]
+impl AuthorizationBackend for AllowAuthorizationBackend {
+    async fn list_admissible(
+        &self,
+        request: &AdmissionAuthorizationRequest,
+    ) -> Result<AdmissionAuthorizationResult, kiteframe_contract::Diagnostic> {
+        Ok(AdmissionAuthorizationResult::new(vec![
+            request.capability().clone(),
+        ]))
+    }
+
+    async fn check(
+        &self,
+        request: &InvocationAuthorizationRequest,
+    ) -> Result<AuthorizationDecision, kiteframe_contract::Diagnostic> {
+        Ok(AuthorizationDecision::allow(
+            "decision-current-allow",
+            revisions("current-8"),
+            Timestamp::new(200),
+            NarrowedAuthorizationConditions::new(
+                vec![request.selected_resource().clone()],
+                Timestamp::new(400),
+                self.required_preconditions.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap())
+    }
+
+    async fn revisions(&self) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
+        Ok(revisions("current-8"))
+    }
+}
+
 struct ReadOperation;
 
 #[async_trait]
@@ -147,6 +279,41 @@ impl CapabilityOperation for ReadOperation {
             "caseId": arguments["caseId"],
             "summary": "stable",
         }))
+    }
+}
+
+struct CountingOperation {
+    executions: Arc<AtomicUsize>,
+}
+
+impl CountingOperation {
+    fn new(executions: Arc<AtomicUsize>) -> Self {
+        Self { executions }
+    }
+}
+
+#[async_trait]
+impl CapabilityOperation for CountingOperation {
+    fn identity(&self) -> &CapabilityIdentity {
+        static IDENTITY: std::sync::OnceLock<CapabilityIdentity> = std::sync::OnceLock::new();
+        IDENTITY.get_or_init(|| capability_identity("1.0.0"))
+    }
+
+    async fn validate_preconditions(
+        &self,
+        _context: &InvocationContext,
+        _preconditions: &[Precondition],
+    ) -> Result<(), kiteframe_contract::Diagnostic> {
+        Ok(())
+    }
+
+    async fn execute(
+        &self,
+        _context: &InvocationContext,
+        _arguments: Value,
+    ) -> Result<Value, OperationFailure> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"caseId": "42", "summary": "stable"}))
     }
 }
 
@@ -191,8 +358,15 @@ fn authorization_request() -> InvocationAuthorizationRequest {
 }
 
 fn invocation_context(version: &str) -> InvocationContext {
+    invocation_context_with_grant_preconditions(version, vec![])
+}
+
+fn invocation_context_with_grant_preconditions(
+    version: &str,
+    preconditions: Vec<PreconditionDescriptor>,
+) -> InvocationContext {
     let identity = capability_identity(version);
-    let descriptor = descriptor(identity.clone());
+    let descriptor = descriptor(identity.clone(), preconditions.clone());
     let locked = LockedCapability::try_new(
         identity.clone(),
         descriptor.clone(),
@@ -215,7 +389,7 @@ fn invocation_context(version: &str) -> InvocationContext {
             ConsentRequirement::None,
         ),
         freshness: FreshnessRequirement::default(),
-        preconditions: vec![],
+        preconditions,
     })
     .unwrap();
     InvocationContext::try_new(
@@ -227,18 +401,6 @@ fn invocation_context(version: &str) -> InvocationContext {
         grant,
         digest(7),
         revisions("current-8"),
-        AuthorizationDecision::allow(
-            "decision-current-allow",
-            revisions("current-8"),
-            Timestamp::new(200),
-            NarrowedAuthorizationConditions::new(
-                vec![selector("case:42")],
-                Timestamp::new(400),
-                vec![],
-            )
-            .unwrap(),
-        )
-        .unwrap(),
     )
     .unwrap()
 }
@@ -266,6 +428,7 @@ fn authenticated_context() -> AuthenticatedInvocationContext {
         PortableInvocationRefs::new(
             ActorRef::new("actor-7").unwrap(),
             AgentRef::new("agent-2").unwrap(),
+            RunRef::new("run-9").unwrap(),
             TaskRef::new("task-4").unwrap(),
             SessionRef::new("session-3").unwrap(),
             AdmissionId::new("admission-5").unwrap(),
@@ -275,7 +438,10 @@ fn authenticated_context() -> AuthenticatedInvocationContext {
     .unwrap()
 }
 
-fn descriptor(identity: CapabilityIdentity) -> CapabilityDescriptor {
+fn descriptor(
+    identity: CapabilityIdentity,
+    preconditions: Vec<PreconditionDescriptor>,
+) -> CapabilityDescriptor {
     CapabilityDescriptor::try_new(CapabilityDescriptorParts {
         identity,
         summary: "Read a stable case projection".to_owned(),
@@ -301,7 +467,7 @@ fn descriptor(identity: CapabilityIdentity) -> CapabilityDescriptor {
         effect: EffectClassification::ReadOnly,
         idempotency: IdempotencyRequirement::None,
         freshness: FreshnessRequirement::default(),
-        preconditions: vec![],
+        preconditions,
         confirmation: ConfirmationRequirement::None,
         approval: ApprovalRequirement::None,
         consent: ConsentRequirement::None,
@@ -343,4 +509,12 @@ fn trace_context() -> TraceContext {
         BTreeMap::new(),
     )
     .unwrap()
+}
+
+fn required_precondition(name: &str, kind: PreconditionKind) -> PreconditionDescriptor {
+    PreconditionDescriptor {
+        name: name.to_owned(),
+        kind,
+        required: true,
+    }
 }

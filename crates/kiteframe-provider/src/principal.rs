@@ -191,6 +191,7 @@ pub trait ProviderPrincipalVerifier: Send + Sync {
 pub struct PortableInvocationRefs {
     actor_ref: ActorRef,
     agent_ref: AgentRef,
+    run_ref: RunRef,
     task_ref: TaskRef,
     session_ref: SessionRef,
     admission_ref: AdmissionId,
@@ -201,6 +202,7 @@ impl PortableInvocationRefs {
     pub fn new(
         actor_ref: ActorRef,
         agent_ref: AgentRef,
+        run_ref: RunRef,
         task_ref: TaskRef,
         session_ref: SessionRef,
         admission_ref: AdmissionId,
@@ -209,6 +211,7 @@ impl PortableInvocationRefs {
         Self {
             actor_ref,
             agent_ref,
+            run_ref,
             task_ref,
             session_ref,
             admission_ref,
@@ -283,6 +286,7 @@ pub fn correlate_principals(
     if human.tenant_ref != workload.tenant_ref
         || human.mapped_actor != refs.actor_ref
         || workload.mapped_agent != refs.agent_ref
+        || workload.run_ref != refs.run_ref
         || workload.task_ref != refs.task_ref
         || workload.session_ref != refs.session_ref
         || workload.admission_ref != refs.admission_ref
@@ -296,7 +300,7 @@ pub fn correlate_principals(
         tenant_ref: human.tenant_ref,
         human_ref: human.human_ref,
         workload_ref: workload.workload_ref,
-        run_ref: workload.run_ref,
+        run_ref: refs.run_ref,
         actor_ref: refs.actor_ref,
         agent_ref: refs.agent_ref,
         task_ref: refs.task_ref,

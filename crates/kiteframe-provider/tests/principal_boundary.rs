@@ -1,6 +1,7 @@
 use kiteframe_contract::{ActorRef, AdmissionId, AgentRef, SessionRef, TaskRef, Timestamp};
 use kiteframe_provider::{
-    PortableInvocationRefs, VerifiedHumanPrincipal, VerifiedWorkloadPrincipal, correlate_principals,
+    PortableInvocationRefs, RunRef, VerifiedHumanPrincipal, VerifiedWorkloadPrincipal,
+    correlate_principals,
 };
 
 #[test]
@@ -20,6 +21,7 @@ fn independently_verified_human_and_workload_are_both_required() {
         portable_refs(
             "actor-7",
             "agent-2",
+            "run-9",
             "task-4",
             "session-3",
             "admission-5",
@@ -58,6 +60,7 @@ fn verified_tenant_or_subject_mismatch_fails_closed() {
             portable_refs(
                 "actor-7",
                 "agent-2",
+                "run-9",
                 "task-4",
                 "session-3",
                 "admission-5",
@@ -79,6 +82,7 @@ fn verified_tenant_or_subject_mismatch_fails_closed() {
             portable_refs(
                 "actor-7",
                 "agent-2",
+                "run-9",
                 "task-4",
                 "session-3",
                 "admission-5",
@@ -100,6 +104,7 @@ fn verified_tenant_or_subject_mismatch_fails_closed() {
             portable_refs(
                 "actor-7",
                 "agent-2",
+                "run-9",
                 "task-4",
                 "session-3",
                 "admission-5",
@@ -121,6 +126,29 @@ fn verified_tenant_or_subject_mismatch_fails_closed() {
             portable_refs(
                 "actor-7",
                 "agent-2",
+                "run-9",
+                "task-4",
+                "session-3",
+                "admission-5",
+                100,
+            ),
+        ),
+        (
+            verified_human("tenant-1", "human-7", "actor-7", 500),
+            verified_workload(
+                "tenant-1",
+                "harness-2",
+                "run-other",
+                "agent-2",
+                "task-4",
+                "session-3",
+                "admission-5",
+                450,
+            ),
+            portable_refs(
+                "actor-7",
+                "agent-2",
+                "run-9",
                 "task-4",
                 "session-3",
                 "admission-5",
@@ -154,6 +182,7 @@ fn expired_or_wrong_session_and_admission_bindings_fail_closed() {
         portable_refs(
             "actor-7",
             "agent-2",
+            "run-9",
             "task-4",
             "session-3",
             "admission-5",
@@ -178,6 +207,7 @@ fn expired_or_wrong_session_and_admission_bindings_fail_closed() {
         portable_refs(
             "actor-7",
             "agent-2",
+            "run-9",
             "task-4",
             "session-3",
             "admission-5",
@@ -202,6 +232,7 @@ fn expired_or_wrong_session_and_admission_bindings_fail_closed() {
         portable_refs(
             "actor-7",
             "agent-2",
+            "run-9",
             "task-4",
             "session-3",
             "admission-5",
@@ -226,6 +257,7 @@ fn expired_or_wrong_session_and_admission_bindings_fail_closed() {
         portable_refs(
             "actor-7",
             "agent-2",
+            "run-9",
             "task-4",
             "session-3",
             "admission-5",
@@ -278,6 +310,7 @@ fn verified_workload(
 fn portable_refs(
     actor: &str,
     agent: &str,
+    run: &str,
     task: &str,
     session: &str,
     admission: &str,
@@ -286,6 +319,7 @@ fn portable_refs(
     PortableInvocationRefs::new(
         ActorRef::new(actor).unwrap(),
         AgentRef::new(agent).unwrap(),
+        RunRef::new(run).unwrap(),
         TaskRef::new(task).unwrap(),
         SessionRef::new(session).unwrap(),
         AdmissionId::new(admission).unwrap(),
