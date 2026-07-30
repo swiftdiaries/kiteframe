@@ -288,7 +288,7 @@ async fn changed_request_with_matching_new_evidence_cannot_resume_old_proposal()
                 BTreeMap::new(),
                 evidence_refs("approval-token", evidence_ref.as_str()),
             ),
-            suspension,
+            suspension.clone(),
         ))
         .await
         .unwrap_err();
@@ -296,6 +296,19 @@ async fn changed_request_with_matching_new_evidence_cannot_resume_old_proposal()
     assert_eq!(error.code.as_str(), "KF-AUTH-003");
     assert!(!fixture.events.snapshot().contains(&"validate_evidence"));
     assert!(!fixture.events.snapshot().contains(&"execute"));
+
+    let consumed = fixture
+        .service
+        .resume(ResumeRequest::new(
+            fixture.request(EvidenceReferences::default()),
+            suspension,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        consumed.message.as_str(),
+        "suspension checkpoint is not pending"
+    );
 }
 
 #[tokio::test]
@@ -345,7 +358,7 @@ async fn pending_checkpoint_collision_is_rejected_without_replacement() {
         .service
         .resume(ResumeRequest::new(
             fixture.request(evidence_refs("approval-token", evidence_ref.as_str())),
-            suspension,
+            suspension.clone(),
         ))
         .await
         .unwrap();
@@ -516,6 +529,24 @@ async fn authorization_expiry_is_checked_at_provider_current_time() {
 }
 
 #[tokio::test]
+async fn point_of_use_rechecks_clock_after_authorization_await() {
+    let fixture = fixture(FixtureOptions {
+        advance_clock_on_authorization: Some(501),
+        ..FixtureOptions::read()
+    });
+
+    let error = fixture
+        .service
+        .invoke(fixture.request(EvidenceReferences::default()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-AUTH-002");
+    assert_eq!(fixture.events.snapshot().last(), Some(&"authorize"));
+    assert!(!fixture.events.snapshot().contains(&"execute"));
+}
+
+#[tokio::test]
 async fn future_authorization_decision_is_rejected() {
     let fixture = fixture(FixtureOptions {
         authorization_decided_at: 201,
@@ -624,6 +655,37 @@ async fn persisted_actor_must_match_the_authenticated_human() {
         fixture.events.snapshot(),
         ["validate_request", "validate_grant", "authenticate"]
     );
+}
+
+#[tokio::test]
+async fn principal_verifier_diagnostic_is_redacted_at_the_trust_boundary() {
+    let mut malicious = kiteframe_contract::Diagnostic::error(
+        kiteframe_contract::DiagnosticCode::RuntimeConstruction,
+        kiteframe_contract::DiagnosticCategory::Runtime,
+        kiteframe_contract::DiagnosticStage::Runtime,
+        "Authorization: Bearer secret-token-value",
+    );
+    malicious
+        .details
+        .insert("credential".to_owned(), json!("Bearer secret-token-value"));
+    let fixture = fixture(FixtureOptions {
+        principal_error: Some(malicious),
+        ..FixtureOptions::read()
+    });
+
+    let error = fixture
+        .service
+        .invoke(fixture.request(EvidenceReferences::default()))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-AUTH-003");
+    assert_eq!(
+        error.message.as_str(),
+        "authenticated principal verification failed"
+    );
+    assert!(error.details.is_empty());
+    assert!(!format!("{error:?}").contains("secret-token-value"));
 }
 
 #[tokio::test]
@@ -777,7 +839,7 @@ async fn resume_revalidates_principals_freshness_preconditions_and_authorization
         .service
         .resume(ResumeRequest::new(
             fixture.request(evidence_refs("approval-token", evidence_ref.as_str())),
-            suspension,
+            suspension.clone(),
         ))
         .await
         .unwrap();
@@ -796,6 +858,101 @@ async fn resume_revalidates_principals_freshness_preconditions_and_authorization
             "authorize",
         ]
     );
+}
+
+#[tokio::test]
+async fn evidence_expiry_is_rechecked_after_authorization_before_effect_handoff() {
+    let fixture = fixture(FixtureOptions {
+        advance_clock_on_authorization: Some(251),
+        ..FixtureOptions::approval()
+    });
+    let missing = fixture.request(EvidenceReferences::default());
+    let outcome = fixture.service.invoke(missing.clone()).await.unwrap();
+    let InvocationOutcome::Suspended { suspension, .. } = outcome else {
+        panic!("approval-gated effect must suspend")
+    };
+    let proposal = EffectProposal::try_new(&missing, fixture.descriptor()).unwrap();
+    let evidence_ref = ProtectedEvidenceRequestRef::new("evidence://approval/boundary").unwrap();
+    fixture.evidence.insert(
+        VerifiedEvidence::try_new(
+            evidence_ref.clone(),
+            EvidenceKind::Approval,
+            "approval-token",
+            "approver-boundary",
+            Some("change-board"),
+            fixture.identity(),
+            selector("case:42"),
+            Timestamp::new(190),
+            Timestamp::new(250),
+            *proposal.proposal_digest(),
+        )
+        .unwrap(),
+    );
+
+    fixture.events.clear();
+    let error = fixture
+        .service
+        .resume(ResumeRequest::new(
+            fixture.request(evidence_refs("approval-token", evidence_ref.as_str())),
+            suspension,
+        ))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-AUTH-003");
+    assert_eq!(fixture.events.snapshot().last(), Some(&"authorize"));
+    assert!(!fixture.events.snapshot().contains(&"execute"));
+}
+
+#[tokio::test]
+async fn concurrent_resume_allows_exactly_one_in_flight_continuation() {
+    let fixture = fixture(FixtureOptions {
+        yield_authorization_check: true,
+        ..FixtureOptions::approval()
+    });
+    let missing = fixture.request(EvidenceReferences::default());
+    let outcome = fixture.service.invoke(missing.clone()).await.unwrap();
+    let InvocationOutcome::Suspended { suspension, .. } = outcome else {
+        panic!("approval-gated effect must suspend")
+    };
+    let proposal = EffectProposal::try_new(&missing, fixture.descriptor()).unwrap();
+    let evidence_ref = ProtectedEvidenceRequestRef::new("evidence://approval/concurrent").unwrap();
+    fixture.evidence.insert(
+        VerifiedEvidence::try_new(
+            evidence_ref.clone(),
+            EvidenceKind::Approval,
+            "approval-token",
+            "approver-concurrent",
+            Some("change-board"),
+            fixture.identity(),
+            selector("case:42"),
+            Timestamp::new(190),
+            Timestamp::new(250),
+            *proposal.proposal_digest(),
+        )
+        .unwrap(),
+    );
+    let resume = ResumeRequest::new(
+        fixture.request(evidence_refs("approval-token", evidence_ref.as_str())),
+        suspension,
+    );
+
+    let (first, second) = tokio::join!(
+        fixture.service.resume(resume.clone()),
+        fixture.service.resume(resume),
+    );
+    let mut succeeded = 0;
+    let mut rejected = 0;
+    for result in [first, second] {
+        match result {
+            Ok(InvocationOutcome::Deferred { .. }) => succeeded += 1,
+            Err(error) if error.code.as_str() == "KF-AUTH-003" => rejected += 1,
+            other => panic!("unexpected concurrent resume result: {other:?}"),
+        }
+    }
+    assert_eq!(succeeded, 1);
+    assert_eq!(rejected, 1);
+    assert!(!fixture.events.snapshot().contains(&"execute"));
 }
 
 #[tokio::test]
@@ -830,7 +987,7 @@ async fn resume_rejects_authority_revision_change_before_evidence_or_authorizati
         .service
         .resume(ResumeRequest::new(
             fixture.request(evidence_refs("approval-token", evidence_ref.as_str())),
-            suspension,
+            suspension.clone(),
         ))
         .await
         .unwrap_err();
@@ -841,6 +998,17 @@ async fn resume_rejects_authority_revision_change_before_evidence_or_authorizati
         Some(&"validate_freshness")
     );
     assert!(!fixture.events.snapshot().contains(&"validate_evidence"));
+
+    *fixture.current_revision.lock().unwrap() = "r1";
+    let retried = fixture
+        .service
+        .resume(ResumeRequest::new(
+            fixture.request(evidence_refs("approval-token", evidence_ref.as_str())),
+            suspension,
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(retried, InvocationOutcome::Deferred { .. }));
 }
 
 #[tokio::test]
@@ -1043,11 +1211,15 @@ impl InvocationCheckpointIssuer for FakeCheckpointIssuer {
 struct FakePrincipalVerifier {
     admission_id: AdmissionId,
     actor: &'static str,
+    error: Option<kiteframe_contract::Diagnostic>,
 }
 
 #[async_trait]
 impl kiteframe_provider::ProviderPrincipalVerifier for FakePrincipalVerifier {
     async fn verify(&self) -> Result<VerifiedProviderPrincipals, kiteframe_contract::Diagnostic> {
+        if let Some(error) = &self.error {
+            return Err(error.clone());
+        }
         Ok(VerifiedProviderPrincipals::new(
             VerifiedHumanPrincipal::try_new(
                 "tenant-1",
@@ -1078,6 +1250,9 @@ struct FakeAuthorizationBackend {
     decided_at: Timestamp,
     expires_at: Timestamp,
     required_preconditions: Vec<PreconditionDescriptor>,
+    clock: Arc<FakeClock>,
+    advance_clock_to: Option<u64>,
+    yield_check: bool,
 }
 
 #[async_trait]
@@ -1095,6 +1270,12 @@ impl AuthorizationBackend for FakeAuthorizationBackend {
         &self,
         request: &kiteframe_provider::InvocationAuthorizationRequest,
     ) -> Result<AuthorizationDecision, kiteframe_contract::Diagnostic> {
+        if self.yield_check {
+            yield_once().await;
+        }
+        if let Some(unix_seconds) = self.advance_clock_to {
+            self.clock.set(unix_seconds);
+        }
         if !self.allows {
             return Ok(AuthorizationDecision::deny(
                 "decision-deny",
@@ -1119,6 +1300,20 @@ impl AuthorizationBackend for FakeAuthorizationBackend {
     async fn revisions(&self) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
         Ok(revisions(*self.revision.lock().unwrap()))
     }
+}
+
+async fn yield_once() {
+    let mut yielded = false;
+    std::future::poll_fn(|context| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
 }
 
 struct FakeOperation {
@@ -1264,7 +1459,10 @@ struct FixtureOptions {
     authorization_decided_at: u64,
     authorization_expires_at: u64,
     authorization_preconditions: Vec<PreconditionDescriptor>,
+    advance_clock_on_authorization: Option<u64>,
+    yield_authorization_check: bool,
     authenticated_actor: &'static str,
+    principal_error: Option<kiteframe_contract::Diagnostic>,
     effect: EffectClassification,
     grant_maximum_effect: Option<EffectClassification>,
     execution_modes: Vec<ExecutionMode>,
@@ -1289,7 +1487,10 @@ impl FixtureOptions {
             authorization_decided_at: 200,
             authorization_expires_at: 400,
             authorization_preconditions: vec![],
+            advance_clock_on_authorization: None,
+            yield_authorization_check: false,
             authenticated_actor: "actor-7",
+            principal_error: None,
             effect: EffectClassification::ReadOnly,
             grant_maximum_effect: None,
             execution_modes: vec![ExecutionMode::Immediate],
@@ -1401,6 +1602,7 @@ fn fixture(options: FixtureOptions) -> Fixture {
             error: options.operation_error,
         })
         .unwrap();
+    let clock = Arc::new(FakeClock(AtomicU64::new(200)));
     let current_revision = Arc::new(Mutex::new(options.current_revision));
     let registry = registry
         .freeze(Arc::new(FakeAuthorizationBackend {
@@ -1410,14 +1612,17 @@ fn fixture(options: FixtureOptions) -> Fixture {
             decided_at: Timestamp::new(options.authorization_decided_at),
             expires_at: Timestamp::new(options.authorization_expires_at),
             required_preconditions: options.authorization_preconditions.clone(),
+            clock: clock.clone(),
+            advance_clock_to: options.advance_clock_on_authorization,
+            yield_check: options.yield_authorization_check,
         }))
         .unwrap();
-    let clock = Arc::new(FakeClock(AtomicU64::new(200)));
     let service = InvocationService::try_new(
         admissions,
         Arc::new(FakePrincipalVerifier {
             admission_id: admission_id.clone(),
             actor: options.authenticated_actor,
+            error: options.principal_error,
         }),
         registry,
         evidence.clone(),

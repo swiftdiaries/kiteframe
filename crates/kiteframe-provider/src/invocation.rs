@@ -9,8 +9,8 @@ use kiteframe_contract::{
     ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
     DiagnosticStage, EffectClassification, EffectProposal, EffectiveCapabilityGrant, EvidenceKind,
     EvidenceRequirement, ExecutionMode, InvocationOutcome, InvocationRequest, LockedCapability,
-    NormalizedResourceSelector, ProtectedEvidenceRequestRef, Sha256Digest, Suspension, Timestamp,
-    resource_selector_is_subset_of,
+    NormalizedResourceSelector, ProtectedEvidenceRequestRef, RetryClass, Sha256Digest, Suspension,
+    Timestamp, resource_selector_is_subset_of,
 };
 use sha2::{Digest, Sha256};
 
@@ -247,6 +247,12 @@ struct PendingSuspension {
     snapshot: AdmissionSnapshot,
 }
 
+#[derive(Clone)]
+enum SuspensionState {
+    Pending(Box<PendingSuspension>),
+    InFlight,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AdmissionSnapshot {
     grant_digest: Sha256Digest,
@@ -288,7 +294,7 @@ pub struct InvocationService {
     clock: Arc<dyn InvocationClock>,
     checkpoint_issuer: Arc<dyn InvocationCheckpointIssuer>,
     events: Arc<dyn InvocationEventSink>,
-    pending: Mutex<BTreeMap<String, PendingSuspension>>,
+    pending: Mutex<BTreeMap<String, SuspensionState>>,
 }
 
 impl InvocationService {
@@ -331,22 +337,9 @@ impl InvocationService {
 
     pub async fn resume(&self, resume: ResumeRequest) -> Result<InvocationOutcome, Diagnostic> {
         let checkpoint = resume.suspension.checkpoint_ref().as_str().to_owned();
-        let pending = self
-            .lock_pending()
-            .get(&checkpoint)
-            .cloned()
-            .ok_or_else(|| authorization_error("suspension checkpoint is not pending"))?;
-        if pending.suspension != resume.suspension {
-            return Err(authorization_error(
-                "resume suspension does not exact-match the pending checkpoint",
-            ));
-        }
-
-        let outcome = self.validate(resume.request, Some(&pending)).await?;
-        if !matches!(outcome, InvocationOutcome::Suspended { .. }) {
-            self.lock_pending().remove(&checkpoint);
-        }
-        Ok(outcome)
+        let pending = self.begin_resume(&checkpoint, &resume.suspension)?;
+        let outcome = self.validate(resume.request, Some(&pending)).await;
+        self.finish_resume(&checkpoint, pending, outcome)
     }
 
     async fn validate(
@@ -406,7 +399,11 @@ impl InvocationService {
         }
 
         self.events.record("authenticate");
-        let verified = self.principal_verifier.verify().await?;
+        let verified = self
+            .principal_verifier
+            .verify()
+            .await
+            .map_err(|_| authorization_error("authenticated principal verification failed"))?;
         let (human, workload) = verified.into_parts();
         let principals = correlate_principals(
             human,
@@ -453,11 +450,11 @@ impl InvocationService {
             ));
         }
         self.events.record("validate_evidence");
-        match self
+        let verified_evidence = match self
             .validate_evidence(&request, grant, &principals, &proposal, now)
             .await?
         {
-            EvidenceStatus::Complete => {}
+            EvidenceStatus::Complete(evidence) => evidence,
             EvidenceStatus::Missing(kind) if resumed.is_none() => {
                 if !descriptor.supports_execution_mode(ExecutionMode::Suspendable)
                     || !grant
@@ -491,10 +488,10 @@ impl InvocationService {
                 }
                 pending.insert(
                     checkpoint,
-                    PendingSuspension {
+                    SuspensionState::Pending(Box::new(PendingSuspension {
                         suspension: suspension.clone(),
                         snapshot: AdmissionSnapshot::new(&admission, locked, grant),
-                    },
+                    })),
                 );
                 drop(pending);
                 return Ok(InvocationOutcome::Suspended {
@@ -503,11 +500,11 @@ impl InvocationService {
                 });
             }
             EvidenceStatus::Missing(_) => {
-                return Err(authorization_error(
+                return Err(evidence_error(
                     "required evidence is still absent at resume",
                 ));
             }
-        }
+        };
 
         let operation = self.operations.resolve(request.capability())?;
         let context = InvocationContext::try_new(
@@ -545,7 +542,16 @@ impl InvocationService {
             context.loaded_authority_revisions().clone(),
         );
         let decision = authorization.check(&authorization_request).await?;
-        validate_authorization(&context, &decision, &current_revisions, &preconditions, now)?;
+        let dispatch_now = self.clock.now();
+        validate_final_point_of_use(
+            admission.grant_set(),
+            &context,
+            &decision,
+            &current_revisions,
+            &preconditions,
+            &verified_evidence,
+            dispatch_now,
+        )?;
 
         if descriptor.effect() != EffectClassification::ReadOnly {
             if !descriptor.supports_execution_mode(ExecutionMode::Deferred)
@@ -595,6 +601,7 @@ impl InvocationService {
         now: Timestamp,
     ) -> Result<EvidenceStatus, Diagnostic> {
         let required = grant.required_evidence();
+        let mut verified = Vec::new();
         for (kind, requirement) in [
             (
                 EvidenceKind::Confirmation,
@@ -616,12 +623,12 @@ impl InvocationService {
                 return Ok(EvidenceStatus::Missing(kind));
             };
             if !protected_evidence_reference(reference) {
-                return Err(authorization_error(
+                return Err(evidence_error(
                     "evidence must use a protected opaque reference",
                 ));
             }
             let reference =
-                ProtectedEvidenceRequestRef::new(reference.clone()).map_err(authorization_error)?;
+                ProtectedEvidenceRequestRef::new(reference.clone()).map_err(evidence_error)?;
             let evidence = self.evidence.resolve(&reference).await?;
             validate_verified_evidence(
                 &evidence,
@@ -634,11 +641,62 @@ impl InvocationService {
                 proposal.proposal_digest(),
                 now,
             )?;
+            verified.push(evidence);
         }
-        Ok(EvidenceStatus::Complete)
+        Ok(EvidenceStatus::Complete(verified))
     }
 
-    fn lock_pending(&self) -> MutexGuard<'_, BTreeMap<String, PendingSuspension>> {
+    fn begin_resume(
+        &self,
+        checkpoint: &str,
+        suspension: &Suspension,
+    ) -> Result<PendingSuspension, Diagnostic> {
+        let mut states = self.lock_pending();
+        let state = states
+            .get_mut(checkpoint)
+            .ok_or_else(|| authorization_error("suspension checkpoint is not pending"))?;
+        match state {
+            SuspensionState::Pending(pending) => {
+                if pending.suspension != *suspension {
+                    return Err(authorization_error(
+                        "resume suspension does not exact-match the pending checkpoint",
+                    ));
+                }
+                let owned = (**pending).clone();
+                *state = SuspensionState::InFlight;
+                Ok(owned)
+            }
+            SuspensionState::InFlight => Err(authorization_error(
+                "suspension checkpoint already has an in-flight resume",
+            )),
+        }
+    }
+
+    fn finish_resume(
+        &self,
+        checkpoint: &str,
+        pending: PendingSuspension,
+        outcome: Result<InvocationOutcome, Diagnostic>,
+    ) -> Result<InvocationOutcome, Diagnostic> {
+        let mut states = self.lock_pending();
+        match &outcome {
+            Ok(_) => {
+                states.remove(checkpoint);
+            }
+            Err(error) if error.retry != RetryClass::Never => {
+                states.insert(
+                    checkpoint.to_owned(),
+                    SuspensionState::Pending(Box::new(pending)),
+                );
+            }
+            Err(_) => {
+                states.remove(checkpoint);
+            }
+        }
+        outcome
+    }
+
+    fn lock_pending(&self) -> MutexGuard<'_, BTreeMap<String, SuspensionState>> {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -646,7 +704,7 @@ impl InvocationService {
 }
 
 enum EvidenceStatus {
-    Complete,
+    Complete(Vec<VerifiedEvidence>),
     Missing(EvidenceKind),
 }
 
@@ -792,7 +850,7 @@ fn validate_verified_evidence(
         || evidence.expires_at <= now
         || &evidence.proposal_digest != proposal_digest
     {
-        return Err(authorization_error(
+        return Err(evidence_error(
             "verified evidence does not match the invocation proposal",
         ));
     }
@@ -968,6 +1026,36 @@ fn validate_required_preconditions(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_final_point_of_use(
+    grant_set: &CapabilityGrantSet,
+    context: &InvocationContext,
+    decision: &AuthorizationDecision,
+    current_revisions: &AuthorityRevisionSet,
+    supplied_preconditions: &[Precondition],
+    verified_evidence: &[VerifiedEvidence],
+    now: Timestamp,
+) -> Result<(), Diagnostic> {
+    if grant_set.expires_at() <= now || context.effective_grant().expires_at() <= now {
+        return Err(grant_error(
+            "capability grant or admission expired before dispatch",
+        ));
+    }
+    if verified_evidence
+        .iter()
+        .any(|evidence| evidence.issued_at > now || evidence.expires_at <= now)
+    {
+        return Err(evidence_error("verified evidence expired before dispatch"));
+    }
+    validate_authorization(
+        context,
+        decision,
+        current_revisions,
+        supplied_preconditions,
+        now,
+    )
+}
+
 fn validate_authorization(
     context: &InvocationContext,
     decision: &AuthorizationDecision,
@@ -1072,22 +1160,32 @@ fn authorization_error(message: impl Into<String>) -> Diagnostic {
     )
 }
 
+fn evidence_error(message: impl Into<String>) -> Diagnostic {
+    let mut diagnostic = authorization_error(message);
+    diagnostic.retry = RetryClass::AfterUserAction;
+    diagnostic
+}
+
 fn policy_error(message: impl Into<String>) -> Diagnostic {
-    Diagnostic::error(
+    let mut diagnostic = Diagnostic::error(
         DiagnosticCode::PolicyStale,
         DiagnosticCategory::Authorization,
         DiagnosticStage::Invoke,
         message.into(),
-    )
+    );
+    diagnostic.retry = RetryClass::AfterRefresh;
+    diagnostic
 }
 
 fn precondition_error(message: impl Into<String>) -> Diagnostic {
-    Diagnostic::error(
+    let mut diagnostic = Diagnostic::error(
         DiagnosticCode::PreconditionMissing,
         DiagnosticCategory::Capability,
         DiagnosticStage::Invoke,
         message.into(),
-    )
+    );
+    diagnostic.retry = RetryClass::AfterRefresh;
+    diagnostic
 }
 
 fn capability_error(message: impl Into<String>) -> Diagnostic {
