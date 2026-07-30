@@ -49,39 +49,54 @@ fn parse_trace_context(
     verifier: &dyn ProviderPrincipalVerifier,
 ) -> Result<TraceContext, ProviderHttpError> {
     let traceparent = header_value(headers, "traceparent")?;
-    let tracestate = headers
-        .get("tracestate")
-        .map(|value| {
-            value
-                .to_str()
-                .map(str::to_owned)
-                .map_err(|_| ProviderHttpError::trace_invalid())
-        })
-        .transpose()?;
+    let tracestate = combined_header_value(headers, "tracestate")?;
     let baggage = parse_baggage(headers, verifier)?;
     TraceContext::try_new(traceparent, tracestate, baggage)
         .map_err(|_| ProviderHttpError::trace_invalid())
 }
 
 fn header_value(headers: &HeaderMap, name: &'static str) -> Result<String, ProviderHttpError> {
-    headers
-        .get(name)
-        .ok_or_else(ProviderHttpError::missing_trace_context)?
+    let mut values = headers.get_all(name).iter();
+    let value = values
+        .next()
+        .ok_or_else(ProviderHttpError::missing_trace_context)?;
+    if values.next().is_some() {
+        return Err(ProviderHttpError::trace_invalid());
+    }
+    value
         .to_str()
         .map(str::to_owned)
         .map_err(|_| ProviderHttpError::trace_invalid())
+}
+
+fn combined_header_value(
+    headers: &HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, ProviderHttpError> {
+    let values = headers
+        .get_all(name)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| ProviderHttpError::trace_invalid())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(values.join(",")))
+    }
 }
 
 fn parse_baggage(
     headers: &HeaderMap,
     verifier: &dyn ProviderPrincipalVerifier,
 ) -> Result<BTreeMap<String, String>, ProviderHttpError> {
-    let Some(raw) = headers.get("baggage") else {
+    let Some(raw) = combined_header_value(headers, "baggage")? else {
         return Ok(BTreeMap::new());
     };
-    let raw = raw
-        .to_str()
-        .map_err(|_| ProviderHttpError::trace_invalid())?;
     let mut baggage = BTreeMap::new();
     for member in raw.split(',') {
         let Some((key, value)) = member.trim().split_once('=') else {

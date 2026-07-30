@@ -10,10 +10,15 @@ use std::{net::SocketAddr, path::PathBuf};
 use axum::Router;
 use url::Url;
 
-pub use auth::{ProviderPrincipalVerifier, ProviderRequestContext};
+pub use auth::{
+    ProviderPrincipalVerifier, ProviderRequestContext, VerifiedHumanAuthentication,
+    VerifiedWorkloadAuthentication,
+};
 pub use kiteframe_provider::VerifiedProviderPrincipals;
 pub use response::{DiagnosticEnvelope, HttpErrorKind, ProviderHttpError};
-pub use routes::{ProviderHttpServices, ProviderHttpState, provider_router};
+pub use routes::{
+    AuthenticatedStatusRequest, ProviderHttpServices, ProviderHttpState, provider_router,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ServerBindConfig {
@@ -21,6 +26,7 @@ pub struct ServerBindConfig {
     certificate: Option<PathBuf>,
     private_key: Option<PathBuf>,
     insecure_loopback: bool,
+    origin: Url,
 }
 
 impl ServerBindConfig {
@@ -40,6 +46,7 @@ impl ServerBindConfig {
             certificate: Some(certificate),
             private_key: Some(private_key),
             insecure_loopback: false,
+            origin: Self::origin(&format!("https://{address}"))?,
         })
     }
 
@@ -53,6 +60,7 @@ impl ServerBindConfig {
             certificate: None,
             private_key: None,
             insecure_loopback: true,
+            origin: Self::origin(&format!("http://{address}"))?,
         })
     }
 
@@ -78,6 +86,15 @@ impl ServerBindConfig {
 
     pub fn address(&self) -> SocketAddr {
         self.address
+    }
+
+    pub fn with_origin(mut self, value: &str) -> Result<Self, String> {
+        self.origin = Self::origin(value)?;
+        Ok(self)
+    }
+
+    pub fn origin_url(&self) -> &Url {
+        &self.origin
     }
 
     pub fn is_insecure_loopback(&self) -> bool {

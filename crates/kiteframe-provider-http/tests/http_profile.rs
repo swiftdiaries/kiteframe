@@ -12,16 +12,18 @@ use http_body_util::BodyExt;
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, CapabilityCatalog,
     CapabilityGrantSet, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CatalogIdentity, DelegationAncestry, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, EvidenceReferences, InvocationId, InvocationOutcome, InvocationRequest,
-    InvocationStatus, SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+    CatalogIdentity, DelegationAncestry, DelegationEdge, Diagnostic, DiagnosticCategory,
+    DiagnosticCode, DiagnosticStage, EvidenceReferences, InvocationId, InvocationOutcome,
+    InvocationRequest, InvocationStatus, RetryClass, SessionRef, Sha256Digest, SourceRange,
+    TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     VerifiedHumanPrincipal, VerifiedProviderPrincipals, VerifiedWorkloadPrincipal,
 };
 use kiteframe_provider_http::{
-    HttpErrorKind, ProviderHttpError, ProviderHttpServices, ProviderHttpState,
-    ProviderPrincipalVerifier, ProviderRequestContext, ServerBindConfig, provider_router,
+    AuthenticatedStatusRequest, HttpErrorKind, ProviderHttpError, ProviderHttpServices,
+    ProviderHttpState, ProviderPrincipalVerifier, ProviderRequestContext, ServerBindConfig,
+    VerifiedHumanAuthentication, VerifiedWorkloadAuthentication, provider_router,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -191,6 +193,7 @@ async fn credential_headers_are_visible_only_to_verifier_and_never_to_services()
     let services = Arc::new(RecordingServices {
         events,
         observed_contexts: Arc::new(Mutex::new(Vec::new())),
+        observed_traces: Arc::new(Mutex::new(Vec::new())),
     });
     let app = provider_router(ProviderHttpState::new(services.clone()), verifier.clone());
     let mut request = request(Method::GET, "/v1/capability-catalog", None);
@@ -204,13 +207,29 @@ async fn credential_headers_are_visible_only_to_verifier_and_never_to_services()
     request
         .headers_mut()
         .insert(header::COOKIE, "session=cookie-secret".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-signature", "signature-opaque".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-jwt", "jwt-opaque".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("client-assertion", "assertion-opaque".parse().unwrap());
 
     let response = send(&app, request).await;
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         verifier.observed_authorization.lock().unwrap().as_slice(),
-        ["Bearer human-secret", "Bearer human-secret"]
+        [
+            "Bearer human-secret",
+            "session=cookie-secret",
+            "signature-opaque",
+            "assertion-opaque",
+            "workload-secret",
+            "jwt-opaque",
+        ]
     );
     let contexts = services.observed_contexts.lock().unwrap();
     assert_eq!(contexts.len(), 1);
@@ -235,6 +254,64 @@ async fn independently_verified_human_and_workload_tenant_mismatch_denies_before
         events.lock().unwrap().as_slice(),
         ["trace", "authenticate_human", "authenticate_workload"]
     );
+}
+
+#[tokio::test]
+async fn status_request_for_another_invocation_is_denied_with_full_principal_context() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = provider_router(
+        test_services(events.clone()),
+        allowing_principal_verifier(events.clone()),
+    );
+
+    let response = send(
+        &app,
+        request(Method::GET, "/v1/capability-invocations/inv-other", None),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "trace",
+            "authenticate_human",
+            "authenticate_workload",
+            "status",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn opaque_sensitive_diagnostic_fields_are_default_deny_projected() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = provider_router(
+        ProviderHttpState::new(Arc::new(AdversarialDiagnosticServices)),
+        allowing_principal_verifier(events),
+    );
+
+    let response = send(&app, request(Method::GET, "/v1/capability-catalog", None)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response_json(response).await;
+    let diagnostic = &body["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "KF-RUNTIME-002");
+    assert_eq!(diagnostic["category"], "runtime");
+    assert_eq!(diagnostic["stage"], "runtime");
+    assert_eq!(diagnostic["retry"], "after_refresh");
+    assert_eq!(diagnostic["message"], "provider request failed");
+    assert!(diagnostic["package_path"].is_null());
+    assert!(diagnostic["source_range"].is_null());
+    assert!(diagnostic["help"].is_null());
+    assert_eq!(diagnostic["details"], json!({}));
+    let wire = body.to_string();
+    for opaque in [
+        "eyJhbGciOiJub25lIn0.opaque.signature",
+        "f43e9b7a1d0c4e8f",
+        "urn:private:payload:7c2a",
+        "blob-4d9190c2",
+    ] {
+        assert!(!wire.contains(opaque));
+    }
 }
 
 #[tokio::test]
@@ -276,6 +353,52 @@ async fn trace_baggage_is_allowlisted_and_sensitive_names_are_rejected_before_au
             "authenticate_workload",
             "catalog_200",
         ]
+    );
+}
+
+#[tokio::test]
+async fn repeated_tracestate_and_baggage_headers_are_combined() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let services = Arc::new(RecordingServices {
+        events: events.clone(),
+        observed_contexts: Arc::new(Mutex::new(Vec::new())),
+        observed_traces: Arc::new(Mutex::new(Vec::new())),
+    });
+    let app = provider_router(
+        ProviderHttpState::new(services.clone()),
+        allowing_principal_verifier(events),
+    );
+    let mut request = request(Method::GET, "/v1/capability-catalog", None);
+    request
+        .headers_mut()
+        .append("tracestate", "vendor1=value1".parse().unwrap());
+    request
+        .headers_mut()
+        .append("tracestate", "vendor2=value2".parse().unwrap());
+    request.headers_mut().append(
+        "baggage",
+        "kiteframe.request_id=0123456789abcdef0123456789abcdef"
+            .parse()
+            .unwrap(),
+    );
+    request.headers_mut().append(
+        "baggage",
+        "kiteframe.task_id=1123456789abcdef0123456789abcdef"
+            .parse()
+            .unwrap(),
+    );
+
+    assert_eq!(send(&app, request).await.status(), StatusCode::OK);
+    let traces = services.observed_traces.lock().unwrap();
+    let trace = &traces[0];
+    assert_eq!(trace.tracestate(), Some("vendor1=value1,vendor2=value2"));
+    assert_eq!(
+        trace.baggage()["kiteframe.request_id"].as_str(),
+        "0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(
+        trace.baggage()["kiteframe.task_id"].as_str(),
+        "1123456789abcdef0123456789abcdef"
     );
 }
 
@@ -322,6 +445,147 @@ async fn malformed_oversized_and_identity_mismatch_requests_are_stable_diagnosti
     assert_eq!(mismatched.status(), StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn oversized_bodies_are_rejected_on_catalog_and_status_routes() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = provider_router(
+        test_services(events.clone()),
+        allowing_principal_verifier(events),
+    );
+    for uri in ["/v1/capability-catalog", "/v1/capability-invocations/inv-1"] {
+        let mut oversized = request(
+            Method::GET,
+            uri,
+            Some(json!({"padding": "x".repeat(1_048_577)})),
+        );
+        oversized
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, "1048600".parse().unwrap());
+        let response = send(&app, oversized).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response_json(response).await["diagnostics"][0]["message"],
+            "provider request failed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_the_four_declared_method_path_contracts_are_accepted() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = provider_router(
+        test_services(events.clone()),
+        allowing_principal_verifier(events),
+    );
+    for (method, uri) in [
+        (Method::HEAD, "/v1/capability-catalog"),
+        (Method::POST, "/v1/capability-catalog"),
+        (Method::GET, "/v1/capability-admissions"),
+        (Method::PUT, "/v1/capability-admissions"),
+        (Method::HEAD, "/v1/capability-invocations/inv-1"),
+        (Method::DELETE, "/v1/capability-invocations/inv-1"),
+    ] {
+        let is_head = method == Method::HEAD;
+        let response = send(&app, request(method, uri, None)).await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        if is_head {
+            assert!(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty()
+            );
+        } else {
+            assert!(response_json(response).await.get("diagnostics").is_some());
+        }
+    }
+}
+
+#[tokio::test]
+async fn admission_rejects_delegation_ancestry_whose_leaf_is_not_verified_agent() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = provider_router(
+        test_services(events.clone()),
+        allowing_principal_verifier(events.clone()),
+    );
+    let response = send(
+        &app,
+        request(
+            Method::POST,
+            "/v1/capability-admissions",
+            Some(serde_json::to_value(admission_request_with_leaf("agent-other")).unwrap()),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        ["trace", "authenticate_human", "authenticate_workload"]
+    );
+}
+
+#[tokio::test]
+async fn admission_accepts_only_when_every_nested_delegation_agent_is_verified() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let app = provider_router(
+        test_services(events.clone()),
+        allowing_principal_verifier(events.clone()),
+    );
+    let response = send(
+        &app,
+        request(
+            Method::POST,
+            "/v1/capability-admissions",
+            Some(serde_json::to_value(admission_request_with_leaf("agent-2")).unwrap()),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        events.lock().unwrap().as_slice(),
+        [
+            "trace",
+            "authenticate_human",
+            "authenticate_workload",
+            "admit",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn running_router_rejects_mismatched_origin_and_redirect_forwarding_hints() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let state = test_services(events.clone())
+        .with_origin("https://provider.example")
+        .unwrap();
+    let app = provider_router(state, allowing_principal_verifier(events));
+
+    let mut mismatched = request(Method::GET, "/v1/capability-catalog", None);
+    mismatched
+        .headers_mut()
+        .insert(header::ORIGIN, "https://attacker.example".parse().unwrap());
+    let response = send(&app, mismatched).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut forwarded = request(Method::GET, "/v1/capability-catalog", None);
+    forwarded
+        .headers_mut()
+        .insert("x-forwarded-host", "redirect.example".parse().unwrap());
+    let response = send(&app, forwarded).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut matching = request(Method::GET, "/v1/capability-catalog", None);
+    matching
+        .headers_mut()
+        .insert(header::ORIGIN, "https://provider.example".parse().unwrap());
+    assert_eq!(send(&app, matching).await.status(), StatusCode::OK);
+}
+
 #[test]
 fn tls_and_origin_configuration_refuses_plaintext_non_loopback_and_redirect_origins() {
     assert!(ServerBindConfig::tls("0.0.0.0:8443", "cert.pem", "key.pem").is_ok());
@@ -332,6 +596,11 @@ fn tls_and_origin_configuration_refuses_plaintext_non_loopback_and_redirect_orig
     assert!(ServerBindConfig::origin("http://provider.example").is_err());
     assert!(ServerBindConfig::origin("https://provider.example/redirect").is_err());
     assert!(ServerBindConfig::origin("https://provider.example?next=elsewhere").is_err());
+    let config = ServerBindConfig::tls("0.0.0.0:8443", "cert.pem", "key.pem")
+        .unwrap()
+        .with_origin("https://provider.example")
+        .unwrap();
+    assert_eq!(config.origin_url().as_str(), "https://provider.example/");
 }
 
 #[derive(Clone)]
@@ -349,29 +618,56 @@ impl ProviderPrincipalVerifier for RecordingVerifier {
     async fn verify_human(
         &self,
         headers: &axum::http::HeaderMap,
-    ) -> Result<VerifiedHumanPrincipal, Diagnostic> {
+    ) -> Result<VerifiedHumanAuthentication, Diagnostic> {
         self.events.lock().unwrap().push("authenticate_human");
-        if let Some(value) = headers.get(header::AUTHORIZATION) {
-            self.observed_authorization
-                .lock()
-                .unwrap()
-                .push(value.to_str().unwrap().to_owned());
+        for name in [
+            header::AUTHORIZATION.as_str(),
+            header::COOKIE.as_str(),
+            "x-signature",
+            "client-assertion",
+        ] {
+            if let Some(value) = headers.get(name) {
+                self.observed_authorization
+                    .lock()
+                    .unwrap()
+                    .push(value.to_str().unwrap().to_owned());
+            }
         }
-        Ok(verified_principals().into_parts().0)
+        Ok(VerifiedHumanAuthentication::new(
+            verified_principals().into_parts().0,
+            [
+                header::AUTHORIZATION,
+                header::COOKIE,
+                "x-signature".parse().unwrap(),
+                "client-assertion".parse().unwrap(),
+            ],
+        ))
     }
 
     async fn verify_workload(
         &self,
         headers: &axum::http::HeaderMap,
-    ) -> Result<VerifiedWorkloadPrincipal, Diagnostic> {
+    ) -> Result<VerifiedWorkloadAuthentication, Diagnostic> {
         self.events.lock().unwrap().push("authenticate_workload");
-        if let Some(value) = headers.get(header::AUTHORIZATION) {
-            self.observed_authorization
-                .lock()
-                .unwrap()
-                .push(value.to_str().unwrap().to_owned());
+        for name in ["x-workload-token", "x-jwt"] {
+            if let Some(value) = headers.get(name) {
+                self.observed_authorization
+                    .lock()
+                    .unwrap()
+                    .push(value.to_str().unwrap().to_owned());
+            }
         }
-        Ok(verified_principals().into_parts().1)
+        Ok(VerifiedWorkloadAuthentication::new(
+            verified_principals().into_parts().1,
+            [
+                "x-workload-token".parse().unwrap(),
+                "x-jwt".parse().unwrap(),
+            ],
+        )
+        .with_delegation_agents([
+            AgentRef::new("agent-root").unwrap(),
+            AgentRef::new("agent-parent").unwrap(),
+        ]))
     }
 }
 
@@ -379,6 +675,7 @@ impl ProviderPrincipalVerifier for RecordingVerifier {
 struct RecordingServices {
     events: Arc<Mutex<Vec<&'static str>>>,
     observed_contexts: Arc<Mutex<Vec<(String, String)>>>,
+    observed_traces: Arc<Mutex<Vec<TraceContext>>>,
 }
 
 struct MismatchedTenantVerifier {
@@ -394,33 +691,39 @@ impl ProviderPrincipalVerifier for MismatchedTenantVerifier {
     async fn verify_human(
         &self,
         _headers: &axum::http::HeaderMap,
-    ) -> Result<VerifiedHumanPrincipal, Diagnostic> {
+    ) -> Result<VerifiedHumanAuthentication, Diagnostic> {
         self.events.lock().unwrap().push("authenticate_human");
-        Ok(VerifiedHumanPrincipal::try_new(
-            "tenant-1",
-            "human-7",
-            ActorRef::new("actor-7").unwrap(),
-            Timestamp::new(500),
-        )
-        .unwrap())
+        Ok(VerifiedHumanAuthentication::new(
+            VerifiedHumanPrincipal::try_new(
+                "tenant-1",
+                "human-7",
+                ActorRef::new("actor-7").unwrap(),
+                Timestamp::new(500),
+            )
+            .unwrap(),
+            [],
+        ))
     }
 
     async fn verify_workload(
         &self,
         _headers: &axum::http::HeaderMap,
-    ) -> Result<VerifiedWorkloadPrincipal, Diagnostic> {
+    ) -> Result<VerifiedWorkloadAuthentication, Diagnostic> {
         self.events.lock().unwrap().push("authenticate_workload");
-        Ok(VerifiedWorkloadPrincipal::try_new(
-            "tenant-other",
-            "workload-2",
-            "run-9",
-            AgentRef::new("agent-2").unwrap(),
-            TaskRef::new("task-4").unwrap(),
-            SessionRef::new("session-3").unwrap(),
-            AdmissionId::new("admission-5").unwrap(),
-            Timestamp::new(500),
-        )
-        .unwrap())
+        Ok(VerifiedWorkloadAuthentication::new(
+            VerifiedWorkloadPrincipal::try_new(
+                "tenant-other",
+                "workload-2",
+                "run-9",
+                AgentRef::new("agent-2").unwrap(),
+                TaskRef::new("task-4").unwrap(),
+                SessionRef::new("session-3").unwrap(),
+                AdmissionId::new("admission-5").unwrap(),
+                Timestamp::new(500),
+            )
+            .unwrap(),
+            [],
+        ))
     }
 }
 
@@ -438,6 +741,10 @@ impl ProviderHttpServices for RecordingServices {
         &self,
         context: &ProviderRequestContext,
     ) -> Result<CapabilityCatalog, ProviderHttpError> {
+        self.observed_traces
+            .lock()
+            .unwrap()
+            .push(context.trace_context().clone());
         self.observed_contexts.lock().unwrap().push((
             context.principals().human().human_ref().as_str().to_owned(),
             context
@@ -480,14 +787,86 @@ impl ProviderHttpServices for RecordingServices {
 
     async fn status(
         &self,
-        context: &ProviderRequestContext,
-        request: kiteframe_contract::StatusRequest,
+        request: AuthenticatedStatusRequest,
     ) -> Result<InvocationStatus, ProviderHttpError> {
-        self.observe(context, "status");
+        self.observe(request.context(), "status");
+        let status_context = request.status_context();
+        assert_eq!(status_context.tenant_ref(), "tenant-1");
+        assert_eq!(status_context.human_ref(), "human-7");
+        assert_eq!(status_context.workload_ref(), "workload-2");
+        assert_eq!(status_context.run_ref(), "run-9");
+        assert_eq!(status_context.actor_ref(), "actor-7");
+        assert_eq!(status_context.agent_ref(), "agent-2");
+        assert_eq!(status_context.task_ref(), "task-4");
+        assert_eq!(status_context.session_ref(), "session-3");
+        assert_eq!(status_context.admission_ref(), "admission-5");
+        if request.request().invocation_id().as_str() != "inv-1" {
+            return Err(ProviderHttpError::new(
+                HttpErrorKind::IdentityMismatch,
+                Diagnostic::error(
+                    DiagnosticCode::InvocationDenied,
+                    DiagnosticCategory::Authorization,
+                    DiagnosticStage::Invoke,
+                    "status context does not own invocation",
+                ),
+            ));
+        }
         Ok(InvocationStatus::Pending {
-            invocation_id: request.invocation_id().clone(),
+            invocation_id: request.request().invocation_id().clone(),
         })
     }
+}
+
+struct AdversarialDiagnosticServices;
+
+#[async_trait]
+impl ProviderHttpServices for AdversarialDiagnosticServices {
+    async fn catalog(
+        &self,
+        _context: &ProviderRequestContext,
+    ) -> Result<CapabilityCatalog, ProviderHttpError> {
+        Err(adversarial_error())
+    }
+
+    async fn admit(
+        &self,
+        _context: &ProviderRequestContext,
+        _request: AdmissionRequest,
+    ) -> Result<CapabilityGrantSet, ProviderHttpError> {
+        Err(adversarial_error())
+    }
+
+    async fn invoke(
+        &self,
+        _context: &ProviderRequestContext,
+        _request: InvocationRequest,
+    ) -> Result<InvocationOutcome, ProviderHttpError> {
+        Err(adversarial_error())
+    }
+
+    async fn status(
+        &self,
+        _request: AuthenticatedStatusRequest,
+    ) -> Result<InvocationStatus, ProviderHttpError> {
+        Err(adversarial_error())
+    }
+}
+
+fn adversarial_error() -> ProviderHttpError {
+    let mut diagnostic = Diagnostic::error(
+        DiagnosticCode::RuntimeConstruction,
+        DiagnosticCategory::Runtime,
+        DiagnosticStage::Runtime,
+        "eyJhbGciOiJub25lIn0.opaque.signature",
+    );
+    diagnostic.package_path = Some("f43e9b7a1d0c4e8f".to_owned());
+    diagnostic.source_range = Some(SourceRange { start: 7, end: 19 });
+    diagnostic.help = Some("urn:private:payload:7c2a".into());
+    diagnostic.retry = RetryClass::AfterRefresh;
+    diagnostic
+        .details
+        .insert("opaque".to_owned(), json!("blob-4d9190c2"));
+    ProviderHttpError::new(HttpErrorKind::ServiceFailure, diagnostic)
 }
 
 impl RecordingServices {
@@ -509,6 +888,7 @@ fn test_services(events: Arc<Mutex<Vec<&'static str>>>) -> ProviderHttpState {
     ProviderHttpState::new(Arc::new(RecordingServices {
         events,
         observed_contexts: Arc::new(Mutex::new(Vec::new())),
+        observed_traces: Arc::new(Mutex::new(Vec::new())),
     }))
 }
 
@@ -557,6 +937,30 @@ fn catalog() -> CapabilityCatalog {
 }
 
 fn admission_request() -> AdmissionRequest {
+    admission_request_with_ancestry(DelegationAncestry::try_new(vec![]).unwrap())
+}
+
+fn admission_request_with_leaf(leaf: &str) -> AdmissionRequest {
+    admission_request_with_ancestry(
+        DelegationAncestry::try_new(vec![
+            DelegationEdge::try_new(
+                AgentRef::new("agent-root").unwrap(),
+                AgentRef::new("agent-parent").unwrap(),
+                vec![CapabilityName::new("cases.read").unwrap()],
+            )
+            .unwrap(),
+            DelegationEdge::try_new(
+                AgentRef::new("agent-parent").unwrap(),
+                AgentRef::new(leaf).unwrap(),
+                vec![CapabilityName::new("cases.read").unwrap()],
+            )
+            .unwrap(),
+        ])
+        .unwrap(),
+    )
+}
+
+fn admission_request_with_ancestry(delegation_ancestry: DelegationAncestry) -> AdmissionRequest {
     AdmissionRequest::try_new(AdmissionRequestParts {
         actor: ActorRef::new("actor-7").unwrap(),
         agent: AgentRef::new("agent-2").unwrap(),
@@ -570,7 +974,7 @@ fn admission_request() -> AdmissionRequest {
         required_capabilities: vec![],
         optional_capabilities: vec![],
         resolved_requirements: vec![],
-        delegation_ancestry: DelegationAncestry::try_new(vec![]).unwrap(),
+        delegation_ancestry,
         contextual_facts: BTreeMap::new(),
         trace_context: trace_context(TRACEPARENT),
     })

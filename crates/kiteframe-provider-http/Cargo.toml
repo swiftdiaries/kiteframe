@@ -20,6 +20,7 @@ kiteframe-provider = { path = "../kiteframe-provider" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tower-http = { version = "0.6", features = ["limit"] }
 url = "2"
 
 [dev-dependencies]

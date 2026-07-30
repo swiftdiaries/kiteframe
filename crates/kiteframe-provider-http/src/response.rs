@@ -16,6 +16,7 @@ pub enum HttpErrorKind {
     Timeout,
     ServiceFailure,
     PayloadTooLarge,
+    MethodNotAllowed,
 }
 
 impl HttpErrorKind {
@@ -29,6 +30,7 @@ impl HttpErrorKind {
             Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
             Self::ServiceFailure => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 }
@@ -121,7 +123,7 @@ impl ProviderHttpError {
 
     pub(crate) fn method_not_allowed() -> Self {
         Self::new(
-            HttpErrorKind::Malformed,
+            HttpErrorKind::MethodNotAllowed,
             Diagnostic::error(
                 DiagnosticCode::RuntimeConstruction,
                 DiagnosticCategory::Runtime,
@@ -149,7 +151,7 @@ impl IntoResponse for ProviderHttpError {
         (
             self.kind.status(),
             Json(DiagnosticEnvelope {
-                diagnostics: vec![safe_diagnostic(self.diagnostic)],
+                diagnostics: vec![project_diagnostic(&self.diagnostic)],
             }),
         )
             .into_response()
@@ -162,35 +164,13 @@ pub struct DiagnosticEnvelope {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-fn safe_diagnostic(diagnostic: Box<Diagnostic>) -> Diagnostic {
-    let serialized = serde_json::to_string(&diagnostic)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if [
-        "bearer ",
-        "cookie",
-        "token",
-        "secret",
-        "api-key",
-        "api_key",
-        "credential",
-        "claim",
-        "prompt",
-        "argument",
-        "result",
-        "evidence",
-    ]
-    .iter()
-    .any(|marker| serialized.contains(marker))
-    {
-        let mut redacted = Diagnostic::error(
-            diagnostic.code,
-            diagnostic.category,
-            diagnostic.stage,
-            "provider request failed",
-        );
-        redacted.retry = diagnostic.retry;
-        return redacted;
-    }
-    *diagnostic
+fn project_diagnostic(diagnostic: &Diagnostic) -> Diagnostic {
+    let mut projected = Diagnostic::error(
+        diagnostic.code,
+        diagnostic.category,
+        diagnostic.stage,
+        "provider request failed",
+    );
+    projected.retry = diagnostic.retry;
+    projected
 }

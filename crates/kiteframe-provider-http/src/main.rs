@@ -6,12 +6,11 @@ use clap::Parser;
 use kiteframe_contract::{
     AdmissionRequest, CapabilityCatalog, CapabilityGrantSet, Diagnostic, DiagnosticCategory,
     DiagnosticCode, DiagnosticStage, InvocationOutcome, InvocationRequest, InvocationStatus,
-    StatusRequest,
 };
-use kiteframe_provider::{VerifiedHumanPrincipal, VerifiedWorkloadPrincipal};
 use kiteframe_provider_http::{
-    HttpErrorKind, ProviderHttpError, ProviderHttpServices, ProviderHttpState,
-    ProviderPrincipalVerifier, ProviderRequestContext, ServerBindConfig, provider_router, serve,
+    AuthenticatedStatusRequest, HttpErrorKind, ProviderHttpError, ProviderHttpServices,
+    ProviderHttpState, ProviderPrincipalVerifier, ProviderRequestContext, ServerBindConfig,
+    VerifiedHumanAuthentication, VerifiedWorkloadAuthentication, provider_router, serve,
 };
 
 #[derive(Debug, Parser)]
@@ -29,6 +28,9 @@ struct Arguments {
 
     #[arg(long, hide = true)]
     insecure_loopback: bool,
+
+    #[arg(long)]
+    origin: Option<String>,
 }
 
 #[tokio::main]
@@ -47,9 +49,17 @@ async fn main() {
             ),
         }
     };
-    let config = config.unwrap_or_else(|message| exit_with_error(message));
+    let mut config = config.unwrap_or_else(|message| exit_with_error(message));
+    if let Some(origin) = arguments.origin.as_deref() {
+        config = config
+            .with_origin(origin)
+            .unwrap_or_else(|message| exit_with_error(message));
+    }
+    let origin = config.origin_url().as_str().to_owned();
     let router = provider_router(
-        ProviderHttpState::new(Arc::new(UnconfiguredServices)),
+        ProviderHttpState::new(Arc::new(UnconfiguredServices))
+            .with_origin(&origin)
+            .unwrap_or_else(|message| exit_with_error(message)),
         Arc::new(RejectingVerifier),
     );
     if let Err(message) = serve(router, config).await {
@@ -69,14 +79,14 @@ impl ProviderPrincipalVerifier for RejectingVerifier {
     async fn verify_human(
         &self,
         _headers: &HeaderMap,
-    ) -> Result<VerifiedHumanPrincipal, Diagnostic> {
+    ) -> Result<VerifiedHumanAuthentication, Diagnostic> {
         Err(unconfigured_diagnostic())
     }
 
     async fn verify_workload(
         &self,
         _headers: &HeaderMap,
-    ) -> Result<VerifiedWorkloadPrincipal, Diagnostic> {
+    ) -> Result<VerifiedWorkloadAuthentication, Diagnostic> {
         Err(unconfigured_diagnostic())
     }
 }
@@ -110,8 +120,7 @@ impl ProviderHttpServices for UnconfiguredServices {
 
     async fn status(
         &self,
-        _context: &ProviderRequestContext,
-        _request: StatusRequest,
+        _request: AuthenticatedStatusRequest,
     ) -> Result<InvocationStatus, ProviderHttpError> {
         Err(unconfigured_error())
     }

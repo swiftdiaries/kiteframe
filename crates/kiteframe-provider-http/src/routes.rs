@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use axum::{
     Extension, Json, Router,
     extract::{
-        DefaultBodyLimit, Path, State,
+        DefaultBodyLimit, Path, Request, State,
         rejection::{BytesRejection, JsonRejection},
     },
-    http::{HeaderMap, StatusCode, header},
-    middleware::from_fn_with_state,
+    http::{HeaderMap, Method, StatusCode, header},
+    middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -16,9 +16,12 @@ use kiteframe_contract::{
     AdmissionRequest, CapabilityCatalog, CapabilityGrantSet, InvocationId, InvocationOutcome,
     InvocationRequest, InvocationStatus, StatusRequest, TraceContext,
 };
+use kiteframe_provider::InvocationStatusContext;
+use tower_http::limit::RequestBodyLimitLayer;
+use url::Url;
 
 use crate::{
-    ProviderHttpError, ProviderPrincipalVerifier, ProviderRequestContext,
+    HttpErrorKind, ProviderHttpError, ProviderPrincipalVerifier, ProviderRequestContext,
     auth::{ProviderAuthState, authenticate_provider_request},
     trace::{ProviderTraceState, extract_trace_context},
 };
@@ -46,19 +49,75 @@ pub trait ProviderHttpServices: Send + Sync {
 
     async fn status(
         &self,
-        context: &ProviderRequestContext,
-        request: StatusRequest,
+        request: AuthenticatedStatusRequest,
     ) -> Result<InvocationStatus, ProviderHttpError>;
 }
 
 #[derive(Clone)]
 pub struct ProviderHttpState {
     services: Arc<dyn ProviderHttpServices>,
+    origin: Url,
 }
 
 impl ProviderHttpState {
     pub fn new(services: Arc<dyn ProviderHttpServices>) -> Self {
-        Self { services }
+        Self {
+            services,
+            origin: Url::parse("https://provider.invalid")
+                .expect("static default provider origin is valid"),
+        }
+    }
+
+    pub fn with_origin(mut self, value: &str) -> Result<Self, String> {
+        self.origin = crate::ServerBindConfig::origin(value)?;
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AuthenticatedStatusRequest {
+    request: StatusRequest,
+    context: ProviderRequestContext,
+    status_context: InvocationStatusContext,
+}
+
+impl AuthenticatedStatusRequest {
+    fn try_new(
+        request: StatusRequest,
+        context: ProviderRequestContext,
+    ) -> Result<Self, ProviderHttpError> {
+        let principals = context.principals();
+        let human = principals.human();
+        let workload = principals.workload();
+        let status_context = InvocationStatusContext::try_new(
+            human.tenant_ref().as_str(),
+            human.human_ref().as_str(),
+            workload.workload_ref().as_str(),
+            workload.run_ref().as_str(),
+            human.mapped_actor().as_str(),
+            workload.mapped_agent().as_str(),
+            workload.task_ref().as_str(),
+            workload.session_ref().as_str(),
+            workload.admission_ref().as_str(),
+        )
+        .map_err(|_| ProviderHttpError::identity_mismatch())?;
+        Ok(Self {
+            request,
+            context,
+            status_context,
+        })
+    }
+
+    pub fn request(&self) -> &StatusRequest {
+        &self.request
+    }
+
+    pub fn context(&self) -> &ProviderRequestContext {
+        &self.context
+    }
+
+    pub fn status_context(&self) -> &InvocationStatusContext {
+        &self.status_context
     }
 }
 
@@ -66,6 +125,7 @@ pub fn provider_router(
     state: ProviderHttpState,
     principal_verifier: Arc<dyn ProviderPrincipalVerifier>,
 ) -> Router {
+    let origin = state.origin.clone();
     Router::new()
         .route("/v1/capability-catalog", get(catalog))
         .route("/v1/capability-admissions", post(admit))
@@ -76,15 +136,54 @@ pub fn provider_router(
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(1_048_576))
+        .layer(RequestBodyLimitLayer::new(1_048_576))
+        .layer(from_fn(normalize_body_limit_response))
+        .layer(from_fn(enforce_exact_contract))
         .layer(from_fn_with_state(
             ProviderAuthState::new(principal_verifier.clone()),
             authenticate_provider_request,
         ))
+        .layer(from_fn_with_state(origin, enforce_runtime_origin))
         .layer(from_fn_with_state(
             ProviderTraceState::new(principal_verifier),
             extract_trace_context,
         ))
         .with_state(state)
+}
+
+async fn enforce_runtime_origin(
+    State(expected): State<Url>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ProviderHttpError> {
+    if ["forwarded", "x-forwarded-host", "x-forwarded-proto"]
+        .iter()
+        .any(|name| request.headers().contains_key(*name))
+    {
+        return Err(ProviderHttpError::identity_mismatch());
+    }
+    if let Some(origin) = request.headers().get(header::ORIGIN) {
+        let origin = origin
+            .to_str()
+            .ok()
+            .and_then(|value| crate::ServerBindConfig::origin(value).ok());
+        if origin.as_ref() != Some(&expected) {
+            return Err(ProviderHttpError::identity_mismatch());
+        }
+    }
+    if request.uri().scheme().is_some() || request.uri().authority().is_some() {
+        let absolute = Url::parse(&request.uri().to_string()).ok().and_then(|url| {
+            crate::ServerBindConfig::origin(&url.origin().ascii_serialization()).ok()
+        });
+        if absolute.as_ref() != Some(&expected) {
+            return Err(ProviderHttpError::identity_mismatch());
+        }
+    }
+    let response = next.run(request).await;
+    if response.status().is_redirection() && response.status() != StatusCode::NOT_MODIFIED {
+        return Err(ProviderHttpError::identity_mismatch());
+    }
+    Ok(response)
 }
 
 async fn catalog(
@@ -149,11 +248,13 @@ async fn status(
     let invocation_id =
         InvocationId::new(invocation_id).map_err(|_| ProviderHttpError::malformed())?;
     let request = StatusRequest::new(invocation_id, context.trace_context().clone());
-    state
-        .services
-        .status(&context, request)
-        .await
-        .map(|value| Json(value).into_response())
+    let expected_invocation_id = request.invocation_id().clone();
+    let request = AuthenticatedStatusRequest::try_new(request, context)?;
+    let response = state.services.status(request).await?;
+    response
+        .validate_invocation_id(&expected_invocation_id)
+        .map_err(|diagnostic| ProviderHttpError::new(HttpErrorKind::ServiceFailure, diagnostic))?;
+    Ok(Json(response).into_response())
 }
 
 fn native_json<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ProviderHttpError> {
@@ -180,10 +281,52 @@ fn validate_admission_principals(
         || principals.workload().mapped_agent() != request.agent()
         || principals.workload().task_ref() != request.task()
         || principals.workload().session_ref() != request.session()
+        || request.delegation_ancestry().edges().iter().any(|edge| {
+            !context.verifies_delegation_agent(edge.parent_agent())
+                || !context.verifies_delegation_agent(edge.child_agent())
+        })
+        || request
+            .delegation_ancestry()
+            .edges()
+            .last()
+            .is_some_and(|edge| edge.child_agent() != request.agent())
     {
         return Err(ProviderHttpError::identity_mismatch());
     }
     Ok(())
+}
+
+async fn enforce_exact_contract(
+    request: Request,
+    next: Next,
+) -> Result<Response, ProviderHttpError> {
+    let method = request.method();
+    let path = request.uri().path();
+    let known_path = path == "/v1/capability-catalog"
+        || path == "/v1/capability-admissions"
+        || invocation_identifier(path).is_some();
+    let allowed = matches!(
+        (method, path),
+        (&Method::GET, "/v1/capability-catalog") | (&Method::POST, "/v1/capability-admissions")
+    ) || (invocation_identifier(path).is_some()
+        && matches!(method, &Method::GET | &Method::POST));
+    if known_path && !allowed {
+        return Err(ProviderHttpError::method_not_allowed());
+    }
+    Ok(next.run(request).await)
+}
+
+async fn normalize_body_limit_response(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ProviderHttpError::payload_too_large().into_response();
+    }
+    response
+}
+
+fn invocation_identifier(path: &str) -> Option<&str> {
+    path.strip_prefix("/v1/capability-invocations/")
+        .filter(|identifier| !identifier.is_empty() && !identifier.contains('/'))
 }
 
 fn validate_trace(
