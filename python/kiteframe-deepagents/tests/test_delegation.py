@@ -5,16 +5,20 @@ import json
 import shutil
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock
 
 import pytest
 from deepagents import CompiledSubAgent, create_deep_agent
 from kiteframe import (
+    AdmissionRequest,
+    CapabilityGrantSet,
     EffectiveCapabilityGrant,
     KiteframeDiagnosticError,
     ResolvedCapabilityRequirement,
     ResolvedRuntimeInputs,
+    load_admission_request,
     load_capability_grant_set,
     load_resolved_agent,
     resolve_package,
@@ -28,15 +32,21 @@ from test_compile import frozen_registry, session_context
 
 import kiteframe_deepagents.adapter as adapter_module
 from kiteframe_deepagents.adapter import DeepAgentsAdapter
+from kiteframe_deepagents.context import (
+    KiteframeSessionContext,
+    KiteframeTraceContext,
+)
 from kiteframe_deepagents.delegation import (
     DeclaredSubAgentInput,
     DelegationAncestryEntry,
+    bind_child_admission,
     intersect_child_envelope,
 )
 from kiteframe_deepagents.middleware import (
     DeclaredChildTaskTool,
     KiteframeGuardMiddleware,
 )
+from kiteframe_deepagents.tools import build_native_invocation_request
 
 WORKSPACE = Path(__file__).resolve().parents[3]
 HOUR_1 = 3_600
@@ -429,6 +439,7 @@ metadata: { runtime: deepagents }
 spec:
   models: { primary: models.anthropic.sonnet }
   components:
+    backend: backends.workspace
     middleware: [middleware.tenant-context]
     harnessProfile: profiles.deepagents
   capabilityProvider: capability-providers.primary
@@ -456,12 +467,249 @@ def child_spec(
     parent: ResolvedRuntimeInputs,
     child: ResolvedRuntimeInputs,
 ) -> DeclaredSubAgentInput:
+    admission_request, admission, session = child_admission(child)
     return DeclaredSubAgentInput(
         declaration=parent.resolved_agent.subagents[0],
         runtime_inputs=child,
-        session=session_context(with_case_grant=True),
+        session=session,
+        admission_request=admission_request,
+        admission=admission,
         children=(),
     )
+
+
+def child_admission(
+    child: ResolvedRuntimeInputs,
+    *,
+    revisions: tuple[tuple[str, str], ...] = (("policy", "7"),),
+    native_ancestry: tuple[str, ...] = ("agent:support-agent",),
+    resolved_digest: str | None = None,
+) -> tuple[AdmissionRequest, CapabilityGrantSet, KiteframeSessionContext]:
+    resolved_wire = json.loads(child.resolved_agent.canonical_json())
+    requirements = resolved_wire["capabilityRequirements"]
+    required = [
+        {
+            "capability": requirement["lockedCapability"]["identity"],
+            "resources": requirement["resources"],
+        }
+        for requirement in requirements
+        if requirement["required"]
+    ]
+    optional = [
+        {
+            "capability": requirement["lockedCapability"]["identity"],
+            "resources": requirement["resources"],
+        }
+        for requirement in requirements
+        if not requirement["required"]
+    ]
+    request_values: dict[str, object] = {
+        "actor": "actor:alice",
+        "agent": f"agent:{child.resolved_agent.package_name}",
+        "task": "task:compile",
+        "session": "session:compile-1",
+        "portableDigest": child.resolved_agent.portable_digest,
+        "lockDigest": child.resolved_agent.lock_digest,
+        "resolvedDigest": resolved_digest or child.resolved_agent.resolved_digest,
+        "catalogIdentity": {
+            "name": child.resolved_agent.catalog_name,
+            "revision": child.resolved_agent.catalog_revision,
+        },
+        "catalogDigest": child.resolved_agent.catalog_digest,
+        "requiredCapabilities": required,
+        "optionalCapabilities": optional,
+        "resolvedRequirements": requirements,
+        "delegationAncestry": list(native_ancestry),
+        "contextualFacts": {},
+        "traceContext": {
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        },
+    }
+    request_values["requestDigest"] = canonical_digest(
+        b"kiteframe:admission-request:v1\0",
+        request_values,
+    )
+    request = load_admission_request(canonical_bytes(request_values))
+
+    authority_entries = [
+        {"revision": revision, "source": source} for source, revision in revisions
+    ]
+    authority_revisions = {
+        "authorityRevisionDigest": canonical_digest(
+            b"kiteframe:authority-revision-set:v1\0",
+            authority_entries,
+        ),
+        "entries": authority_entries,
+    }
+    session_source = session_context(with_case_grant=True)
+    grant_values = [
+        {
+            "capability": {"name": value.name, "version": value.version},
+            "executionModes": list(value.execution_modes),
+            "expiresAt": value.expires_at,
+            "freshness": value.freshness,
+            "maximumEffect": value.maximum_effect,
+            "preconditions": value.preconditions,
+            "requiredEvidence": value.required_evidence,
+            "resources": list(value.resources),
+        }
+        for value in session_source.grants
+    ]
+    admission_values: dict[str, object] = {
+        "actor": request.actor,
+        "admissionId": "admission:child",
+        "admissionRequestDigest": request.request_digest,
+        "agent": request.agent,
+        "authorityRevisions": authority_revisions,
+        "catalogDigest": request.catalog_digest,
+        "catalogIdentity": {
+            "name": request.catalog_name,
+            "revision": request.catalog_revision,
+        },
+        "expiresAt": 4_000_000_000,
+        "grants": grant_values,
+        "issuedAt": 1_900_000_000,
+        "optionalDenials": [],
+        "policyRevision": "policy:7",
+        "session": request.session,
+        "task": request.task,
+    }
+    admission_values["grantDigest"] = canonical_digest(
+        b"kiteframe:capability-grant-set:v1\0",
+        admission_values,
+    )
+    admission = load_capability_grant_set(canonical_bytes(admission_values))
+    session = KiteframeSessionContext(
+        actor=admission.actor,
+        session=admission.session,
+        task=admission.task,
+        admission_id=admission.admission_id,
+        grant_digest=admission.grant_digest,
+        grants=admission.grants,
+        authority_revisions=admission.authority_revisions,
+        trace_context=KiteframeTraceContext(
+            traceparent=request.traceparent,
+        ),
+    )
+    return request, admission, session
+
+
+def test_child_revision_set_must_extend_the_parent_authority_history(
+    tmp_path: Path,
+) -> None:
+    parent, child = resolved_parent_and_child(tmp_path)
+    root_session = session_context(with_case_grant=True)
+    _, _, unrelated_session = child_admission(
+        child,
+        revisions=(("policy", "8"),),
+    )
+
+    with pytest.raises(KiteframeDiagnosticError) as caught:
+        intersect_child_envelope(
+            parent=root_session.grants,
+            delegation=parent.resolved_agent.subagents[0],
+            child_requirements=child.resolved_agent.capability_requirements,
+            child_admission=unrelated_session,
+            parent_authority_revisions=root_session.authority_revisions,
+        )
+
+    assert_admission_denied(caught.value)
+
+
+def test_recursive_compile_rejects_forged_native_child_ancestry_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, child = resolved_parent_and_child(tmp_path)
+    request, admission, session = child_admission(
+        child,
+        native_ancestry=("agent:forged",),
+    )
+    declared = DeclaredSubAgentInput(
+        declaration=parent.resolved_agent.subagents[0],
+        runtime_inputs=child,
+        session=session,
+        admission_request=request,
+        admission=admission,
+    )
+    create_spy = Mock(return_value=compiled_graph())
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+
+    with pytest.raises(KiteframeDiagnosticError) as caught:
+        DeepAgentsAdapter().compile(
+            parent,
+            frozen_registry(parent),
+            session_context(with_case_grant=True),
+            declared_children=(declared,),
+        )
+
+    assert_admission_denied(caught.value)
+    create_spy.assert_not_called()
+
+
+def test_recursive_compile_rejects_admission_for_other_resolved_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, child = resolved_parent_and_child(tmp_path)
+    request, admission, session = child_admission(
+        child,
+        resolved_digest="ff" * 32,
+    )
+    declared = DeclaredSubAgentInput(
+        declaration=parent.resolved_agent.subagents[0],
+        runtime_inputs=child,
+        session=session,
+        admission_request=request,
+        admission=admission,
+    )
+    create_spy = Mock(return_value=compiled_graph())
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+
+    with pytest.raises(KiteframeDiagnosticError) as caught:
+        DeepAgentsAdapter().compile(
+            parent,
+            frozen_registry(parent),
+            session_context(with_case_grant=True),
+            declared_children=(declared,),
+        )
+
+    assert_admission_denied(caught.value)
+    create_spy.assert_not_called()
+
+
+def test_child_invocation_rechecks_bound_native_admission_correlation(
+    tmp_path: Path,
+) -> None:
+    _parent, child = resolved_parent_and_child(tmp_path)
+    request, admission, session = child_admission(child)
+    correlated = bind_child_admission(
+        session,
+        request,
+        admission,
+        (
+            DelegationAncestryEntry(
+                parent_agent="agent:support-agent",
+                child_agent="agent:case-child",
+                delegated_capabilities=("cases.read",),
+            ),
+        ),
+    )
+    object.__setattr__(correlated, "admission_id", "admission:forged")
+
+    with pytest.raises(
+        ValueError,
+        match="child admission correlation does not match",
+    ):
+        build_native_invocation_request(
+            requirement=child.resolved_agent.capability_requirements[0],
+            grant=correlated.grants[0],
+            grant_digest=correlated.grant_digest,
+            session=correlated,
+            resource=RESOURCE,
+            arguments={},
+            idempotency_key=None,
+        )
 
 
 def test_recursive_compile_builds_real_public_child_before_parent_task_tool(
@@ -537,6 +785,37 @@ def test_recursive_compile_rejects_duplicate_declared_child_identity(
             frozen_registry(parent),
             session_context(with_case_grant=True),
             declared_children=(declared, declared),
+        )
+
+    assert_admission_denied(caught.value)
+    create_spy.assert_not_called()
+
+
+def test_recursive_compile_rejects_same_public_child_name_with_other_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, child = resolved_parent_and_child(tmp_path)
+    create_spy = Mock(return_value=compiled_graph())
+    monkeypatch.setattr(adapter_module, "create_deep_agent", create_spy)
+    first = child_spec(parent, child)
+    second = child_spec(parent, child)
+    object.__setattr__(
+        second,
+        "declaration",
+        SimpleNamespace(
+            package_name=first.declaration.package_name,
+            package_version="0.2.0",
+            resolved_digest="ff" * 32,
+        ),
+    )
+
+    with pytest.raises(KiteframeDiagnosticError) as caught:
+        DeepAgentsAdapter().compile(
+            parent,
+            frozen_registry(parent),
+            session_context(with_case_grant=True),
+            declared_children=(first, second),
         )
 
     assert_admission_denied(caught.value)

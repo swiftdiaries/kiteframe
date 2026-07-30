@@ -37,6 +37,13 @@ fn request_and_catalog_projections_expose_only_stable_values() {
         Some(expected_catalog_digest.as_str())
     );
     assert_eq!(catalog_request.traceparent(), valid_traceparent());
+    assert_eq!(admission.actor(), "actor:alice");
+    assert_eq!(admission.agent(), "agent:case-worker");
+    assert_eq!(admission.task(), "task:triage");
+    assert_eq!(admission.session(), "session:1");
+    assert_eq!(admission.portable_digest(), "01".repeat(32));
+    assert_eq!(admission.lock_digest(), "02".repeat(32));
+    assert_eq!(admission.resolved_digest(), "03".repeat(32));
     assert_eq!(admission.traceparent(), valid_traceparent());
     assert_eq!(invocation.invocation_id(), "inv-1");
     assert_eq!(invocation.admission_id(), "adm-1");
@@ -45,6 +52,14 @@ fn request_and_catalog_projections_expose_only_stable_values() {
     assert_eq!(catalog.name(), "provider.test");
     assert_eq!(catalog.revision(), "revision-1");
     Python::attach(|py| {
+        assert_eq!(
+            admission
+                .delegation_ancestry(py)
+                .unwrap()
+                .extract::<Vec<String>>()
+                .unwrap(),
+            vec![String::from("agent:root")]
+        );
         assert_eq!(
             admission
                 .required_capabilities(py)
@@ -442,7 +457,10 @@ fn admission_request() -> AdmissionRequest {
         ],
         optional_capabilities: Vec::new(),
         resolved_requirements: vec![resolved_requirement()],
-        delegation_ancestry: DelegationAncestry::default(),
+        delegation_ancestry: DelegationAncestry::try_new(vec![
+            AgentRef::new("agent:root").unwrap(),
+        ])
+        .unwrap(),
         contextual_facts: BTreeMap::new(),
         trace_context: trace_context(),
     })

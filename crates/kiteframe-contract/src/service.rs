@@ -528,6 +528,38 @@ impl AdmissionRequest {
         &self.required_capabilities
     }
 
+    pub fn actor(&self) -> &ActorRef {
+        &self.actor
+    }
+
+    pub fn agent(&self) -> &AgentRef {
+        &self.agent
+    }
+
+    pub fn task(&self) -> &TaskRef {
+        &self.task
+    }
+
+    pub fn session(&self) -> &SessionRef {
+        &self.session
+    }
+
+    pub fn portable_digest(&self) -> &Sha256Digest {
+        &self.portable_digest
+    }
+
+    pub fn lock_digest(&self) -> &Sha256Digest {
+        &self.lock_digest
+    }
+
+    pub fn resolved_digest(&self) -> &Sha256Digest {
+        &self.resolved_digest
+    }
+
+    pub fn delegation_ancestry(&self) -> &DelegationAncestry {
+        &self.delegation_ancestry
+    }
+
     pub fn optional_capabilities(&self) -> &[RequestedCapability] {
         &self.optional_capabilities
     }

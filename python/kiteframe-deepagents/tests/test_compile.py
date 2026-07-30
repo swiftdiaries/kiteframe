@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 from deepagents import create_deep_agent
+from deepagents.backends import BackendProtocol, StateBackend
 from kiteframe import (
     ComponentKind,
     ComponentRegistry,
@@ -353,6 +354,7 @@ def frozen_registry(
     inputs: ResolvedRuntimeInputs,
     *,
     install_profile: bool = False,
+    backend: BackendProtocol | None = None,
 ) -> FrozenComponentRegistry:
     registry = ComponentRegistry()
     primary_symbol = dict(inputs.runtime_binding.model_symbols)["primary"]
@@ -372,6 +374,13 @@ def frozen_registry(
             ComponentKind.MIDDLEWARE,
             symbol,
             TenantMiddleware(),
+        )
+    backend_symbol = inputs.runtime_binding.backend
+    if backend_symbol is not None:
+        registry.register(
+            ComponentKind.BACKEND,
+            backend_symbol,
+            backend if backend is not None else StateBackend(),
         )
     profile_symbol = inputs.runtime_binding.harness_profile
     assert profile_symbol is not None

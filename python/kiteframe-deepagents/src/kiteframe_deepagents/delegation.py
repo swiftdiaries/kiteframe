@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from kiteframe import (
+    AdmissionRequest,
     AuthorityRevisionSet,
+    CapabilityGrantSet,
     EffectiveCapabilityGrant,
     KiteframeDiagnosticError,
     ResolvedCapabilityRequirement,
@@ -15,7 +17,12 @@ from kiteframe import (
     ResolvedSubagent,
 )
 
-from .context import KiteframeSessionContext, _snapshot_session_context
+from .context import (
+    ChildAdmissionCorrelation,
+    DelegationAncestryEntry,
+    KiteframeSessionContext,
+    _snapshot_session_context,
+)
 
 AUTHORIZATION_DENIED = "KF-AUTH-001"
 _EFFECT_RANK = {
@@ -24,30 +31,6 @@ _EFFECT_RANK = {
     "irreversible_write": 2,
     "external_side_effect": 3,
 }
-
-
-@dataclass(frozen=True, slots=True)
-class DelegationAncestryEntry:
-    """One immutable declared authority edge."""
-
-    parent_agent: str
-    child_agent: str
-    delegated_capabilities: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if type(self.parent_agent) is not str or not self.parent_agent:
-            raise TypeError("parent_agent must be a non-empty exact string")
-        if type(self.child_agent) is not str or not self.child_agent:
-            raise TypeError("child_agent must be a non-empty exact string")
-        if (
-            type(self.delegated_capabilities) is not tuple
-            or not all(
-                type(capability) is str and capability
-                for capability in self.delegated_capabilities
-            )
-            or len(self.delegated_capabilities) != len(set(self.delegated_capabilities))
-        ):
-            raise TypeError("delegated_capabilities must be unique exact strings")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +50,8 @@ class DeclaredSubAgentInput:
     declaration: ResolvedSubagent
     runtime_inputs: ResolvedRuntimeInputs
     session: KiteframeSessionContext
+    admission_request: AdmissionRequest
+    admission: CapabilityGrantSet
     children: tuple[DeclaredSubAgentInput, ...] = ()
 
     def __post_init__(self) -> None:
@@ -76,6 +61,10 @@ class DeclaredSubAgentInput:
             raise TypeError("runtime_inputs must be native ResolvedRuntimeInputs")
         if type(self.session) is not KiteframeSessionContext:
             raise TypeError("session must be exact KiteframeSessionContext")
+        if type(self.admission_request) is not AdmissionRequest:
+            raise TypeError("admission_request must be native AdmissionRequest")
+        if type(self.admission) is not CapabilityGrantSet:
+            raise TypeError("admission must be native CapabilityGrantSet")
         if type(self.children) is not tuple or not all(
             type(child) is DeclaredSubAgentInput for child in self.children
         ):
@@ -343,6 +332,7 @@ def intersect_child_envelope(
     | EffectiveCapabilityGrant
     | tuple[EffectiveCapabilityGrant, ...],
     ancestry: tuple[DelegationAncestryEntry, ...] = (),
+    parent_authority_revisions: AuthorityRevisionSet | None = None,
     parent_agent: str | None = None,
     child_agent: str | None = None,
 ) -> ChildAuthorityEnvelope:
@@ -352,9 +342,24 @@ def intersect_child_envelope(
     requirements = _requirements(child_requirements)
     authority_revisions: AuthorityRevisionSet | None = None
     if type(child_admission) is KiteframeSessionContext:
+        if type(parent_authority_revisions) is not AuthorityRevisionSet:
+            raise TypeError(
+                "parent_authority_revisions must be native AuthorityRevisionSet"
+            )
         admitted_session = _snapshot_session_context(child_admission)
         admitted = admitted_session.grants
         authority_revisions = admitted_session.authority_revisions
+        parent_entries = {
+            entry.source: entry.revision for entry in parent_authority_revisions.entries
+        }
+        child_entries = {
+            entry.source: entry.revision for entry in authority_revisions.entries
+        }
+        if any(
+            child_entries.get(source) != revision
+            for source, revision in parent_entries.items()
+        ):
+            raise _admission_denied()
     else:
         admitted = _grants(
             cast(
@@ -452,9 +457,40 @@ def intersect_child_envelope(
     )
 
 
+def bind_child_admission(
+    session: KiteframeSessionContext,
+    request: AdmissionRequest,
+    admission: CapabilityGrantSet,
+    ancestry: tuple[DelegationAncestryEntry, ...],
+) -> KiteframeSessionContext:
+    """Bind an already narrowed child session to native admission evidence."""
+
+    try:
+        correlation = ChildAdmissionCorrelation(
+            request=request,
+            admission=admission,
+            ancestry=ancestry,
+        )
+        return KiteframeSessionContext(
+            actor=session.actor,
+            session=session.session,
+            task=session.task,
+            admission_id=session.admission_id,
+            grant_digest=session.grant_digest,
+            grants=session.grants,
+            authority_revisions=session.authority_revisions,
+            trace_context=session.trace_context,
+            suspension=session.suspension,
+            child_admission=correlation,
+        )
+    except Exception:
+        raise _admission_denied() from None
+
+
 __all__ = [
     "ChildAuthorityEnvelope",
     "DeclaredSubAgentInput",
     "DelegationAncestryEntry",
+    "bind_child_admission",
     "intersect_child_envelope",
 ]

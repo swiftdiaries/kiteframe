@@ -30,6 +30,7 @@ from .delegation import (
     DeclaredSubAgentInput,
     DelegationAncestryEntry,
     _admission_denied,
+    bind_child_admission,
     intersect_child_envelope,
 )
 from .middleware import (
@@ -174,14 +175,22 @@ class DeepAgentsAdapter:
 
         validated = self.validate(runtime_inputs, registry)
         try:
+            isolated_backend = validated.package_backend
+            if runtime_inputs.runtime_binding.backend is not None:
+                isolated_backend = deepcopy(validated.package_backend)
+                if isolated_backend is validated.package_backend:
+                    raise TypeError(
+                        "package backend did not create an isolated copy"
+                    )
             components = replace(
                 validated,
                 middleware=tuple(
                     deepcopy(component) for component in validated.middleware
                 ),
+                package_backend=isolated_backend,
             )
         except Exception:
-            raise _runtime_error("middleware session isolation is unresolved") from None
+            raise _runtime_error("runtime session isolation is unresolved") from None
         if type(declared_children) is not tuple or not all(
             type(child) is DeclaredSubAgentInput for child in declared_children
         ):
@@ -190,6 +199,14 @@ class DeepAgentsAdapter:
             )
         resolved = runtime_inputs.resolved_agent
         declarations = resolved.subagents
+        declaration_names = tuple(child.package_name for child in declarations)
+        supplied_names = tuple(
+            child.declaration.package_name for child in declared_children
+        )
+        if len(declaration_names) != len(set(declaration_names)) or len(
+            supplied_names
+        ) != len(set(supplied_names)):
+            raise _admission_denied()
         if not declarations:
             if declared_children:
                 raise _admission_denied()
@@ -250,6 +267,18 @@ class DeepAgentsAdapter:
             if (
                 child_resolved.package_name != child_declaration.package_name
                 or child_resolved.resolved_digest != child_declaration.resolved_digest
+                or child.admission_request.agent
+                != f"agent:{child_declaration.package_name}"
+                or child.admission_request.portable_digest
+                != child_resolved.portable_digest
+                or child.admission_request.lock_digest != child_resolved.lock_digest
+                or child.admission_request.resolved_digest
+                != child_resolved.resolved_digest
+                or child.admission_request.catalog_name != child_resolved.catalog_name
+                or child.admission_request.catalog_revision
+                != child_resolved.catalog_revision
+                or child.admission_request.catalog_digest
+                != child_resolved.catalog_digest
                 or child_identity in identities
                 or child.session.actor != session.actor
                 or child.session.session != session.session
@@ -262,16 +291,23 @@ class DeepAgentsAdapter:
                 child_requirements=child_resolved.capability_requirements,
                 child_admission=child.session,
                 ancestry=ancestry,
-                parent_agent=resolved.package_name,
-                child_agent=child_declaration.package_name,
+                parent_authority_revisions=session.authority_revisions,
+                parent_agent=f"agent:{resolved.package_name}",
+                child_agent=f"agent:{child_declaration.package_name}",
             )
             if envelope.authority_revisions is not child.session.authority_revisions:
                 raise _admission_denied()
+            correlated_session = bind_child_admission(
+                child.session,
+                child.admission_request,
+                child.admission,
+                envelope.ancestry,
+            )
             prepared_children.append(
                 self._prepare_agent(
                     child.runtime_inputs,
                     registry,
-                    child.session,
+                    correlated_session,
                     child.children,
                     declaration=child_declaration,
                     ancestry=envelope.ancestry,

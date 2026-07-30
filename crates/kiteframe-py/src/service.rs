@@ -739,6 +739,57 @@ impl From<ContractAdmissionRequest> for PyAdmissionRequest {
 #[pymethods]
 impl PyAdmissionRequest {
     #[getter]
+    pub fn actor(&self) -> &str {
+        self.inner.actor().as_str()
+    }
+
+    #[getter]
+    pub fn agent(&self) -> &str {
+        self.inner.agent().as_str()
+    }
+
+    #[getter]
+    pub fn task(&self) -> &str {
+        self.inner.task().as_str()
+    }
+
+    #[getter]
+    pub fn session(&self) -> &str {
+        self.inner.session().as_str()
+    }
+
+    #[getter]
+    pub fn portable_digest(&self) -> String {
+        self.inner.portable_digest().to_string()
+    }
+
+    #[getter]
+    pub fn lock_digest(&self) -> String {
+        self.inner.lock_digest().to_string()
+    }
+
+    #[getter]
+    pub fn resolved_digest(&self) -> String {
+        self.inner.resolved_digest().to_string()
+    }
+
+    #[getter]
+    #[gen_stub(override_return_type(
+        type_repr = "builtins.tuple[builtins.str, ...]",
+        imports = ("builtins",)
+    ))]
+    pub fn delegation_ancestry<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(
+            py,
+            self.inner
+                .delegation_ancestry()
+                .agents()
+                .iter()
+                .map(|agent| agent.as_str()),
+        )
+    }
+
+    #[getter]
     pub fn catalog_name(&self) -> &str {
         &self.inner.catalog_identity().name
     }

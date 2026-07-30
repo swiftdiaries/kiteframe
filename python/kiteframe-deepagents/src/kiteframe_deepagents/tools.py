@@ -207,6 +207,18 @@ def build_native_invocation_request(
         raise ValueError("requirement and effective grant do not match")
     if grant_digest != session.grant_digest:
         raise ValueError("grant digest does not match the session")
+    correlation = session.child_admission
+    if correlation is not None:
+        admission = correlation.admission
+        if (
+            admission.admission_id != session.admission_id
+            or admission.grant_digest != grant_digest
+            or admission.admission_request_digest
+            != correlation.request.request_digest
+            or admission.authority_revisions.authority_revision_digest
+            != session.authority_revisions.authority_revision_digest
+        ):
+            raise ValueError("child admission correlation does not match the session")
 
     trace = _trace_context_wire(session)
     return build_invocation_request_for_requirement(
