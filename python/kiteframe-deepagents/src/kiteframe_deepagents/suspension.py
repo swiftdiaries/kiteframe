@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 import re
-import secrets
+import time
 from collections.abc import (
     AsyncIterator,
     Collection,
@@ -12,7 +12,6 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import asdict, dataclass, field
-from threading import Lock
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from kiteframe import (
@@ -30,7 +29,8 @@ from langgraph.checkpoint.base import (
     CheckpointTuple,
 )
 from langgraph.checkpoint.serde.base import SerializerProtocol
-from langgraph.types import Command, interrupt
+from langgraph.runtime import get_runtime
+from langgraph.types import Command, Interrupt, interrupt
 
 from .context import KiteframeSessionContext
 
@@ -48,11 +48,9 @@ _LEGACY_SERIALIZED_REFERENCE_KEY = (
     "__kiteframe_resolver_issued_evidence_reference_v1__"
 )
 _SERIALIZED_REFERENCE_PREFIX = (
-    b"\x00kiteframe-resolver-issued-evidence-reference-v2\x00"
+    b"\x00kiteframe-resolver-issued-evidence-reference-v3\x00"
 )
-_ISSUANCE_TOKEN_BYTES = 32
-_ISSUED_REFERENCES: dict[bytes, str] = {}
-_ISSUED_REFERENCES_LOCK = Lock()
+_CREDENTIAL_VERSION = "kiteframe.evidence-resume.v1"
 
 
 def _exact_non_empty(value: object, name: str) -> str:
@@ -67,6 +65,14 @@ def _evidence_kind(value: object) -> EvidenceKind:
     return value  # type: ignore[return-value]
 
 
+def _suspension_type(
+    value: object,
+) -> Literal["kiteframe.capability.suspension"]:
+    if type(value) is not str or value != SUSPENSION_TYPE:
+        raise ValueError("suspension type is unsupported")
+    return SUSPENSION_TYPE
+
+
 def _protected_evidence_ref(value: object) -> str:
     reference = _exact_non_empty(value, "evidence_ref")
     if _PROTECTED_REFERENCE_PATTERN.fullmatch(reference) is None:
@@ -76,9 +82,35 @@ def _protected_evidence_ref(value: object) -> str:
 
 @runtime_checkable
 class EvidenceReferenceResolver(Protocol):
-    """Trusted resolver from an external handle to a protected reference."""
+    """Deployment issuer from an external handle to an opaque credential."""
 
-    async def resolve_evidence_reference(self, handle: str) -> str: ...
+    async def resolve_evidence_reference(
+        self,
+        handle: str,
+        suspension: SuspensionEnvelope,
+    ) -> bytes: ...
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceResumeCredentialClaims:
+    """Verified deployment claims carried by one opaque resume credential."""
+
+    credential_version: str
+    key_id: str
+    nonce: str
+    expires_at: int
+    evidence_ref: str
+    suspension: SuspensionEnvelope
+
+
+@runtime_checkable
+class EvidenceResumeCredentialVerifier(Protocol):
+    """Restart-stable deployment verifier for opaque resume credentials."""
+
+    def verify_evidence_resume_credential(
+        self,
+        credential: bytes,
+    ) -> EvidenceResumeCredentialClaims: ...
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -86,13 +118,15 @@ class ProtectedEvidenceReference:
     """Resolver-issued reference brand required by the resume API."""
 
     _reference: str
-    _issuance_token: bytes = field(repr=False)
+    _credential: bytes = field(repr=False)
+    _claims: EvidenceResumeCredentialClaims = field(repr=False)
 
     def __init__(
         self,
         reference: str,
         *,
-        _issuance_token: bytes | None = None,
+        _credential: bytes | None = None,
+        _claims: EvidenceResumeCredentialClaims | None = None,
         _issuer: object | None = None,
     ) -> None:
         if _issuer is not _REFERENCE_ISSUER:
@@ -104,37 +138,85 @@ class ProtectedEvidenceReference:
             "_reference",
             _protected_evidence_ref(reference),
         )
-        if (
-            type(_issuance_token) is not bytes
-            or len(_issuance_token) != _ISSUANCE_TOKEN_BYTES
-        ):
-            raise TypeError("protected evidence issuance token is invalid")
-        object.__setattr__(self, "_issuance_token", _issuance_token)
+        if type(_credential) is not bytes or not _credential:
+            raise TypeError("protected evidence credential is invalid")
+        if type(_claims) is not EvidenceResumeCredentialClaims:
+            raise TypeError("protected evidence credential claims are invalid")
+        object.__setattr__(self, "_credential", _credential)
+        object.__setattr__(self, "_claims", _claims)
 
 
-def _register_protected_evidence_ref(reference: str) -> bytes:
-    token = secrets.token_bytes(_ISSUANCE_TOKEN_BYTES)
-    with _ISSUED_REFERENCES_LOCK:
-        _ISSUED_REFERENCES[token] = reference
-    return token
+def _verified_credential_claims(
+    credential: object,
+    verifier: EvidenceResumeCredentialVerifier,
+) -> EvidenceResumeCredentialClaims:
+    if type(credential) is not bytes or not credential:
+        raise TypeError("resume credential must be non-empty opaque bytes")
+    if not isinstance(verifier, EvidenceResumeCredentialVerifier):
+        raise TypeError(
+            "resume credential verifier must implement "
+            "EvidenceResumeCredentialVerifier"
+        )
+    try:
+        claims = verifier.verify_evidence_resume_credential(credential)
+    except Exception:
+        raise TypeError(
+            "resume payload must be a resolver-issued "
+            "protected evidence reference"
+        ) from None
+    if (
+        type(claims) is not EvidenceResumeCredentialClaims
+        or type(claims.credential_version) is not str
+        or claims.credential_version != _CREDENTIAL_VERSION
+        or type(claims.key_id) is not str
+        or not claims.key_id
+        or type(claims.nonce) is not str
+        or not claims.nonce
+        or type(claims.expires_at) is not int
+        or claims.expires_at <= int(time.time())
+        or type(claims.suspension) is not SuspensionEnvelope
+    ):
+        raise TypeError(
+            "resume payload must be a resolver-issued "
+            "protected evidence reference"
+        )
+    try:
+        SuspensionEnvelope.from_payload(claims.suspension)
+    except (TypeError, ValueError):
+        raise TypeError(
+            "resume payload must be a resolver-issued "
+            "protected evidence reference"
+        ) from None
+    _protected_evidence_ref(claims.evidence_ref)
+    return claims
 
 
-def _is_resolver_issued_reference(value: object) -> bool:
+def _is_resolver_issued_reference(
+    value: object,
+    verifier: EvidenceResumeCredentialVerifier,
+) -> bool:
     if type(value) is not ProtectedEvidenceReference:
         return False
-    with _ISSUED_REFERENCES_LOCK:
-        return (
-            _ISSUED_REFERENCES.get(value._issuance_token)
-            == value._reference
-        )
+    try:
+        claims = _verified_credential_claims(value._credential, verifier)
+    except TypeError:
+        return False
+    return claims == value._claims and claims.evidence_ref == value._reference
 
 
 def _require_resolver_issued_reference(
     value: object,
+    verifier: EvidenceResumeCredentialVerifier,
+    *,
+    suspension: SuspensionEnvelope | None = None,
 ) -> ProtectedEvidenceReference:
     if (
         type(value) is not ProtectedEvidenceReference
-        or not _is_resolver_issued_reference(value)
+        or not _is_resolver_issued_reference(value, verifier)
+        or (
+            suspension is not None
+            and value._claims.suspension != suspension
+        )
     ):
         raise TypeError(
             "resume payload must be a resolver-issued "
@@ -145,7 +227,9 @@ def _require_resolver_issued_reference(
 
 async def resolve_protected_evidence_reference(
     handle: str,
+    suspension: object,
     resolver: EvidenceReferenceResolver,
+    verifier: EvidenceResumeCredentialVerifier,
 ) -> ProtectedEvidenceReference:
     """Resolve an untrusted handle before any value enters a Command."""
 
@@ -153,67 +237,77 @@ async def resolve_protected_evidence_reference(
         raise TypeError("evidence handle must be a non-empty exact string")
     if not isinstance(resolver, EvidenceReferenceResolver):
         raise TypeError("resolver must implement EvidenceReferenceResolver")
-    reference = _protected_evidence_ref(
-        await resolver.resolve_evidence_reference(handle)
+    envelope = SuspensionEnvelope.from_payload(suspension)
+    credential = await resolver.resolve_evidence_reference(
+        handle,
+        envelope,
     )
-    issuance_token = _register_protected_evidence_ref(reference)
+    claims = _verified_credential_claims(credential, verifier)
+    if claims.suspension != envelope:
+        raise TypeError(
+            "resume credential does not match the requested suspension"
+        )
     return ProtectedEvidenceReference(
-        reference,
-        _issuance_token=issuance_token,
+        claims.evidence_ref,
+        _credential=credential,
+        _claims=claims,
         _issuer=_REFERENCE_ISSUER,
     )
 
 
-def _encode_protected_reference(value: object) -> object:
+def _encode_protected_reference(
+    value: object,
+    verifier: EvidenceResumeCredentialVerifier,
+) -> object:
     if type(value) is ProtectedEvidenceReference:
-        reference = _require_resolver_issued_reference(value)
+        reference = _require_resolver_issued_reference(value, verifier)
         return (
             _SERIALIZED_REFERENCE_PREFIX
-            + reference._issuance_token
-            + reference._reference.encode("utf-8")
+            + reference._credential
         )
     if type(value) is list:
-        return [_encode_protected_reference(item) for item in value]
+        return [
+            _encode_protected_reference(item, verifier)
+            for item in value
+        ]
     if type(value) is tuple:
-        return tuple(_encode_protected_reference(item) for item in value)
+        return tuple(
+            _encode_protected_reference(item, verifier)
+            for item in value
+        )
     if type(value) is dict:
         return {
-            key: _encode_protected_reference(item)
+            key: _encode_protected_reference(item, verifier)
             for key, item in value.items()
         }
     return value
 
 
-def _decode_protected_reference(value: object) -> object:
+def _decode_protected_reference(
+    value: object,
+    verifier: EvidenceResumeCredentialVerifier,
+) -> object:
     if type(value) is bytes and value.startswith(
         _SERIALIZED_REFERENCE_PREFIX
     ):
-        payload = value[len(_SERIALIZED_REFERENCE_PREFIX) :]
-        token = payload[:_ISSUANCE_TOKEN_BYTES]
-        encoded_reference = payload[_ISSUANCE_TOKEN_BYTES:]
-        try:
-            reference = encoded_reference.decode("utf-8")
-        except UnicodeDecodeError:
-            reference = ""
-        with _ISSUED_REFERENCES_LOCK:
-            verified = _ISSUED_REFERENCES.get(token) == reference
-        if (
-            len(token) != _ISSUANCE_TOKEN_BYTES
-            or not verified
-        ):
-            raise TypeError(
-                "resume payload must be a resolver-issued "
-                "protected evidence reference"
-            )
+        credential = value[len(_SERIALIZED_REFERENCE_PREFIX) :]
+        claims = _verified_credential_claims(credential, verifier)
         return ProtectedEvidenceReference(
-            _protected_evidence_ref(reference),
-            _issuance_token=token,
+            claims.evidence_ref,
+            _credential=credential,
+            _claims=claims,
             _issuer=_REFERENCE_ISSUER,
         )
     if type(value) is list:
-        return [_decode_protected_reference(item) for item in value]
+        return [
+            _decode_protected_reference(item, verifier)
+            for item in value
+        ]
     if type(value) is tuple:
-        return tuple(_decode_protected_reference(item) for item in value)
+        return tuple(
+            _decode_protected_reference(item, verifier)
+            for item in value
+        )
     if type(value) is dict:
         if _LEGACY_SERIALIZED_REFERENCE_KEY in value:
             raise TypeError(
@@ -221,7 +315,7 @@ def _decode_protected_reference(value: object) -> object:
                 "protected evidence reference"
             )
         return {
-            key: _decode_protected_reference(item)
+            key: _decode_protected_reference(item, verifier)
             for key, item in value.items()
         }
     return value
@@ -230,30 +324,43 @@ def _decode_protected_reference(value: object) -> object:
 @dataclass(frozen=True, slots=True)
 class _ProtectedResumeSerializer:
     delegate: SerializerProtocol
+    verifier: EvidenceResumeCredentialVerifier
 
     def dumps_typed(self, obj: Any) -> tuple[str, bytes]:
         return self.delegate.dumps_typed(
-            _encode_protected_reference(obj)
+            _encode_protected_reference(obj, self.verifier)
         )
 
     def loads_typed(self, data: tuple[str, bytes]) -> Any:
         return _decode_protected_reference(
-            self.delegate.loads_typed(data)
+            self.delegate.loads_typed(data),
+            self.verifier,
         )
 
 
 class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
     """Reject forged LangGraph resume writes before durable persistence."""
 
-    __slots__ = ("delegate",)
+    __slots__ = ("delegate", "verifier")
 
-    def __init__(self, delegate: BaseCheckpointSaver[Any]) -> None:
+    def __init__(
+        self,
+        delegate: BaseCheckpointSaver[Any],
+        verifier: EvidenceResumeCredentialVerifier,
+    ) -> None:
+        if not isinstance(verifier, EvidenceResumeCredentialVerifier):
+            raise TypeError(
+                "resume credential verifier must implement "
+                "EvidenceResumeCredentialVerifier"
+            )
         protected_delegate = copy.copy(delegate)
         protected_delegate.serde = _ProtectedResumeSerializer(
-            delegate.serde
+            delegate.serde,
+            verifier,
         )
         self.delegate = protected_delegate
         self.serde = protected_delegate.serde
+        self.verifier = verifier
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
@@ -271,7 +378,10 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
         if type(serializer) is not _ProtectedResumeSerializer:
             raise TypeError("protected resume serializer is unresolved")
         source.serde = serializer.delegate
-        return type(self)(source.with_allowlist(extra_allowlist))
+        return type(self)(
+            source.with_allowlist(extra_allowlist),
+            self.verifier,
+        )
 
     def get_tuple(
         self,
@@ -308,25 +418,52 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
             new_versions,
         )
 
-    @staticmethod
     def _validate_writes(
+        self,
+        config: RunnableConfig,
         writes: Sequence[tuple[str, Any]],
         task_id: str,
+        expected_suspensions: frozenset[SuspensionEnvelope],
     ) -> None:
+        configurable = config.get("configurable", {})
+        thread_id = configurable.get("thread_id")
+        checkpoint_id = configurable.get("checkpoint_id")
+
+        def valid_reference(value: object) -> bool:
+            if (
+                type(value) is not ProtectedEvidenceReference
+                or not _is_resolver_issued_reference(
+                    value,
+                    self.verifier,
+                )
+            ):
+                return False
+            claims = value._claims
+            suspension = claims.suspension
+            return (
+                suspension.graph_thread_id == thread_id
+                and suspension.graph_checkpoint_id == checkpoint_id
+                and (
+                    task_id == _NULL_TASK_ID
+                    or suspension.graph_task_id == task_id
+                )
+                and suspension in expected_suspensions
+            )
+
         for channel, value in writes:
             if (
                 channel == _RESUME_CHANNEL
                 and not (
                     (
                         task_id == _NULL_TASK_ID
-                        and _is_resolver_issued_reference(value)
+                        and valid_reference(value)
                     )
                     or (
                         task_id != _NULL_TASK_ID
                         and type(value) is list
                         and bool(value)
                         and all(
-                            _is_resolver_issued_reference(item)
+                            valid_reference(item)
                             for item in value
                         )
                     )
@@ -337,6 +474,32 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
                     "protected evidence reference"
                 )
 
+    @staticmethod
+    def _checkpoint_suspensions(
+        checkpoint: CheckpointTuple | None,
+    ) -> frozenset[SuspensionEnvelope]:
+        if checkpoint is None or checkpoint.pending_writes is None:
+            return frozenset()
+        suspensions: set[SuspensionEnvelope] = set()
+        for _task_id, channel, value in checkpoint.pending_writes:
+            if channel != "__interrupt__":
+                continue
+            items = (
+                value
+                if type(value) in {list, tuple}
+                else (value,)
+            )
+            for item in items:
+                if (
+                    type(item) is Interrupt
+                    and type(item.value) is dict
+                    and item.value.get("type") == SUSPENSION_TYPE
+                ):
+                    suspensions.add(
+                        SuspensionEnvelope.from_payload(item.value)
+                    )
+        return frozenset(suspensions)
+
     def put_writes(
         self,
         config: RunnableConfig,
@@ -344,7 +507,19 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        self._validate_writes(writes, task_id)
+        expected_suspensions = (
+            self._checkpoint_suspensions(
+                self.delegate.get_tuple(config)
+            )
+            if any(channel == _RESUME_CHANNEL for channel, _ in writes)
+            else frozenset()
+        )
+        self._validate_writes(
+            config,
+            writes,
+            task_id,
+            expected_suspensions,
+        )
         self.delegate.put_writes(  # type: ignore[attr-defined]
             config,
             writes,
@@ -416,7 +591,19 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        self._validate_writes(writes, task_id)
+        expected_suspensions = (
+            self._checkpoint_suspensions(
+                await self.delegate.aget_tuple(config)
+            )
+            if any(channel == _RESUME_CHANNEL for channel, _ in writes)
+            else frozenset()
+        )
+        self._validate_writes(
+            config,
+            writes,
+            task_id,
+            expected_suspensions,
+        )
         await self.delegate.aput_writes(  # type: ignore[attr-defined]
             config,
             writes,
@@ -454,6 +641,7 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
 
 def protect_resume_checkpointer(
     checkpointer: object,
+    verifier: EvidenceResumeCredentialVerifier,
 ) -> BaseCheckpointSaver[Any]:
     """Guard public LangGraph resume writes without replacing the saver."""
 
@@ -461,7 +649,7 @@ def protect_resume_checkpointer(
         raise TypeError(
             "suspendable checkpointer must be a public BaseCheckpointSaver"
         )
-    return _ProtectedResumeCheckpointer(checkpointer)
+    return _ProtectedResumeCheckpointer(checkpointer, verifier)
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +664,82 @@ class SuspensionEnvelope:
     evidence_request_ref: str
     proposal_digest: str
     traceparent: str
+    graph_thread_id: str
+    graph_task_id: str
+    graph_checkpoint_ns: str
+    graph_checkpoint_id: str
+
+    @classmethod
+    def from_payload(cls, value: object) -> SuspensionEnvelope:
+        """Validate the exact public interrupt payload."""
+
+        if type(value) is cls:
+            value = value.to_payload()
+        expected = {
+            "type",
+            "invocation_id",
+            "admission_id",
+            "checkpoint_ref",
+            "evidence_kind",
+            "evidence_request_ref",
+            "proposal_digest",
+            "traceparent",
+            "graph_thread_id",
+            "graph_task_id",
+            "graph_checkpoint_ns",
+            "graph_checkpoint_id",
+        }
+        if type(value) is not dict or set(value) != expected:
+            raise TypeError("suspension payload has an invalid exact shape")
+        return cls(
+            type=_suspension_type(value["type"]),
+            invocation_id=_exact_non_empty(
+                value["invocation_id"],
+                "invocation_id",
+            ),
+            admission_id=_exact_non_empty(
+                value["admission_id"],
+                "admission_id",
+            ),
+            checkpoint_ref=_exact_non_empty(
+                value["checkpoint_ref"],
+                "checkpoint_ref",
+            ),
+            evidence_kind=_evidence_kind(value["evidence_kind"]),
+            evidence_request_ref=_exact_non_empty(
+                value["evidence_request_ref"],
+                "evidence_request_ref",
+            ),
+            proposal_digest=_exact_non_empty(
+                value["proposal_digest"],
+                "proposal_digest",
+            ),
+            traceparent=_exact_non_empty(
+                value["traceparent"],
+                "traceparent",
+            ),
+            graph_thread_id=_exact_non_empty(
+                value["graph_thread_id"],
+                "graph_thread_id",
+            ),
+            graph_task_id=_exact_non_empty(
+                value["graph_task_id"],
+                "graph_task_id",
+            ),
+            graph_checkpoint_ns=_exact_non_empty(
+                value["graph_checkpoint_ns"],
+                "graph_checkpoint_ns",
+            ),
+            graph_checkpoint_id=_exact_non_empty(
+                value["graph_checkpoint_id"],
+                "graph_checkpoint_id",
+            ),
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        """Return the exact reference-only public interrupt payload."""
+
+        return asdict(self)
 
     @classmethod
     def from_native(
@@ -496,6 +760,13 @@ class SuspensionEnvelope:
             or outcome.invocation_id != request.invocation_id
         ):
             raise ValueError("outcome is not the request's native suspension")
+        execution_info = get_runtime().execution_info
+        if (
+            execution_info is None
+            or type(execution_info.thread_id) is not str
+            or not execution_info.thread_id
+        ):
+            raise ValueError("LangGraph suspension scope is unresolved")
         return cls(
             type=SUSPENSION_TYPE,
             invocation_id=_exact_non_empty(
@@ -523,6 +794,19 @@ class SuspensionEnvelope:
                 request.traceparent,
                 "traceparent",
             ),
+            graph_thread_id=execution_info.thread_id,
+            graph_task_id=_exact_non_empty(
+                execution_info.task_id,
+                "graph_task_id",
+            ),
+            graph_checkpoint_ns=_exact_non_empty(
+                execution_info.checkpoint_ns,
+                "graph_checkpoint_ns",
+            ),
+            graph_checkpoint_id=_exact_non_empty(
+                execution_info.checkpoint_id,
+                "graph_checkpoint_id",
+            ),
         )
 
 
@@ -530,25 +814,41 @@ class SuspensionEnvelope:
 class LangGraphSuspensionBridge:
     """Map a native suspension to the public LangGraph interrupt primitive."""
 
+    verifier: EvidenceResumeCredentialVerifier
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verifier, EvidenceResumeCredentialVerifier):
+            raise TypeError(
+                "resume credential verifier must implement "
+                "EvidenceResumeCredentialVerifier"
+            )
+
     async def suspend(
         self,
         request: InvocationRequest,
         outcome: InvocationOutcome,
     ) -> str:
         envelope = SuspensionEnvelope.from_native(request, outcome)
-        resumed = interrupt(asdict(envelope))
-        resumed = _require_resolver_issued_reference(resumed)
+        resumed = interrupt(envelope.to_payload())
+        resumed = _require_resolver_issued_reference(
+            resumed,
+            self.verifier,
+            suspension=envelope,
+        )
         return _protected_evidence_ref(resumed._reference)
 
 
-def resume_command(evidence_ref: ProtectedEvidenceReference) -> Command:
+def resume_command(
+    evidence_ref: ProtectedEvidenceReference,
+    verifier: EvidenceResumeCredentialVerifier,
+) -> Command:
     """Create the only public resume command accepted by the adapter."""
 
     if type(evidence_ref) is not ProtectedEvidenceReference:
         raise TypeError(
             "evidence_ref must be an exact ProtectedEvidenceReference"
         )
-    _require_resolver_issued_reference(evidence_ref)
+    _require_resolver_issued_reference(evidence_ref, verifier)
     return Command(resume=evidence_ref)
 
 
@@ -601,8 +901,10 @@ def build_resumed_invocation_request(
 
 
 __all__ = [
-    "LangGraphSuspensionBridge",
+    "EvidenceResumeCredentialClaims",
+    "EvidenceResumeCredentialVerifier",
     "EvidenceReferenceResolver",
+    "LangGraphSuspensionBridge",
     "ProtectedEvidenceReference",
     "SuspensionEnvelope",
     "build_resumed_invocation_request",

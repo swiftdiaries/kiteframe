@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import ast
+import asyncio
+import base64
 import copy
 import hashlib
+import hmac
 import json
+import multiprocessing
 import pickle
 import re
+import secrets
+import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
@@ -38,8 +44,11 @@ from kiteframe_deepagents.context import (
 )
 from kiteframe_deepagents.suspension import (
     EvidenceReferenceResolver,
+    EvidenceResumeCredentialClaims,
+    EvidenceResumeCredentialVerifier,
     LangGraphSuspensionBridge,
     ProtectedEvidenceReference,
+    SuspensionEnvelope,
     protect_resume_checkpointer,
     resolve_protected_evidence_reference,
     resume_command,
@@ -61,28 +70,131 @@ RESOURCE = "tenant:t1/case:case-1"
 RAW_EVIDENCE = "I approve this comment"
 EVIDENCE_REF = "evidence-ref-1"
 EVIDENCE_HANDLE = "approval-handle-1"
+TEST_CREDENTIAL_KEY = b"test-only-restart-stable-credential-key"
 
 
-class FakeEvidenceReferenceResolver(EvidenceReferenceResolver):
-    def __init__(self, references: dict[str, str]) -> None:
+class FakeEvidenceReferenceAuthority(
+    EvidenceReferenceResolver,
+    EvidenceResumeCredentialVerifier,
+):
+    def __init__(
+        self,
+        references: dict[str, str] | None = None,
+        *,
+        key: bytes = TEST_CREDENTIAL_KEY,
+        expires_at: int | None = None,
+    ) -> None:
         self.references = references
+        self.key = key
+        self.expires_at = expires_at
 
-    async def resolve_evidence_reference(self, handle: str) -> str:
+    async def resolve_evidence_reference(
+        self,
+        handle: str,
+        suspension: SuspensionEnvelope,
+    ) -> bytes:
         try:
-            return self.references[handle]
+            reference = (self.references or {})[handle]
         except KeyError:
             raise ValueError("evidence handle is unresolved") from None
+        payload = canonical_bytes(
+            {
+                "credential_version": "kiteframe.evidence-resume.v1",
+                "evidence_ref": reference,
+                "expires_at": (
+                    self.expires_at
+                    if self.expires_at is not None
+                    else int(time.time()) + 3600
+                ),
+                "key_id": "test-key-v1",
+                "nonce": secrets.token_hex(16),
+                "suspension": suspension.to_payload(),
+            }
+        )
+        signature = hmac.digest(self.key, payload, "sha256")
+        return b"test-v1." + base64.urlsafe_b64encode(
+            payload
+        ) + b"." + signature.hex().encode()
+
+    def verify_evidence_resume_credential(
+        self,
+        credential: bytes,
+    ) -> EvidenceResumeCredentialClaims:
+        try:
+            prefix, payload_wire, signature_wire = credential.split(b".", 2)
+            payload = base64.urlsafe_b64decode(payload_wire)
+            signature = bytes.fromhex(signature_wire.decode())
+            decoded = json.loads(payload)
+        except Exception:
+            raise ValueError("resume credential is malformed") from None
+        if (
+            prefix != b"test-v1"
+            or not hmac.compare_digest(
+                signature,
+                hmac.digest(self.key, payload, "sha256"),
+            )
+        ):
+            raise ValueError("resume credential signature is invalid")
+        return EvidenceResumeCredentialClaims(
+            credential_version=decoded["credential_version"],
+            key_id=decoded["key_id"],
+            nonce=decoded["nonce"],
+            expires_at=decoded["expires_at"],
+            evidence_ref=decoded["evidence_ref"],
+            suspension=SuspensionEnvelope.from_payload(
+                decoded["suspension"]
+            ),
+        )
 
 
-async def trusted_resume_command() -> Any:
-    return resume_command(await trusted_reference())
-
-
-async def trusted_reference() -> ProtectedEvidenceReference:
+async def trusted_reference(
+    suspension: object,
+    verifier: EvidenceResumeCredentialVerifier,
+) -> ProtectedEvidenceReference:
+    resolver = FakeEvidenceReferenceAuthority(
+        {EVIDENCE_HANDLE: EVIDENCE_REF}
+    )
     return await resolve_protected_evidence_reference(
         EVIDENCE_HANDLE,
-        FakeEvidenceReferenceResolver({EVIDENCE_HANDLE: EVIDENCE_REF}),
+        suspension,
+        resolver,
+        verifier,
     )
+
+
+async def trusted_resume_command(
+    suspension: object,
+    verifier: EvidenceResumeCredentialVerifier,
+) -> Command:
+    reference = await trusted_reference(suspension, verifier)
+    return resume_command(reference, verifier)
+
+
+def suspension_payload(result: object) -> object:
+    assert type(result) is dict
+    return result["__interrupt__"][0].value
+
+
+def literal_suspension_payload(
+    *,
+    thread_id: str = "thread-1",
+    task_id: str = "task-1",
+    checkpoint_id: str = "checkpoint-1",
+) -> dict[str, object]:
+    return {
+        "type": "kiteframe.capability.suspension",
+        "invocation_id": "invocation:1",
+        "admission_id": "admission:1",
+        "checkpoint_ref": "checkpoint-ref-1",
+        "evidence_kind": "approval",
+        "evidence_request_ref": "evidence-ref-request-1",
+        "proposal_digest": "proposal-digest-1",
+        "traceparent": VALID_TRACEPARENT,
+        "graph_thread_id": thread_id,
+        "graph_task_id": task_id,
+        "graph_checkpoint_ns": f"invoke_tool:{task_id}",
+        "graph_checkpoint_id": checkpoint_id,
+    }
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -411,9 +523,17 @@ class FakeDurableCheckpointer(
 ):
     kiteframe_durable = True
 
-    def __init__(self, durable_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        durable_path: Path | None = None,
+        *,
+        credential_key: bytes = TEST_CREDENTIAL_KEY,
+    ) -> None:
         super().__init__()
         self.durable_path = durable_path
+        self.credential_authority = FakeEvidenceReferenceAuthority(
+            key=credential_key
+        )
         self.correlations: dict[IdempotencyScope, PersistedIdempotencyKey] = {}
         self.invocations: dict[
             IdempotencyScope,
@@ -428,6 +548,16 @@ class FakeDurableCheckpointer(
             self.blobs.update(state["blobs"])
             self.correlations.update(state["correlations"])
             self.invocations.update(state["invocations"])
+
+    def verify_evidence_resume_credential(
+        self,
+        credential: bytes,
+    ) -> EvidenceResumeCredentialClaims:
+        return (
+            self.credential_authority.verify_evidence_resume_credential(
+                credential
+            )
+        )
 
     def _flush(self) -> None:
         if self.durable_path is None:
@@ -554,7 +684,7 @@ def compile_graph(
         invoker=invoker,
         session=session,
         checkpoint_store=checkpointer,
-        suspension_bridge=LangGraphSuspensionBridge(),
+        suspension_bridge=LangGraphSuspensionBridge(checkpointer),
     )[0]
 
     async def invoke_tool(state: GraphState) -> GraphState:
@@ -569,8 +699,46 @@ def compile_graph(
     builder.add_edge(START, "invoke_tool")
     builder.add_edge("invoke_tool", END)
     return builder.compile(
-        checkpointer=protect_resume_checkpointer(checkpointer)
+        checkpointer=protect_resume_checkpointer(
+            checkpointer,
+            checkpointer,
+        )
     )
+
+
+def _resume_persisted_command_in_fresh_process(
+    durable_path: str,
+    credential_key: bytes,
+    config: RunnableConfig,
+    result_queue: Any,
+) -> None:
+    async def run() -> None:
+        checkpointer = FakeDurableCheckpointer(
+            Path(durable_path),
+            credential_key=credential_key,
+        )
+        invoker = FakeInvoker()
+        graph = compile_graph(
+            checkpointer=checkpointer,
+            invoker=invoker,
+        )
+        result = await graph.ainvoke(None, config)
+        resumed = invoker.requests[-1]
+        result_queue.put(
+            (
+                "ok",
+                result,
+                resumed.invocation_id,
+                resumed.admission_id,
+                resumed.evidence_refs,
+                tuple(invoker.calls),
+            )
+        )
+
+    try:
+        asyncio.run(run())
+    except BaseException as error:
+        result_queue.put(("error", repr(error)))
 
 
 @pytest.mark.asyncio
@@ -612,7 +780,7 @@ async def test_process_restart_resume_reauthorizes_before_effect() -> None:
     config: RunnableConfig = {
         "configurable": {"thread_id": "task-7-restart"}
     }
-    await graph.ainvoke(
+    interrupted = await graph.ainvoke(
         {
             "arguments": {
                 "body": "hello",
@@ -630,7 +798,10 @@ async def test_process_restart_resume_reauthorizes_before_effect() -> None:
         invoker=restarted_invoker,
     )
     result = await restarted_graph.ainvoke(
-        await trusted_resume_command(),
+        await trusted_resume_command(
+            suspension_payload(interrupted),
+            checkpointer,
+        ),
         config,
     )
 
@@ -650,6 +821,179 @@ async def test_process_restart_resume_reauthorizes_before_effect() -> None:
     assert resumed.traceparent == original.traceparent == VALID_TRACEPARENT
     assert resumed.evidence_refs == {"approval": EVIDENCE_REF}
     assert not hasattr(resumed, "authority_revisions")
+
+
+@pytest.mark.asyncio
+async def test_fresh_process_consumes_same_persisted_resume_credential(
+    tmp_path: Path,
+) -> None:
+    durable_path = tmp_path / "fresh-process-checkpoint.bin"
+    checkpointer = FakeDurableCheckpointer(
+        durable_path,
+        credential_key=TEST_CREDENTIAL_KEY,
+    )
+    invoker = FakeInvoker()
+    graph = compile_graph(checkpointer=checkpointer, invoker=invoker)
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "task-7-fresh-process"}
+    }
+    interrupted = await graph.ainvoke(
+        {
+            "arguments": {
+                "body": "hello",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        config,
+    )
+    original = invoker.requests[-1]
+    reference = await trusted_reference(
+        suspension_payload(interrupted),
+        checkpointer,
+    )
+    command = resume_command(reference, checkpointer)
+    latest = await checkpointer.aget_tuple(config)
+    assert latest is not None
+    protected = protect_resume_checkpointer(
+        checkpointer,
+        checkpointer,
+    )
+    await protected.aput_writes(
+        latest.config,
+        [("__resume__", command.resume)],
+        "00000000-0000-0000-0000-000000000000",
+    )
+
+    process_context = multiprocessing.get_context("spawn")
+    result_queue = process_context.Queue()
+    process = process_context.Process(
+        target=_resume_persisted_command_in_fresh_process,
+        args=(
+            str(durable_path),
+            TEST_CREDENTIAL_KEY,
+            config,
+            result_queue,
+        ),
+    )
+    process.start()
+    process.join(timeout=30)
+    assert process.exitcode == 0
+    child_result = result_queue.get(timeout=5)
+
+    assert child_result[0] == "ok", child_result
+    assert child_result[1]["result"] == {"ok": True}
+    assert child_result[2] == original.invocation_id
+    assert child_result[3] == original.admission_id
+    assert child_result[4] == {"approval": EVIDENCE_REF}
+    assert child_result[5] == (
+        "validate_evidence",
+        "check_grant_expiry",
+        "check_authority_revisions",
+        "check_preconditions",
+        "invoke_point_of_use",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_credential_cannot_cross_graph_suspensions() -> None:
+    checkpointer = FakeDurableCheckpointer()
+    first_graph = compile_graph(
+        checkpointer=checkpointer,
+        invoker=FakeInvoker(),
+    )
+    second_invoker = FakeInvoker()
+    second_graph = compile_graph(
+        checkpointer=checkpointer,
+        invoker=second_invoker,
+    )
+    first_config: RunnableConfig = {
+        "configurable": {"thread_id": "task-7-scope-first"}
+    }
+    second_config: RunnableConfig = {
+        "configurable": {"thread_id": "task-7-scope-second"}
+    }
+    first_interrupted = await first_graph.ainvoke(
+        {
+            "arguments": {
+                "body": "first",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        first_config,
+    )
+    await second_graph.ainvoke(
+        {
+            "arguments": {
+                "body": "second",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        second_config,
+    )
+    before = checkpointer_snapshot(checkpointer)
+    first_reference = await trusted_reference(
+        suspension_payload(first_interrupted),
+        checkpointer,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        await second_graph.ainvoke(
+            resume_command(first_reference, checkpointer),
+            second_config,
+        )
+
+    assert checkpointer_snapshot(checkpointer) == before
+    assert all(
+        request.evidence_refs == {}
+        for request in second_invoker.requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_scope_mismatch_fails_before_saver_write() -> None:
+    checkpointer = FakeDurableCheckpointer()
+    invoker = FakeInvoker()
+    graph = compile_graph(checkpointer=checkpointer, invoker=invoker)
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "task-7-native-scope"}
+    }
+    interrupted = await graph.ainvoke(
+        {
+            "arguments": {
+                "body": "hello",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        config,
+    )
+    suspension = suspension_payload(interrupted)
+    assert type(suspension) is dict
+    forged_scope = dict(suspension)
+    forged_scope["proposal_digest"] = "proposal-digest-forged"
+    reference = await trusted_reference(
+        forged_scope,
+        checkpointer,
+    )
+    before = checkpointer_snapshot(checkpointer)
+
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        await graph.ainvoke(
+            resume_command(reference, checkpointer),
+            config,
+        )
+
+    assert checkpointer_snapshot(checkpointer) == before
+    assert all(request.evidence_refs == {} for request in invoker.requests)
 
 
 @pytest.mark.asyncio
@@ -712,7 +1056,7 @@ async def test_read_only_restart_uses_new_checkpointer_and_same_invocation(
     config: RunnableConfig = {
         "configurable": {"thread_id": "task-7-read-only-restart"}
     }
-    await first_graph.ainvoke(
+    interrupted = await first_graph.ainvoke(
         {
             "arguments": {
                 "body": "read",
@@ -735,7 +1079,10 @@ async def test_read_only_restart_uses_new_checkpointer_and_same_invocation(
         read_only_suspendable=True,
     )
     result = await restarted_graph.ainvoke(
-        await trusted_resume_command(),
+        await trusted_resume_command(
+            suspension_payload(interrupted),
+            restarted_checkpointer,
+        ),
         config,
     )
 
@@ -757,6 +1104,7 @@ class PersistOnlyCheckpointStore:
 def test_suspendable_tool_requires_durable_invocation_load_and_persist() -> None:
     requirement = comment_requirement()
     grant, session = grant_and_session()
+    verifier = FakeEvidenceReferenceAuthority()
 
     with pytest.raises(TypeError, match="durable invocation correlation"):
         build_capability_tools(
@@ -766,7 +1114,7 @@ def test_suspendable_tool_requires_durable_invocation_load_and_persist() -> None
             invoker=FakeInvoker(),
             session=session,
             checkpoint_store=PersistOnlyCheckpointStore(),
-            suspension_bridge=LangGraphSuspensionBridge(),
+            suspension_bridge=LangGraphSuspensionBridge(verifier),
         )
 
 
@@ -784,7 +1132,10 @@ def test_untrusted_evidence_cannot_construct_resume_command(
     untrusted_value: str,
 ) -> None:
     with pytest.raises((TypeError, ValueError)):
-        resume_command(untrusted_value)  # type: ignore[arg-type]
+        resume_command(
+            untrusted_value,  # type: ignore[arg-type]
+            FakeEvidenceReferenceAuthority(),
+        )
 
 
 @pytest.mark.asyncio
@@ -801,14 +1152,35 @@ def test_untrusted_evidence_cannot_construct_resume_command(
 async def test_resolver_rejects_non_reference_values(
     untrusted_reference: str,
 ) -> None:
-    resolver = FakeEvidenceReferenceResolver(
+    resolver = FakeEvidenceReferenceAuthority(
         {EVIDENCE_HANDLE: untrusted_reference}
     )
 
     with pytest.raises(ValueError, match="protected reference"):
         await resolve_protected_evidence_reference(
             EVIDENCE_HANDLE,
+            literal_suspension_payload(),
             resolver,
+            resolver,
+        )
+
+
+@pytest.mark.asyncio
+async def test_resolver_rejects_expired_resume_credential() -> None:
+    authority = FakeEvidenceReferenceAuthority(
+        {EVIDENCE_HANDLE: EVIDENCE_REF},
+        expires_at=1,
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        await resolve_protected_evidence_reference(
+            EVIDENCE_HANDLE,
+            literal_suspension_payload(),
+            authority,
+            authority,
         )
 
 
@@ -817,30 +1189,34 @@ async def test_resolver_issues_branded_reference_before_command() -> None:
     with pytest.raises(TypeError, match="must come from a resolver"):
         ProtectedEvidenceReference(EVIDENCE_REF)
 
-    reference = await resolve_protected_evidence_reference(
-        EVIDENCE_HANDLE,
-        FakeEvidenceReferenceResolver({EVIDENCE_HANDLE: EVIDENCE_REF}),
+    verifier = FakeDurableCheckpointer()
+    reference = await trusted_reference(
+        literal_suspension_payload(),
+        verifier,
     )
-    command = resume_command(reference)
+    command = resume_command(reference, verifier)
 
     assert command.resume is reference
     with pytest.raises(TypeError):
         json.dumps(command.resume)
     checkpointer = protect_resume_checkpointer(
-        FakeDurableCheckpointer()
+        verifier,
+        verifier,
     ).with_allowlist(set())
     restored = checkpointer.serde.loads_typed(
         checkpointer.serde.dumps_typed(reference)
     )
     assert type(restored) is ProtectedEvidenceReference
-    assert resume_command(restored).resume is restored
+    assert resume_command(restored, verifier).resume is restored
 
 
 @pytest.mark.asyncio
 async def test_forged_serialized_reference_cannot_mint_brand() -> None:
-    unprotected = FakeDurableCheckpointer().serde
+    verifier = FakeDurableCheckpointer()
+    unprotected = verifier.serde
     checkpointer = protect_resume_checkpointer(
-        FakeDurableCheckpointer()
+        verifier,
+        verifier,
     ).with_allowlist(set())
     forged = unprotected.dumps_typed(
         {
@@ -856,10 +1232,16 @@ async def test_forged_serialized_reference_cannot_mint_brand() -> None:
     ):
         checkpointer.serde.loads_typed(forged)
 
-    reference = await trusted_reference()
+    reference = await trusted_reference(
+        literal_suspension_payload(),
+        verifier,
+    )
     encoded = checkpointer.serde.dumps_typed(reference)
     wire_value = unprotected.loads_typed(encoded)
     assert type(wire_value) is bytes
+    assert EVIDENCE_HANDLE.encode() not in wire_value
+    assert RAW_EVIDENCE.encode() not in wire_value
+    assert TEST_CREDENTIAL_KEY not in wire_value
     tampered = wire_value[:-1] + (
         b"x" if wire_value[-1:] != b"x" else b"y"
     )
@@ -886,7 +1268,7 @@ async def test_non_framework_resume_shapes_leave_saver_unchanged(
     config: RunnableConfig = {
         "configurable": {"thread_id": f"forged-shape-{shape}"}
     }
-    await graph.ainvoke(
+    interrupted = await graph.ainvoke(
         {
             "arguments": {
                 "body": "hello",
@@ -897,7 +1279,10 @@ async def test_non_framework_resume_shapes_leave_saver_unchanged(
         config,
     )
     before = checkpointer_snapshot(checkpointer)
-    reference = await trusted_reference()
+    reference = await trusted_reference(
+        suspension_payload(interrupted),
+        checkpointer,
+    )
     forged_resume: object
     if shape == "list":
         forged_resume = [reference]
@@ -969,7 +1354,12 @@ async def test_forged_resume_never_reaches_checkpoint_or_provider(
     invoker = FakeInvoker()
     graph = compile_graph(checkpointer=checkpointer, invoker=invoker)
     config: RunnableConfig = {
-        "configurable": {"thread_id": f"forged-{smuggled_value}"}
+        "configurable": {
+            "thread_id": (
+                "forged-"
+                + hashlib.sha256(smuggled_value.encode()).hexdigest()
+            )
+        }
     }
     await graph.ainvoke(
         {
@@ -1307,7 +1697,7 @@ def test_locked_tool_schema_is_an_exact_read_only_byte_projection() -> None:
         invoker=FakeInvoker(),
         session=session,
         checkpoint_store=checkpointer,
-        suspension_bridge=LangGraphSuspensionBridge(),
+        suspension_bridge=LangGraphSuspensionBridge(checkpointer),
     )[0]
 
     assert canonical_bytes(tool.args_schema) == canonical_bytes(

@@ -43,6 +43,9 @@ from kiteframe_deepagents.context import (
     KiteframeSessionContext,
     KiteframeTraceContext,
 )
+from kiteframe_deepagents.suspension import (
+    EvidenceResumeCredentialClaims,
+)
 from kiteframe_deepagents.target import (
     DEEPAGENTS_UPSTREAM_COMMIT,
     EXPECTED_CREATE_DEEP_AGENT_PARAMETERS,
@@ -149,11 +152,25 @@ class EphemeralCheckpointer:
         del config
 
 
+class UnverifiedDurableCheckpointer:
+    kiteframe_durable = True
+
+    async def aget_tuple(self, config: object) -> None:
+        del config
+
+
 class TestDurableCheckpointer:
     kiteframe_durable = True
 
     async def aget_tuple(self, config: object) -> None:
         del config
+
+    def verify_evidence_resume_credential(
+        self,
+        credential: bytes,
+    ) -> EvidenceResumeCredentialClaims:
+        del credential
+        raise ValueError("test verifier rejects every credential")
 
 
 class PersistOnlyDurableCheckpointer(TestDurableCheckpointer):
@@ -179,6 +196,13 @@ class SecureDurableCheckpointer(InMemorySaver):
     ) -> PersistedInvocationCorrelation | None:
         del scope
         return None
+
+    def verify_evidence_resume_credential(
+        self,
+        credential: bytes,
+    ) -> EvidenceResumeCredentialClaims:
+        del credential
+        raise ValueError("test verifier rejects every credential")
 
 
 class TestCapabilityInvoker:
@@ -483,6 +507,23 @@ def test_suspendable_capability_requires_durable_checkpointer(
             registry_for(
                 suspendable_inputs,
                 checkpointer=EphemeralCheckpointer(),
+            ),
+        )
+
+    assert error.value.code == "KF-RUNTIME-001"
+    assert "durable checkpointer" in str(error.value)
+
+
+def test_suspendable_capability_requires_restart_stable_resume_verifier(
+    adapter: DeepAgentsAdapter,
+    suspendable_inputs: ResolvedRuntimeInputs,
+) -> None:
+    with pytest.raises(KiteframeDiagnosticError) as error:
+        adapter.validate(
+            suspendable_inputs,
+            registry_for(
+                suspendable_inputs,
+                checkpointer=UnverifiedDurableCheckpointer(),
             ),
         )
 

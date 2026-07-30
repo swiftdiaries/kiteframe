@@ -17,6 +17,8 @@ from .components import (
 from .context import KiteframeSessionContext, KiteframeTraceContext
 from .suspension import (
     EvidenceReferenceResolver,
+    EvidenceResumeCredentialClaims,
+    EvidenceResumeCredentialVerifier,
     LangGraphSuspensionBridge,
     ProtectedEvidenceReference,
     SuspensionEnvelope,
@@ -30,6 +32,8 @@ __all__ = [
     "DENY_ONLY_PROFILE",
     "DeepAgentsCompatibility",
     "DurableCheckpointer",
+    "EvidenceResumeCredentialClaims",
+    "EvidenceResumeCredentialVerifier",
     "EvidenceReferenceResolver",
     "KiteframeSessionContext",
     "KiteframeHarnessProfileToken",

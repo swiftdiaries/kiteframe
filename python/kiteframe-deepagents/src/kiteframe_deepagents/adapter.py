@@ -355,19 +355,21 @@ class DeepAgentsAdapter:
                 )
                 else _UnavailableCheckpointStore()
             )
-            suspension_bridge = (
-                LangGraphSuspensionBridge()
-                if isinstance(
-                    components.checkpointer,
-                    DurableCheckpointer,
+            if isinstance(
+                components.checkpointer,
+                DurableCheckpointer,
+            ):
+                resume_verifier = components.checkpointer
+                suspension_bridge = LangGraphSuspensionBridge(
+                    resume_verifier
                 )
-                else _UnavailableSuspensionBridge()
-            )
-            graph_checkpointer = (
-                protect_resume_checkpointer(components.checkpointer)
-                if isinstance(suspension_bridge, LangGraphSuspensionBridge)
-                else components.checkpointer
-            )
+                graph_checkpointer = protect_resume_checkpointer(
+                    components.checkpointer,
+                    resume_verifier,
+                )
+            else:
+                suspension_bridge = _UnavailableSuspensionBridge()
+                graph_checkpointer = components.checkpointer
             capability_tools = build_capability_tools(
                 resolved.capability_requirements,
                 session_snapshot.grants,

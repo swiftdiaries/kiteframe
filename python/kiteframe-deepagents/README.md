@@ -53,9 +53,14 @@ read-only suspendable capabilities.
 
 On suspension, `SuspensionEnvelope` exposes only the native invocation and
 admission IDs, checkpoint reference, evidence kind, protected evidence-request
-reference, proposal digest, and traceparent. A deployment-owned
-`EvidenceReferenceResolver` must turn the untrusted external handle into a
-branded reference before a public LangGraph command can be built:
+reference, proposal digest, traceparent, and the public LangGraph execution
+scope (`thread_id`, task ID, checkpoint namespace, and checkpoint ID). A
+deployment-owned `EvidenceReferenceResolver` must turn the untrusted external
+handle and exact suspension payload into a versioned opaque credential. The
+durable checkpointer must implement `EvidenceResumeCredentialVerifier` with
+restart-stable verification material and return exact
+`EvidenceResumeCredentialClaims` containing only a protected reference,
+key ID, nonce, expiry, and the complete suspension scope:
 
 ```python
 from kiteframe_deepagents import (
@@ -65,16 +70,29 @@ from kiteframe_deepagents import (
 
 protected_reference = await resolve_protected_evidence_reference(
     external_evidence_handle,
+    interrupt.value,
     deployment_evidence_resolver,
+    durable_checkpointer,
 )
-command = resume_command(protected_reference)
+command = resume_command(protected_reference, durable_checkpointer)
 ```
 
 Plain approval text, passwords, JWTs, and base64-like secret values are rejected
 before `Command` construction. The command retains the exact resolver-issued
-brand rather than downcasting it to a public dictionary. Adapter compilation
-wraps the public checkpointer with a delegating saver that rejects any forged
-LangGraph `__resume__` write before it reaches durable storage or a provider.
+brand rather than downcasting it to a public dictionary. Credentials must not
+embed the external handle, raw evidence, signing keys, or other client
+evidence. Adapter compilation injects the checkpointer's verifier into both the
+protected serializer and a delegating saver. Every deserialize and write
+re-verifies the opaque credential, its expiry, and its graph scope before
+privately restoring the brand or calling the deployment saver. The suspension
+bridge additionally requires exact native invocation, admission, proposal, and
+LangGraph task/checkpoint equality, preventing cross-suspension replay.
+
+The credential remains replayable only for the same unexpired suspension. This
+is required to recover when a process exits after the resume write is durable
+but before the interrupted node consumes it; provider idempotency and the full
+native point-of-use revalidation remain authoritative. Deployments that rotate
+keys must keep the credential's `key_id` verifiable until its expiry.
 Resume then rebuilds a native `InvocationRequest` with the same invocation ID,
 idempotency key, admission ID, canonical grant-set digest, arguments,
 preconditions, and trace context. The provider validates the referenced

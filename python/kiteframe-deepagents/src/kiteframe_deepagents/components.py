@@ -40,6 +40,7 @@ from .compatibility import (
     DEEPAGENTS_VERSION,
     KiteframeHarnessProfileToken,
 )
+from .suspension import EvidenceResumeCredentialVerifier
 
 RUNTIME_COMPONENT_UNRESOLVED = "KF-RUNTIME-001"
 RUNTIME_CONSTRUCTION_FAILED = "KF-RUNTIME-002"
@@ -57,7 +58,11 @@ class CheckpointerProtocol(Protocol):
 
 
 @runtime_checkable
-class DurableCheckpointer(CheckpointerProtocol, Protocol):
+class DurableCheckpointer(
+    CheckpointerProtocol,
+    EvidenceResumeCredentialVerifier,
+    Protocol,
+):
     """The additional restart-safe attestation required for suspension."""
 
     kiteframe_durable: Literal[True]
