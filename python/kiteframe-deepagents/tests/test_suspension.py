@@ -75,11 +75,14 @@ class FakeEvidenceReferenceResolver(EvidenceReferenceResolver):
 
 
 async def trusted_resume_command() -> Any:
-    reference = await resolve_protected_evidence_reference(
+    return resume_command(await trusted_reference())
+
+
+async def trusted_reference() -> ProtectedEvidenceReference:
+    return await resolve_protected_evidence_reference(
         EVIDENCE_HANDLE,
         FakeEvidenceReferenceResolver({EVIDENCE_HANDLE: EVIDENCE_REF}),
     )
-    return resume_command(reference)
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -510,6 +513,23 @@ class FakeDurableCheckpointer(
         }
 
 
+def checkpointer_snapshot(checkpointer: InMemorySaver) -> bytes:
+    storage = {
+        thread_id: {
+            checkpoint_ns: dict(checkpoints)
+            for checkpoint_ns, checkpoints in namespaces.items()
+        }
+        for thread_id, namespaces in checkpointer.storage.items()
+    }
+    return pickle.dumps(
+        (
+            storage,
+            dict(checkpointer.writes),
+            dict(checkpointer.blobs),
+        )
+    )
+
+
 class GraphState(TypedDict, total=False):
     arguments: NotRequired[dict[str, object]]
     result: NotRequired[object]
@@ -817,6 +837,91 @@ async def test_resolver_issues_branded_reference_before_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_forged_serialized_reference_cannot_mint_brand() -> None:
+    unprotected = FakeDurableCheckpointer().serde
+    checkpointer = protect_resume_checkpointer(
+        FakeDurableCheckpointer()
+    ).with_allowlist(set())
+    forged = unprotected.dumps_typed(
+        {
+            "__kiteframe_resolver_issued_evidence_reference_v1__": (
+                "evidence-ref-forged"
+            )
+        }
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        checkpointer.serde.loads_typed(forged)
+
+    reference = await trusted_reference()
+    encoded = checkpointer.serde.dumps_typed(reference)
+    wire_value = unprotected.loads_typed(encoded)
+    assert type(wire_value) is bytes
+    tampered = wire_value[:-1] + (
+        b"x" if wire_value[-1:] != b"x" else b"y"
+    )
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        checkpointer.serde.loads_typed(
+            unprotected.dumps_typed(tampered)
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "shape",
+    ["list", "tuple", "nested-list", "nested-dict", "dict-key"],
+)
+async def test_non_framework_resume_shapes_leave_saver_unchanged(
+    shape: str,
+) -> None:
+    checkpointer = FakeDurableCheckpointer()
+    invoker = FakeInvoker()
+    graph = compile_graph(checkpointer=checkpointer, invoker=invoker)
+    config: RunnableConfig = {
+        "configurable": {"thread_id": f"forged-shape-{shape}"}
+    }
+    await graph.ainvoke(
+        {
+            "arguments": {
+                "body": "hello",
+                "case_id": "case-1",
+                "_resource": RESOURCE,
+            }
+        },
+        config,
+    )
+    before = checkpointer_snapshot(checkpointer)
+    reference = await trusted_reference()
+    forged_resume: object
+    if shape == "list":
+        forged_resume = [reference]
+    elif shape == "tuple":
+        forged_resume = (reference,)
+    elif shape == "nested-list":
+        forged_resume = [[reference]]
+    elif shape == "nested-dict":
+        forged_resume = {"attacker-password": [reference]}
+    else:
+        forged_resume = {"attacker-password": reference}
+
+    with pytest.raises(
+        TypeError,
+        match="resolver-issued protected evidence reference",
+    ):
+        await graph.ainvoke(Command(resume=forged_resume), config)
+
+    after = checkpointer_snapshot(checkpointer)
+    assert after == before
+    assert all(request.evidence_refs == {} for request in invoker.requests)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("forged_resume", "smuggled_value"),
     [
@@ -923,6 +1028,13 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
             prefix = attribute_path(expression.value)
             if prefix is not None:
                 return (*prefix, expression.attr)
+        if (
+            isinstance(expression, ast.Subscript)
+            and (prefix := attribute_path(expression.value)) is not None
+            and isinstance(expression.slice, ast.Constant)
+            and type(expression.slice.value) in {str, int}
+        ):
+            return (*prefix, f"[{expression.slice.value!r}]")
         return None
 
     def semantic_words(identifier: str) -> set[str]:
@@ -978,6 +1090,24 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
             for child in ast.walk(expression)
             if (path := attribute_path(child)) is not None
         }
+
+    def annotation_paths(
+        annotation: ast.AST,
+    ) -> set[tuple[str, ...]]:
+        paths = referenced_paths(annotation)
+        if (
+            isinstance(annotation, ast.Constant)
+            and type(annotation.value) is str
+        ):
+            try:
+                forward_reference = ast.parse(
+                    annotation.value,
+                    mode="eval",
+                ).body
+            except SyntaxError:
+                return paths
+            paths.update(referenced_paths(forward_reference))
+        return paths
 
     def is_json_decoder(expression: ast.AST) -> bool:
         path = attribute_path(expression)
@@ -1072,7 +1202,7 @@ def _adapter_source_violations(source: str, filename: str) -> list[str]:
                 )
                 words.update(
                     word
-                    for path in referenced_paths(argument.annotation)
+                    for path in annotation_paths(argument.annotation)
                     for word in semantic_aliases.get(path, set())
                 )
             if not words.isdisjoint(forbidden_input_words):
@@ -1140,6 +1270,15 @@ def _adapter_tree_violations(source_root: Path) -> list[str]:
             "shadow = holder.payload\n"
             "decode = json.loads\n"
             "decode(shadow)\n"
+        ),
+        (
+            "import json\n"
+            "slots['payload'] = native.canonical_json()\n"
+            "json.loads(slots['payload'])\n"
+        ),
+        (
+            "from runtime import RuntimeTarget as RT\n"
+            "def validate(runtime_inputs, *, candidate: 'RT'): pass\n"
         ),
     ],
 )

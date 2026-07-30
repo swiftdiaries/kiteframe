@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import copy
 import re
+import secrets
 from collections.abc import (
     AsyncIterator,
     Collection,
     Iterator,
     Sequence,
 )
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
+from threading import Lock
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from kiteframe import (
@@ -41,9 +43,16 @@ _PROTECTED_REFERENCE_PATTERN = re.compile(
 )
 _REFERENCE_ISSUER = object()
 _RESUME_CHANNEL = "__resume__"
-_SERIALIZED_REFERENCE_KEY = (
+_NULL_TASK_ID = "00000000-0000-0000-0000-000000000000"
+_LEGACY_SERIALIZED_REFERENCE_KEY = (
     "__kiteframe_resolver_issued_evidence_reference_v1__"
 )
+_SERIALIZED_REFERENCE_PREFIX = (
+    b"\x00kiteframe-resolver-issued-evidence-reference-v2\x00"
+)
+_ISSUANCE_TOKEN_BYTES = 32
+_ISSUED_REFERENCES: dict[bytes, str] = {}
+_ISSUED_REFERENCES_LOCK = Lock()
 
 
 def _exact_non_empty(value: object, name: str) -> str:
@@ -77,11 +86,13 @@ class ProtectedEvidenceReference:
     """Resolver-issued reference brand required by the resume API."""
 
     _reference: str
+    _issuance_token: bytes = field(repr=False)
 
     def __init__(
         self,
         reference: str,
         *,
+        _issuance_token: bytes | None = None,
         _issuer: object | None = None,
     ) -> None:
         if _issuer is not _REFERENCE_ISSUER:
@@ -93,6 +104,43 @@ class ProtectedEvidenceReference:
             "_reference",
             _protected_evidence_ref(reference),
         )
+        if (
+            type(_issuance_token) is not bytes
+            or len(_issuance_token) != _ISSUANCE_TOKEN_BYTES
+        ):
+            raise TypeError("protected evidence issuance token is invalid")
+        object.__setattr__(self, "_issuance_token", _issuance_token)
+
+
+def _register_protected_evidence_ref(reference: str) -> bytes:
+    token = secrets.token_bytes(_ISSUANCE_TOKEN_BYTES)
+    with _ISSUED_REFERENCES_LOCK:
+        _ISSUED_REFERENCES[token] = reference
+    return token
+
+
+def _is_resolver_issued_reference(value: object) -> bool:
+    if type(value) is not ProtectedEvidenceReference:
+        return False
+    with _ISSUED_REFERENCES_LOCK:
+        return (
+            _ISSUED_REFERENCES.get(value._issuance_token)
+            == value._reference
+        )
+
+
+def _require_resolver_issued_reference(
+    value: object,
+) -> ProtectedEvidenceReference:
+    if (
+        type(value) is not ProtectedEvidenceReference
+        or not _is_resolver_issued_reference(value)
+    ):
+        raise TypeError(
+            "resume payload must be a resolver-issued "
+            "protected evidence reference"
+        )
+    return value
 
 
 async def resolve_protected_evidence_reference(
@@ -105,31 +153,25 @@ async def resolve_protected_evidence_reference(
         raise TypeError("evidence handle must be a non-empty exact string")
     if not isinstance(resolver, EvidenceReferenceResolver):
         raise TypeError("resolver must implement EvidenceReferenceResolver")
-    reference = await resolver.resolve_evidence_reference(handle)
+    reference = _protected_evidence_ref(
+        await resolver.resolve_evidence_reference(handle)
+    )
+    issuance_token = _register_protected_evidence_ref(reference)
     return ProtectedEvidenceReference(
-        _protected_evidence_ref(reference),
+        reference,
+        _issuance_token=issuance_token,
         _issuer=_REFERENCE_ISSUER,
     )
 
 
-def _resolver_issued_resume(value: object) -> bool:
-    if type(value) is ProtectedEvidenceReference:
-        return True
-    if type(value) is list:
-        return bool(value) and all(_resolver_issued_resume(item) for item in value)
-    if type(value) is tuple:
-        return bool(value) and all(_resolver_issued_resume(item) for item in value)
-    if type(value) is dict:
-        return bool(value) and all(
-            type(key) is str and _resolver_issued_resume(item)
-            for key, item in value.items()
-        )
-    return False
-
-
 def _encode_protected_reference(value: object) -> object:
     if type(value) is ProtectedEvidenceReference:
-        return {_SERIALIZED_REFERENCE_KEY: value._reference}
+        reference = _require_resolver_issued_reference(value)
+        return (
+            _SERIALIZED_REFERENCE_PREFIX
+            + reference._issuance_token
+            + reference._reference.encode("utf-8")
+        )
     if type(value) is list:
         return [_encode_protected_reference(item) for item in value]
     if type(value) is tuple:
@@ -143,12 +185,29 @@ def _encode_protected_reference(value: object) -> object:
 
 
 def _decode_protected_reference(value: object) -> object:
-    if (
-        type(value) is dict
-        and set(value) == {_SERIALIZED_REFERENCE_KEY}
+    if type(value) is bytes and value.startswith(
+        _SERIALIZED_REFERENCE_PREFIX
     ):
+        payload = value[len(_SERIALIZED_REFERENCE_PREFIX) :]
+        token = payload[:_ISSUANCE_TOKEN_BYTES]
+        encoded_reference = payload[_ISSUANCE_TOKEN_BYTES:]
+        try:
+            reference = encoded_reference.decode("utf-8")
+        except UnicodeDecodeError:
+            reference = ""
+        with _ISSUED_REFERENCES_LOCK:
+            verified = _ISSUED_REFERENCES.get(token) == reference
+        if (
+            len(token) != _ISSUANCE_TOKEN_BYTES
+            or not verified
+        ):
+            raise TypeError(
+                "resume payload must be a resolver-issued "
+                "protected evidence reference"
+            )
         return ProtectedEvidenceReference(
-            _protected_evidence_ref(value[_SERIALIZED_REFERENCE_KEY]),
+            _protected_evidence_ref(reference),
+            _issuance_token=token,
             _issuer=_REFERENCE_ISSUER,
         )
     if type(value) is list:
@@ -156,6 +215,11 @@ def _decode_protected_reference(value: object) -> object:
     if type(value) is tuple:
         return tuple(_decode_protected_reference(item) for item in value)
     if type(value) is dict:
+        if _LEGACY_SERIALIZED_REFERENCE_KEY in value:
+            raise TypeError(
+                "resume payload must be a resolver-issued "
+                "protected evidence reference"
+            )
         return {
             key: _decode_protected_reference(item)
             for key, item in value.items()
@@ -245,9 +309,29 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
         )
 
     @staticmethod
-    def _validate_writes(writes: Sequence[tuple[str, Any]]) -> None:
+    def _validate_writes(
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+    ) -> None:
         for channel, value in writes:
-            if channel == _RESUME_CHANNEL and not _resolver_issued_resume(value):
+            if (
+                channel == _RESUME_CHANNEL
+                and not (
+                    (
+                        task_id == _NULL_TASK_ID
+                        and _is_resolver_issued_reference(value)
+                    )
+                    or (
+                        task_id != _NULL_TASK_ID
+                        and type(value) is list
+                        and bool(value)
+                        and all(
+                            _is_resolver_issued_reference(item)
+                            for item in value
+                        )
+                    )
+                )
+            ):
                 raise TypeError(
                     "resume payload must be a resolver-issued "
                     "protected evidence reference"
@@ -260,7 +344,7 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        self._validate_writes(writes)
+        self._validate_writes(writes, task_id)
         self.delegate.put_writes(  # type: ignore[attr-defined]
             config,
             writes,
@@ -332,7 +416,7 @@ class _ProtectedResumeCheckpointer(BaseCheckpointSaver[Any]):
         task_id: str,
         task_path: str = "",
     ) -> None:
-        self._validate_writes(writes)
+        self._validate_writes(writes, task_id)
         await self.delegate.aput_writes(  # type: ignore[attr-defined]
             config,
             writes,
@@ -453,11 +537,7 @@ class LangGraphSuspensionBridge:
     ) -> str:
         envelope = SuspensionEnvelope.from_native(request, outcome)
         resumed = interrupt(asdict(envelope))
-        if type(resumed) is not ProtectedEvidenceReference:
-            raise TypeError(
-                "resume payload must be a resolver-issued "
-                "protected evidence reference"
-            )
+        resumed = _require_resolver_issued_reference(resumed)
         return _protected_evidence_ref(resumed._reference)
 
 
@@ -468,6 +548,7 @@ def resume_command(evidence_ref: ProtectedEvidenceReference) -> Command:
         raise TypeError(
             "evidence_ref must be an exact ProtectedEvidenceReference"
         )
+    _require_resolver_issued_reference(evidence_ref)
     return Command(resume=evidence_ref)
 
 
