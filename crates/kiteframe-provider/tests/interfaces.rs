@@ -82,6 +82,22 @@ async fn frozen_registry_uses_exact_version_and_validates_stable_projection() {
 }
 
 #[tokio::test]
+async fn raw_registry_dispatch_rejects_effect_capabilities() {
+    let mut registry = OperationRegistry::new();
+    registry.register(ReadOperation).unwrap();
+    let registry = registry
+        .freeze(Arc::new(AllowAuthorizationBackend::new(vec![])))
+        .unwrap();
+
+    let error = registry
+        .execute(&effect_invocation_context(), &[], json!({"caseId": "42"}))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.diagnostic().code.as_str(), "KF-RUNTIME-001");
+}
+
+#[tokio::test]
 async fn output_with_deployment_internal_fields_is_rejected_by_locked_schema() {
     let mut registry = OperationRegistry::new();
     registry.register(LeakyReadOperation).unwrap();
@@ -395,6 +411,70 @@ fn invocation_context_with_grant_preconditions(
         ),
         freshness: FreshnessRequirement::default(),
         preconditions,
+    })
+    .unwrap();
+    InvocationContext::try_new(
+        authenticated_context(),
+        identity,
+        selector("case:42"),
+        trace_context(),
+        locked,
+        grant,
+        digest(7),
+        revisions("current-8"),
+    )
+    .unwrap()
+}
+
+fn effect_invocation_context() -> InvocationContext {
+    let identity = capability_identity("1.0.0");
+    let mut parts = descriptor(identity.clone(), vec![]);
+    let wire = serde_json::to_value(&parts).unwrap();
+    let mut descriptor_parts = CapabilityDescriptorParts {
+        identity: identity.clone(),
+        summary: "Update a case".to_owned(),
+        input_schema: wire["inputSchema"].clone(),
+        output_schema: wire["outputSchema"].clone(),
+        stable_errors: vec![],
+        execution_modes: modes(&[ExecutionMode::Deferred]),
+        resource_selector_schema: ResourceSelectorSchema::try_new(json!({"type": "string"}))
+            .unwrap(),
+        effect: EffectClassification::ReversibleWrite,
+        idempotency: IdempotencyRequirement::Required {
+            scope: kiteframe_contract::IdempotencyScope::ActorCapabilityResourceOperation,
+            retention_seconds: std::num::NonZeroU64::new(3_600).unwrap(),
+        },
+        freshness: FreshnessRequirement::default(),
+        preconditions: vec![],
+        confirmation: ConfirmationRequirement::None,
+        approval: ApprovalRequirement::None,
+        consent: ConsentRequirement::None,
+    };
+    descriptor_parts.summary = "Update a case".to_owned();
+    parts = CapabilityDescriptor::try_new(descriptor_parts).unwrap();
+    let locked = LockedCapability::try_new(
+        identity.clone(),
+        parts.clone(),
+        *parts.descriptor_digest(),
+        digest(1),
+        digest(2),
+        digest(3),
+        digest(4),
+    )
+    .unwrap();
+    let grant = EffectiveCapabilityGrant::try_new(EffectiveCapabilityGrantParts {
+        capability: identity.clone(),
+        resources: vec![selector("case:42")],
+        execution_modes: modes(&[ExecutionMode::Deferred]),
+        maximum_effect: EffectClassification::ReversibleWrite,
+        expires_at: Timestamp::new(450),
+        required_evidence: RequiredEvidence::new(
+            ConfirmationRequirement::None,
+            ApprovalRequirement::None,
+            ConsentRequirement::None,
+        ),
+        freshness: FreshnessRequirement::default(),
+        preconditions: vec![],
     })
     .unwrap();
     InvocationContext::try_new(

@@ -147,9 +147,12 @@ impl AdmissionService {
             || catalog
                 .expires_at()
                 .is_some_and(|expiry| expiry <= config.issued_at)
+            || catalog
+                .expires_at()
+                .is_some_and(|expiry| config.expires_at > expiry)
         {
             return Err(vec![catalog_error(
-                "authoritative catalog is not valid at admission issue time",
+                "admission validity must be contained by the authoritative catalog",
             )]);
         }
 

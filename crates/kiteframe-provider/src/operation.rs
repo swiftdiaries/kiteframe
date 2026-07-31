@@ -240,6 +240,13 @@ impl OperationRegistry {
         preconditions: &[Precondition],
         arguments: Value,
     ) -> Result<Value, OperationFailure> {
+        if context.locked_capability().descriptor().effect()
+            != kiteframe_contract::EffectClassification::ReadOnly
+        {
+            return Err(OperationFailure::from(runtime_error(
+                "effect operations require the durable invocation enforcement plane",
+            )));
+        }
         let authorization_backend = self.authorization_backend.as_deref().ok_or_else(|| {
             OperationFailure::from(runtime_error(
                 "operation registry must be frozen with an authorization backend before use",

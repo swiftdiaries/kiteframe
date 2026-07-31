@@ -316,6 +316,24 @@ async fn session_expiry_caps_each_capability_grant() {
     );
 }
 
+#[test]
+fn admission_expiry_cannot_outlive_the_authoritative_catalog() {
+    let error = match AdmissionService::try_new(
+        authoritative_catalog(),
+        authoritative_registry(),
+        authority_sources(),
+        AdmissionServiceConfig {
+            expires_at: Timestamp::new(10_001),
+            ..service_config()
+        },
+    ) {
+        Ok(_) => panic!("admission service must not outlive its catalog"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error[0].code.as_str(), "KF-CAT-001");
+}
+
 #[tokio::test]
 async fn every_resolved_requirement_must_map_to_exactly_one_request_entry() {
     let error = service()
