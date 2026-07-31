@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 
+use async_trait::async_trait;
 use kiteframe_contract::{
-    ActorRef, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
-    AuthorityRevision, CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts,
-    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
+    ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
+    AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog, CapabilityDescriptor,
+    CapabilityDescriptorParts, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
+    CatalogIdentity,
     ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
     EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceRequirement, ExecutionMode,
     FreshnessRequirement, IdempotencyRequirement, LockedCapability, NonEmptySet,
@@ -12,8 +14,11 @@ use kiteframe_contract::{
     Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    AdmissionService, AdmissionServiceConfig, AuthorityDomain, AuthorityPlane, AuthoritySource,
-    AuthorityTerm,
+    AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AdmissionService,
+    AdmissionServiceConfig, AuthenticatedInvocationContext, AuthorityDomain, AuthorityPlane,
+    AuthoritySource, AuthorityTerm, AuthorizationBackend, AuthorizationDecision,
+    InvocationAuthorizationRequest, PortableInvocationRefs, RunRef, VerifiedHumanPrincipal,
+    VerifiedWorkloadPrincipal, correlate_principals,
 };
 use serde_json::json;
 
@@ -21,7 +26,7 @@ use serde_json::json;
 async fn admission_proves_catalog_and_all_required_capabilities() {
     let service = service();
     let request = admission_request(authoritative_catalog().identity().clone(), None);
-    let result = service.admit(request).await.unwrap();
+    let result = admit(&service, request).await.unwrap();
 
     assert_eq!(
         result.catalog_identity(),
@@ -73,9 +78,23 @@ async fn client_lock_drift_from_provider_registry_fails_closed() {
         authoritative_catalog().identity().clone(),
         Some(tampered_lock()),
     );
-    let error = service().admit(request).await.unwrap_err();
+    let error = admit(&service(), request).await.unwrap_err();
 
     assert_eq!(error.code.as_str(), "KF-CAP-001");
+}
+
+#[tokio::test]
+async fn required_capability_cannot_bypass_dynamic_admission_authorization() {
+    let error = service()
+        .admit(
+            admission_request(authoritative_catalog().identity().clone(), None),
+            authenticated_context(),
+            &DenyAuthorizationBackend,
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-AUTH-001");
 }
 
 #[tokio::test]
@@ -84,14 +103,15 @@ async fn catalog_identity_or_digest_drift_fails_before_authority_evaluation() {
         name: "different-catalog".to_owned(),
         revision: "catalog-7".to_owned(),
     };
-    let identity_error = service()
-        .admit(admission_request(wrong_identity, None))
+    let identity_error = admit(&service(), admission_request(wrong_identity, None))
         .await
         .unwrap_err();
     assert_eq!(identity_error.code.as_str(), "KF-CAT-001");
 
-    let digest_error = service()
-        .admit(admission_request_with_catalog_digest(digest(99)))
+    let digest_error = admit(
+        &service(),
+        admission_request_with_catalog_digest(digest(99)),
+    )
         .await
         .unwrap_err();
     assert_eq!(digest_error.code.as_str(), "KF-CAT-001");
@@ -114,11 +134,13 @@ async fn missing_required_authority_fails_the_whole_admission() {
     )
     .unwrap();
 
-    let error = service
-        .admit(admission_request(
+    let error = admit(
+        &service,
+        admission_request(
             authoritative_catalog().identity().clone(),
             None,
-        ))
+        ),
+    )
         .await
         .unwrap_err();
 
@@ -127,11 +149,13 @@ async fn missing_required_authority_fails_the_whole_admission() {
 
 #[tokio::test]
 async fn optional_authority_miss_is_safe_stable_and_creates_no_grant() {
-    let result = service()
-        .admit(admission_request(
+    let result = admit(
+        &service(),
+        admission_request(
             authoritative_catalog().identity().clone(),
             None,
-        ))
+        ),
+    )
         .await
         .unwrap();
     let denied = identity("cases.delete");
@@ -154,7 +178,7 @@ async fn optional_authority_miss_is_safe_stable_and_creates_no_grant() {
 #[tokio::test]
 async fn revision_source_order_does_not_change_the_canonical_grant_digest() {
     let request = admission_request(authoritative_catalog().identity().clone(), None);
-    let first = service().admit(request.clone()).await.unwrap();
+    let first = admit(&service(), request.clone()).await.unwrap();
     let mut reversed = authority_sources();
     reversed.reverse();
     let second_service = AdmissionService::try_new(
@@ -164,7 +188,7 @@ async fn revision_source_order_does_not_change_the_canonical_grant_digest() {
         service_config(),
     )
     .unwrap();
-    let second = second_service.admit(request).await.unwrap();
+    let second = admit(&second_service, request).await.unwrap();
 
     assert_eq!(first.authority_revisions(), second.authority_revisions());
     assert_eq!(first.grant_digest(), second.grant_digest());
@@ -199,11 +223,13 @@ async fn optional_unresolved_selector_becomes_a_stable_denial() {
     )
     .unwrap();
 
-    let result = service
-        .admit(admission_request(
+    let result = admit(
+        &service,
+        admission_request(
             authoritative_catalog().identity().clone(),
             None,
-        ))
+        ),
+    )
         .await
         .unwrap();
 
@@ -249,11 +275,13 @@ async fn optional_conflicting_evidence_becomes_a_stable_denial() {
     )
     .unwrap();
 
-    let result = service
-        .admit(admission_request(
+    let result = admit(
+        &service,
+        admission_request(
             authoritative_catalog().identity().clone(),
             None,
-        ))
+        ),
+    )
         .await
         .unwrap();
 
@@ -271,11 +299,13 @@ async fn omitting_any_mandatory_authority_plane_denies_admission() {
         )
         .unwrap();
 
-        let error = service
-            .admit(admission_request(
+        let error = admit(
+            &service,
+            admission_request(
                 authoritative_catalog().identity().clone(),
                 None,
-            ))
+            ),
+        )
             .await
             .unwrap_err();
 
@@ -300,11 +330,13 @@ async fn session_expiry_caps_each_capability_grant() {
     )
     .unwrap();
 
-    let result = service
-        .admit(admission_request(
+    let result = admit(
+        &service,
+        admission_request(
             authoritative_catalog().identity().clone(),
             None,
-        ))
+        ),
+    )
         .await
         .unwrap();
 
@@ -336,8 +368,7 @@ fn admission_expiry_cannot_outlive_the_authoritative_catalog() {
 
 #[tokio::test]
 async fn every_resolved_requirement_must_map_to_exactly_one_request_entry() {
-    let error = service()
-        .admit(admission_request_without_optional_entry())
+    let error = admit(&service(), admission_request_without_optional_entry())
         .await
         .unwrap_err();
 
@@ -360,6 +391,111 @@ fn service_config() -> AdmissionServiceConfig {
         expires_at: Timestamp::new(8_000),
         policy_revision: PolicyRevision::new("policy-9").unwrap(),
     }
+}
+
+async fn admit(
+    service: &AdmissionService,
+    request: AdmissionRequest,
+) -> Result<kiteframe_contract::CapabilityGrantSet, kiteframe_contract::Diagnostic> {
+    service
+        .admit(request, authenticated_context(), &TestAuthorizationBackend)
+        .await
+}
+
+struct TestAuthorizationBackend;
+struct DenyAuthorizationBackend;
+
+#[async_trait]
+impl AuthorizationBackend for TestAuthorizationBackend {
+    async fn list_admissible(
+        &self,
+        request: &AdmissionAuthorizationRequest,
+    ) -> Result<AdmissionAuthorizationResult, kiteframe_contract::Diagnostic> {
+        Ok(AdmissionAuthorizationResult::new(vec![
+            request.capability().clone(),
+        ]))
+    }
+
+    async fn check(
+        &self,
+        _request: &InvocationAuthorizationRequest,
+    ) -> Result<AuthorizationDecision, kiteframe_contract::Diagnostic> {
+        unreachable!("admission tests do not perform invocation checks")
+    }
+
+    async fn revisions(
+        &self,
+    ) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
+        AuthorityRevisionSet::try_new(vec![
+            revision("deployment-policy", "deploy-7"),
+            revision("openfga-model", "model-3"),
+            revision("tenant-policy", "tenant-42"),
+        ])
+        .map_err(|message| {
+            kiteframe_contract::Diagnostic::error(
+                kiteframe_contract::DiagnosticCode::PolicyStale,
+                kiteframe_contract::DiagnosticCategory::Authorization,
+                kiteframe_contract::DiagnosticStage::Admit,
+                message,
+            )
+        })
+    }
+}
+
+#[async_trait]
+impl AuthorizationBackend for DenyAuthorizationBackend {
+    async fn list_admissible(
+        &self,
+        _request: &AdmissionAuthorizationRequest,
+    ) -> Result<AdmissionAuthorizationResult, kiteframe_contract::Diagnostic> {
+        Ok(AdmissionAuthorizationResult::new(vec![]))
+    }
+
+    async fn check(
+        &self,
+        _request: &InvocationAuthorizationRequest,
+    ) -> Result<AuthorizationDecision, kiteframe_contract::Diagnostic> {
+        unreachable!("admission tests do not perform invocation checks")
+    }
+
+    async fn revisions(
+        &self,
+    ) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
+        TestAuthorizationBackend.revisions().await
+    }
+}
+
+fn authenticated_context() -> AuthenticatedInvocationContext {
+    correlate_principals(
+        VerifiedHumanPrincipal::try_new(
+            "tenant-1",
+            "human-7",
+            ActorRef::new("actor-7").unwrap(),
+            Timestamp::new(9_000),
+        )
+        .unwrap(),
+        VerifiedWorkloadPrincipal::try_new(
+            "tenant-1",
+            "workload-2",
+            "run-9",
+            AgentRef::new("agent-2").unwrap(),
+            TaskRef::new("task-4").unwrap(),
+            SessionRef::new("session-3").unwrap(),
+            AdmissionId::new("prior-admission").unwrap(),
+            Timestamp::new(9_000),
+        )
+        .unwrap(),
+        PortableInvocationRefs::new(
+            ActorRef::new("actor-7").unwrap(),
+            AgentRef::new("agent-2").unwrap(),
+            RunRef::new("run-9").unwrap(),
+            TaskRef::new("task-4").unwrap(),
+            SessionRef::new("session-3").unwrap(),
+            AdmissionId::new("prior-admission").unwrap(),
+            Timestamp::new(1_000),
+        ),
+    )
+    .unwrap()
 }
 
 fn authority_sources() -> Vec<AuthoritySource> {

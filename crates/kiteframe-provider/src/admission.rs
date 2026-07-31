@@ -12,6 +12,9 @@ use kiteframe_contract::{
 };
 
 use crate::{AuthorityTerm, intersect_authority};
+use crate::{
+    AdmissionAuthorizationRequest, AuthenticatedInvocationContext, AuthorizationBackend,
+};
 
 #[derive(Clone, Debug)]
 pub struct AdmissionServiceConfig {
@@ -215,11 +218,22 @@ impl AdmissionService {
         &self.authority_revisions
     }
 
-    pub async fn admit(&self, request: AdmissionRequest) -> Result<CapabilityGrantSet, Diagnostic> {
+    pub async fn admit(
+        &self,
+        request: AdmissionRequest,
+        principals: AuthenticatedInvocationContext,
+        authorization: &dyn AuthorizationBackend,
+    ) -> Result<CapabilityGrantSet, Diagnostic> {
         self.validate_catalog_binding(&request)?;
         let request_requirements = request_requirements(&request)?;
         let validated_locks = self.validate_request_locks(&request_requirements)?;
         validate_requirement_mapping(&request, &request_requirements)?;
+        let current_revisions = authorization.revisions().await?;
+        if current_revisions != self.authority_revisions {
+            return Err(authorization_error(
+                "admission authority revisions do not match the deployment-bound backend",
+            ));
+        }
 
         let mut grants = Vec::new();
         let mut optional_denials = Vec::new();
@@ -230,14 +244,30 @@ impl AdmissionService {
                 .chain(request.optional_capabilities())
                 .find(|requested| requested.capability() == requirement.identity())
                 .expect("one-to-one requirement mapping was validated");
+            let dynamically_admissible = self
+                .dynamically_admissible(
+                    requested,
+                    &principals,
+                    authorization,
+                    &current_revisions,
+                )
+                .await?;
             if requirement.required() {
-                let Some(grant) = self.admit_capability(requested, requirement)? else {
+                let Some(grant) = dynamically_admissible
+                    .then(|| self.admit_capability(requested, requirement))
+                    .transpose()?
+                    .flatten()
+                else {
                     return Err(authorization_error("required capability was not admitted"));
                 };
                 grants.push(grant);
                 continue;
             }
 
+            if !dynamically_admissible {
+                optional_denials.push(optional_denial(requested)?);
+                continue;
+            }
             match self.admit_capability(requested, requirement) {
                 Ok(Some(grant)) => grants.push(grant),
                 Ok(None) => optional_denials.push(optional_denial(requested)?),
@@ -261,7 +291,7 @@ impl AdmissionService {
             policy_revision: self.config.policy_revision.clone(),
             catalog_identity: self.catalog.identity().clone(),
             catalog_digest: *self.catalog.catalog_digest(),
-            authority_revisions: self.authority_revisions.clone(),
+            authority_revisions: current_revisions,
             issued_at: self.config.issued_at,
             expires_at: self.config.expires_at,
             grants,
@@ -361,6 +391,29 @@ impl AdmissionService {
         )?));
 
         intersect_authority(requirement, &terms).map_err(first_diagnostic)
+    }
+
+    async fn dynamically_admissible(
+        &self,
+        requested: &RequestedCapability,
+        principals: &AuthenticatedInvocationContext,
+        authorization: &dyn AuthorizationBackend,
+        current_revisions: &AuthorityRevisionSet,
+    ) -> Result<bool, Diagnostic> {
+        for resource in requested.resources() {
+            let result = authorization
+                .list_admissible(&AdmissionAuthorizationRequest::new(
+                    principals.clone(),
+                    requested.capability().clone(),
+                    resource.clone(),
+                    current_revisions.clone(),
+                ))
+                .await?;
+            if !result.admissible().contains(requested.capability()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn lock_admissions(&self) -> MutexGuard<'_, BTreeMap<(String, String), PersistedAdmission>> {
