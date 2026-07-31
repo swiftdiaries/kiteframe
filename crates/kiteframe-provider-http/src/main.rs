@@ -5,7 +5,7 @@ use axum::http::HeaderMap;
 use clap::Parser;
 use kiteframe_contract::{
     AdmissionRequest, CapabilityCatalog, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, InvocationOutcome, InvocationRequest,
+    DiagnosticStage, InvocationRequest,
 };
 use kiteframe_provider::InMemoryInvocationStore;
 use kiteframe_provider_http::{
@@ -114,11 +114,11 @@ impl ProviderHttpServices for UnconfiguredServices {
         Err(unconfigured_error())
     }
 
-    async fn invoke(
+    async fn observe_invocation(
         &self,
         _context: &ProviderRequestContext,
-        _request: InvocationRequest,
-    ) -> Result<InvocationOutcome, ProviderHttpError> {
+        _request: &InvocationRequest,
+    ) -> Result<(), ProviderHttpError> {
         Err(unconfigured_error())
     }
 

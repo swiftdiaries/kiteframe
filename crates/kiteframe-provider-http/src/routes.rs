@@ -17,7 +17,8 @@ use kiteframe_contract::{
     InvocationRequest, StatusRequest, TraceContext,
 };
 use kiteframe_provider::{
-    AdmissionService, AuthorizationBackend, InvocationStatusContext, InvocationStore,
+    AdmissionService, AuthorizationBackend, InvocationService, InvocationStatusContext,
+    InvocationStore,
 };
 use tower_http::limit::RequestBodyLimitLayer;
 use url::Url;
@@ -45,11 +46,13 @@ pub trait ProviderHttpServices: Send + Sync {
         Ok(())
     }
 
-    async fn invoke(
+    async fn observe_invocation(
         &self,
-        context: &ProviderRequestContext,
-        request: InvocationRequest,
-    ) -> Result<InvocationOutcome, ProviderHttpError>;
+        _context: &ProviderRequestContext,
+        _request: &InvocationRequest,
+    ) -> Result<(), ProviderHttpError> {
+        Ok(())
+    }
 
     async fn observe_status(
         &self,
@@ -64,12 +67,33 @@ pub struct ProviderHttpState {
     services: Arc<dyn ProviderHttpServices>,
     status_store: Arc<dyn InvocationStore>,
     admission_plane: Option<Arc<EnforcedAdmissionPlane>>,
+    invocation_plane: Option<Arc<EnforcedInvocationPlane>>,
     origin: Url,
 }
 
 pub struct EnforcedAdmissionPlane {
     service: Arc<AdmissionService>,
     authorization: Arc<dyn AuthorizationBackend>,
+}
+
+pub struct EnforcedInvocationPlane {
+    service: Arc<InvocationService>,
+}
+
+impl EnforcedInvocationPlane {
+    pub fn new(service: Arc<InvocationService>) -> Self {
+        Self { service }
+    }
+
+    async fn invoke(
+        &self,
+        request: InvocationRequest,
+    ) -> Result<InvocationOutcome, ProviderHttpError> {
+        self.service
+            .invoke(request)
+            .await
+            .map_err(|diagnostic| ProviderHttpError::new(HttpErrorKind::Conflict, diagnostic))
+    }
 }
 
 impl EnforcedAdmissionPlane {
@@ -109,6 +133,7 @@ impl ProviderHttpState {
             services,
             status_store,
             admission_plane: None,
+            invocation_plane: None,
             origin: Url::parse("https://provider.invalid")
                 .expect("static default provider origin is valid"),
         }
@@ -116,6 +141,11 @@ impl ProviderHttpState {
 
     pub fn with_admission_plane(mut self, plane: Arc<EnforcedAdmissionPlane>) -> Self {
         self.admission_plane = Some(plane);
+        self
+    }
+
+    pub fn with_invocation_plane(mut self, plane: Arc<EnforcedInvocationPlane>) -> Self {
+        self.invocation_plane = Some(plane);
         self
     }
 
@@ -318,9 +348,20 @@ async fn invoke(
         return Err(ProviderHttpError::identity_mismatch());
     }
     validate_trace(&context, request.trace_context())?;
-    state
-        .services
-        .invoke(&context, request)
+    state.services.observe_invocation(&context, &request).await?;
+    let plane = state.invocation_plane.as_ref().ok_or_else(|| {
+        ProviderHttpError::new(
+            HttpErrorKind::ServiceFailure,
+            kiteframe_contract::Diagnostic::error(
+                kiteframe_contract::DiagnosticCode::RuntimeConstruction,
+                kiteframe_contract::DiagnosticCategory::Runtime,
+                kiteframe_contract::DiagnosticStage::Runtime,
+                "provider invocation enforcement plane is not configured",
+            ),
+        )
+    })?;
+    plane
+        .invoke(request)
         .await
         .map(|value| Json(value).into_response())
 }

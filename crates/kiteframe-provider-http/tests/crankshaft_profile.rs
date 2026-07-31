@@ -203,11 +203,11 @@ impl ProviderHttpServices for WorkforceServices {
         Err(profile_denial())
     }
 
-    async fn invoke(
+    async fn observe_invocation(
         &self,
         context: &ProviderRequestContext,
-        _request: InvocationRequest,
-    ) -> Result<InvocationOutcome, ProviderHttpError> {
+        _request: &InvocationRequest,
+    ) -> Result<(), ProviderHttpError> {
         self.observe(context, "invoke");
         Err(profile_denial())
     }

@@ -17,8 +17,8 @@ pub use auth::{
 pub use kiteframe_provider::VerifiedProviderPrincipals;
 pub use response::{DiagnosticEnvelope, HttpErrorKind, ProviderHttpError};
 pub use routes::{
-    AuthenticatedStatusRequest, EnforcedAdmissionPlane, ProviderHttpServices, ProviderHttpState,
-    provider_router,
+    AuthenticatedStatusRequest, EnforcedAdmissionPlane, EnforcedInvocationPlane,
+    ProviderHttpServices, ProviderHttpState, provider_router,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

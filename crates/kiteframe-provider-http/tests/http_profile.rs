@@ -75,10 +75,10 @@ async fn exact_v1_routes_return_stable_native_contract_bodies() {
         ),
     )
     .await;
-    assert_eq!(invocation_response.status(), StatusCode::OK);
+    assert_eq!(invocation_response.status(), StatusCode::CONFLICT);
     assert_eq!(
-        response_json(invocation_response).await,
-        json!({"status": "deferred", "invocation_id": "inv-1"})
+        response_json(invocation_response).await["diagnostics"][0]["code"],
+        "KF-AUTH-003"
     );
 
     let status_response = send(
@@ -831,15 +831,21 @@ impl ProviderHttpServices for RecordingServices {
         ))
     }
 
-    async fn invoke(
+    async fn observe_invocation(
         &self,
         context: &ProviderRequestContext,
-        _request: InvocationRequest,
-    ) -> Result<InvocationOutcome, ProviderHttpError> {
+        _request: &InvocationRequest,
+    ) -> Result<(), ProviderHttpError> {
         self.observe(context, "invoke");
-        Ok(InvocationOutcome::Deferred {
-            invocation_id: InvocationId::new("inv-1").unwrap(),
-        })
+        Err(ProviderHttpError::new(
+            HttpErrorKind::Conflict,
+            Diagnostic::error(
+                DiagnosticCode::InvocationDenied,
+                DiagnosticCategory::Authorization,
+                DiagnosticStage::Invoke,
+                "test invocation observer stops before the unconfigured plane",
+            ),
+        ))
     }
 
     async fn observe_status(
@@ -891,11 +897,11 @@ impl ProviderHttpServices for AdversarialDiagnosticServices {
         Err(adversarial_error())
     }
 
-    async fn invoke(
+    async fn observe_invocation(
         &self,
         _context: &ProviderRequestContext,
-        _request: InvocationRequest,
-    ) -> Result<InvocationOutcome, ProviderHttpError> {
+        _request: &InvocationRequest,
+    ) -> Result<(), ProviderHttpError> {
         Err(adversarial_error())
     }
 
