@@ -16,6 +16,8 @@ serde_json_canonicalizer.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
+kiteframe-provider-sqlite = { path = "../kiteframe-provider-sqlite" }
 proptest = "1"
 serde_json.workspace = true
+tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt"] }

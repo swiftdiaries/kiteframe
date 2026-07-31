@@ -15,11 +15,14 @@ use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, CapabilityCatalog,
     CapabilityGrantSet, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
     DelegationAncestry, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage,
-    EvidenceReferences, InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus,
-    SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
+    EvidenceReferences, IdempotencyKey, InvocationId, InvocationOutcome, InvocationRequest,
+    InvocationStatus, LockedCapability, NormalizedResourceSelector, SessionRef, Sha256Digest,
+    TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    InMemoryInvocationStore, VerifiedHumanPrincipal, VerifiedWorkloadPrincipal,
+    IdempotencyScopeValue, InMemoryInvocationStore, InvocationReservationInput, InvocationState,
+    InvocationStatusContext, InvocationStore, InvocationStoreClock, InvocationTransition,
+    TransitionAuditRecord, VerifiedHumanPrincipal, VerifiedWorkloadPrincipal,
 };
 use kiteframe_provider_http::{
     AuthenticatedStatusRequest, HttpErrorKind, ProviderHttpError, ProviderHttpServices,
@@ -38,12 +41,16 @@ const WORKLOAD_CREDENTIAL: &str = "workload-workforce-secret";
 async fn workforce_profile_authenticates_every_route_and_never_returns_credentials() {
     let catalog = load_catalog();
     let events = Arc::new(Mutex::new(Vec::new()));
+    let status_store = Arc::new(InMemoryInvocationStore::with_clock(Arc::new(
+        FixedInvocationStoreClock(Timestamp::new(500)),
+    )));
+    seed_pending_invocation(status_store.as_ref(), &catalog).await;
     let state = ProviderHttpState::new(
         Arc::new(WorkforceServices {
-            catalog,
+            catalog: catalog.clone(),
             events: Arc::clone(&events),
         }),
-        Arc::new(InMemoryInvocationStore::new()),
+        status_store,
     );
     let app = provider_router(
         state,
@@ -62,7 +69,7 @@ async fn workforce_profile_authenticates_every_route_and_never_returns_credentia
         request(
             Method::POST,
             "/v1/capability-invocations/workforce.absence.propose",
-            Some(serde_json::to_value(invocation_request()).unwrap()),
+            Some(serde_json::to_value(validated_invocation_request(&catalog)).unwrap()),
         ),
         request(
             Method::GET,
@@ -71,10 +78,14 @@ async fn workforce_profile_authenticates_every_route_and_never_returns_credentia
         ),
     ];
     let mut response_bodies = Vec::new();
-    for request in requests {
+    let mut returned_status = None;
+    for (index, request) in requests.into_iter().enumerate() {
         let response = app.clone().oneshot(request).await.unwrap();
-        response_bodies
-            .extend_from_slice(&response.into_body().collect().await.unwrap().to_bytes());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        if index == 3 {
+            returned_status = Some(serde_json::from_slice::<InvocationStatus>(&body).unwrap());
+        }
+        response_bodies.extend_from_slice(&body);
     }
 
     let events = events.lock().unwrap();
@@ -96,6 +107,13 @@ async fn workforce_profile_authenticates_every_route_and_never_returns_credentia
     assert!(events.iter().any(|event| *event == "catalog"));
     assert!(events.iter().any(|event| *event == "admit"));
     assert!(events.iter().any(|event| *event == "invoke"));
+    assert!(events.iter().any(|event| *event == "status"));
+    assert_eq!(
+        returned_status,
+        Some(InvocationStatus::Pending {
+            invocation_id: InvocationId::new("inv-absence-1").unwrap(),
+        })
+    );
     let response_text = String::from_utf8(response_bodies).unwrap();
     assert!(!response_text.contains(HUMAN_CREDENTIAL));
     assert!(!response_text.contains(WORKLOAD_CREDENTIAL));
@@ -199,7 +217,9 @@ impl ProviderHttpServices for WorkforceServices {
         request: AuthenticatedStatusRequest,
     ) -> Result<InvocationStatus, ProviderHttpError> {
         self.observe(request.context(), "status");
-        Err(profile_denial())
+        Ok(InvocationStatus::Pending {
+            invocation_id: request.request().invocation_id().clone(),
+        })
     }
 }
 
@@ -325,21 +345,119 @@ fn admission_request() -> AdmissionRequest {
     .unwrap()
 }
 
-fn invocation_request() -> InvocationRequest {
-    InvocationRequest::try_new(
+fn validated_invocation_request(catalog: &CapabilityCatalog) -> InvocationRequest {
+    let request = InvocationRequest::try_new(
         InvocationId::new("inv-absence-1").unwrap(),
         AdmissionId::new("admission-workforce-1").unwrap(),
         digest(4),
         digest(5),
         capability("workforce.absence.propose"),
         "tenant:tenant-1/employee:employee-7",
-        json!({"employeeId": "employee-7", "startDate": "2026-08-01"}),
+        json!({
+            "employeeId": "employee-7",
+            "startDate": "2026-08-01",
+            "endDate": "2026-08-02"
+        }),
         BTreeMap::new(),
         Some("absence-proposal-1".to_owned()),
         EvidenceReferences::try_new(BTreeMap::new()).unwrap(),
         trace_context(),
     )
+    .unwrap();
+    let descriptor = catalog
+        .descriptors()
+        .iter()
+        .find(|descriptor| descriptor.identity().name().as_str() == "workforce.absence.propose")
+        .unwrap();
+    let locked = LockedCapability::try_new(
+        descriptor.identity().clone(),
+        descriptor.clone(),
+        *descriptor.descriptor_digest(),
+        digest(20),
+        digest(21),
+        digest(22),
+        digest(23),
+    )
+    .unwrap();
+    locked
+        .descriptor()
+        .validate_input(request.arguments())
+        .unwrap();
+    request
+}
+
+async fn seed_pending_invocation(store: &InMemoryInvocationStore, catalog: &CapabilityCatalog) {
+    let descriptor = catalog
+        .descriptors()
+        .iter()
+        .find(|descriptor| descriptor.identity().name().as_str() == "workforce.absence.propose")
+        .unwrap();
+    let invocation_id = InvocationId::new("inv-absence-1").unwrap();
+    store
+        .reserve_or_get(
+            InvocationReservationInput {
+                invocation_id: invocation_id.clone(),
+                status_id: "status-inv-absence-1".to_owned(),
+                scope: IdempotencyScopeValue::try_new(
+                    ActorRef::new("employee-7").unwrap(),
+                    capability("workforce.absence.propose"),
+                    NormalizedResourceSelector::new("tenant:tenant-1/employee:employee-7").unwrap(),
+                    "workforce.absence.propose",
+                )
+                .unwrap(),
+                idempotency_key: IdempotencyKey::new("absence-proposal-1").unwrap(),
+                request_digest: digest(6),
+                admission_id: AdmissionId::new("admission-workforce-1").unwrap(),
+                grant_digest: digest(4),
+                catalog_identity: catalog.identity().clone(),
+                catalog_digest: *catalog.catalog_digest(),
+                authority_revision_digest: digest(7),
+                status_context: workforce_status_context(),
+                proposal_digest: digest(8),
+                protected_evidence_refs: vec![],
+            },
+            descriptor,
+            Timestamp::new(86_900),
+        )
+        .await
+        .unwrap();
+    store
+        .transition(
+            &invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Reserved,
+                InvocationState::Pending,
+                TransitionAuditRecord::Authorization(
+                    "audit-authorization-workforce-http-1".to_owned(),
+                ),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+fn workforce_status_context() -> InvocationStatusContext {
+    InvocationStatusContext::try_new(
+        "tenant-1",
+        "employee-7",
+        "workforce-harness-2",
+        "run-9",
+        "employee-7",
+        "workforce-agent-2",
+        "absence-task-4",
+        "absence-session-3",
+        "admission-workforce-1",
+    )
     .unwrap()
+}
+
+struct FixedInvocationStoreClock(Timestamp);
+
+impl InvocationStoreClock for FixedInvocationStoreClock {
+    fn now(&self) -> Timestamp {
+        self.0
+    }
 }
 
 fn load_catalog() -> CapabilityCatalog {

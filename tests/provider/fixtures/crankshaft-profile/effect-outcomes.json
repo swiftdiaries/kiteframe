@@ -21,7 +21,7 @@
   "evidenceKind": "approval",
   "evidenceRequestRef": "evidence://workforce/approval/1",
   "statusTraceparent": "00-abcdef0123456789abcdef0123456789-abcdef0123456789-01",
-  "retentionUntil": 18446744073709551615,
+  "retentionUntil": 86900,
   "requestDigest": "1111111111111111111111111111111111111111111111111111111111111111",
   "authorizationAuditRef": "audit-authorization-workforce-1"
 }

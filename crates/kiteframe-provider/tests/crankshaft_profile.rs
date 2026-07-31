@@ -12,13 +12,14 @@ use kiteframe_contract::{
 };
 use kiteframe_provider::{
     AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AuthorizationBackend,
-    AuthorizationDecision, DecisionRef, IdempotencyScopeValue, InMemoryInvocationStore,
-    InvocationAuthorizationRequest, InvocationReservationInput, InvocationState,
-    InvocationStatusContext, InvocationStore, InvocationTransition,
-    NarrowedAuthorizationConditions, PortableInvocationRefs, SafeDenialReason, StatusState,
-    TransitionAuditRecord, VerifiedHumanPrincipal, VerifiedWorkloadPrincipal, correlate_principals,
+    AuthorizationDecision, DecisionRef, IdempotencyScopeValue, InvocationAuthorizationRequest,
+    InvocationReservationInput, InvocationState, InvocationStatusContext, InvocationStore,
+    InvocationStoreClock, InvocationTransition, NarrowedAuthorizationConditions,
+    PortableInvocationRefs, SafeDenialReason, StatusState, TransitionAuditRecord,
+    VerifiedHumanPrincipal, VerifiedWorkloadPrincipal, correlate_principals,
     require_current_authorization,
 };
+use kiteframe_provider_sqlite::SqliteInvocationStore;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -223,7 +224,14 @@ async fn revision_change_revokes_then_restart_status_recovers_effect() {
     .unwrap_err();
     assert_eq!(wrong_binding.code.as_str(), "KF-CAP-002");
 
-    let store = Arc::new(InMemoryInvocationStore::new());
+    let directory = tempfile::tempdir().unwrap();
+    let database_path = directory.path().join("workforce-profile.sqlite3");
+    let store = SqliteInvocationStore::open_with_clock(
+        &database_path,
+        Arc::new(FixedInvocationStoreClock(Timestamp::new(500))),
+    )
+    .await
+    .unwrap();
     store
         .reserve_or_get(
             InvocationReservationInput {
@@ -280,7 +288,14 @@ async fn revision_change_revokes_then_restart_status_recovers_effect() {
         .await
         .unwrap();
 
-    let restarted_service_store = Arc::clone(&store);
+    drop(store);
+
+    let restarted_service_store = SqliteInvocationStore::open_with_clock(
+        &database_path,
+        Arc::new(FixedInvocationStoreClock(Timestamp::new(501))),
+    )
+    .await
+    .unwrap();
     let status_request =
         StatusRequest::new(invocation_id, trace_context(&effects.status_traceparent));
     assert_eq!(
@@ -297,6 +312,10 @@ async fn revision_change_revokes_then_restart_status_recovers_effect() {
         status.audit_authorization_record_id(),
         Some(effects.authorization_audit_ref.as_str())
     );
+    assert_eq!(
+        restarted_service_store.last_traceparent().as_deref(),
+        Some(effects.status_traceparent.as_str())
+    );
     let portable_unknown = InvocationOutcome::outcome_unknown(
         InvocationId::new(&effects.invocation_id).unwrap(),
         Diagnostic::outcome_unknown("look up invocation status before retry"),
@@ -306,6 +325,14 @@ async fn revision_change_revokes_then_restart_status_recovers_effect() {
         portable_unknown.diagnostic().unwrap().retry,
         RetryClass::StatusFirst
     );
+}
+
+struct FixedInvocationStoreClock(Timestamp);
+
+impl InvocationStoreClock for FixedInvocationStoreClock {
+    fn now(&self) -> Timestamp {
+        self.0
+    }
 }
 
 #[derive(Deserialize)]

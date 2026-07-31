@@ -1419,11 +1419,13 @@ dependencies = [
  "async-trait",
  "jsonschema",
  "kiteframe-contract",
+ "kiteframe-provider-sqlite",
  "proptest",
  "serde",
  "serde_json",
  "serde_json_canonicalizer",
  "sha2",
+ "tempfile",
  "tokio",
 ]
 
