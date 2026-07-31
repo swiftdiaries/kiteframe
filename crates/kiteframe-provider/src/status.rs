@@ -304,7 +304,9 @@ impl<'de> Deserialize<'de> for StatusSafeError {
 pub enum InvocationState {
     Reserved,
     Pending,
-    Suspended,
+    Suspended {
+        suspension: Box<kiteframe_contract::Suspension>,
+    },
     Succeeded { result: StatusSafeResult },
     Failed { error: StatusSafeError },
     Denied { error: StatusSafeError },
@@ -316,7 +318,7 @@ impl InvocationState {
     pub const fn status_state(&self) -> StatusState {
         match self {
             Self::Reserved | Self::Pending => StatusState::Pending,
-            Self::Suspended => StatusState::Suspended,
+            Self::Suspended { .. } => StatusState::Suspended,
             Self::Succeeded { .. } => StatusState::Succeeded,
             Self::Failed { .. } => StatusState::Failed,
             Self::Denied { .. } => StatusState::Denied,
@@ -333,7 +335,7 @@ impl InvocationState {
         match self {
             Self::Reserved => "reserved",
             Self::Pending => "pending",
-            Self::Suspended => "suspended",
+            Self::Suspended { .. } => "suspended",
             Self::Succeeded { .. } => "succeeded",
             Self::Failed { .. } => "failed",
             Self::Denied { .. } => "denied",
@@ -765,13 +767,10 @@ impl InvocationStatus {
             InvocationState::Reserved | InvocationState::Pending => Ok(Portable::Pending {
                 invocation_id: self.invocation_id.clone(),
             }),
-            InvocationState::Suspended => Portable::outcome_unknown(
-                self.invocation_id.clone(),
-                Diagnostic::outcome_unknown(
-                    "durable suspension details are unavailable; query the provider before retrying",
-                ),
-            )
-            .map_err(|_| invalid("portable suspension status projection failed")),
+            InvocationState::Suspended { suspension } => Ok(Portable::Suspended {
+                invocation_id: self.invocation_id.clone(),
+                suspension: (**suspension).clone(),
+            }),
             InvocationState::Succeeded { result } => Ok(Portable::Succeeded {
                 invocation_id: self.invocation_id.clone(),
                 result: result.value().clone(),
@@ -1067,15 +1066,15 @@ fn allowed_transition(expected: &InvocationState, next: &InvocationState) -> boo
     matches!(
         (expected, next),
         (InvocationState::Reserved, InvocationState::Pending)
-            | (InvocationState::Reserved, InvocationState::Suspended)
+            | (InvocationState::Reserved, InvocationState::Suspended { .. })
             | (InvocationState::Reserved, InvocationState::Denied { .. })
-            | (InvocationState::Pending, InvocationState::Suspended)
+            | (InvocationState::Pending, InvocationState::Suspended { .. })
             | (InvocationState::Pending, InvocationState::Succeeded { .. })
             | (InvocationState::Pending, InvocationState::Failed { .. })
             | (InvocationState::Pending, InvocationState::Denied { .. })
             | (InvocationState::Pending, InvocationState::OutcomeUnknown)
-            | (InvocationState::Suspended, InvocationState::Pending)
-            | (InvocationState::Suspended, InvocationState::Denied { .. })
+            | (InvocationState::Suspended { .. }, InvocationState::Pending)
+            | (InvocationState::Suspended { .. }, InvocationState::Denied { .. })
             | (
                 InvocationState::OutcomeUnknown,
                 InvocationState::Succeeded { .. }
@@ -1099,7 +1098,7 @@ fn audit_matches_transition(
     matches!(
         (expected, next, audit),
         (
-            InvocationState::Reserved | InvocationState::Suspended,
+            InvocationState::Reserved | InvocationState::Suspended { .. },
             InvocationState::Pending,
             TransitionAuditRecord::Authorization(_)
         ) | (
@@ -1112,14 +1111,14 @@ fn audit_matches_transition(
             TransitionAuditRecord::None | TransitionAuditRecord::Outcome(_)
         ) | (
             InvocationState::Reserved,
-            InvocationState::Suspended | InvocationState::Denied { .. },
+            InvocationState::Suspended { .. } | InvocationState::Denied { .. },
             TransitionAuditRecord::None
         ) | (
             InvocationState::Pending,
-            InvocationState::Suspended | InvocationState::Denied { .. },
+            InvocationState::Suspended { .. } | InvocationState::Denied { .. },
             TransitionAuditRecord::None
         ) | (
-            InvocationState::Suspended,
+            InvocationState::Suspended { .. },
             InvocationState::Denied { .. },
             TransitionAuditRecord::None
         ) | (

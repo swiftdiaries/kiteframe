@@ -8,12 +8,13 @@ use std::{
 
 use kiteframe_contract::{
     ActorRef, AdmissionId, ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
-    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CheckpointRef,
     ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, EffectClassification, ExecutionMode, FreshnessRequirement, IdempotencyKey,
+    DiagnosticStage, EffectClassification, EvidenceKind, ExecutionMode, FreshnessRequirement,
+    IdempotencyKey,
     IdempotencyRequirement, IdempotencyScope, InvocationId, NonEmptySet,
     NormalizedResourceSelector, ProtectedEvidenceRequestRef, ResourceSelectorSchema, Sha256Digest,
-    StatusRequest, Timestamp, TraceContext,
+    StatusRequest, Suspension, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore,
@@ -211,11 +212,15 @@ async fn audit_history_appends_every_receipt_across_resume_and_unknown_resolutio
         ),
         (
             InvocationState::Pending,
-            InvocationState::Suspended,
+            InvocationState::Suspended {
+                suspension: Box::new(test_suspension()),
+            },
             TransitionAuditRecord::None,
         ),
         (
-            InvocationState::Suspended,
+            InvocationState::Suspended {
+                suspension: Box::new(test_suspension()),
+            },
             InvocationState::Pending,
             TransitionAuditRecord::Authorization("audit-authz-resumed".to_owned()),
         ),
@@ -601,6 +606,16 @@ impl InvocationStoreClock for FakeClock {
 
 fn digest(byte: u8) -> Sha256Digest {
     Sha256Digest::from_bytes([byte; 32])
+}
+
+fn test_suspension() -> Suspension {
+    Suspension::try_new(
+        CheckpointRef::new("checkpoint://test/01").unwrap(),
+        EvidenceKind::Approval,
+        ProtectedEvidenceRequestRef::new("evidence-request://test").unwrap(),
+        digest(6),
+    )
+    .unwrap()
 }
 
 fn trace_context(parent_nibble: &str) -> TraceContext {

@@ -21,10 +21,12 @@ use kiteframe_contract::{
     Sha256Digest, StableCapabilityError, Suspension, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
-    AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AuthorizationBackend,
-    AuthorizationDecision, CapabilityOperation, InMemoryInvocationAdmissionStore,
-    InvocationAdmission, InvocationCheckpointIssuer, InvocationClock, InvocationContext,
-    InvocationEventSink, InvocationEvidenceProvider, InvocationService,
+    AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AuditRecord, AuditSink,
+    AuthorizationBackend, AuthorizationDecision, CapabilityOperation, DurableAuditReceipt,
+    EffectAuditDigests, EffectEnforcementPlane, InMemoryInvocationAdmissionStore,
+    InMemoryInvocationStore, InvocationAdmission, InvocationCheckpointIssuer, InvocationClock,
+    InvocationContext, InvocationEventSink, InvocationEvidenceProvider, InvocationService,
+    InvocationStoreClock,
     NarrowedAuthorizationConditions, OperationFailure, OperationRegistry, Precondition,
     ResumeRequest, SafeDenialReason, VerifiedEvidence, VerifiedHumanPrincipal,
     VerifiedProviderPrincipals, VerifiedWorkloadPrincipal,
@@ -308,7 +310,7 @@ async fn changed_request_with_matching_new_evidence_cannot_resume_old_proposal()
         .unwrap_err();
     assert_eq!(
         consumed.message.as_str(),
-        "suspension checkpoint is not pending"
+        "required evidence is still absent at resume"
     );
 }
 
@@ -363,7 +365,7 @@ async fn pending_checkpoint_collision_is_rejected_without_replacement() {
         ))
         .await
         .unwrap();
-    assert!(matches!(resumed, InvocationOutcome::Deferred { .. }));
+    assert!(matches!(resumed, InvocationOutcome::Succeeded { .. }));
 }
 
 #[tokio::test]
@@ -845,7 +847,7 @@ async fn resume_revalidates_principals_freshness_preconditions_and_authorization
         .await
         .unwrap();
 
-    assert!(matches!(outcome, InvocationOutcome::Deferred { .. }));
+    assert!(matches!(outcome, InvocationOutcome::Succeeded { .. }));
     assert_eq!(
         fixture.events.snapshot(),
         [
@@ -857,6 +859,11 @@ async fn resume_revalidates_principals_freshness_preconditions_and_authorization
             "validate_evidence",
             "validate_preconditions",
             "authorize",
+            "reserve",
+            "audit_authorization",
+            "execute",
+            "audit_outcome",
+            "terminal_status",
         ]
     );
 }
@@ -946,14 +953,22 @@ async fn concurrent_resume_allows_exactly_one_in_flight_continuation() {
     let mut rejected = 0;
     for result in [first, second] {
         match result {
-            Ok(InvocationOutcome::Deferred { .. }) => succeeded += 1,
+            Ok(InvocationOutcome::Succeeded { .. }) => succeeded += 1,
             Err(error) if error.code.as_str() == "KF-AUTH-003" => rejected += 1,
             other => panic!("unexpected concurrent resume result: {other:?}"),
         }
     }
     assert_eq!(succeeded, 1);
     assert_eq!(rejected, 1);
-    assert!(!fixture.events.snapshot().contains(&"execute"));
+    assert_eq!(
+        fixture
+            .events
+            .snapshot()
+            .iter()
+            .filter(|event| **event == "execute")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1000,8 +1015,8 @@ async fn dropped_resume_future_restores_pending_checkpoint_for_retry() {
     drop(abandoned);
 
     let retried = fixture.service.resume(resume).await.unwrap();
-    assert!(matches!(retried, InvocationOutcome::Deferred { .. }));
-    assert!(!fixture.events.snapshot().contains(&"execute"));
+    assert!(matches!(retried, InvocationOutcome::Succeeded { .. }));
+    assert!(fixture.events.snapshot().contains(&"execute"));
 }
 
 #[tokio::test]
@@ -1057,7 +1072,7 @@ async fn resume_rejects_authority_revision_change_before_evidence_or_authorizati
         ))
         .await
         .unwrap();
-    assert!(matches!(retried, InvocationOutcome::Deferred { .. }));
+    assert!(matches!(retried, InvocationOutcome::Succeeded { .. }));
 }
 
 #[tokio::test]
@@ -1218,6 +1233,38 @@ struct FakeClock(AtomicU64);
 impl InvocationClock for FakeClock {
     fn now(&self) -> Timestamp {
         Timestamp::new(self.0.load(Ordering::SeqCst))
+    }
+}
+
+impl InvocationStoreClock for FakeClock {
+    fn now(&self) -> Timestamp {
+        InvocationClock::now(self)
+    }
+}
+
+struct TestAuditSink(AtomicU64);
+
+#[async_trait]
+impl AuditSink for TestAuditSink {
+    async fn append(
+        &self,
+        record: AuditRecord,
+    ) -> Result<DurableAuditReceipt, kiteframe_contract::Diagnostic> {
+        let sequence = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+        DurableAuditReceipt::try_new(
+            record.partition(),
+            sequence,
+            digest(0),
+            digest(sequence as u8),
+        )
+        .map_err(|message| {
+            kiteframe_contract::Diagnostic::error(
+                kiteframe_contract::DiagnosticCode::AuditUnavailable,
+                kiteframe_contract::DiagnosticCategory::Audit,
+                kiteframe_contract::DiagnosticStage::Invoke,
+                message,
+            )
+        })
     }
 }
 
@@ -1666,6 +1713,11 @@ fn fixture(options: FixtureOptions) -> Fixture {
             yield_check: options.yield_authorization_check,
         }))
         .unwrap();
+    let enforcement = EffectEnforcementPlane::new(
+        Arc::new(InMemoryInvocationStore::with_clock(clock.clone())),
+        Arc::new(TestAuditSink(AtomicU64::new(0))),
+        EffectAuditDigests::new(digest(20), digest(21), digest(22), digest(23)),
+    );
     let service = InvocationService::try_new(
         admissions,
         Arc::new(FakePrincipalVerifier {
@@ -1682,7 +1734,8 @@ fn fixture(options: FixtureOptions) -> Fixture {
         }),
     )
     .unwrap()
-    .with_event_sink(Arc::new(events.clone()));
+    .with_event_sink(Arc::new(events.clone()))
+    .with_effect_enforcement(enforcement);
 
     Fixture {
         service,

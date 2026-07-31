@@ -8,12 +8,13 @@ use std::{
 
 use kiteframe_contract::{
     ActorRef, AdmissionId, ApprovalRequirement, CapabilityDescriptor, CapabilityDescriptorParts,
-    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CheckpointRef,
     ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
-    DiagnosticStage, EffectClassification, ExecutionMode, FreshnessRequirement, IdempotencyKey,
+    DiagnosticStage, EffectClassification, EvidenceKind, ExecutionMode, FreshnessRequirement,
+    IdempotencyKey,
     IdempotencyRequirement, IdempotencyScope, InvocationId, NonEmptySet,
     NormalizedResourceSelector, ProtectedEvidenceRequestRef, ResourceSelectorSchema, RetryClass,
-    Sha256Digest, StableCapabilityError, StatusRequest, Timestamp, TraceContext,
+    Sha256Digest, StableCapabilityError, StatusRequest, Suspension, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     AbandonmentAuthorization, IdempotencyScopeValue, InvocationAuditLinkKind,
@@ -273,6 +274,59 @@ async fn unknown_outcome_survives_retention_and_restart_until_authorized_abandon
 }
 
 #[tokio::test]
+async fn exact_suspension_checkpoint_and_proposal_survive_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("suspension.sqlite3");
+    let clock = Arc::new(FakeClock::new(100));
+    let descriptor = descriptor(standard_output_schema(), 3_600);
+    let input = reservation("inv-suspended", "key-suspended", "human-7");
+    let suspension = test_suspension();
+    let store = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
+    store
+        .reserve_or_get(input.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+    store
+        .transition(
+            &input.invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Reserved,
+                InvocationState::Suspended {
+                    suspension: Box::new(suspension.clone()),
+                },
+                TransitionAuditRecord::None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    drop(store);
+
+    let reopened = SqliteInvocationStore::open_with_clock(&path, clock)
+        .await
+        .unwrap();
+    let status = reopened
+        .status(
+            &StatusRequest::new(input.invocation_id.clone(), trace_context("a")),
+            &status_context("human-7"),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        status.state(),
+        InvocationState::Suspended { suspension: stored } if stored.as_ref() == &suspension
+    ));
+    assert!(matches!(
+        status.portable().unwrap(),
+        kiteframe_contract::InvocationStatus::Suspended { suspension: stored, .. }
+            if stored == suspension
+    ));
+}
+
+#[tokio::test]
 async fn audit_ids_attach_with_transitions_and_safe_terminal_data_survives_restart() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("terminal.sqlite3");
@@ -400,11 +454,15 @@ async fn audit_history_survives_resume_unknown_and_terminal_resolution_in_order(
         ),
         (
             InvocationState::Pending,
-            InvocationState::Suspended,
+            InvocationState::Suspended {
+                suspension: Box::new(test_suspension()),
+            },
             TransitionAuditRecord::None,
         ),
         (
-            InvocationState::Suspended,
+            InvocationState::Suspended {
+                suspension: Box::new(test_suspension()),
+            },
             InvocationState::Pending,
             TransitionAuditRecord::Authorization("audit-authz-resumed".to_owned()),
         ),
@@ -835,6 +893,16 @@ fn standard_output_schema() -> serde_json::Value {
 
 fn digest(byte: u8) -> Sha256Digest {
     Sha256Digest::from_bytes([byte; 32])
+}
+
+fn test_suspension() -> Suspension {
+    Suspension::try_new(
+        CheckpointRef::new("checkpoint://test/01").unwrap(),
+        EvidenceKind::Approval,
+        ProtectedEvidenceRequestRef::new("evidence-request://test").unwrap(),
+        digest(6),
+    )
+    .unwrap()
 }
 
 fn trace_context(parent_nibble: &str) -> TraceContext {

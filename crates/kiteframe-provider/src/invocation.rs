@@ -10,7 +10,7 @@ use kiteframe_contract::{
     DiagnosticStage, EffectClassification, EffectProposal, EffectiveCapabilityGrant, EvidenceKind,
     EvidenceReferences, EvidenceRequirement, ExecutionMode, IdempotencyRequirement,
     InvocationOutcome, InvocationRequest, LockedCapability, NormalizedResourceSelector,
-    ProtectedEvidenceRequestRef, RetryClass, Sha256Digest, Suspension, Timestamp,
+    ProtectedEvidenceRequestRef, RetryClass, Sha256Digest, StatusRequest, Suspension, Timestamp,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -430,7 +430,14 @@ impl InvocationService {
 
     pub async fn resume(&self, resume: ResumeRequest) -> Result<InvocationOutcome, Diagnostic> {
         let checkpoint = resume.suspension.checkpoint_ref().as_str().to_owned();
-        let lease = self.begin_resume(&checkpoint, &resume.suspension)?;
+        let lease = match self.begin_resume(&checkpoint, &resume.suspension) {
+            Ok(lease) => lease,
+            Err(error) if error.message.as_str() == "suspension checkpoint is not pending" => {
+                self.restore_durable_suspension(&resume).await?;
+                self.begin_resume(&checkpoint, &resume.suspension)?
+            }
+            Err(error) => return Err(error),
+        };
         let pending = lease.pending().clone();
         let outcome = self.validate(resume.request, Some(&pending)).await;
         lease.finish(outcome)
@@ -573,6 +580,16 @@ impl InvocationService {
                     *proposal.proposal_digest(),
                 )
                 .map_err(authorization_error)?;
+                self.persist_suspension(
+                    &request,
+                    &admission,
+                    locked,
+                    &current_revisions,
+                    &principals,
+                    &proposal,
+                    &suspension,
+                )
+                .await?;
                 let checkpoint = suspension.checkpoint_ref().as_str().to_owned();
                 let mut pending = self.lock_pending();
                 if pending.contains_key(&checkpoint) {
@@ -675,6 +692,7 @@ impl InvocationService {
                     &decision,
                     &verified_evidence,
                     operation.as_ref(),
+                    resumed.is_some(),
                 )
                 .await;
         }
@@ -715,6 +733,7 @@ impl InvocationService {
         decision: &AuthorizationDecision,
         verified_evidence: &[VerifiedEvidence],
         operation: &dyn crate::CapabilityOperation,
+        resumed: bool,
     ) -> Result<InvocationOutcome, Diagnostic> {
         let descriptor = locked.descriptor();
         let idempotency_key = request.idempotency_key().cloned().ok_or_else(|| {
@@ -760,10 +779,13 @@ impl InvocationService {
             .store
             .reserve_or_get(reservation_input, descriptor, retention_until)
             .await?;
-        if reservation.kind() == ReservationKind::Existing {
+        let reservation_state = reservation.status().state().clone();
+        let resuming_suspension =
+            resumed && matches!(reservation_state, InvocationState::Suspended { .. });
+        if reservation.kind() == ReservationKind::Existing && !resuming_suspension {
             return existing_invocation_outcome(
                 request.invocation_id().clone(),
-                reservation.status().state(),
+                &reservation_state,
             );
         }
 
@@ -822,7 +844,11 @@ impl InvocationService {
             .transition(
                 request.invocation_id(),
                 InvocationTransition::try_new(
-                    InvocationState::Reserved,
+                    if resuming_suspension {
+                        reservation_state
+                    } else {
+                        InvocationState::Reserved
+                    },
                     InvocationState::Pending,
                     TransitionAuditRecord::Authorization(
                         authorization_receipt.record_id().to_owned(),
@@ -929,6 +955,87 @@ impl InvocationService {
         prepared.outcome
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_suspension(
+        &self,
+        request: &InvocationRequest,
+        admission: &InvocationAdmission,
+        locked: &LockedCapability,
+        current_revisions: &AuthorityRevisionSet,
+        principals: &AuthenticatedInvocationContext,
+        proposal: &EffectProposal,
+        suspension: &Suspension,
+    ) -> Result<(), Diagnostic> {
+        let descriptor = locked.descriptor();
+        if descriptor.effect() == EffectClassification::ReadOnly {
+            return Err(capability_error(
+                "suspendable invocations require a durable effect contract",
+            ));
+        }
+        let enforcement = self.effect_enforcement.as_ref().ok_or_else(|| {
+            audit_unavailable("suspendable effect requires the durable enforcement plane")
+        })?;
+        let idempotency_key = request.idempotency_key().cloned().ok_or_else(|| {
+            capability_error("suspendable effect is missing its required idempotency key")
+        })?;
+        let authority_revision_digest =
+            canonical_audit_digest(b"kiteframe:authority-revisions:v1\0", current_revisions)?;
+        let input = InvocationReservationInput {
+            invocation_id: request.invocation_id().clone(),
+            status_id: format!("status://{}", request.invocation_id().as_str()),
+            scope: IdempotencyScopeValue::try_new(
+                principals.actor_ref().clone(),
+                request.capability().clone(),
+                request.selected_resource().clone(),
+                descriptor.identity().name().as_str(),
+            )
+            .map_err(capability_error)?,
+            idempotency_key,
+            request_digest: *proposal.proposal_digest(),
+            admission_id: request.admission_id().clone(),
+            grant_digest: *request.grant_digest(),
+            catalog_identity: admission.grant_set().catalog_identity().clone(),
+            catalog_digest: *admission.grant_set().catalog_digest(),
+            authority_revision_digest,
+            status_context: InvocationStatusContext::from_authenticated(principals)
+                .map_err(capability_error)?,
+            proposal_digest: *proposal.proposal_digest(),
+            protected_evidence_refs: Vec::new(),
+        };
+        let reservation = enforcement
+            .store
+            .reserve_or_get(
+                input,
+                descriptor,
+                effect_retention_deadline(descriptor, self.clock.now())?,
+            )
+            .await?;
+        match reservation.status().state() {
+            InvocationState::Suspended {
+                suspension: existing,
+            } if existing.as_ref() == suspension => return Ok(()),
+            InvocationState::Reserved => {}
+            _ => {
+                return Err(authorization_error(
+                    "invocation already has non-suspendable durable state",
+                ));
+            }
+        }
+        enforcement
+            .store
+            .transition(
+                request.invocation_id(),
+                InvocationTransition::try_new(
+                    InvocationState::Reserved,
+                    InvocationState::Suspended {
+                        suspension: Box::new(suspension.clone()),
+                    },
+                    TransitionAuditRecord::None,
+                )?,
+            )
+            .await
+    }
+
     async fn validate_evidence(
         &self,
         request: &InvocationRequest,
@@ -1012,6 +1119,102 @@ impl InvocationService {
                 "suspension checkpoint already has an in-flight resume",
             )),
         }
+    }
+
+    async fn restore_durable_suspension(
+        &self,
+        resume: &ResumeRequest,
+    ) -> Result<(), Diagnostic> {
+        let enforcement = self.effect_enforcement.as_ref().ok_or_else(|| {
+            authorization_error("suspension has no durable enforcement plane")
+        })?;
+        let request = &resume.request;
+        let admission = self
+            .admissions
+            .load(request.admission_id(), request.grant_digest())
+            .await?;
+        let locked = admission.locked_capability(request.capability())?;
+        validate_locked_semantics(locked)?;
+        request
+            .validate_against_admission(admission.grant_set(), locked.descriptor())
+            .map_err(|_| {
+                capability_error(
+                    "resume request does not match its persisted admission and locked schema",
+                )
+            })?;
+        let grant = admission.effective_grant(request.capability())?;
+        let proposal =
+            EffectProposal::try_new(request, locked.descriptor()).map_err(first_diagnostic)?;
+        if resume.suspension.proposal_digest() != proposal.proposal_digest() {
+            return Err(authorization_error(
+                "resume suspension does not match the invocation proposal",
+            ));
+        }
+
+        let now = self.clock.now();
+        let verified = self
+            .principal_verifier
+            .verify()
+            .await
+            .map_err(|_| authorization_error("authenticated principal verification failed"))?;
+        let (human, workload) = verified.into_parts();
+        let principals = correlate_principals(
+            human,
+            workload.clone(),
+            PortableInvocationRefs::new(
+                admission.grant_set().actor().clone(),
+                admission.grant_set().agent().clone(),
+                workload.run_ref().clone(),
+                admission.grant_set().task().clone(),
+                admission.grant_set().session().clone(),
+                admission.grant_set().admission_id().clone(),
+                now,
+            ),
+        )?;
+        let status_context =
+            InvocationStatusContext::from_authenticated(&principals).map_err(capability_error)?;
+        let status = enforcement
+            .store
+            .status(
+                &StatusRequest::new(
+                    request.invocation_id().clone(),
+                    request.trace_context().clone(),
+                ),
+                &status_context,
+            )
+            .await?;
+        match status.state() {
+            InvocationState::Suspended { suspension }
+                if suspension.as_ref() == &resume.suspension => {}
+            _ => {
+                return Err(authorization_error(
+                    "durable suspension does not exact-match the resume request",
+                ));
+            }
+        }
+
+        let pending = PendingSuspension {
+            suspension: resume.suspension.clone(),
+            snapshot: AdmissionSnapshot::new(&admission, locked, grant),
+        };
+        let checkpoint = resume.suspension.checkpoint_ref().as_str().to_owned();
+        let mut states = self.lock_pending();
+        match states.get(&checkpoint) {
+            None => {
+                states.insert(
+                    checkpoint,
+                    SuspensionState::Pending(Box::new(pending)),
+                );
+            }
+            Some(SuspensionState::Pending(existing))
+                if existing.suspension == resume.suspension => {}
+            Some(_) => {
+                return Err(authorization_error(
+                    "suspension checkpoint already has incompatible state",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn finish_resume(
