@@ -26,4 +26,9 @@ url = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"
+kiteframe-audit = { path = "../kiteframe-audit" }
+kiteframe-provider-sqlite = { path = "../kiteframe-provider-sqlite" }
+serde_json_canonicalizer.workspace = true
+sha2.workspace = true
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
