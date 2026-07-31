@@ -757,6 +757,48 @@ impl InvocationStatus {
     pub fn retention_until(&self) -> Timestamp {
         self.retention_until
     }
+
+    pub fn portable(&self) -> Result<kiteframe_contract::InvocationStatus, Diagnostic> {
+        use kiteframe_contract::InvocationStatus as Portable;
+
+        match &self.state {
+            InvocationState::Reserved | InvocationState::Pending => Ok(Portable::Pending {
+                invocation_id: self.invocation_id.clone(),
+            }),
+            InvocationState::Suspended => Portable::outcome_unknown(
+                self.invocation_id.clone(),
+                Diagnostic::outcome_unknown(
+                    "durable suspension details are unavailable; query the provider before retrying",
+                ),
+            )
+            .map_err(|_| invalid("portable suspension status projection failed")),
+            InvocationState::Succeeded { result } => Ok(Portable::Succeeded {
+                invocation_id: self.invocation_id.clone(),
+                result: result.value().clone(),
+            }),
+            InvocationState::Failed { error } => Ok(Portable::Failed {
+                invocation_id: self.invocation_id.clone(),
+                error: StableCapabilityError::try_new(
+                    error.code(),
+                    error.category(),
+                    error.retry(),
+                    error.message(),
+                )
+                .map_err(|_| invalid("portable stable error projection failed"))?,
+            }),
+            InvocationState::Denied { .. } | InvocationState::Abandoned => Ok(Portable::Denied {
+                invocation_id: self.invocation_id.clone(),
+                diagnostic: unauthorized(),
+            }),
+            InvocationState::OutcomeUnknown => Portable::outcome_unknown(
+                self.invocation_id.clone(),
+                Diagnostic::outcome_unknown(
+                    "effect outcome is uncertain; query status before retrying",
+                ),
+            )
+            .map_err(|_| invalid("portable outcome-unknown projection failed")),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

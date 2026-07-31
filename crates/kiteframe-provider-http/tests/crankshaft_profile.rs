@@ -212,14 +212,12 @@ impl ProviderHttpServices for WorkforceServices {
         Err(profile_denial())
     }
 
-    async fn status(
+    async fn observe_status(
         &self,
-        request: AuthenticatedStatusRequest,
-    ) -> Result<InvocationStatus, ProviderHttpError> {
+        request: &AuthenticatedStatusRequest,
+    ) -> Result<(), ProviderHttpError> {
         self.observe(request.context(), "status");
-        Ok(InvocationStatus::Pending {
-            invocation_id: request.request().invocation_id().clone(),
-        })
+        Ok(())
     }
 }
 

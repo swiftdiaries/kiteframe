@@ -47,10 +47,12 @@ pub trait ProviderHttpServices: Send + Sync {
         request: InvocationRequest,
     ) -> Result<InvocationOutcome, ProviderHttpError>;
 
-    async fn status(
+    async fn observe_status(
         &self,
-        request: AuthenticatedStatusRequest,
-    ) -> Result<InvocationStatus, ProviderHttpError>;
+        _request: &AuthenticatedStatusRequest,
+    ) -> Result<(), ProviderHttpError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -278,14 +280,16 @@ async fn status(
     let request = StatusRequest::new(invocation_id, context.trace_context().clone());
     let expected_invocation_id = request.invocation_id().clone();
     let request = AuthenticatedStatusRequest::try_new(request, context)?;
-    state
+    let response = state
         .status_store
         .status(request.request(), request.status_context())
         .await
         .map_err(|diagnostic| {
             ProviderHttpError::new(HttpErrorKind::IdentityMismatch, diagnostic)
-        })?;
-    let response = state.services.status(request).await?;
+        })?
+        .portable()
+        .map_err(|diagnostic| ProviderHttpError::new(HttpErrorKind::ServiceFailure, diagnostic))?;
+    state.services.observe_status(&request).await?;
     response
         .validate_invocation_id(&expected_invocation_id)
         .map_err(|diagnostic| ProviderHttpError::new(HttpErrorKind::ServiceFailure, diagnostic))?;

@@ -842,10 +842,10 @@ impl ProviderHttpServices for RecordingServices {
         })
     }
 
-    async fn status(
+    async fn observe_status(
         &self,
-        request: AuthenticatedStatusRequest,
-    ) -> Result<InvocationStatus, ProviderHttpError> {
+        request: &AuthenticatedStatusRequest,
+    ) -> Result<(), ProviderHttpError> {
         self.observe(request.context(), "status");
         let status_context = request.status_context();
         assert_eq!(status_context.tenant_ref(), "tenant-1");
@@ -868,9 +868,7 @@ impl ProviderHttpServices for RecordingServices {
                 ),
             ));
         }
-        Ok(InvocationStatus::Pending {
-            invocation_id: request.request().invocation_id().clone(),
-        })
+        Ok(())
     }
 }
 
@@ -901,10 +899,10 @@ impl ProviderHttpServices for AdversarialDiagnosticServices {
         Err(adversarial_error())
     }
 
-    async fn status(
+    async fn observe_status(
         &self,
-        _request: AuthenticatedStatusRequest,
-    ) -> Result<InvocationStatus, ProviderHttpError> {
+        _request: &AuthenticatedStatusRequest,
+    ) -> Result<(), ProviderHttpError> {
         Err(adversarial_error())
     }
 }
