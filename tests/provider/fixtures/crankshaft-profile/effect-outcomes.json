@@ -1,0 +1,27 @@
+{
+  "coverage": [
+    "allow",
+    "revocation",
+    "proposal_bound_suspension",
+    "policy_revision_change",
+    "outcome_unknown",
+    "traced_status_first_lookup",
+    "restart_recovery"
+  ],
+  "invocationId": "inv-absence-1",
+  "statusId": "status-inv-absence-1",
+  "resource": "tenant:tenant-1/employee:employee-7",
+  "arguments": {
+    "employeeId": "employee-7",
+    "startDate": "2026-08-01",
+    "endDate": "2026-08-02"
+  },
+  "idempotencyKey": "absence-proposal-1",
+  "checkpointRef": "checkpoint:workforce:absence:1",
+  "evidenceKind": "approval",
+  "evidenceRequestRef": "evidence://workforce/approval/1",
+  "statusTraceparent": "00-abcdef0123456789abcdef0123456789-abcdef0123456789-01",
+  "retentionUntil": 18446744073709551615,
+  "requestDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "authorizationAuditRef": "audit-authorization-workforce-1"
+}

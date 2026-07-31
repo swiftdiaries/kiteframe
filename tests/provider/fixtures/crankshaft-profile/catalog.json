@@ -1,0 +1,152 @@
+{
+  "identity": {
+    "name": "neutral-workforce-provider",
+    "revision": "2026-07-25"
+  },
+  "issuedAt": 100,
+  "expiresAt": 1000,
+  "descriptors": [
+    {
+      "identity": {
+        "name": "workforce.absence.read",
+        "version": "1.0.0"
+      },
+      "summary": "Read the stable absence projection for one tenant-scoped employee",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["employeeId"],
+        "properties": {
+          "employeeId": {"type": "string"}
+        }
+      },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["employeeId", "status"],
+        "properties": {
+          "employeeId": {"type": "string"},
+          "status": {"enum": ["approved", "pending", "rejected"]}
+        }
+      },
+      "stableErrors": [
+        {
+          "code": "WORKFORCE_ABSENCE_NOT_FOUND",
+          "category": "not_found",
+          "retry": "never",
+          "message": "absence record was not found"
+        },
+        {
+          "code": "WORKFORCE_ABSENCE_STALE",
+          "category": "authorization",
+          "retry": "after_refresh",
+          "message": "workforce authority changed"
+        }
+      ],
+      "executionModes": ["immediate"],
+      "resourceSelectorSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "pattern": "^tenant:[a-z0-9-]+/employee:[a-z0-9-]+$"
+      },
+      "effect": "read_only",
+      "idempotency": {"kind": "none"},
+      "freshness": {
+        "maxAdmissionAgeSeconds": 300,
+        "policyRevisionRequired": true,
+        "maxInputAgeSeconds": 60
+      },
+      "preconditions": [],
+      "confirmation": {"kind": "none"},
+      "approval": {"kind": "none"},
+      "consent": {"kind": "none"},
+      "descriptorDigest": "ad05c74cd98c11bb7885f0410a06f3cd4aee45e4dcaf06ceedf21cc877caa4cf"
+    },
+    {
+      "identity": {
+        "name": "workforce.absence.propose",
+        "version": "1.0.0"
+      },
+      "summary": "Propose a tenant-scoped employee absence with durable outcome recovery",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["employeeId", "startDate", "endDate"],
+        "properties": {
+          "employeeId": {"type": "string"},
+          "startDate": {"type": "string"},
+          "endDate": {"type": "string"}
+        }
+      },
+      "outputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["employeeId", "proposalId", "status"],
+        "properties": {
+          "employeeId": {"type": "string"},
+          "proposalId": {"type": "string"},
+          "status": {"enum": ["proposed", "accepted", "rejected"]}
+        }
+      },
+      "stableErrors": [
+        {
+          "code": "WORKFORCE_ABSENCE_CONFLICT",
+          "category": "precondition",
+          "retry": "after_refresh",
+          "message": "absence state changed"
+        },
+        {
+          "code": "WORKFORCE_ABSENCE_APPROVAL_REQUIRED",
+          "category": "evidence",
+          "retry": "after_user_action",
+          "message": "absence approval is required"
+        },
+        {
+          "code": "WORKFORCE_ABSENCE_OUTCOME_UNKNOWN",
+          "category": "runtime",
+          "retry": "status_first",
+          "message": "look up invocation status before retry"
+        }
+      ],
+      "executionModes": ["immediate", "suspendable"],
+      "resourceSelectorSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "string",
+        "pattern": "^tenant:[a-z0-9-]+/employee:[a-z0-9-]+$"
+      },
+      "effect": "reversible_write",
+      "idempotency": {
+        "kind": "required",
+        "scope": "actor_capability_resource_operation",
+        "retention_seconds": 86400
+      },
+      "freshness": {
+        "maxAdmissionAgeSeconds": 120,
+        "policyRevisionRequired": true,
+        "maxInputAgeSeconds": 30
+      },
+      "preconditions": [
+        {
+          "name": "absenceVersion",
+          "kind": "entity_version",
+          "required": true
+        }
+      ],
+      "confirmation": {"kind": "none"},
+      "approval": {
+        "kind": "required",
+        "evidence": {
+          "kind": "workforce_manager_approval",
+          "issuer": "neutral-workforce-policy"
+        }
+      },
+      "consent": {"kind": "none"},
+      "descriptorDigest": "9efa2e932eb3f50ff4710ac3b79a3b5221502b6369f3c34b95c1860514afb7df"
+    }
+  ],
+  "catalogDigest": "d08fdb55013366548e276f6070338340df0387df9d880c7d167c16fb552d38ea"
+}

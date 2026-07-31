@@ -1,0 +1,12 @@
+{
+  "admitted": [
+    {"source": "deployment", "revision": "deploy-17"},
+    {"source": "model", "revision": "workforce-model-4"},
+    {"source": "tenant", "revision": "tenant-1-policy-22"}
+  ],
+  "current": [
+    {"source": "deployment", "revision": "deploy-17"},
+    {"source": "model", "revision": "workforce-model-4"},
+    {"source": "tenant", "revision": "tenant-1-policy-23"}
+  ]
+}

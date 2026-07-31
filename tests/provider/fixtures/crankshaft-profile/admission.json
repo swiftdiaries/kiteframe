@@ -1,0 +1,87 @@
+{
+  "principals": {
+    "tenantRef": "tenant-1",
+    "humanRef": "employee-7",
+    "workloadRef": "workforce-harness-2",
+    "runRef": "run-9",
+    "actorRef": "employee-7",
+    "agentRef": "workforce-agent-2",
+    "taskRef": "absence-task-4",
+    "sessionRef": "absence-session-3",
+    "admissionRef": "admission-workforce-1",
+    "expiresAt": 900
+  },
+  "admissionRequestDigest": "0101010101010101010101010101010101010101010101010101010101010101",
+  "delegationAncestryDigest": "0202020202020202020202020202020202020202020202020202020202020202",
+  "catalogDigest": "d08fdb55013366548e276f6070338340df0387df9d880c7d167c16fb552d38ea",
+  "descriptorDigests": {
+    "workforce.absence.read": "ad05c74cd98c11bb7885f0410a06f3cd4aee45e4dcaf06ceedf21cc877caa4cf",
+    "workforce.absence.propose": "9efa2e932eb3f50ff4710ac3b79a3b5221502b6369f3c34b95c1860514afb7df"
+  },
+  "policyRevision": "tenant-1-policy-22",
+  "authorityRevisions": [
+    {"source": "deployment", "revision": "deploy-17"},
+    {"source": "model", "revision": "workforce-model-4"},
+    {"source": "tenant", "revision": "tenant-1-policy-22"}
+  ],
+  "authorityRevisionDigest": "0661c2e2a784c882f3d02f50172fdb63d0f87cf9886854c8fadd2e78b786e36d",
+  "issuedAt": 400,
+  "expiresAt": 900,
+  "grants": [
+    {
+      "capability": {
+        "name": "workforce.absence.read",
+        "version": "1.0.0"
+      },
+      "resources": ["tenant:tenant-1/employee:employee-7"],
+      "executionModes": ["immediate"],
+      "maximumEffect": "read_only",
+      "expiresAt": 800,
+      "requiredEvidence": {
+        "confirmation": {"kind": "none"},
+        "approval": {"kind": "none"},
+        "consent": {"kind": "none"}
+      },
+      "freshness": {
+        "maxAdmissionAgeSeconds": 300,
+        "policyRevisionRequired": true,
+        "maxInputAgeSeconds": 60
+      },
+      "preconditions": []
+    },
+    {
+      "capability": {
+        "name": "workforce.absence.propose",
+        "version": "1.0.0"
+      },
+      "resources": ["tenant:tenant-1/employee:employee-7"],
+      "executionModes": ["immediate", "suspendable"],
+      "maximumEffect": "reversible_write",
+      "expiresAt": 850,
+      "requiredEvidence": {
+        "confirmation": {"kind": "none"},
+        "approval": {
+          "kind": "required",
+          "evidence": {
+            "kind": "workforce_manager_approval",
+            "issuer": "neutral-workforce-policy"
+          }
+        },
+        "consent": {"kind": "none"}
+      },
+      "freshness": {
+        "maxAdmissionAgeSeconds": 120,
+        "policyRevisionRequired": true,
+        "maxInputAgeSeconds": 30
+      },
+      "preconditions": [
+        {
+          "name": "absenceVersion",
+          "kind": "entity_version",
+          "required": true
+        }
+      ]
+    }
+  ],
+  "grantDigest": "8bae2e83e272546fb79ed3bb25fc8221cd3a1c83a3ab9d632e27f00d449ae408"
+}
