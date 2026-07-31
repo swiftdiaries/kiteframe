@@ -3,6 +3,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
+use async_trait::async_trait;
 use kiteframe_contract::{
     AdmissionId, AdmissionRequest, AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog,
     CapabilityDenial, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity, Diagnostic,
@@ -14,6 +15,7 @@ use kiteframe_contract::{
 use crate::{AuthorityTerm, intersect_authority};
 use crate::{
     AdmissionAuthorizationRequest, AuthenticatedInvocationContext, AuthorizationBackend,
+    InvocationAdmission, InvocationAdmissionStore,
 };
 
 #[derive(Clone, Debug)]
@@ -112,10 +114,15 @@ impl AuthoritySource {
 
 #[derive(Clone, Debug)]
 pub struct PersistedAdmission {
+    grant_set: CapabilityGrantSet,
     locked_capabilities: BTreeMap<CapabilityIdentity, LockedCapability>,
 }
 
 impl PersistedAdmission {
+    pub fn grant_set(&self) -> &CapabilityGrantSet {
+        &self.grant_set
+    }
+
     pub fn locked_capability(&self, identity: &CapabilityIdentity) -> Option<&LockedCapability> {
         self.locked_capabilities.get(identity)
     }
@@ -310,6 +317,7 @@ impl AdmissionService {
                 grant_set.grant_digest().to_string(),
             ),
             PersistedAdmission {
+                grant_set: grant_set.clone(),
                 locked_capabilities: validated_locks,
             },
         );
@@ -424,6 +432,21 @@ impl AdmissionService {
         self.admissions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[async_trait]
+impl InvocationAdmissionStore for AdmissionService {
+    async fn load(
+        &self,
+        admission_id: &AdmissionId,
+        grant_digest: &Sha256Digest,
+    ) -> Result<InvocationAdmission, Diagnostic> {
+        let persisted = self.load_admission(admission_id, grant_digest).await?;
+        InvocationAdmission::try_new(
+            persisted.grant_set,
+            persisted.locked_capabilities.into_values().collect(),
+        )
     }
 }
 
