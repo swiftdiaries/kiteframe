@@ -108,6 +108,14 @@ fn condition_context(
 }
 
 fn contextual_tuples(principals: &AuthenticatedInvocationContext) -> Value {
+    let actor = actor_user(principals);
+    let workload = scoped_object(
+        "workload",
+        &[
+            principals.tenant_ref().as_str(),
+            principals.workload_ref().as_str(),
+        ],
+    );
     let task = scoped_object(
         "task",
         &[
@@ -131,6 +139,7 @@ fn contextual_tuples(principals: &AuthenticatedInvocationContext) -> Value {
     );
     json!({
         "tuple_keys": [
+            tuple(&actor, "actor", &workload),
             tuple(&task, "assigned_task", &agent),
             tuple(&task, "task", &session),
         ]

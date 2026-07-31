@@ -94,6 +94,11 @@ async fn requests_bind_correlated_principals_and_ephemeral_context() {
         body["contextual_tuples"]["tuple_keys"],
         json!([
             {
+                "user": "actor:6163746f722d31",
+                "relation": "actor",
+                "object": "workload:74656e616e742d3100776f726b6c6f61642d31"
+            },
+            {
                 "user": "task:74656e616e742d31007461736b2d31",
                 "relation": "assigned_task",
                 "object": "agent:74656e616e742d31006167656e742d31"

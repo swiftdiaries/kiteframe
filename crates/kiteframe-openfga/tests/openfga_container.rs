@@ -390,7 +390,6 @@ fn authorization_model() -> Value {
 fn stored_policy_tuples() -> Vec<Value> {
     vec![
         tuple(&actor(), "actor", &task()),
-        tuple(&actor(), "actor", &workload()),
         tuple(&actor(), "allowed_actor", &capability()),
         tuple(
             &format!("{}#actor", agent()),

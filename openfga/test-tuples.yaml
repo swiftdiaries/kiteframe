@@ -12,9 +12,6 @@ tuples:
     relation: task
     object: session:74656e616e742d310073657373696f6e2d31
   - user: actor:6163746f722d31
-    relation: actor
-    object: workload:74656e616e742d3100776f726b6c6f61642d31
-  - user: actor:6163746f722d31
     relation: allowed_actor
     object: capability:63617365732e7265616440312e302e30
   - user: agent:74656e616e742d31006167656e742d31#actor
@@ -29,8 +26,22 @@ tuples:
 
 tests:
   - name: actor task workload and resource policy intersect
+    contextual_tuples:
+      - user: actor:6163746f722d31
+        relation: actor
+        object: workload:74656e616e742d3100776f726b6c6f61642d31
     check:
       - user: actor:6163746f722d31
         object: resource:74656e616e743a74312f636173653a636173652d37
         assertions:
           can_invoke: true
+  - name: another authenticated workload cannot reuse stored membership
+    contextual_tuples:
+      - user: actor:6163746f722d31
+        relation: actor
+        object: workload:74656e616e742d3100776f726b6c6f61642d32
+    check:
+      - user: actor:6163746f722d31
+        object: resource:74656e616e743a74312f636173653a636173652d37
+        assertions:
+          can_invoke: false
