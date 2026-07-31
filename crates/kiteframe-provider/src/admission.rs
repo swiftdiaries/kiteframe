@@ -218,6 +218,10 @@ impl AdmissionService {
         &self.authority_revisions
     }
 
+    pub fn issued_at(&self) -> Timestamp {
+        self.config.issued_at
+    }
+
     pub async fn admit(
         &self,
         request: AdmissionRequest,

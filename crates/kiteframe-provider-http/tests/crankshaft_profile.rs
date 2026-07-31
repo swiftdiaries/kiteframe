@@ -194,11 +194,11 @@ impl ProviderHttpServices for WorkforceServices {
         Ok(self.catalog.clone())
     }
 
-    async fn admit(
+    async fn observe_admission(
         &self,
         context: &ProviderRequestContext,
-        _request: AdmissionRequest,
-    ) -> Result<CapabilityGrantSet, ProviderHttpError> {
+        _request: &AdmissionRequest,
+    ) -> Result<(), ProviderHttpError> {
         self.observe(context, "admit");
         Err(profile_denial())
     }

@@ -7,8 +7,11 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use kiteframe_contract::{AgentRef, Diagnostic, TraceContext};
-use kiteframe_provider::{VerifiedHumanPrincipal, VerifiedWorkloadPrincipal};
+use kiteframe_contract::{AdmissionRequest, AgentRef, Diagnostic, TraceContext};
+use kiteframe_provider::{
+    AuthenticatedInvocationContext, PortableInvocationRefs, VerifiedHumanPrincipal,
+    VerifiedWorkloadPrincipal, correlate_principals,
+};
 
 use crate::{VerifiedProviderPrincipals, response::ProviderHttpError};
 
@@ -107,6 +110,28 @@ impl ProviderRequestContext {
 
     pub fn trace_context(&self) -> &TraceContext {
         &self.trace_context
+    }
+
+    pub(crate) fn authenticated_admission_context(
+        &self,
+        request: &AdmissionRequest,
+        correlated_at: kiteframe_contract::Timestamp,
+    ) -> Result<AuthenticatedInvocationContext, Diagnostic> {
+        let human = self.principals.human().clone();
+        let workload = self.principals.workload().clone();
+        correlate_principals(
+            human,
+            workload.clone(),
+            PortableInvocationRefs::new(
+                request.actor().clone(),
+                request.agent().clone(),
+                workload.run_ref().clone(),
+                request.task().clone(),
+                request.session().clone(),
+                workload.admission_ref().clone(),
+                correlated_at,
+            ),
+        )
     }
 
     pub(crate) fn verifies_delegation_agent(&self, agent: &AgentRef) -> bool {

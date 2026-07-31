@@ -14,9 +14,11 @@ use axum::{
 };
 use kiteframe_contract::{
     AdmissionRequest, CapabilityCatalog, CapabilityGrantSet, InvocationId, InvocationOutcome,
-    InvocationRequest, InvocationStatus, StatusRequest, TraceContext,
+    InvocationRequest, StatusRequest, TraceContext,
 };
-use kiteframe_provider::{InvocationStatusContext, InvocationStore};
+use kiteframe_provider::{
+    AdmissionService, AuthorizationBackend, InvocationStatusContext, InvocationStore,
+};
 use tower_http::limit::RequestBodyLimitLayer;
 use url::Url;
 
@@ -35,11 +37,13 @@ pub trait ProviderHttpServices: Send + Sync {
         context: &ProviderRequestContext,
     ) -> Result<CapabilityCatalog, ProviderHttpError>;
 
-    async fn admit(
+    async fn observe_admission(
         &self,
-        context: &ProviderRequestContext,
-        request: AdmissionRequest,
-    ) -> Result<CapabilityGrantSet, ProviderHttpError>;
+        _context: &ProviderRequestContext,
+        _request: &AdmissionRequest,
+    ) -> Result<(), ProviderHttpError> {
+        Ok(())
+    }
 
     async fn invoke(
         &self,
@@ -59,7 +63,41 @@ pub trait ProviderHttpServices: Send + Sync {
 pub struct ProviderHttpState {
     services: Arc<dyn ProviderHttpServices>,
     status_store: Arc<dyn InvocationStore>,
+    admission_plane: Option<Arc<EnforcedAdmissionPlane>>,
     origin: Url,
+}
+
+pub struct EnforcedAdmissionPlane {
+    service: Arc<AdmissionService>,
+    authorization: Arc<dyn AuthorizationBackend>,
+}
+
+impl EnforcedAdmissionPlane {
+    pub fn new(
+        service: Arc<AdmissionService>,
+        authorization: Arc<dyn AuthorizationBackend>,
+    ) -> Self {
+        Self {
+            service,
+            authorization,
+        }
+    }
+
+    async fn admit(
+        &self,
+        context: &ProviderRequestContext,
+        request: AdmissionRequest,
+    ) -> Result<CapabilityGrantSet, ProviderHttpError> {
+        let principals = context
+            .authenticated_admission_context(&request, self.service.issued_at())
+            .map_err(|diagnostic| {
+                ProviderHttpError::new(HttpErrorKind::IdentityMismatch, diagnostic)
+            })?;
+        self.service
+            .admit(request, principals, self.authorization.as_ref())
+            .await
+            .map_err(|diagnostic| ProviderHttpError::new(HttpErrorKind::Conflict, diagnostic))
+    }
 }
 
 impl ProviderHttpState {
@@ -70,9 +108,15 @@ impl ProviderHttpState {
         Self {
             services,
             status_store,
+            admission_plane: None,
             origin: Url::parse("https://provider.invalid")
                 .expect("static default provider origin is valid"),
         }
+    }
+
+    pub fn with_admission_plane(mut self, plane: Arc<EnforcedAdmissionPlane>) -> Self {
+        self.admission_plane = Some(plane);
+        self
     }
 
     pub fn with_origin(mut self, value: &str) -> Result<Self, String> {
@@ -243,8 +287,19 @@ async fn admit(
     let request = native_json(payload)?;
     validate_admission_principals(&context, &request)?;
     validate_trace(&context, request.trace_context())?;
-    state
-        .services
+    state.services.observe_admission(&context, &request).await?;
+    let plane = state.admission_plane.as_ref().ok_or_else(|| {
+        ProviderHttpError::new(
+            HttpErrorKind::ServiceFailure,
+            kiteframe_contract::Diagnostic::error(
+                kiteframe_contract::DiagnosticCode::RuntimeConstruction,
+                kiteframe_contract::DiagnosticCategory::Runtime,
+                kiteframe_contract::DiagnosticStage::Runtime,
+                "provider admission enforcement plane is not configured",
+            ),
+        )
+    })?;
+    plane
         .admit(&context, request)
         .await
         .map(|value| Json(value).into_response())

@@ -814,11 +814,11 @@ impl ProviderHttpServices for RecordingServices {
         Ok(catalog())
     }
 
-    async fn admit(
+    async fn observe_admission(
         &self,
         context: &ProviderRequestContext,
-        _request: AdmissionRequest,
-    ) -> Result<CapabilityGrantSet, ProviderHttpError> {
+        _request: &AdmissionRequest,
+    ) -> Result<(), ProviderHttpError> {
         self.observe(context, "admit");
         Err(ProviderHttpError::new(
             HttpErrorKind::Conflict,
@@ -883,11 +883,11 @@ impl ProviderHttpServices for AdversarialDiagnosticServices {
         Err(adversarial_error())
     }
 
-    async fn admit(
+    async fn observe_admission(
         &self,
         _context: &ProviderRequestContext,
-        _request: AdmissionRequest,
-    ) -> Result<CapabilityGrantSet, ProviderHttpError> {
+        _request: &AdmissionRequest,
+    ) -> Result<(), ProviderHttpError> {
         Err(adversarial_error())
     }
 

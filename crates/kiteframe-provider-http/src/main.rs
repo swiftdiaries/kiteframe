@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use axum::http::HeaderMap;
 use clap::Parser;
 use kiteframe_contract::{
-    AdmissionRequest, CapabilityCatalog, CapabilityGrantSet, Diagnostic, DiagnosticCategory,
-    DiagnosticCode, DiagnosticStage, InvocationOutcome, InvocationRequest,
+    AdmissionRequest, CapabilityCatalog, Diagnostic, DiagnosticCategory, DiagnosticCode,
+    DiagnosticStage, InvocationOutcome, InvocationRequest,
 };
 use kiteframe_provider::InMemoryInvocationStore;
 use kiteframe_provider_http::{
@@ -106,11 +106,11 @@ impl ProviderHttpServices for UnconfiguredServices {
         Err(unconfigured_error())
     }
 
-    async fn admit(
+    async fn observe_admission(
         &self,
         _context: &ProviderRequestContext,
-        _request: AdmissionRequest,
-    ) -> Result<CapabilityGrantSet, ProviderHttpError> {
+        _request: &AdmissionRequest,
+    ) -> Result<(), ProviderHttpError> {
         Err(unconfigured_error())
     }
 
