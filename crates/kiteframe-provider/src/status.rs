@@ -307,9 +307,15 @@ pub enum InvocationState {
     Suspended {
         suspension: Box<kiteframe_contract::Suspension>,
     },
-    Succeeded { result: StatusSafeResult },
-    Failed { error: StatusSafeError },
-    Denied { error: StatusSafeError },
+    Succeeded {
+        result: StatusSafeResult,
+    },
+    Failed {
+        error: StatusSafeError,
+    },
+    Denied {
+        error: StatusSafeError,
+    },
     OutcomeUnknown,
     Abandoned,
 }
@@ -1074,7 +1080,10 @@ fn allowed_transition(expected: &InvocationState, next: &InvocationState) -> boo
             | (InvocationState::Pending, InvocationState::Denied { .. })
             | (InvocationState::Pending, InvocationState::OutcomeUnknown)
             | (InvocationState::Suspended { .. }, InvocationState::Pending)
-            | (InvocationState::Suspended { .. }, InvocationState::Denied { .. })
+            | (
+                InvocationState::Suspended { .. },
+                InvocationState::Denied { .. }
+            )
             | (
                 InvocationState::OutcomeUnknown,
                 InvocationState::Succeeded { .. }

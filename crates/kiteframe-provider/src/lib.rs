@@ -40,8 +40,7 @@ pub use principal::{
     correlate_principals,
 };
 pub use resource::{
-    intersect_resource_selectors, resource_selector_is_subset,
-    validate_concrete_resource_selector,
+    intersect_resource_selectors, resource_selector_is_subset, validate_concrete_resource_selector,
 };
 pub use status::{
     AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore, InvocationAuditLink,

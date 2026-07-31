@@ -5,13 +5,12 @@ use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
     AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog, CapabilityDescriptor,
     CapabilityDescriptorParts, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    CatalogIdentity,
-    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, EffectClassification,
-    EffectiveCapabilityGrant, EffectiveCapabilityGrantParts, EvidenceRequirement, ExecutionMode,
-    FreshnessRequirement, IdempotencyRequirement, LockedCapability, NonEmptySet,
-    NormalizedResourceSelector, PolicyRevision, RequestedCapability, RequiredEvidence,
-    ResolvedCapabilityRequirement, ResourceSelectorSchema, SessionRef, Sha256Digest, TaskRef,
-    Timestamp, TraceContext,
+    CatalogIdentity, ConfirmationRequirement, ConsentRequirement, DelegationAncestry,
+    EffectClassification, EffectiveCapabilityGrant, EffectiveCapabilityGrantParts,
+    EvidenceRequirement, ExecutionMode, FreshnessRequirement, IdempotencyRequirement,
+    LockedCapability, NonEmptySet, NormalizedResourceSelector, PolicyRevision, RequestedCapability,
+    RequiredEvidence, ResolvedCapabilityRequirement, ResourceSelectorSchema, SessionRef,
+    Sha256Digest, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AdmissionService,
@@ -112,8 +111,8 @@ async fn catalog_identity_or_digest_drift_fails_before_authority_evaluation() {
         &service(),
         admission_request_with_catalog_digest(digest(99)),
     )
-        .await
-        .unwrap_err();
+    .await
+    .unwrap_err();
     assert_eq!(digest_error.code.as_str(), "KF-CAT-001");
 }
 
@@ -136,13 +135,10 @@ async fn missing_required_authority_fails_the_whole_admission() {
 
     let error = admit(
         &service,
-        admission_request(
-            authoritative_catalog().identity().clone(),
-            None,
-        ),
+        admission_request(authoritative_catalog().identity().clone(), None),
     )
-        .await
-        .unwrap_err();
+    .await
+    .unwrap_err();
 
     assert_eq!(error.code.as_str(), "KF-AUTH-001");
 }
@@ -151,13 +147,10 @@ async fn missing_required_authority_fails_the_whole_admission() {
 async fn optional_authority_miss_is_safe_stable_and_creates_no_grant() {
     let result = admit(
         &service(),
-        admission_request(
-            authoritative_catalog().identity().clone(),
-            None,
-        ),
+        admission_request(authoritative_catalog().identity().clone(), None),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
     let denied = identity("cases.delete");
 
     assert!(
@@ -225,13 +218,10 @@ async fn optional_unresolved_selector_becomes_a_stable_denial() {
 
     let result = admit(
         &service,
-        admission_request(
-            authoritative_catalog().identity().clone(),
-            None,
-        ),
+        admission_request(authoritative_catalog().identity().clone(), None),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     assert_optional_denial(&result);
 }
@@ -277,13 +267,10 @@ async fn optional_conflicting_evidence_becomes_a_stable_denial() {
 
     let result = admit(
         &service,
-        admission_request(
-            authoritative_catalog().identity().clone(),
-            None,
-        ),
+        admission_request(authoritative_catalog().identity().clone(), None),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     assert_optional_denial(&result);
 }
@@ -301,13 +288,10 @@ async fn omitting_any_mandatory_authority_plane_denies_admission() {
 
         let error = admit(
             &service,
-            admission_request(
-                authoritative_catalog().identity().clone(),
-                None,
-            ),
+            admission_request(authoritative_catalog().identity().clone(), None),
         )
-            .await
-            .unwrap_err();
+        .await
+        .unwrap_err();
 
         assert_eq!(
             error.code.as_str(),
@@ -332,13 +316,10 @@ async fn session_expiry_caps_each_capability_grant() {
 
     let result = admit(
         &service,
-        admission_request(
-            authoritative_catalog().identity().clone(),
-            None,
-        ),
+        admission_request(authoritative_catalog().identity().clone(), None),
     )
-        .await
-        .unwrap();
+    .await
+    .unwrap();
 
     assert!(
         result
@@ -423,9 +404,7 @@ impl AuthorizationBackend for TestAuthorizationBackend {
         unreachable!("admission tests do not perform invocation checks")
     }
 
-    async fn revisions(
-        &self,
-    ) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
+    async fn revisions(&self) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
         AuthorityRevisionSet::try_new(vec![
             revision("deployment-policy", "deploy-7"),
             revision("openfga-model", "model-3"),
@@ -458,9 +437,7 @@ impl AuthorizationBackend for DenyAuthorizationBackend {
         unreachable!("admission tests do not perform invocation checks")
     }
 
-    async fn revisions(
-        &self,
-    ) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
+    async fn revisions(&self) -> Result<AuthorityRevisionSet, kiteframe_contract::Diagnostic> {
         TestAuthorizationBackend.revisions().await
     }
 }

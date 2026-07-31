@@ -12,14 +12,13 @@ use axum::{
 use http_body_util::BodyExt;
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, ApprovalRequirement,
-    CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts, CapabilityGrantSet,
-    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity,
-    ConfirmationRequirement, ConsentRequirement, DelegationAncestry, DelegationEdge, Diagnostic,
-    DiagnosticCategory, DiagnosticCode, DiagnosticStage, EffectClassification, EvidenceReferences,
-    ExecutionMode, FreshnessRequirement, IdempotencyKey, IdempotencyRequirement, IdempotencyScope,
-    InvocationId, InvocationOutcome, InvocationRequest, InvocationStatus, NonEmptySet,
-    NormalizedResourceSelector, ResourceSelectorSchema, RetryClass, SessionRef, Sha256Digest,
-    SourceRange, TaskRef, Timestamp, TraceContext,
+    CapabilityCatalog, CapabilityDescriptor, CapabilityDescriptorParts, CapabilityIdentity,
+    CapabilityName, CapabilityReleaseVersion, CatalogIdentity, ConfirmationRequirement,
+    ConsentRequirement, DelegationAncestry, DelegationEdge, Diagnostic, DiagnosticCategory,
+    DiagnosticCode, DiagnosticStage, EffectClassification, EvidenceReferences, ExecutionMode,
+    FreshnessRequirement, IdempotencyKey, IdempotencyRequirement, IdempotencyScope, InvocationId,
+    InvocationRequest, NonEmptySet, NormalizedResourceSelector, ResourceSelectorSchema, RetryClass,
+    SessionRef, Sha256Digest, SourceRange, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     IdempotencyScopeValue, InMemoryInvocationStore, InvocationReservationInput,

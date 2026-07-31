@@ -40,11 +40,7 @@ fn authority_intersection_uses_the_same_exact_segment_model() {
         Some("tenant:t1/case:case-7".to_owned())
     );
     assert_eq!(
-        intersect_resource_selectors(
-            "tenant:t1/case:*",
-            "tenant:t1/case:case-7/detail:*"
-        )
-        .unwrap(),
+        intersect_resource_selectors("tenant:t1/case:*", "tenant:t1/case:case-7/detail:*").unwrap(),
         None
     );
 }

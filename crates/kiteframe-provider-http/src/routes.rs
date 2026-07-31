@@ -348,7 +348,10 @@ async fn invoke(
         return Err(ProviderHttpError::identity_mismatch());
     }
     validate_trace(&context, request.trace_context())?;
-    state.services.observe_invocation(&context, &request).await?;
+    state
+        .services
+        .observe_invocation(&context, &request)
+        .await?;
     let plane = state.invocation_plane.as_ref().ok_or_else(|| {
         ProviderHttpError::new(
             HttpErrorKind::ServiceFailure,
@@ -380,9 +383,7 @@ async fn status(
         .status_store
         .status(request.request(), request.status_context())
         .await
-        .map_err(|diagnostic| {
-            ProviderHttpError::new(HttpErrorKind::IdentityMismatch, diagnostic)
-        })?
+        .map_err(|diagnostic| ProviderHttpError::new(HttpErrorKind::IdentityMismatch, diagnostic))?
         .portable()
         .map_err(|diagnostic| ProviderHttpError::new(HttpErrorKind::ServiceFailure, diagnostic))?;
     state.services.observe_status(&request).await?;

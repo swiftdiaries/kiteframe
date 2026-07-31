@@ -4,11 +4,10 @@ use async_trait::async_trait;
 use kiteframe_contract::{
     ActorRef, AdmissionId, AgentRef, AuthorityRevision, AuthorityRevisionSet, CapabilityCatalog,
     CapabilityDescriptor, CapabilityGrantSet, CapabilityGrantSetParts, CapabilityIdentity,
-    CatalogIdentity, CheckpointRef, Diagnostic, EffectProposal, EffectiveCapabilityGrant,
-    EvidenceReferences, IdempotencyKey, InvocationId, InvocationOutcome, InvocationRequest,
-    LockedCapability, NormalizedResourceSelector, PolicyRevision, ProtectedEvidenceRequestRef,
-    RetryClass, SessionRef, Sha256Digest, StatusRequest, Suspension, TaskRef, Timestamp,
-    TraceContext,
+    CheckpointRef, Diagnostic, EffectProposal, EffectiveCapabilityGrant, EvidenceReferences,
+    IdempotencyKey, InvocationId, InvocationOutcome, InvocationRequest, LockedCapability,
+    NormalizedResourceSelector, PolicyRevision, ProtectedEvidenceRequestRef, RetryClass,
+    SessionRef, Sha256Digest, StatusRequest, Suspension, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     AdmissionAuthorizationRequest, AdmissionAuthorizationResult, AuthorizationBackend,

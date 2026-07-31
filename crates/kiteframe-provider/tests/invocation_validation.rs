@@ -26,9 +26,8 @@ use kiteframe_provider::{
     EffectAuditDigests, EffectEnforcementPlane, InMemoryInvocationAdmissionStore,
     InMemoryInvocationStore, InvocationAdmission, InvocationCheckpointIssuer, InvocationClock,
     InvocationContext, InvocationEventSink, InvocationEvidenceProvider, InvocationService,
-    InvocationStoreClock,
-    NarrowedAuthorizationConditions, OperationFailure, OperationRegistry, Precondition,
-    ResumeRequest, SafeDenialReason, VerifiedEvidence, VerifiedHumanPrincipal,
+    InvocationStoreClock, NarrowedAuthorizationConditions, OperationFailure, OperationRegistry,
+    Precondition, ResumeRequest, SafeDenialReason, VerifiedEvidence, VerifiedHumanPrincipal,
     VerifiedProviderPrincipals, VerifiedWorkloadPrincipal,
 };
 use serde_json::{Value, json};

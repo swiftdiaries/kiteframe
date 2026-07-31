@@ -11,8 +11,7 @@ use kiteframe_contract::{
     CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, CatalogIdentity, CheckpointRef,
     ConfirmationRequirement, ConsentRequirement, Diagnostic, DiagnosticCategory, DiagnosticCode,
     DiagnosticStage, EffectClassification, EvidenceKind, ExecutionMode, FreshnessRequirement,
-    IdempotencyKey,
-    IdempotencyRequirement, IdempotencyScope, InvocationId, NonEmptySet,
+    IdempotencyKey, IdempotencyRequirement, IdempotencyScope, InvocationId, NonEmptySet,
     NormalizedResourceSelector, ProtectedEvidenceRequestRef, ResourceSelectorSchema, RetryClass,
     Sha256Digest, StableCapabilityError, StatusRequest, Suspension, Timestamp, TraceContext,
 };

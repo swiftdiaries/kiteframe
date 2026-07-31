@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use crate::{
     AuthenticatedInvocationContext, AuthorizationBackend, AuthorizationDecision,
-    InvocationAuthorizationRequest, NarrowedAuthorizationConditions,
-    resource_selector_is_subset, require_current_authorization,
+    InvocationAuthorizationRequest, NarrowedAuthorizationConditions, require_current_authorization,
+    resource_selector_is_subset,
 };
 
 #[derive(Clone, Debug, PartialEq)]

@@ -13,11 +13,10 @@ use axum::{
 use http_body_util::BodyExt;
 use kiteframe_contract::{
     ActorRef, AdmissionId, AdmissionRequest, AdmissionRequestParts, AgentRef, CapabilityCatalog,
-    CapabilityGrantSet, CapabilityIdentity, CapabilityName, CapabilityReleaseVersion,
-    DelegationAncestry, Diagnostic, DiagnosticCategory, DiagnosticCode, DiagnosticStage,
-    EvidenceReferences, IdempotencyKey, InvocationId, InvocationOutcome, InvocationRequest,
-    InvocationStatus, LockedCapability, NormalizedResourceSelector, SessionRef, Sha256Digest,
-    TaskRef, Timestamp, TraceContext,
+    CapabilityIdentity, CapabilityName, CapabilityReleaseVersion, DelegationAncestry, Diagnostic,
+    DiagnosticCategory, DiagnosticCode, DiagnosticStage, EvidenceReferences, IdempotencyKey,
+    InvocationId, InvocationRequest, InvocationStatus, LockedCapability,
+    NormalizedResourceSelector, SessionRef, Sha256Digest, TaskRef, Timestamp, TraceContext,
 };
 use kiteframe_provider::{
     IdempotencyScopeValue, InMemoryInvocationStore, InvocationReservationInput, InvocationState,
@@ -104,10 +103,10 @@ async fn workforce_profile_authenticates_every_route_and_never_returns_credentia
             .count(),
         4
     );
-    assert!(events.iter().any(|event| *event == "catalog"));
-    assert!(events.iter().any(|event| *event == "admit"));
-    assert!(events.iter().any(|event| *event == "invoke"));
-    assert!(events.iter().any(|event| *event == "status"));
+    assert!(events.contains(&"catalog"));
+    assert!(events.contains(&"admit"));
+    assert!(events.contains(&"invoke"));
+    assert!(events.contains(&"status"));
     assert_eq!(
         returned_status,
         Some(InvocationStatus::Pending {

@@ -12,11 +12,11 @@ use kiteframe_contract::{
     RequiredEvidence, ResolvedCapabilityRequirement, Sha256Digest, Timestamp,
 };
 
-use crate::{AuthorityTerm, intersect_authority};
 use crate::{
     AdmissionAuthorizationRequest, AuthenticatedInvocationContext, AuthorizationBackend,
     InvocationAdmission, InvocationAdmissionStore,
 };
+use crate::{AuthorityTerm, intersect_authority};
 
 #[derive(Clone, Debug)]
 pub struct AdmissionServiceConfig {
@@ -256,12 +256,7 @@ impl AdmissionService {
                 .find(|requested| requested.capability() == requirement.identity())
                 .expect("one-to-one requirement mapping was validated");
             let dynamically_admissible = self
-                .dynamically_admissible(
-                    requested,
-                    &principals,
-                    authorization,
-                    &current_revisions,
-                )
+                .dynamically_admissible(requested, &principals, authorization, &current_revisions)
                 .await?;
             if requirement.required() {
                 let Some(grant) = dynamically_admissible

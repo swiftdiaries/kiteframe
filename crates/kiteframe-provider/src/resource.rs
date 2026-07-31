@@ -75,10 +75,7 @@ pub fn resource_selector_is_subset(candidate: &str, allowed: &str) -> bool {
             .all(|(candidate, allowed)| candidate == allowed || allowed == "*")
 }
 
-pub fn intersect_resource_selectors(
-    left: &str,
-    right: &str,
-) -> Result<Option<String>, String> {
+pub fn intersect_resource_selectors(left: &str, right: &str) -> Result<Option<String>, String> {
     let left = ParsedSelector::parse(left)?;
     let right = ParsedSelector::parse(right)?;
     if left.separators != right.separators || left.segments.len() != right.segments.len() {

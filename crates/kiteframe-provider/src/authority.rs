@@ -141,9 +141,10 @@ impl EffectiveGrantSubset for EffectiveCapabilityGrant {
     fn is_subset_of(&self, other: &Self) -> bool {
         self.capability() == other.capability()
             && self.resources().iter().all(|resource| {
-                other.resources().iter().any(|allowed| {
-                    resource_selector_is_subset(resource.as_str(), allowed.as_str())
-                })
+                other
+                    .resources()
+                    .iter()
+                    .any(|allowed| resource_selector_is_subset(resource.as_str(), allowed.as_str()))
             })
             && self
                 .execution_modes()
@@ -169,9 +170,8 @@ fn intersect_resource_sets(
         validate_selector(left_selector).map_err(|message| vec![denied(message)])?;
         for right_selector in right {
             validate_selector(right_selector).map_err(|message| vec![denied(message)])?;
-            if let Some(intersection) =
-                intersect_resource_selectors(left_selector, right_selector)
-                    .map_err(|message| vec![denied(message)])?
+            if let Some(intersection) = intersect_resource_selectors(left_selector, right_selector)
+                .map_err(|message| vec![denied(message)])?
             {
                 intersections.insert(intersection);
             }

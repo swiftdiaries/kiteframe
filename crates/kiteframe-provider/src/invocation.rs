@@ -1121,13 +1121,11 @@ impl InvocationService {
         }
     }
 
-    async fn restore_durable_suspension(
-        &self,
-        resume: &ResumeRequest,
-    ) -> Result<(), Diagnostic> {
-        let enforcement = self.effect_enforcement.as_ref().ok_or_else(|| {
-            authorization_error("suspension has no durable enforcement plane")
-        })?;
+    async fn restore_durable_suspension(&self, resume: &ResumeRequest) -> Result<(), Diagnostic> {
+        let enforcement = self
+            .effect_enforcement
+            .as_ref()
+            .ok_or_else(|| authorization_error("suspension has no durable enforcement plane"))?;
         let request = &resume.request;
         let admission = self
             .admissions
@@ -1201,10 +1199,7 @@ impl InvocationService {
         let mut states = self.lock_pending();
         match states.get(&checkpoint) {
             None => {
-                states.insert(
-                    checkpoint,
-                    SuspensionState::Pending(Box::new(pending)),
-                );
+                states.insert(checkpoint, SuspensionState::Pending(Box::new(pending)));
             }
             Some(SuspensionState::Pending(existing))
                 if existing.suspension == resume.suspension => {}
