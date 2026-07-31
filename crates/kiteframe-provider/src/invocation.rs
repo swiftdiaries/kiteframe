@@ -11,7 +11,6 @@ use kiteframe_contract::{
     EvidenceReferences, EvidenceRequirement, ExecutionMode, IdempotencyRequirement,
     InvocationOutcome, InvocationRequest, LockedCapability, NormalizedResourceSelector,
     ProtectedEvidenceRequestRef, RetryClass, Sha256Digest, Suspension, Timestamp,
-    resource_selector_is_subset_of,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -24,7 +23,7 @@ use crate::{
     OperationRegistry, OutcomeAuditKind, OutcomeAuditRecord, PortableInvocationRefs, Precondition,
     PreconditionRef, ProviderPrincipalVerifier, ReservationKind, SpanId, StatusSafeError,
     StatusSafeResult, TraceId, TransitionAuditRecord, audit::audit_unavailable,
-    correlate_principals,
+    correlate_principals, resource_selector_is_subset, validate_concrete_resource_selector,
 };
 
 #[derive(Clone, Debug)]
@@ -1513,11 +1512,11 @@ fn validate_resource(
     descriptor: &kiteframe_contract::CapabilityDescriptor,
     selected: &NormalizedResourceSelector,
 ) -> Result<(), Diagnostic> {
-    if selected.as_str().ends_with(":*")
+    if validate_concrete_resource_selector(selected.as_str()).is_err()
         || !grant
             .resources()
             .iter()
-            .any(|allowed| resource_selector_is_subset_of(selected.as_str(), allowed.as_str()))
+            .any(|allowed| resource_selector_is_subset(selected.as_str(), allowed.as_str()))
     {
         return Err(authorization_error(
             "selected resource is not concrete and within the effective grant",
@@ -1630,7 +1629,7 @@ fn validate_narrowed_conditions(
         || context.effective_grant().expires_at() <= now
         || conditions.expires_at() <= now
         || !conditions.resources().iter().any(|allowed| {
-            resource_selector_is_subset_of(context.selected_resource().as_str(), allowed.as_str())
+            resource_selector_is_subset(context.selected_resource().as_str(), allowed.as_str())
         })
     {
         return Err(authorization_error(

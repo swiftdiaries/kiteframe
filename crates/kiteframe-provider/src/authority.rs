@@ -7,6 +7,8 @@ use kiteframe_contract::{
     RequiredEvidence, ResolvedCapabilityRequirement,
 };
 
+use crate::{intersect_resource_selectors, resource_selector_is_subset};
+
 #[derive(Clone, Debug)]
 pub enum AuthorityTerm {
     Allow(Box<EffectiveCapabilityGrant>),
@@ -140,7 +142,7 @@ impl EffectiveGrantSubset for EffectiveCapabilityGrant {
         self.capability() == other.capability()
             && self.resources().iter().all(|resource| {
                 other.resources().iter().any(|allowed| {
-                    selector_is_subset(resource.as_str(), allowed.as_str()).unwrap_or(false)
+                    resource_selector_is_subset(resource.as_str(), allowed.as_str())
                 })
             })
             && self
@@ -167,7 +169,10 @@ fn intersect_resource_sets(
         validate_selector(left_selector).map_err(|message| vec![denied(message)])?;
         for right_selector in right {
             validate_selector(right_selector).map_err(|message| vec![denied(message)])?;
-            if let Some(intersection) = selector_intersection(left_selector, right_selector) {
+            if let Some(intersection) =
+                intersect_resource_selectors(left_selector, right_selector)
+                    .map_err(|message| vec![denied(message)])?
+            {
                 intersections.insert(intersection);
             }
         }
@@ -175,94 +180,8 @@ fn intersect_resource_sets(
     Ok(intersections.into_iter().collect())
 }
 
-fn selector_intersection(left: &str, right: &str) -> Option<String> {
-    let left = ParsedSelector::parse(left)?;
-    let right = ParsedSelector::parse(right)?;
-    if left.separators != right.separators || left.tokens.len() != right.tokens.len() {
-        return None;
-    }
-
-    let mut tokens = Vec::with_capacity(left.tokens.len());
-    for (left, right) in left.tokens.iter().zip(&right.tokens) {
-        match (left.as_str(), right.as_str()) {
-            (left, right) if left == right => tokens.push(left.to_owned()),
-            ("*", right) => tokens.push(right.to_owned()),
-            (left, "*") => tokens.push(left.to_owned()),
-            _ => return None,
-        }
-    }
-    Some(
-        ParsedSelector {
-            tokens,
-            separators: left.separators,
-        }
-        .render(),
-    )
-}
-
-fn selector_is_subset(left: &str, right: &str) -> Result<bool, String> {
-    validate_selector(left)?;
-    validate_selector(right)?;
-    Ok(selector_intersection(left, right).as_deref() == Some(left))
-}
-
 fn validate_selector(value: &str) -> Result<(), String> {
-    if value.contains("${context.") {
-        return Err("resource selector contains an unresolved context placeholder".to_owned());
-    }
-    let parsed = ParsedSelector::parse(value)
-        .ok_or_else(|| "resource selector must contain non-empty segments".to_owned())?;
-    if parsed
-        .tokens
-        .iter()
-        .any(|token| token.contains('*') && token != "*")
-    {
-        return Err("resource selector wildcard must occupy a complete segment".to_owned());
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-struct ParsedSelector {
-    tokens: Vec<String>,
-    separators: Vec<char>,
-}
-
-impl ParsedSelector {
-    fn parse(value: &str) -> Option<Self> {
-        let mut tokens = Vec::new();
-        let mut separators = Vec::new();
-        let mut current = String::new();
-        for character in value.chars() {
-            if matches!(character, '/' | ':') {
-                if current.is_empty() {
-                    return None;
-                }
-                tokens.push(std::mem::take(&mut current));
-                separators.push(character);
-            } else {
-                current.push(character);
-            }
-        }
-        if current.is_empty() {
-            return None;
-        }
-        tokens.push(current);
-        Some(Self { tokens, separators })
-    }
-
-    fn render(self) -> String {
-        let mut rendered = self.tokens[0].clone();
-        for (separator, token) in self
-            .separators
-            .into_iter()
-            .zip(self.tokens.into_iter().skip(1))
-        {
-            rendered.push(separator);
-            rendered.push_str(&token);
-        }
-        rendered
-    }
+    intersect_resource_selectors(value, value).map(|_| ())
 }
 
 fn intersect_evidence(

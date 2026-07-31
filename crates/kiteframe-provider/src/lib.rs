@@ -7,6 +7,7 @@ mod authorization;
 mod invocation;
 mod operation;
 mod principal;
+mod resource;
 mod status;
 
 pub use admission::{
@@ -37,6 +38,10 @@ pub use principal::{
     ProviderPrincipalVerifier, RunRef, TenantRef, VerifiedHumanPrincipal,
     VerifiedProviderPrincipals, VerifiedWorkloadPrincipal, WorkloadPrincipalRef,
     correlate_principals,
+};
+pub use resource::{
+    intersect_resource_selectors, resource_selector_is_subset,
+    validate_concrete_resource_selector,
 };
 pub use status::{
     AbandonmentAuthorization, IdempotencyScopeValue, InMemoryInvocationStore, InvocationAuditLink,

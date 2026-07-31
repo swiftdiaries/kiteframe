@@ -4,13 +4,14 @@ use async_trait::async_trait;
 use kiteframe_contract::{
     AuthorityRevisionSet, CapabilityIdentity, Diagnostic, DiagnosticCategory, DiagnosticCode,
     DiagnosticStage, EffectiveCapabilityGrant, LockedCapability, NormalizedResourceSelector,
-    Sha256Digest, StableCapabilityError, TraceContext, resource_selector_is_subset_of,
+    Sha256Digest, StableCapabilityError, TraceContext,
 };
 use serde_json::Value;
 
 use crate::{
     AuthenticatedInvocationContext, AuthorizationBackend, AuthorizationDecision,
-    InvocationAuthorizationRequest, NarrowedAuthorizationConditions, require_current_authorization,
+    InvocationAuthorizationRequest, NarrowedAuthorizationConditions,
+    resource_selector_is_subset, require_current_authorization,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,7 +65,7 @@ impl InvocationContext {
         if locked_capability.identity() != &capability
             || effective_grant.capability() != &capability
             || !effective_grant.resources().iter().any(|granted| {
-                resource_selector_is_subset_of(selected_resource.as_str(), granted.as_str())
+                resource_selector_is_subset(selected_resource.as_str(), granted.as_str())
             })
         {
             return Err(capability_error(
@@ -124,7 +125,7 @@ fn condition_allows_resource(
     conditions
         .resources()
         .iter()
-        .any(|allowed| resource_selector_is_subset_of(selected.as_str(), allowed.as_str()))
+        .any(|allowed| resource_selector_is_subset(selected.as_str(), allowed.as_str()))
 }
 
 #[derive(Clone, Debug)]
