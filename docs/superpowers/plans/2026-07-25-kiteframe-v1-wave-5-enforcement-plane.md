@@ -1052,3 +1052,69 @@ rtk git commit -m "test: add workforce provider conformance profile"
 - The four standardized TLS routes authenticate and propagate filtered W3C context; matching catalog ETags produce bodyless HTTP `304`, which only the native client interprets as its typed not-modified result.
 - Provider-internal row/field ACL behavior is visible only through stable capability projection schemas and validated results.
 - The Crankshaft-shaped conformance profile passes dual-principal, scoped-resource, revision-freshness, stable-projection, revocation, restart/status, audit/outcome-linkage, and repository-independence gates without claiming a Crankshaft provider implementation.
+
+---
+
+## Post-Wave 5 Improvement Waves
+
+The following work is deliberately **not** a Wave 5 exit criterion. Wave 5
+uses SQLite as its reference transactional invocation store. It is valid for
+local and single-node deployments, but it is not the coordination authority
+for a replicated Kubernetes provider deployment.
+
+### Improvement Wave 1: PostgreSQL transactional invocation store for distributed Kiteframe
+
+**Goal:** Add a production PostgreSQL implementation of `InvocationStore` so
+every provider replica shares one transactional idempotency, status, and
+suspension authority. SQLite remains the local/reference implementation and
+must preserve the same portable contracts.
+
+**Files (anticipated):**
+
+- Create: `crates/kiteframe-provider-postgres/Cargo.toml`
+- Create: `crates/kiteframe-provider-postgres/migrations/`
+- Create: `crates/kiteframe-provider-postgres/src/lib.rs`
+- Create: `crates/kiteframe-provider-postgres/tests/distributed_recovery.rs`
+- Modify: deployment/server configuration and provider integration tests
+
+- [ ] **Step 1: Define production-store selection and migration ownership**
+
+Add explicit deployment configuration selecting `sqlite` only for
+local/single-node reference deployments and `postgres` for replicated
+deployments. Define one PostgreSQL migration history owned by the new crate;
+do not share a writable SQLite volume between Kubernetes replicas or infer the
+backend from environment topology.
+
+- [ ] **Step 2: Implement atomic shared reservations and durable leases**
+
+Use PostgreSQL transactions and unique constraints/row locks to atomically
+reserve the effect scope `(tenant, actor, capability, normalized resource,
+operation)` across all replicas. Persist `Reserved`, `Pending`, `Suspended`,
+and `OutcomeUnknown` states, proposal/checkpoint binding, audit receipts, and
+an execution lease. Recovery must conservatively turn an expired or
+crash-interrupted execution into `OutcomeUnknown`; a new key remains denied
+until status resolution or authorized abandonment is recorded transactionally.
+
+- [ ] **Step 3: Preserve status and audit correlation across replicas**
+
+Implement `StatusRequest` lookup and safe terminal projection from the shared
+store, with exact principal/admission/grant/catalog/descriptor/revision/audit
+correlation. A request admitted or invoked by one replica must be resumable
+and status-addressable through another replica without leaking credentials or
+unprojected provider data.
+
+- [ ] **Step 4: Prove distributed behavior with real PostgreSQL integration tests**
+
+Run two independently constructed provider service handles against the same
+PostgreSQL database and prove concurrent duplicate effects execute once,
+lease/crash recovery becomes status-first `OutcomeUnknown`, suspension resumes
+on a different replica, and authorized abandonment is the only route that
+releases the scope for a new key. Include migration-from-empty and
+upgrade/rollback safety evidence.
+
+- [ ] **Step 5: Publish Kubernetes deployment guidance**
+
+Document connection/TLS/credential-secret configuration, readiness checks that
+exercise the real shared store, migration execution/locking, backup and
+restore expectations, and the rule that SQLite is unsupported for a
+multi-replica provider deployment.
