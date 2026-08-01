@@ -347,6 +347,32 @@ async fn unknown_outcome_rejects_new_key_until_resolved() {
 }
 
 #[tokio::test]
+async fn pending_effect_rejects_a_different_key_in_the_same_scope() {
+    let store = InMemoryInvocationStore::new();
+    let first = reservation("inv-pending", "key-pending", 100);
+    reserve_default(&store, first.clone()).await.unwrap();
+    store
+        .transition(
+            &first.invocation_id,
+            InvocationTransition::try_new(
+                InvocationState::Reserved,
+                InvocationState::Pending,
+                TransitionAuditRecord::Authorization("audit-authz-pending".to_owned()),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let error = reserve_default(&store, reservation("inv-retry", "key-retry", 101))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code.as_str(), "KF-CAP-003");
+    assert_eq!(error.retry, kiteframe_contract::RetryClass::StatusFirst);
+}
+
+#[tokio::test]
 async fn unknown_outcome_remains_blocking_after_its_retention_deadline() {
     let clock = Arc::new(FakeClock(AtomicU64::new(1)));
     let store = InMemoryInvocationStore::with_clock(clock.clone());

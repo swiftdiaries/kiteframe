@@ -59,6 +59,7 @@ impl SqliteInvocationStore {
             .await
             .map_err(|_| storage_error())?;
         MIGRATOR.run(&pool).await.map_err(|_| storage_error())?;
+        recover_incomplete_effects(&pool, clock.now()).await?;
         Ok(Self {
             pool,
             clock,
@@ -98,6 +99,31 @@ impl SqliteInvocationStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
     }
+}
+
+async fn recover_incomplete_effects(
+    pool: &SqlitePool,
+    recovered_at: Timestamp,
+) -> Result<(), Diagnostic> {
+    let recovered_at = as_i64(recovered_at)?;
+    let mut connection = pool.acquire().await.map_err(|_| storage_error())?;
+    let mut transaction = connection
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(|_| storage_error())?;
+    sqlx::query(
+        "UPDATE invocations
+         SET state_kind = 'outcome_unknown',
+             state_json = ?,
+             updated_at = MAX(updated_at, ?)
+         WHERE state_kind IN ('reserved', 'pending')",
+    )
+    .bind(encode_state(&InvocationState::OutcomeUnknown)?)
+    .bind(recovered_at)
+    .execute(&mut *transaction)
+    .await
+    .map_err(|_| storage_error())?;
+    transaction.commit().await.map_err(|_| storage_error())
 }
 
 #[async_trait]

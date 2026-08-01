@@ -66,6 +66,116 @@ async fn status_survives_restart_with_digests_trace_and_unknown_state() {
 }
 
 #[tokio::test]
+async fn restart_fences_pending_effect_until_authorized_abandonment() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("pending-recovery.sqlite3");
+    let clock = Arc::new(FakeClock::new(100));
+    let descriptor = descriptor(standard_output_schema(), 3_600);
+    let first = reservation("inv-pending", "key-pending", "human-7");
+    let store = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
+    store
+        .reserve_or_get(first.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+    attach_authorization(&store, &first.invocation_id, "audit-authz-pending").await;
+    drop(store);
+
+    clock.set(101);
+    let reopened = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
+    let recovered = status(&reopened, &first.invocation_id, "9").await;
+    assert_eq!(recovered.state(), &InvocationState::OutcomeUnknown);
+    assert_eq!(
+        recovered.audit_authorization_record_id(),
+        Some("audit-authz-pending")
+    );
+
+    let error = reopened
+        .reserve_or_get(
+            reservation("inv-retry", "key-retry", "human-7"),
+            &descriptor,
+            Timestamp::new(3_701),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code.as_str(), "KF-CAP-003");
+
+    let unauthorized = reopened
+        .abandon(
+            &first.invocation_id,
+            &status_context("human-8"),
+            AbandonmentAuthorization::try_new("audit-abandon-denied", "operator-8").unwrap(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(unauthorized.code.as_str(), "KF-AUTH-003");
+    let still_blocked = reopened
+        .reserve_or_get(
+            reservation("inv-retry", "key-retry", "human-7"),
+            &descriptor,
+            Timestamp::new(3_701),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(still_blocked.code.as_str(), "KF-CAP-003");
+
+    reopened
+        .abandon(
+            &first.invocation_id,
+            &status_context("human-7"),
+            AbandonmentAuthorization::try_new("audit-abandon-approved", "operator-3").unwrap(),
+        )
+        .await
+        .unwrap();
+    let replacement = reopened
+        .reserve_or_get(
+            reservation("inv-retry", "key-retry", "human-7"),
+            &descriptor,
+            Timestamp::new(3_701),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replacement.kind(), ReservationKind::Reserved);
+}
+
+#[tokio::test]
+async fn restart_also_fences_a_durable_reserved_effect() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("reserved-recovery.sqlite3");
+    let clock = Arc::new(FakeClock::new(100));
+    let descriptor = descriptor(standard_output_schema(), 3_600);
+    let first = reservation("inv-reserved", "key-reserved", "human-7");
+    let store = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+        .await
+        .unwrap();
+    store
+        .reserve_or_get(first.clone(), &descriptor, Timestamp::new(3_700))
+        .await
+        .unwrap();
+    drop(store);
+
+    clock.set(101);
+    let reopened = SqliteInvocationStore::open_with_clock(&path, clock)
+        .await
+        .unwrap();
+    let recovered = status(&reopened, &first.invocation_id, "8").await;
+
+    assert_eq!(recovered.state(), &InvocationState::OutcomeUnknown);
+    let denied = reopened
+        .reserve_or_get(
+            reservation("inv-retry", "key-retry", "human-7"),
+            &descriptor,
+            Timestamp::new(3_701),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code.as_str(), "KF-CAP-003");
+}
+
+#[tokio::test]
 async fn concurrent_duplicate_reservation_has_one_owner() {
     let directory = tempfile::tempdir().unwrap();
     let clock = Arc::new(FakeClock::new(100));

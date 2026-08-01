@@ -963,8 +963,7 @@ impl InvocationStore for InMemoryInvocationStore {
         let key = ReservationKey::from_invocation(&invocation);
         let mut records = self.lock();
         records.retain(|_, stored| {
-            stored.retention_until > now
-                || stored.state.status_state() == StatusState::OutcomeUnknown
+            stored.retention_until > now || state_fences_idempotency_scope(&stored.state)
         });
 
         if let Some(existing) = records.get(&key) {
@@ -979,8 +978,7 @@ impl InvocationStore for InMemoryInvocationStore {
             return Ok(InvocationReservation::existing(existing));
         }
         if records.iter().any(|(existing_key, stored)| {
-            existing_key.same_scope(&key)
-                && stored.state.status_state() == StatusState::OutcomeUnknown
+            existing_key.same_scope(&key) && state_fences_idempotency_scope(&stored.state)
         }) {
             return Err(outcome_unknown());
         }
@@ -1066,6 +1064,13 @@ impl InvocationStore for InMemoryInvocationStore {
         stored.updated_at = Timestamp::new(stored.updated_at.unix_seconds().saturating_add(1));
         Ok(())
     }
+}
+
+fn state_fences_idempotency_scope(state: &InvocationState) -> bool {
+    matches!(
+        state,
+        InvocationState::Reserved | InvocationState::Pending | InvocationState::OutcomeUnknown
+    )
 }
 
 fn allowed_transition(expected: &InvocationState, next: &InvocationState) -> bool {
