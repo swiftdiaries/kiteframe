@@ -383,6 +383,82 @@ async fn unknown_outcome_survives_retention_and_restart_until_authorized_abandon
 }
 
 #[tokio::test]
+async fn every_unresolved_effect_state_fences_its_scope_before_and_after_expired_restart() {
+    for (index, state) in [
+        InvocationState::Reserved,
+        InvocationState::Pending,
+        InvocationState::Suspended {
+            suspension: Box::new(test_suspension()),
+        },
+        InvocationState::OutcomeUnknown,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(format!("unresolved-{index}.sqlite3"));
+        let clock = Arc::new(FakeClock::new(1));
+        let descriptor = descriptor(standard_output_schema(), 1);
+        let first = reservation("inv-unresolved", "key-unresolved", "human-7");
+        let store = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+            .await
+            .unwrap();
+        store
+            .reserve_or_get(first.clone(), &descriptor, Timestamp::new(2))
+            .await
+            .unwrap();
+        transition_to_unresolved(&store, &first.invocation_id, &state).await;
+
+        let before_expiration = store
+            .reserve_or_get(
+                reservation("inv-before-expiration", "key-before-expiration", "human-7"),
+                &descriptor,
+                Timestamp::new(2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            before_expiration.code.as_str(),
+            "KF-CAP-003",
+            "state {state:?} must fence a different key before expiration"
+        );
+
+        clock.set(3);
+        let after_expiration = store
+            .reserve_or_get(
+                reservation("inv-after-expiration", "key-after-expiration", "human-7"),
+                &descriptor,
+                Timestamp::new(4),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            after_expiration.code.as_str(),
+            "KF-CAP-003",
+            "state {state:?} must fence a different key after expiration"
+        );
+        drop(store);
+
+        let reopened = SqliteInvocationStore::open_with_clock(&path, clock.clone())
+            .await
+            .unwrap();
+        let after_restart = reopened
+            .reserve_or_get(
+                reservation("inv-after-restart", "key-after-restart", "human-7"),
+                &descriptor,
+                Timestamp::new(4),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            after_restart.code.as_str(),
+            "KF-CAP-003",
+            "state {state:?} must fence a different key after expired restart"
+        );
+    }
+}
+
+#[tokio::test]
 async fn exact_suspension_checkpoint_and_proposal_survive_restart() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("suspension.sqlite3");
@@ -854,6 +930,37 @@ async fn mark_unknown(store: &SqliteInvocationStore, invocation_id: &InvocationI
         )
         .await
         .unwrap();
+}
+
+async fn transition_to_unresolved(
+    store: &SqliteInvocationStore,
+    invocation_id: &InvocationId,
+    target: &InvocationState,
+) {
+    match target {
+        InvocationState::Reserved => {}
+        InvocationState::Pending => {
+            attach_authorization(store, invocation_id, "audit-authz-pending-state").await;
+        }
+        InvocationState::Suspended { suspension } => {
+            store
+                .transition(
+                    invocation_id,
+                    InvocationTransition::try_new(
+                        InvocationState::Reserved,
+                        InvocationState::Suspended {
+                            suspension: suspension.clone(),
+                        },
+                        TransitionAuditRecord::None,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        InvocationState::OutcomeUnknown => mark_unknown(store, invocation_id).await,
+        _ => panic!("test helper received a terminal invocation state"),
+    }
 }
 
 async fn status(

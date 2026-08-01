@@ -1069,7 +1069,10 @@ impl InvocationStore for InMemoryInvocationStore {
 fn state_fences_idempotency_scope(state: &InvocationState) -> bool {
     matches!(
         state,
-        InvocationState::Reserved | InvocationState::Pending | InvocationState::OutcomeUnknown
+        InvocationState::Reserved
+            | InvocationState::Pending
+            | InvocationState::Suspended { .. }
+            | InvocationState::OutcomeUnknown
     )
 }
 

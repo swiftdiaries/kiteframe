@@ -146,7 +146,8 @@ impl InvocationStore for SqliteInvocationStore {
 
         sqlx::query(
             "DELETE FROM invocations
-             WHERE retention_until <= ? AND state_kind != 'outcome_unknown'",
+             WHERE retention_until <= ?
+               AND state_kind NOT IN ('reserved', 'pending', 'suspended', 'outcome_unknown')",
         )
         .bind(as_i64(now)?)
         .execute(&mut *transaction)
@@ -169,7 +170,7 @@ impl InvocationStore for SqliteInvocationStore {
             return Ok(existing_reservation(&existing));
         }
 
-        if has_unknown_in_scope(&mut transaction, &invocation).await? {
+        if has_unresolved_in_scope(&mut transaction, &invocation).await? {
             return Err(Diagnostic::outcome_unknown(
                 "a prior invocation in this idempotency scope has an unknown outcome; query status first",
             ));
@@ -388,7 +389,7 @@ fn audit_record_parts(record: &TransitionAuditRecord) -> Option<(&'static str, &
     }
 }
 
-async fn has_unknown_in_scope(
+async fn has_unresolved_in_scope(
     transaction: &mut Transaction<'_, Sqlite>,
     invocation: &StoredInvocation,
 ) -> Result<bool, Diagnostic> {
@@ -399,7 +400,7 @@ async fn has_unknown_in_scope(
            AND capability_version = ?
            AND normalized_resource = ?
            AND semantic_operation = ?
-           AND state_kind = 'outcome_unknown'",
+           AND state_kind IN ('reserved', 'pending', 'suspended', 'outcome_unknown')",
     )
     .bind(invocation.scope.actor().as_str())
     .bind(invocation.scope.capability().name().as_str())
