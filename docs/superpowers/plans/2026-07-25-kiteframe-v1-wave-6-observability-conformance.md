@@ -2,14 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Prove the complete Kiteframe V1 failure model with correlated, privacy-safe observability, adversarial hardening, and traceable release evidence.
+**Goal:** Prove the complete Kiteframe V1 failure model, all ten site journeys with explicit host/Kiteframe ownership, the provider-neutral Crankshaft conformance profile, correlated privacy-safe observability, adversarial hardening, and traceable release evidence.
 
-**Architecture:** Stable Kiteframe correlation names live in an SDK-neutral Rust contract module; Rust and Python instrumentation project them into OpenTelemetry without feeding telemetry back into authorization. A deterministic end-to-end harness combines the Rust provider, fake semantic operations/model, Deep Agents adapter, OpenFGA, durable checkpointer, invocation store, and audit ledger. Runtime-neutral conformance vectors keep the portable contracts independently testable without adding a second V1 runtime.
+**Architecture:** Stable Kiteframe correlation names live in an SDK-neutral Rust contract module; Rust and Python instrumentation project them into OpenTelemetry without feeding telemetry back into authorization. A deterministic end-to-end harness combines the Wave 3R contracts, Rust provider, fake semantic operations/model, Deep Agents adapter, OpenFGA, durable checkpointer, invocation store, audit ledger, and explicit host-boundary fixtures. Runtime-neutral journey and Crankshaft-shaped conformance vectors prove portable ownership without adding a workflow DSL, hosted conversation platform, portable progress stream, Crankshaft dependency, or second V1 runtime.
 
 **Tech Stack:** Rust 1.97.1, Python 3.11+, OpenTelemetry Rust/Python, Deep Agents 0.6.12, OpenFGA, Docker Compose, pytest, cargo test/fuzz.
 
 ## Global Constraints
 
+- Wave 3R and Waves 4–5 are hard prerequisites. Conformance must exercise the exact `ResolvedRuntimeInputs`, embedded `LockedCapability`, `EffectiveCapabilityGrant`, `AuthorityRevisionSet`, `StatusRequest`, `CatalogFetchResult`, `ProviderAuthenticator`, and expanded `Suspension` contracts.
 - Rust and Python emit OpenTelemetry traces and metrics with W3C context propagation through runtime, provider, and OpenFGA.
 - GenAI operations are pinned for `create_agent`, `invoke_agent`, and `execute_tool`, but V1 stable `kiteframe.*` attributes never rename or disappear.
 - Prompt, message, argument, result, confirmation text, approval evidence, and consent evidence capture is disabled by default.
@@ -18,6 +19,12 @@
 - Audit remains separate, unsampled, append-only, and independently durable.
 - Every safety claim in the design has a unit, integration, property, fuzz, concurrency, restart, or end-to-end test.
 - Second-runtime adapters and portability spikes are V2 work and MUST NOT enter the V1 release gate.
+- The ten site journeys have explicit ownership rows. Host fixtures own conversation restoration, clarification, task synthesis, UI streaming, and presentation. Kiteframe owns package/runtime construction, declared delegation narrowing, current reads/effects, safe denial, proposal/evidence-bound suspension, restart/status, audit, and correlation.
+- Journey conformance must not imply a workflow/planner DSL, hosted conversation store, automatic task synthesis, portable UI, or portable progress streaming. Host streaming may project Kiteframe statuses but is not a Kiteframe execution mode.
+- The Crankshaft profile is provider-neutral conformance data only. It proves dual-auth correlation, authority narrowing, field projection, revision freshness, audit/outcome linkage, and status-first restart without importing Crankshaft crates or claiming its provider exists.
+- `StatusRequest.trace_context` propagates through Python, HTTP, provider, persistence lookup, telemetry, and correlated audit/status evidence.
+- Invocation conformance treats `AuthorityRevisionSet` as provider-produced state: clients bind by admission ID plus canonical grant-set `grant_digest`, while the provider loads persisted admission revisions and obtains current revisions before authorization.
+- Credential leakage scans cover source fixtures, serialized contracts, logs, diagnostics, traces, audit records, invocation/status storage, snapshots, and failure output.
 
 ---
 
@@ -38,6 +45,8 @@ tests/conformance/
 ├── diagnostic-vectors.json
 ├── authority-vectors.json
 ├── invocation-vectors.json
+├── journey-vectors.json
+├── crankshaft-profile-vectors.json
 └── telemetry-vectors.json
 tests/e2e/
 ├── pyproject.toml
@@ -53,6 +62,8 @@ tests/e2e/
 ├── test_suspension_restart.py
 ├── test_delegation.py
 ├── test_tamper_and_outages.py
+├── test_journeys.py
+├── test_crankshaft_profile.py
 └── test_telemetry_audit.py
 docs/
 └── v1alpha1-conformance.md                    # Requirement-to-test and V1 release decision
@@ -86,7 +97,11 @@ fn stable_v1_attribute_names_match_contract() {
     assert_eq!(ATTR_CAPABILITY_NAME, "kiteframe.capability.name");
     assert_eq!(ATTR_CAPABILITY_VERSION, "kiteframe.capability.version");
     assert_eq!(ATTR_ADMISSION_ID, "kiteframe.admission.id");
-    assert_eq!(ATTR_POLICY_REVISION, "kiteframe.policy.revision");
+    assert_eq!(ATTR_AUTHORITY_REVISION_DIGEST, "kiteframe.authority_revision.digest");
+    assert_eq!(ATTR_TENANT_REF, "kiteframe.principal.tenant_ref");
+    assert_eq!(ATTR_HUMAN_REF, "kiteframe.principal.human_ref");
+    assert_eq!(ATTR_WORKLOAD_REF, "kiteframe.principal.workload_ref");
+    assert_eq!(ATTR_RUN_REF, "kiteframe.run.id");
     assert_eq!(ATTR_INVOCATION_ID, "kiteframe.invocation.id");
     assert_eq!(ATTR_AUDIT_RECORD_ID, "kiteframe.audit.record_id");
 }
@@ -118,13 +133,17 @@ pub struct TelemetryAttributes {
     pub runtime_adapter: RuntimeTarget,
     pub capability: Option<CapabilityIdentity>,
     pub admission_id: Option<AdmissionId>,
-    pub policy_revision: Option<PolicyRevision>,
+    pub authority_revision_digest: Option<Sha256Digest>,
+    pub tenant_ref: Option<TenantRef>,
+    pub human_ref: Option<HumanPrincipalRef>,
+    pub workload_ref: Option<WorkloadPrincipalRef>,
+    pub run_ref: Option<RunRef>,
     pub invocation_id: Option<InvocationId>,
     pub audit_record_id: Option<AuditRecordId>,
 }
 ```
 
-Keep this module free of OpenTelemetry SDK types; `kiteframe-otel` owns conversion into span attributes.
+Keep this module free of OpenTelemetry SDK types; `kiteframe-otel` owns conversion into span attributes. Principal values are opaque verified references, never raw claims, subjects copied from request bodies, bearer tokens, cookies, API keys, or authorization tuples.
 
 - [ ] **Step 4: Implement the five-part capture gate**
 
@@ -209,6 +228,18 @@ async def test_traceparent_reaches_provider_and_openfga(
         "openfga.check",
     ]
     assert len({span.trace_id for span in trace_collector.spans}) == 1
+
+
+@pytest.mark.asyncio
+async def test_status_request_keeps_trace_after_restart(
+    restarted_client: ProviderHttpClient,
+    trace_collector: TraceCollector,
+) -> None:
+    await restarted_client.status(
+        build_status_request("inv-1", trace_context("00-status-trace"))
+    )
+    assert trace_collector.path() == ["provider.status", "invocation_store.status"]
+    assert {span.trace_id for span in trace_collector.spans} == {"status-trace"}
 ```
 
 - [ ] **Step 2: Run telemetry tests**
@@ -223,7 +254,7 @@ Expected: FAIL because Python instrumentation does not exist.
 
 - [ ] **Step 3: Add Rust provider and OpenFGA spans**
 
-Create spans around catalog fetch, admission, invocation validation, point-of-use authorization, audit append, operation execution, status lookup, and OpenFGA calls. Record stable identifiers and safe status categories; never record raw prompt, arguments, results, evidence, credentials, or policy tuples.
+Create spans around catalog fetch (including typed not-modified), authentication of human/workload principals, admission, invocation validation, point-of-use authorization, audit append, operation execution, traced `StatusRequest` lookup, and OpenFGA calls. Record stable identifiers, opaque tenant/human/workload/run refs, authority-revision digest, and safe status categories; never record raw prompt, arguments, results, evidence, credentials, claims, cookies, API keys, provider ACL rules, legacy fields, or policy tuples.
 
 - [ ] **Step 4: Add Python runtime spans**
 
@@ -253,7 +284,7 @@ Expected: PASS.
 
 Run: `rtk uv run --project python/kiteframe-deepagents pytest tests/test_telemetry.py -q`
 
-Expected: PASS for trace continuity, stable attributes, default content omission, exporter outage, and audit-path independence.
+Expected: PASS for create/invoke/status trace continuity across restart, dual-principal and authority-revision correlation, stable attributes, default content omission, credential leakage scans, exporter outage, and audit-path independence.
 
 - [ ] **Step 6: Commit cross-runtime observability**
 
@@ -277,11 +308,15 @@ rtk git commit -m "feat: correlate runtime and provider traces"
 - Create: `tests/e2e/test_suspension_restart.py`
 - Create: `tests/e2e/test_delegation.py`
 - Create: `tests/e2e/test_tamper_and_outages.py`
+- Create: `tests/e2e/test_journeys.py`
+- Create: `tests/e2e/test_crankshaft_profile.py`
 - Create: `tests/e2e/test_telemetry_audit.py`
+- Create: `tests/conformance/journey-vectors.json`
+- Create: `tests/conformance/crankshaft-profile-vectors.json`
 
 **Interfaces:**
-- Consumes: complete Waves 1–5 system.
-- Produces: deterministic scenario harness and one named test per design end-to-end requirement.
+- Consumes: complete Waves 1–5 system including Wave 3R contracts, explicit synthetic host adapters, and the provider-neutral Crankshaft-shaped fixture from Wave 5.
+- Produces: deterministic scenario harness, ten exact journey ownership rows, one named test per design end-to-end requirement, and one named test per Crankshaft profile requirement.
 
 - [ ] **Step 1: Write the scenario matrix before fixture implementation**
 
@@ -303,10 +338,65 @@ SCENARIOS = {
     "audit_outage_blocks_effect",
 }
 
+JOURNEY_ROWS = {
+    "J01": {
+        "host": {"restore_conversation", "supply_identity_tenant_task_session"},
+        "kiteframe": {"construct_runtime", "admit_session", "correlate_status"},
+    },
+    "J02": {
+        "host": {"synthesize_bounded_task", "present_answer"},
+        "kiteframe": {"construct_runtime", "authorize_current_capabilities"},
+    },
+    "J03": {
+        "host": {"synthesize_investigation_task", "present_report"},
+        "kiteframe": {"compile_declared_child", "narrow_delegated_authority"},
+    },
+    "J04": {
+        "host": {"present_projection"},
+        "kiteframe": {"reauthorize_read", "validate_projection_schema"},
+    },
+    "J05": {
+        "host": {"clarify_request", "synthesize_task_after_clarification"},
+        "kiteframe": set(),
+    },
+    "J06": {
+        "host": {"render_exact_proposal"},
+        "kiteframe": {"digest_proposal", "bind_suspension_to_proposal"},
+    },
+    "J07": {
+        "host": {"collect_and_submit_evidence"},
+        "kiteframe": {"revalidate_resume", "authorize_and_audit_effect"},
+    },
+    "J08": {
+        "host": {"stream_ui_status"},
+        "kiteframe": {"deferred_status", "restart_status_recovery"},
+    },
+    "J09": {
+        "host": {"present_safe_denial"},
+        "kiteframe": {"stable_redacted_denial", "no_ambient_fallback"},
+    },
+    "J10": {
+        "host": {"restore_conversation", "synthesize_new_task"},
+        "kiteframe": {"bind_authority_to_task_session", "readmit_without_carryover"},
+    },
+}
+
 
 def test_every_design_scenario_has_a_collected_test(pytestconfig: pytest.Config) -> None:
     collected = set(pytestconfig.stash[SCENARIO_MARKS])
     assert collected == SCENARIOS
+
+
+def test_all_ten_journeys_have_exact_ownership_and_evidence(
+    pytestconfig: pytest.Config,
+) -> None:
+    assert set(JOURNEY_ROWS) == {f"J{number:02d}" for number in range(1, 11)}
+    evidence = pytestconfig.stash[JOURNEY_EVIDENCE]
+    assert evidence == JOURNEY_ROWS
+    portable_surfaces = json.dumps(load_portable_contract_schemas())
+    assert "conversation_store" not in portable_surfaces
+    assert "workflow" not in portable_surfaces
+    assert "progress_stream" not in portable_surfaces
 ```
 
 - [ ] **Step 2: Run collection and observe missing scenario markers**
@@ -317,11 +407,13 @@ Expected: FAIL because the harness and scenario tests do not exist.
 
 - [ ] **Step 3: Create deterministic services and fake model/operations**
 
-Use OpenFGA in Docker, the real Rust provider binary, SQLite invocation state, file audit ledger, an in-memory durable LangGraph checkpointer with restart serialization, and a scripted model that makes exact tool calls. Every test controls time through injected Rust and Python clocks.
+Use OpenFGA in Docker, the real Rust provider binary, SQLite invocation state, file audit ledger, an in-memory durable LangGraph checkpointer with restart serialization, a scripted model that makes exact tool calls, and a synthetic host adapter. The synthetic host owns identity/tenant/conversation restoration, clarification, task creation, presentation, and UI status streaming; it is test scaffolding and never enters `agent.yaml`, `ResolvedAgent`, `ResolvedRuntimeInputs`, provider schemas, or runtime feature negotiation. Every test controls time through injected Rust and Python clocks.
 
 - [ ] **Step 4: Implement all named scenarios**
 
-Each test asserts returned stable outcome/diagnostic, model-visible tool names, provider call order, OpenFGA call count, effect count, invocation status, audit record chain, and trace correlation. Outage tests additionally assert no filesystem, shell, HTTP, MCP, or undeclared delegation fallback appears.
+Each technical scenario asserts returned stable outcome/diagnostic, model-visible tool names, provider call order, OpenFGA call count, effect count, invocation status, audit record chain, and trace correlation. Each journey test asserts its exact host and Kiteframe evidence sets from `JOURNEY_ROWS`, including proposal/evidence digest binding, task/session authority non-carryover, and the explicit absence of workflow/planner, hosted conversation, and portable progress-stream contracts. Outage tests additionally assert no filesystem, shell, HTTP, MCP, or undeclared delegation fallback appears.
+
+`test_crankshaft_profile.py` consumes only the checked-in provider-neutral JSON vectors. It proves independently verified human/workload/run correlation, tenant/resource narrowing, stable field projection, canonical authority-revision freshness, revocation after admission, complete audit/outcome linkage, traced status-first restart, and absence of credentials/legacy fields. It must not import a Crankshaft module, read another checkout, or claim provider implementation status.
 
 - [ ] **Step 5: Run the scenario suite twice**
 
@@ -333,10 +425,14 @@ Run: `rtk uv run --project tests/e2e pytest -q`
 
 Expected: PASS with identical golden outcomes, audit records except timestamps/IDs normalized by the fixture clock, and trace topology.
 
+Run: `rtk uv run --project tests/e2e pytest tests/e2e/test_journeys.py tests/e2e/test_crankshaft_profile.py -q`
+
+Expected: PASS with exactly ten ownership rows, no portable workflow/conversation/progress contract, and all Crankshaft profile dual-auth/projection/revision/audit/restart assertions.
+
 - [ ] **Step 6: Commit the end-to-end harness**
 
 ```bash
-rtk git add tests/e2e
+rtk git add tests/e2e tests/conformance/journey-vectors.json tests/conformance/crankshaft-profile-vectors.json
 rtk git commit -m "test: cover kiteframe v1 end to end"
 ```
 
@@ -346,6 +442,8 @@ rtk git commit -m "test: cover kiteframe v1 end to end"
 - Create: `tests/conformance/diagnostic-vectors.json`
 - Create: `tests/conformance/authority-vectors.json`
 - Create: `tests/conformance/invocation-vectors.json`
+- Modify: `tests/conformance/journey-vectors.json`
+- Modify: `tests/conformance/crankshaft-profile-vectors.json`
 - Create: `fuzz/fuzz_targets/lock_bytes.rs`
 - Create: `fuzz/fuzz_targets/descriptor_bundle.rs`
 - Create: `fuzz/fuzz_targets/resolved_ir.rs`
@@ -354,8 +452,8 @@ rtk git commit -m "test: cover kiteframe v1 end to end"
 - Create: `python/kiteframe-deepagents/tests/test_session_isolation_property.py`
 
 **Interfaces:**
-- Consumes: complete Rust/Python contracts.
-- Produces: runtime-neutral conformance vectors and adversarial release gates.
+- Consumes: complete Rust/Python contracts, exact journey ownership rows, provider-neutral Crankshaft profile, and traced `StatusRequest`.
+- Produces: runtime-neutral conformance vectors plus adversarial authority-revision, dual-principal, credential-leakage, crash/restart, and release gates.
 
 - [ ] **Step 1: Write conformance-vector loaders in Rust and Python**
 
@@ -375,6 +473,13 @@ fn diagnostic_vectors_match_reserved_codes_and_retry_classes() {
 @pytest.mark.parametrize("vector", load_authority_vectors())
 def test_python_visibility_matches_rust_vector(vector: AuthorityVector) -> None:
     assert visible_names(vector.to_session()) == set(vector.expected_visible)
+
+
+@pytest.mark.parametrize("vector", load_crankshaft_profile_vectors())
+def test_provider_profile_matches_rust_and_python(vector: ProviderProfileVector) -> None:
+    assert evaluate_profile(vector).canonical_json() == vector.expected_canonical_json
+    assert evaluate_profile(vector).authority_revision_digest == vector.expected_revision_digest
+    assert evaluate_profile(vector).authenticated_refs == vector.expected_authenticated_refs
 ```
 
 - [ ] **Step 2: Run vector tests before checking in the corpus**
@@ -385,7 +490,7 @@ Expected: FAIL because the vector corpus is absent.
 
 - [ ] **Step 3: Add adversarial vectors and fuzz targets**
 
-Include duplicate identities, selector widening, expiry boundary, evidence substitution, mixed effect classes, unknown status retry, malformed canonical JSON, digest collision attempts via concatenation boundaries, and sensitive diagnostic values.
+Include duplicate identities, catalog identity/digest mismatch, missing required capabilities, optional denial ordering, selector widening, per-grant expiry boundary, evidence-kind/reference/proposal-digest substitution, locked stable-error/mode mismatch, mixed effect classes, attempted client-supplied authority revisions, stale provider-loaded `AuthorityRevisionSet`, admission/grant-set digest mismatch, human/workload/tenant/run mismatch, unknown status retry, missing or malformed status trace context, malformed canonical JSON, digest collision attempts via concatenation boundaries, field-projection widening, and sensitive diagnostic values.
 
 ```rust
 fuzz_target!(|bytes: &[u8]| {
@@ -398,7 +503,9 @@ fuzz_target!(|bytes: &[u8]| {
 
 - [ ] **Step 4: Add concurrent duplicate and crash-window tests**
 
-Exercise 100 concurrent same-key effect requests, process termination after reservation, after authorization audit, during effect response loss, and before outcome audit. Assert one effect maximum, correct `outcome_unknown`, recoverable status, and intact audit chain.
+Exercise 100 concurrent same-key effect requests, process termination after reservation, after authorization audit, during effect response loss, and before outcome audit. Rotate policy/model/configuration revisions and restart with the same traced `StatusRequest`. Assert one effect maximum, correct `outcome_unknown`, recoverable status, unchanged admission/grant/catalog/descriptor/authority-revision/principal/idempotency/audit linkage, and intact audit chain.
+
+Add a recursive leakage scan over canonical contracts, fixture snapshots, captured logs, diagnostics, traces, audit JSONL, SQLite invocation/status rows, and pytest failure output. Seed unique sentinels for human bearer token, workload credential, cookie, raw claims, evidence body, provider field-ACL rule, and legacy field; assert none appears while opaque human/workload/run references remain correlated.
 
 - [ ] **Step 5: Run the hardening suite**
 
@@ -408,7 +515,11 @@ Expected: PASS.
 
 Run: `rtk uv run --project python/kiteframe-deepagents pytest tests/test_session_isolation_property.py -q`
 
-Expected: PASS.
+Expected: PASS for task/session authority non-carryover, principal isolation, authority-revision refresh, and traced status lookup.
+
+Run: `rtk uv run --project tests/e2e pytest tests/e2e/test_crankshaft_profile.py -q`
+
+Expected: PASS for dual-auth correlation, authority narrowing, stable field projection, revision freshness, audit/outcome linkage, credential leakage scan, and status-first restart.
 
 Run: `rtk cargo fuzz run lock_bytes -- -max_total_time=30`
 
@@ -434,10 +545,12 @@ rtk git commit -m "test: harden authority and recovery invariants"
 **Files:**
 - Create: `docs/v1alpha1-conformance.md`
 - Modify: `README.md`
+- Modify: `site/app/page.tsx`
+- Modify: `site/app/diagrams.ts`
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Consumes: all V1 plan exit evidence.
+- Consumes: all V1 plan exit evidence, exact ten-journey ownership/evidence rows, Wave 3R contract rows, and provider-neutral Crankshaft profile rows.
 - Produces: final V1 alpha conformance document and release readiness decision; no new runtime API.
 
 - [ ] **Step 1: Create the traceability test**
@@ -446,13 +559,40 @@ rtk git commit -m "test: harden authority and recovery invariants"
 #[test]
 fn every_normative_requirement_has_a_test_evidence_id() {
     let matrix = load_conformance_matrix("docs/v1alpha1-conformance.md");
-    for requirement in load_normative_requirements(DESIGN_SPEC) {
+    for requirement in load_normative_requirements([
+        FOUNDING_DESIGN_SPEC,
+        WAVE_3R_DESIGN_ADDENDUM,
+    ]) {
         assert!(
             matrix.has_passing_evidence(&requirement.id),
             "missing passing evidence for {}",
             requirement.id
         );
     }
+}
+
+#[test]
+fn journeys_and_provider_profiles_have_exact_owned_evidence() {
+    let matrix = load_conformance_matrix("docs/v1alpha1-conformance.md");
+    assert_eq!(
+        matrix.ids_with_prefix("JOURNEY-"),
+        (1..=10).map(|number| format!("JOURNEY-{number:02}")).collect::<Vec<_>>()
+    );
+    for row in matrix.journey_rows() {
+        assert!(!row.host_owned.is_empty() || !row.kiteframe_owned.is_empty());
+        assert_eq!(row.passing_tests, row.required_tests);
+    }
+    assert_eq!(
+        matrix.ids_with_prefix("PROFILE-CRANKSHAFT-"),
+        [
+            "PROFILE-CRANKSHAFT-DUAL-AUTH",
+            "PROFILE-CRANKSHAFT-AUTHORITY-NARROWING",
+            "PROFILE-CRANKSHAFT-FIELD-PROJECTION",
+            "PROFILE-CRANKSHAFT-REVISION-FRESHNESS",
+            "PROFILE-CRANKSHAFT-AUDIT-OUTCOME",
+            "PROFILE-CRANKSHAFT-STATUS-RESTART",
+        ]
+    );
 }
 ```
 
@@ -464,7 +604,29 @@ Expected: FAIL and list every unmapped normative requirement.
 
 - [ ] **Step 3: Fill the matrix with exact evidence**
 
-For each package, lock, capability, admission, invocation, authorization, adapter, delegation, suspension, telemetry, audit, and reliability requirement, record the owning test path/name and most recent passing command. Distinguish unit, property, fuzz, integration, container, restart, concurrency, and end-to-end evidence.
+For each normative requirement in the founding design and Wave 3R addendum, including every package, lock, capability, admission, authentication, invocation, authorization, adapter, delegation, suspension, proposal/evidence binding, traced status, telemetry, audit, reliability, journey, and provider-profile requirement, record:
+
+1. stable requirement ID;
+2. normative source file and section;
+3. owner (`host`, `kiteframe`, or `provider deployment`);
+4. exact contract/type and field names;
+5. exact test path and test name;
+6. evidence kind (`unit`, `property`, `fuzz`, `integration`, `container`, `restart`, `concurrency`, or `end-to-end`);
+7. most recent passing command; and
+8. expected security outcome.
+
+The ten `JOURNEY-01` through `JOURNEY-10` rows must reproduce `JOURNEY_ROWS` exactly. Host rows never count as proof of a Kiteframe workflow, conversation store, task synthesizer, UI, or progress stream. Crankshaft profile rows state “provider-neutral fixture; implementation status not asserted” and map dual authentication, authority narrowing, stable field projection, revision freshness, audit/outcome linkage, and status-first restart to exact tests.
+
+Update `site/app/page.tsx` and `site/app/diagrams.ts` in the same review so they
+state that the host bounds the request and supplies task/session context,
+Kiteframe resolves a published agent package, declared child packages narrow
+authority without a separate V1 typed child-I/O contract, and host progress
+streaming projects durable status rather than defining a portable Kiteframe
+mode. Keep exact proposal presentation host-owned and describe Kiteframe's
+portable responsibility as proposal/evidence reference and digest binding.
+The conformance test MUST extract these claims and fail when the site reclaims
+task synthesis, workflow execution, conversation storage, or portable progress
+streaming.
 
 - [ ] **Step 4: Run the complete release candidate suite**
 
@@ -492,23 +654,36 @@ Run: `rtk uv run --project tests/e2e pytest -q`
 
 Expected: PASS.
 
+Run: `rtk uv run --project tests/e2e pytest tests/e2e/test_journeys.py tests/e2e/test_crankshaft_profile.py -q`
+
+Expected: PASS for exactly ten host/Kiteframe ownership rows and all six provider-neutral Crankshaft profile requirements.
+
+Run: `rtk proxy rg -n \"bearer-sentinel|workload-secret-sentinel|cookie-sentinel|raw-claims-sentinel|evidence-body-sentinel|field-acl-rule-sentinel|legacy-field-sentinel\" target tests docs/v1alpha1-conformance.md`
+
+Expected: no matches outside the leakage-test source declarations themselves.
+
 - [ ] **Step 5: Apply the V1 release rule**
 
-Mark V1 ready for release review only when every required V1 conformance row passes. Otherwise list the exact failed rows and keep V1 unreleased; do not defer a failed V1 requirement to V2 or weaken portable semantics to force a pass.
+Mark V1 ready for release review only when every required V1, Wave 3R, journey-ownership, and provider-profile conformance row passes. Otherwise list the exact failed row IDs and keep V1 unreleased; do not claim host-owned presentation behavior as Kiteframe evidence, claim Crankshaft provider implementation from the neutral profile, defer a failed V1 requirement to V2, or weaken portable semantics to force a pass.
 
 - [ ] **Step 6: Commit the final conformance gate**
 
 ```bash
-rtk git add docs/v1alpha1-conformance.md README.md .github/workflows/ci.yml
+rtk git add docs/v1alpha1-conformance.md README.md site/app/page.tsx site/app/diagrams.ts .github/workflows/ci.yml
 rtk git commit -m "docs: publish kiteframe v1 conformance"
 ```
 
 ## Wave 6 Exit Criteria
 
+- Every Wave 3R canonical contract has exact cross-language, schema, runtime, provider, and conformance evidence; no stale shadow grant/status/catalog/suspension type remains.
 - Rust, Python, provider, and OpenFGA spans share W3C trace context and stable `kiteframe.*` attributes.
+- Human/workload/run refs and `AuthorityRevisionSet` digests correlate across admission, invocation, traced status, audit, outcome, and restart without recording credentials or raw claims.
 - Content capture is off by default and can only emit a classified, redacted, approved, policy-bound opaque reference.
 - Telemetry exporter failure and backpressure do not alter decisions, effects, statuses, or audit durability.
-- Every end-to-end scenario named in the design passes with exact diagnostic, visibility, effect-count, status, audit, and trace assertions.
-- Adversarial vectors, fuzz targets, concurrent duplicates, crash windows, restart, and session isolation pass.
+- All ten site journeys have deterministic host/Kiteframe ownership rows and passing evidence. Host conversation restoration, clarification, task synthesis, UI streaming, and presentation are never described as portable Kiteframe features.
+- Kiteframe package/runtime construction, declared delegation narrowing, current reads/effects, safe denial, proposal/evidence-bound suspension, restart/status, audit, and correlation have direct evidence.
+- No workflow/planner DSL, hosted conversation store, automatic task synthesis, or portable progress-stream contract appears in V1 schemas, IR, runtime features, or release claims.
+- The provider-neutral Crankshaft profile passes dual-auth correlation, authority narrowing, field projection, revision freshness, audit/outcome linkage, status-first restart, and repository-independence tests without asserting provider implementation.
+- Adversarial vectors, credential leakage scans, fuzz targets, concurrent duplicates, crash windows, traced status restart, and session isolation pass.
 - The V1 release decision follows the full requirement-to-test matrix, not schedule pressure.
 - No second-runtime adapter or portability spike is required for V1 completion.

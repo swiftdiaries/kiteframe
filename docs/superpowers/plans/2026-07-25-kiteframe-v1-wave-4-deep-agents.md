@@ -2,14 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Compile immutable `ResolvedAgent` values into the pinned public Deep Agents graph while preserving default denial, dynamic capability visibility, point-of-use authorization, strict subagent narrowing, and durable suspension.
+**Goal:** Compile immutable `ResolvedRuntimeInputs` into the pinned public Deep Agents graph while preserving default denial, dynamic capability visibility, point-of-use authorization, strict subagent narrowing, and durable suspension.
 
-**Architecture:** A deployment installs one static, deny-only Deep Agents harness profile before it builds Kiteframe registries; adapter compilation never registers or mutates a process-global profile. The adapter resolves trusted components from a frozen registry, creates one typed provider-backed tool per admitted capability, and adds a guard middleware that filters each model request and blocks forged calls. Declared nested agents compile recursively from immutable session state.
+**Architecture:** Wave 3R supplies one frozen `ResolvedRuntimeInputs` value retaining the `ResolvedAgent`, validated `RuntimeBinding`, selected `RuntimeTarget`, and target component descriptors. A deployment installs one static, deny-only Deep Agents harness profile before it builds Kiteframe registries; adapter compilation never registers or mutates a process-global profile. The adapter resolves trusted components from those inputs and a frozen registry, creates one typed provider-backed tool per effective admitted capability, and adds a guard middleware that filters each model request and blocks forged calls.
 
 **Tech Stack:** Python 3.11+, `deepagents==0.6.12`, LangChain/LangGraph public APIs pinned through Deep Agents, Kiteframe native contracts, pytest, pytest-asyncio, uv.
 
 ## Global Constraints
 
+- [`Wave 3R contract closure`](2026-07-28-kiteframe-v1-wave-3r-contract-closure.md) is a hard prerequisite. The merged Wave 3 surface at `54a2175` does not authorize Wave 4 implementation.
 - The adapter targets `deepagents==0.6.12` at upstream commit `196a0870fcf8a7f29d1fb37886dd323b190f9c16`; the implementation lock records distribution hashes.
 - The only construction call is public `deepagents.create_deep_agent(...)`, returning public `CompiledStateGraph`.
 - Adapter source MUST NOT import `deepagents._*`, call private functions, or mutate a global harness profile during validation or compilation.
@@ -21,6 +22,8 @@
 - Child effective authority equals parent current authority ∩ parent delegation declaration ∩ child requirements ∩ child admission.
 - Any suspendable capability requires a durable checkpointer. Resume revalidates evidence, grant expiry, policy freshness, resource preconditions, and point-of-use authorization.
 - Runtime state, component registries, grants, middleware, and subagent graphs are immutable per session and never shared through mutable globals.
+- Adapter entrypoints consume only `ResolvedRuntimeInputs`, `ResolvedCapabilityRequirement` with its embedded exact `LockedCapability`, structured native outcomes/statuses, `StatusRequest`, `EffectiveCapabilityGrant`, `AuthorityRevisionSet`, and the strengthened native `Suspension`.
+- Adapter code MUST NOT reread package YAML, runtime binding, capability lock, or target metadata; refetch a live catalog; hardcode descriptor schemas; accept a standalone descriptor argument; or use `json.loads(canonical_json())` to create an alternate contract model.
 
 ---
 
@@ -37,11 +40,11 @@ python/kiteframe-deepagents/
 │   ├── target.py                              # Exact supported-feature descriptor
 │   ├── adapter.py                             # Validate and compile entrypoint
 │   ├── components.py                          # Runtime-checkable trusted component contracts
-│   ├── context.py                             # Immutable actor/task/session state
+│   ├── context.py                             # Immutable actor/task/session and authority-revision state
 │   ├── tools.py                               # Provider-backed typed BaseTool
 │   ├── middleware.py                          # Visibility and forged-call guard
 │   ├── delegation.py                          # Authority intersection and recursive compile
-│   └── suspension.py                          # Interrupt/resume evidence references
+│   └── suspension.py                          # Interrupt/resume correlation from native Suspension
 └── tests/
     ├── conftest.py                            # Fake model/provider/registry/checkpointer
     ├── test_compatibility.py
@@ -161,7 +164,7 @@ rtk git commit -m "test: pin deep agents public compatibility"
 - Create: `python/kiteframe-deepagents/tests/test_adapter_validation.py`
 
 **Interfaces:**
-- Consumes: `ResolvedAgent`, `RuntimeBinding`, `FrozenComponentRegistry`, native `CompilationReport`.
+- Consumes: Wave 3R `ResolvedRuntimeInputs` and `FrozenComponentRegistry`; the input owns the `ResolvedAgent`, validated `RuntimeBinding`, selected `RuntimeTarget`, target component descriptors, and native `CompilationReport`.
 - Produces: `DeepAgentsAdapter.target()`, `supported_features()`, `validate(...)`, `KiteframeSessionContext`, and runtime-checkable `DurableCheckpointer`.
 
 - [ ] **Step 1: Write failing component and feature validation tests**
@@ -169,25 +172,21 @@ rtk git commit -m "test: pin deep agents public compatibility"
 ```python
 def test_missing_model_symbol_fails_before_constructor(
     adapter: DeepAgentsAdapter,
-    resolved_agent: ResolvedAgent,
+    runtime_inputs: ResolvedRuntimeInputs,
     registry_without_model: FrozenComponentRegistry,
 ) -> None:
     with pytest.raises(KiteframeDiagnosticError) as error:
-        adapter.validate(resolved_agent, deepagents_binding(), registry_without_model)
+        adapter.validate(runtime_inputs, registry_without_model)
     assert error.value.code == "KF-RUNTIME-001"
 
 
 def test_suspendable_capability_requires_durable_checkpointer(
     adapter: DeepAgentsAdapter,
-    suspendable_agent: ResolvedAgent,
+    suspendable_inputs: ResolvedRuntimeInputs,
     registry_with_ephemeral_checkpointer: FrozenComponentRegistry,
 ) -> None:
     with pytest.raises(KiteframeDiagnosticError) as error:
-        adapter.validate(
-            suspendable_agent,
-            deepagents_binding(),
-            registry_with_ephemeral_checkpointer,
-        )
+        adapter.validate(suspendable_inputs, registry_with_ephemeral_checkpointer)
     assert error.value.code == "KF-RUNTIME-001"
     assert "durable checkpointer" in str(error.value)
 ```
@@ -217,7 +216,7 @@ Generate `runtime-targets/deepagents-0.6.12.json` from this constant and include
 
 - [ ] **Step 4: Resolve and validate components without constructing the graph**
 
-Validate model role objects, middleware sequence, package backend, optional store, durable checkpointer, capability provider, audit sink, and harness profile token by exact `ComponentKind`. The profile token must match the resolved model key, Deep Agents version, ambient exclusion set, and general-subagent-disabled flag.
+Read symbols and expected component metadata only from `ResolvedRuntimeInputs.runtime_binding` and `ResolvedRuntimeInputs.target_components`. Validate model role objects, middleware sequence, package backend, optional store, durable checkpointer, capability provider, audit sink, and harness profile token by exact `ComponentKind`. `ProviderAuthenticator` remains deployment-owned configuration inside the registered provider client rather than a manifest/binding symbol. The profile token must match the resolved model key, Deep Agents version, ambient exclusion set, and general-subagent-disabled flag. Validation does not reopen the binding or target, consult `CatalogFetchResult`, or fetch a current catalog.
 
 ```python
 @runtime_checkable
@@ -247,7 +246,7 @@ rtk git commit -m "feat: validate deep agents runtime bindings"
 - Create: `python/kiteframe-deepagents/tests/test_tools.py`
 
 **Interfaces:**
-- Consumes: `ResolvedCapabilityRequirement`, locked `CapabilityDescriptor`, `CapabilityGrant`, `CapabilityInvoker`, `KiteframeSessionContext`.
+- Consumes: `ResolvedCapabilityRequirement` with its embedded exact `LockedCapability`, `EffectiveCapabilityGrant`, the canonical grant-set `grant_digest`, `AuthorityRevisionSet`, `CapabilityInvoker`, and `KiteframeSessionContext`.
 - Produces: `CapabilityTool(BaseTool)` and `build_capability_tools(...) -> tuple[CapabilityTool, ...]`.
 
 - [ ] **Step 1: Write failing schema, authorization, and retry tests**
@@ -255,11 +254,13 @@ rtk git commit -m "feat: validate deep agents runtime bindings"
 ```python
 def test_tool_name_description_and_schema_come_from_lock(
     read_tool: CapabilityTool,
-    locked_read_descriptor: CapabilityDescriptor,
+    read_requirement: ResolvedCapabilityRequirement,
 ) -> None:
+    descriptor = read_requirement.descriptor
     assert read_tool.name == "cases.read"
-    assert read_tool.description == locked_read_descriptor.summary
-    assert read_tool.args_schema == locked_read_descriptor.input_schema
+    assert read_tool.description == descriptor.summary
+    assert read_tool.args_schema == descriptor.input_schema
+    assert read_tool.descriptor_digest == read_requirement.descriptor_digest
 
 
 @pytest.mark.asyncio
@@ -270,6 +271,7 @@ async def test_tool_invokes_provider_with_session_and_trace_context(
     await read_tool.ainvoke({"case_id": "case-1", "_resource": "tenant:t1/case:case-1"})
     request = fake_invoker.requests[-1]
     assert request.admission_id == "adm-1"
+    assert request.grant_digest == read_tool.grant_digest
     assert request.trace_context.traceparent == VALID_TRACEPARENT
 
 
@@ -283,7 +285,7 @@ async def test_unknown_outcome_queries_status_before_same_key_retry(
         {"case_id": "case-1", "body": "hello", "_resource": "tenant:t1/case:case-1"}
     )
     assert result == {"ok": True}
-    assert fake_invoker.calls == ["invoke:key-1", "status:inv-1"]
+    assert fake_invoker.calls == ["invoke:key-1", "status:inv-1:traced"]
 ```
 
 - [ ] **Step 2: Run tool tests**
@@ -299,16 +301,18 @@ class CapabilityTool(BaseTool):
     name: str
     description: str
     args_schema: dict[str, Any]
-    descriptor: CapabilityDescriptor
-    grant: CapabilityGrant
+    requirement: ResolvedCapabilityRequirement
+    grant: EffectiveCapabilityGrant
+    grant_digest: str
     invoker: CapabilityInvoker
     session: KiteframeSessionContext
 
     async def _arun(self, **arguments: Any) -> Any:
         resource = self._select_resource(arguments.pop("_resource", None))
         request = build_native_invocation_request(
-            descriptor=self.descriptor,
+            requirement=self.requirement,
             grant=self.grant,
+            grant_digest=self.grant_digest,
             session=self.session,
             resource=resource,
             arguments=arguments,
@@ -320,11 +324,11 @@ class CapabilityTool(BaseTool):
         raise RuntimeError("Kiteframe capability tools require async invocation")
 ```
 
-Use a caller-generated UUIDv7 idempotency key scoped by actor, exact capability version, normalized resource, and semantic operation. Persist the key in session checkpoint state before provider invocation.
+`build_capability_tools(...)` receives no standalone descriptor or schema. It uses the exact embedded locked descriptor and digests from each requirement, the matching `EffectiveCapabilityGrant`, and the enclosing canonical grant-set `grant_digest`. `AuthorityRevisionSet` remains in immutable session/guard state for local visibility decisions; it is never serialized as client-supplied authority. The native invocation request binds `admission_id` and `grant_digest`, allowing the provider to reload the admitted revision snapshot and obtain fresh revisions at point of use. Use a caller-generated UUIDv7 idempotency key scoped by actor, exact capability version, normalized resource, and semantic operation. Persist the key in session checkpoint state before provider invocation.
 
 - [ ] **Step 4: Validate provider results against the locked output schema**
 
-Native Rust validation runs first. The tool maps `Denied`, `Failed`, and `OutcomeUnknown` to stable safe tool errors, returns `Deferred` as an invocation reference, and sends `Suspended` to the suspension bridge. Provider-native exceptions never become tool output.
+Native Rust validation runs first. Match the structured native outcome/status discriminants and typed fields directly; never parse `canonical_json()` into dictionaries. The tool maps `Denied`, `Failed`, and `OutcomeUnknown` to stable safe tool errors, returns `Deferred` as an invocation reference, and sends `Suspended` to the suspension bridge. For deferred or unknown outcomes, build a native `StatusRequest` from the invocation ID and current native trace context before `CapabilityInvoker.status(...)`. Provider-native exceptions never become tool output.
 
 - [ ] **Step 5: Run tool tests**
 
@@ -346,7 +350,7 @@ rtk git commit -m "feat: map grants to deep agents tools"
 - Create: `python/kiteframe-deepagents/tests/test_default_denial.py`
 
 **Interfaces:**
-- Consumes: current `CapabilityGrantSet`, session time, suspension state, admitted capability tools, declared child tool.
+- Consumes: current immutable `EffectiveCapabilityGrant` values, `AuthorityRevisionSet`, session time, suspension state, admitted capability tools, and declared child tool.
 - Produces: `KiteframeGuardMiddleware`.
 
 - [ ] **Step 1: Write failing visibility and forged-call tests**
@@ -357,8 +361,8 @@ async def test_expired_or_revoked_grants_disappear_from_each_model_request(
     middleware: KiteframeGuardMiddleware,
 ) -> None:
     assert tool_names(await middleware.visible_tools(now=ISSUED_AT)) == {"cases.read"}
-    middleware.replace_grants(expired_grant_set())
-    assert tool_names(await middleware.visible_tools(now=EXPIRED_AT)) == set()
+    expired = middleware.with_authority(expired_effective_grants(), next_revision_set())
+    assert tool_names(await expired.visible_tools(now=EXPIRED_AT)) == set()
 
 
 @pytest.mark.parametrize(
@@ -397,7 +401,7 @@ class KiteframeGuardMiddleware(AgentMiddleware):
         return await handler(request)
 ```
 
-The tool list is recomputed for every model request from immutable current grants, expiry, task/session identity, child declarations, and suspension state. The deny-only ambient set is always removed before the request reaches the model.
+The tool list is recomputed for every model request from immutable effective grants, the matching authority revision set, expiry, task/session identity, child declarations, and suspension state. Authority refresh replaces the complete immutable middleware/session snapshot; it never mutates grants in place. The deny-only ambient set is always removed before the request reaches the model.
 
 - [ ] **Step 4: Add provider and middleware failure tests**
 
@@ -424,20 +428,19 @@ rtk git commit -m "feat: enforce dynamic tool visibility"
 - Create: `python/kiteframe-deepagents/tests/test_compile.py`
 
 **Interfaces:**
-- Consumes: validated binding components, root prompt/skill assets, capability tools, guard middleware, explicit child specs.
-- Produces: `DeepAgentsAdapter.compile(...) -> CompiledStateGraph`.
+- Consumes: validated `ResolvedRuntimeInputs`, registered components, root prompt/skill assets, capability tools, guard middleware, and explicit child specs.
+- Produces: `DeepAgentsAdapter.compile(inputs, registry, session) -> CompiledStateGraph`.
 
 - [ ] **Step 1: Write failing public-construction tests**
 
 ```python
 def test_compile_returns_public_compiled_state_graph(
     adapter: DeepAgentsAdapter,
-    resolved_agent: ResolvedAgent,
+    runtime_inputs: ResolvedRuntimeInputs,
     frozen_registry: FrozenComponentRegistry,
 ) -> None:
     graph = adapter.compile(
-        resolved_agent,
-        deepagents_binding(),
+        runtime_inputs,
         frozen_registry,
         session_context(),
     )
@@ -448,7 +451,7 @@ def test_constructor_receives_only_resolved_and_registered_values(
     create_spy: Mock,
     adapter: DeepAgentsAdapter,
 ) -> None:
-    adapter.compile(resolved_agent(), deepagents_binding(), registry(), session_context())
+    adapter.compile(runtime_inputs(), registry(), session_context())
     kwargs = create_spy.call_args.kwargs
     assert kwargs["system_prompt"] == "You are the support agent."
     assert kwargs["model"] is registry().resolve(ComponentKind.MODEL, "models.primary")
@@ -465,6 +468,7 @@ Expected: FAIL because `compile` does not construct a graph.
 - [ ] **Step 3: Assemble exact public arguments**
 
 ```python
+resolved = runtime_inputs.resolved_agent
 graph = create_deep_agent(
     model=components.primary_model,
     tools=capability_tools,
@@ -482,7 +486,7 @@ graph = create_deep_agent(
 )
 ```
 
-The package backend exposes only validated prompt/skill bytes under the virtual `/__kiteframe__/` prefix. `permissions=None` does not grant ambient tools because the deployment profile and guard independently exclude them.
+All constructor arguments derive from `ResolvedRuntimeInputs` plus objects resolved from the frozen registry. The package backend exposes only already-validated prompt/skill bytes under the virtual `/__kiteframe__/` prefix. Compilation does not reopen package YAML, binding, lock, or target files and does not consult a live catalog. `permissions=None` does not grant ambient tools because the deployment profile and guard independently exclude them.
 
 - [ ] **Step 4: Map construction failures safely**
 
@@ -510,7 +514,7 @@ rtk git commit -m "feat: compile resolved agents to deep agents"
 - Create: `python/kiteframe-deepagents/tests/test_concurrency.py`
 
 **Interfaces:**
-- Consumes: parent current grants, parent delegation requirement, child requirements, child admission, delegation ancestry.
+- Consumes: parent current `EffectiveCapabilityGrant` values, parent `AuthorityRevisionSet`, parent delegation requirement, child requirements with embedded locked capabilities, child admission, and delegation ancestry.
 - Produces: `intersect_child_envelope(...)`, recursively compiled `CompiledSubAgent` values, and isolated child session contexts.
 
 - [ ] **Step 1: Write failing narrowing and isolation tests**
@@ -550,7 +554,7 @@ Intersect exact version, resource selector, effect class, execution mode, expiry
 
 - [ ] **Step 4: Recursively compile only declared child packages**
 
-Use each `ResolvedSubagent` from Rust IR, admit the child against the narrowed request, create a new frozen child session context, and pass a public `CompiledSubAgent` to the parent. Reject duplicate identity and cycles even if Rust validation already rejected them.
+Use each `ResolvedSubagent` from `ResolvedRuntimeInputs.resolved_agent`, admit the child against the narrowed request, create a new frozen child session context with its `AuthorityRevisionSet`, and pass a public `CompiledSubAgent` to the parent. Reject duplicate identity and cycles even if Rust validation already rejected them.
 
 - [ ] **Step 5: Run delegation and concurrency tests**
 
@@ -575,7 +579,7 @@ rtk git commit -m "feat: narrow deep agents subagent authority"
 - Modify: `.github/workflows/ci.yml`
 
 **Interfaces:**
-- Consumes: native `Suspension`, evidence references, durable checkpointer, provider invoker, session context.
+- Consumes: strengthened native `Suspension`, native `StatusRequest`, durable checkpointer, provider invoker, `EffectiveCapabilityGrant`, `AuthorityRevisionSet`, and session context.
 - Produces: `SuspensionEnvelope`, public LangGraph interrupt/resume mapping, and final Wave 4 compatibility suite.
 
 - [ ] **Step 1: Write failing suspension and restart tests**
@@ -590,7 +594,9 @@ async def test_suspension_checkpoint_contains_references_not_evidence_text(
     checkpoint = durable_checkpointer.latest()
     serialized = json.dumps(checkpoint)
     assert result["type"] == "kiteframe.capability.suspension"
+    assert "checkpoint-ref-1" in serialized
     assert "evidence-ref-1" in serialized
+    assert proposal_digest() in serialized
     assert "I approve this comment" not in serialized
 
 
@@ -603,7 +609,7 @@ async def test_process_restart_resume_reauthorizes_before_effect(
     assert fake_invoker.calls == [
         "validate_evidence",
         "check_grant_expiry",
-        "check_policy_revision",
+        "check_authority_revisions",
         "check_preconditions",
         "invoke_point_of_use",
     ]
@@ -622,8 +628,10 @@ Expected: FAIL because the suspension bridge does not exist.
 class SuspensionEnvelope:
     invocation_id: str
     admission_id: str
+    checkpoint_ref: str
     evidence_kind: Literal["confirmation", "approval", "consent"]
     evidence_request_ref: str
+    proposal_digest: str
     traceparent: str
 
 
@@ -632,11 +640,11 @@ def suspend(outcome: InvocationOutcome) -> NoReturn:
     interrupt(dataclasses.asdict(envelope))
 ```
 
-Checkpoint payloads contain only opaque references and correlation IDs. On resume, construct a new native `InvocationRequest` with the evidence reference and the same idempotency key.
+`SuspensionEnvelope.from_native(...)` copies the native checkpoint reference, evidence kind, protected evidence-request reference, and proposal digest without decoding or recomputing them. Checkpoint payloads contain only opaque references, digests, and correlation IDs. On resume, use native factories to construct a new `InvocationRequest` with the protected evidence reference, same idempotency key, admission ID, and canonical grant-set `grant_digest`; the provider reloads the admitted revision snapshot and obtains fresh revisions at point of use. `AuthorityRevisionSet` remains local immutable session/guard state. Use `StatusRequest` for any status reconciliation. Do not deserialize `canonical_json()` into an adapter-owned model.
 
-- [ ] **Step 4: Add the public-surface and no-global-mutation scan**
+- [ ] **Step 4: Add the public-surface, closed-input, and no-global-mutation scan**
 
-Parse adapter Python source with `ast` and fail when an import starts with `deepagents._`. Monkeypatch public `register_harness_profile` to raise during every adapter validation/compile test and prove the adapter never calls it.
+Parse adapter Python source with `ast` and fail when an import starts with `deepagents._`, a call uses `json.loads` over `canonical_json()`, or an adapter entrypoint accepts standalone package, binding, lock, target, or descriptor parameters. Spy on filesystem and catalog-provider entrypoints during validation/compile and prove there is no package/binding/lock/target reread or live catalog refetch. Verify tool schemas are byte- and digest-identical read-only projections of the embedded locked descriptor rather than adapter constants. Monkeypatch public `register_harness_profile` to raise during every adapter validation/compile test and prove the adapter never calls it.
 
 - [ ] **Step 5: Run the complete Wave 4 suite**
 
@@ -667,11 +675,14 @@ rtk git commit -m "test: gate secure deep agents compilation"
 
 ## Wave 4 Exit Criteria
 
+- Wave 3R has passed, and every adapter entrypoint accepts complete `ResolvedRuntimeInputs` rather than separate package, binding, lock, target, or descriptor arguments.
 - The exact pinned distribution, public signature, profile behavior, and target feature descriptor pass a compatibility fixture.
 - Adapter validation resolves every model/component/provider/audit/profile symbol before calling the constructor.
+- Tools use only the exact `LockedCapability` embedded in `ResolvedCapabilityRequirement`; structured native outcomes/statuses and `StatusRequest` reach the real invocation path without alternate Python contract models. `AuthorityRevisionSet` is persisted with admission for immutable local visibility state, while native invocation requests bind only `admission_id` plus the canonical grant-set `grant_digest` and the provider obtains fresh revisions at point of use.
 - Model-visible tools are recomputed for every request; expired, revoked, suspended, undeclared, and ambient tools are absent.
 - Forged calls to hidden or built-in tools fail with `KF-AUTH-003`; no failure path restores the Deep Agents default tool suite.
 - Only declared child packages compile, and every child authority dimension is equal or narrower than the parent.
 - Concurrent sessions do not leak registries, grants, middleware, subagents, or idempotency state.
-- Suspendable capabilities require a durable checkpointer; checkpoint payloads contain opaque evidence references; restart/resume performs full revalidation.
+- Suspendable capabilities require a durable checkpointer; native `Suspension` supplies checkpoint reference, evidence kind, protected evidence-request reference, and proposal digest; restart/resume performs full revalidation.
 - Adapter source uses no private Deep Agents imports and does not call global profile registration during validation or compilation.
+- Source and tests prove there is no package/binding/lock/target reread, live catalog refetch, hardcoded locked schema, standalone descriptor parameter, or `json.loads(canonical_json())` contract reconstruction.

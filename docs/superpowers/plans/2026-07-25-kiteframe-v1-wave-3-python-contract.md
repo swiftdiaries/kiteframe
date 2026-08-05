@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust 1.97.1, Python 3.11+, maturin, PyO3, pyo3-stub-gen, uv, pytest, pytest-asyncio, httpx, W3C Trace Context.
 
+> **Post-implementation adversarial review (2026-07-28):** The implementation merged at `54a2175`, but Wave 3 did not pass its consumer-boundary exit assumptions. `ResolvedCapabilityRequirement` lost the exact locked descriptor, `resolve_package(...)` discarded the validated binding and selected target inputs, outcome/status projections were opaque, and leaving status untraced contradicted the approved design. [`Wave 3R contract closure`](2026-07-28-kiteframe-v1-wave-3r-contract-closure.md) is mandatory before Waves 4 or 5. Corrections in this document identify the intended boundary; they do not claim that `54a2175` already implements the repairs.
+
 ## Global Constraints
 
 - Python cannot construct a partially valid `ResolvedAgent`; it may only receive one from successful Rust resolution or canonical IR deserialization that passes the same Rust validation.
@@ -17,8 +19,9 @@
 - An absent symbol, duplicate symbol, or wrong-kind symbol fails with `KF-RUNTIME-001` before runtime construction.
 - Registries are instance-scoped and frozen before compilation; no process-global mutable registry is permitted.
 - Provider redirects are disabled, TLS is required outside an explicit in-memory test transport, and response bodies always use the stable Kiteframe contract.
-- `traceparent` and `tracestate` propagate for provider calls that carry a native request. The V1 `status(invocation_id)` lookup has no caller trace context and is explicitly exempt; it must not invent ambient trace state. `baggage` is allowlisted and never carries credentials, prompts, arguments, results, or authorization tuples.
+- `traceparent` and `tracestate` propagate on all four provider calls through native request values. Status uses a native `StatusRequest` carrying the invocation ID and trace context, and no ambient trace state may be invented. `baggage` is allowlisted and never carries credentials, prompts, arguments, results, or authorization tuples.
 - Provider output is validated against Rust-owned response types and locked JSON schemas before an adapter receives it.
+- The historical Wave 3 consumer freeze is closed and superseded by Wave 3R. No downstream plan may treat the merged projections or `resolve_package(...) -> ResolvedAgent` surface as complete compilation inputs.
 
 ---
 
@@ -60,6 +63,7 @@ schemas/v1alpha1/
 ├── capability-grant-set.schema.json
 ├── invocation-request.schema.json
 ├── invocation-outcome.schema.json
+├── status-request.schema.json
 └── invocation-status.schema.json
 ```
 
@@ -73,12 +77,13 @@ schemas/v1alpha1/
 - Create: `schemas/v1alpha1/capability-grant-set.schema.json`
 - Create: `schemas/v1alpha1/invocation-request.schema.json`
 - Create: `schemas/v1alpha1/invocation-outcome.schema.json`
+- Create: `schemas/v1alpha1/status-request.schema.json`
 - Create: `schemas/v1alpha1/invocation-status.schema.json`
 - Test: `crates/kiteframe-contract/tests/service_contract.rs`
 
 **Interfaces:**
 - Consumes: Wave 2 descriptors, locked capabilities, digests, diagnostics, and resolved requirements.
-- Produces: `CatalogRequest`, `AdmissionRequest`, `CapabilityGrantSet`, `CapabilityGrant`, `InvocationRequest`, `InvocationOutcome`, `InvocationStatus`, `TraceContext`, `EvidenceReferences`, and `DelegationAncestry`.
+- Produces: `CatalogRequest`, `AdmissionRequest`, `CapabilityGrantSet`, `CapabilityGrant`, `InvocationRequest`, `InvocationOutcome`, `StatusRequest`, `InvocationStatus`, `TraceContext`, `EvidenceReferences`, and `DelegationAncestry`.
 
 - [ ] **Step 1: Write failing service-contract tests**
 
@@ -148,7 +153,7 @@ pub enum InvocationOutcome {
 }
 ```
 
-`CapabilityGrantSet` is constructed only through digest-validating `try_new`/deserialization entrypoints and exposes read-only getters. `InvocationStatus` uses exactly `pending`, `suspended`, `succeeded`, `failed`, `denied`, and `outcome_unknown`. `InvocationRequest` carries exact capability identity, selected resource, typed arguments, preconditions, optional idempotency key, evidence references, admission ID, and trace context.
+`CapabilityGrantSet` is constructed only through digest-validating `try_new`/deserialization entrypoints and exposes read-only getters. `InvocationStatus` uses exactly `pending`, `suspended`, `succeeded`, `failed`, `denied`, and `outcome_unknown`. `CatalogRequest`, `AdmissionRequest`, and `InvocationRequest` carry native trace context; `InvocationRequest` also carries exact capability identity, selected resource, typed arguments, preconditions, optional idempotency key, evidence references, and admission ID. `StatusRequest` carries the exact invocation ID and the native `TraceContext` used for status propagation.
 
 - [ ] **Step 4: Validate grant and request invariants**
 
@@ -158,7 +163,7 @@ Reject `expires_at <= issued_at`, duplicate capability versions, selectors broad
 
 Run: `rtk cargo run -p kiteframe-schema -- schemas/v1alpha1`
 
-Expected: writes the five new service schemas.
+Expected: writes the six new service schemas, including `status-request.schema.json`.
 
 Run: `rtk cargo test -p kiteframe-contract --test service_contract`
 
@@ -302,7 +307,7 @@ rtk git commit -m "feat: expose immutable resolved agents to python"
 
 **Interfaces:**
 - Consumes: Rust service contracts and Wave 2 golden fixtures.
-- Produces: frozen Python `CapabilityGrantSet`, `InvocationOutcome`, and `InvocationStatus`; generated `_native.pyi`.
+- Produces: frozen Python `CapabilityGrantSet`, structured `InvocationOutcome` and `InvocationStatus`, and generated `_native.pyi`.
 
 - [ ] **Step 1: Write failing golden and stub-drift tests**
 
@@ -334,7 +339,7 @@ Expected: FAIL because service projections and generated stubs are incomplete.
 
 - [ ] **Step 3: Add frozen service projections**
 
-Expose scalar getters, tuple grants, stable outcome variants, and `canonical_json()` for all provider response types. Do not expose Python setters, `__dict__`, pickle reconstruction, or constructors.
+Expose scalar getters, tuple grants, explicit variant discriminants and typed per-variant fields, and `canonical_json()` for all provider response types. An adapter must be able to branch on and consume succeeded results, stable failures/denials, suspensions, deferred IDs, pending statuses, and outcome-unknown diagnostics without parsing canonical JSON. Do not expose Python setters, `__dict__`, pickle reconstruction, or constructors.
 
 ```rust
 #[pyclass(frozen, immutable_type, module = "kiteframe._native")]
@@ -485,8 +490,8 @@ rtk git commit -m "feat: add frozen component registry"
 - Create: `python/kiteframe/tests/test_native_provider_requests.py`
 
 **Interfaces:**
-- Consumes: Rust-owned `CatalogRequest`, `AdmissionRequest`, `InvocationRequest`, `CapabilityCatalog`, canonical JSON, locked schemas, diagnostics, and the existing schema-first native response boundary.
-- Produces: frozen native `CatalogRequest`, `AdmissionRequest`, `InvocationRequest`, and `CapabilityCatalog`; `CatalogRequest.default()`; and canonical-only `load_catalog_request(...)`, `load_admission_request(...)`, `load_invocation_request(...)`, and `load_capability_catalog(...)` entrypoints.
+- Consumes: Rust-owned `CatalogRequest`, `AdmissionRequest`, `InvocationRequest`, `StatusRequest`, `CapabilityCatalog`, canonical JSON, locked schemas, diagnostics, and the existing schema-first native response boundary.
+- Produces: frozen native `CatalogRequest`, `AdmissionRequest`, `InvocationRequest`, `StatusRequest`, and `CapabilityCatalog`; native `build_catalog_request(trace_context)` and `build_status_request(invocation_id, trace_context)` factories; and canonical-only `load_catalog_request(...)`, `load_admission_request(...)`, `load_invocation_request(...)`, `load_status_request(...)`, and `load_capability_catalog(...)` entrypoints.
 
 - [ ] **Step 1: Write failing native request and catalog boundary tests**
 
@@ -494,16 +499,20 @@ rtk git commit -m "feat: add frozen component registry"
 import pytest
 from kiteframe import (
     CatalogRequest,
+    build_catalog_request,
     load_admission_request,
     load_capability_catalog,
     load_invocation_request,
+    load_status_request,
 )
 
 
 def test_catalog_request_is_factory_only_and_canonical() -> None:
     with pytest.raises(TypeError):
         CatalogRequest()  # type: ignore[call-arg]
-    assert CatalogRequest.default().canonical_json()
+    request = build_catalog_request(valid_trace_context())
+    assert request.trace_context.traceparent == VALID_TRACEPARENT
+    assert request.canonical_json()
 
 
 def test_provider_requests_are_frozen_and_reject_noncanonical_bytes(valid_invocation: bytes) -> None:
@@ -518,6 +527,14 @@ def test_catalog_loader_rejects_schema_invalid_output(schema_invalid_catalog: by
     with pytest.raises(Exception) as error:
         load_capability_catalog(schema_invalid_catalog)
     assert error.value.code == "KF-CAP-002"
+
+
+def test_status_request_is_native_frozen_and_carries_trace(valid_status: bytes) -> None:
+    request = load_status_request(valid_status)
+    assert request.invocation_id == "inv-1"
+    assert request.trace_context.traceparent == VALID_TRACEPARENT
+    with pytest.raises(AttributeError):
+        request.invocation_id = "forged"  # type: ignore[misc]
 ```
 
 - [ ] **Step 2: Run the focused boundary tests**
@@ -528,7 +545,7 @@ Expected: FAIL because native request/catalog projections and loaders do not exi
 
 - [ ] **Step 3: Add frozen request/catalog projections and canonical loaders**
 
-Expose only read-only scalar/tuple properties plus `canonical_json() -> bytes`. `CatalogRequest.default()` is the sole public factory for its empty request; no native request/catalog class receives a public `#[new]` method. Every `load_*` entrypoint must deserialize only canonical bytes, validate the corresponding checked-in locked schema before typed Rust deserialization, and map parse, schema, and contract failures to redacted `KiteframeDiagnosticError` with stable code `KF-CAP-002`.
+Expose only read-only scalar/tuple properties plus `canonical_json() -> bytes`. Native factories require explicit `TraceContext` for catalog and status requests; no native request/catalog class receives a public `#[new]` method. `StatusRequest` exposes its invocation ID and native trace context. Every `load_*` entrypoint must deserialize only canonical bytes, validate the corresponding checked-in locked schema before typed Rust deserialization, and map parse, schema, and contract failures to redacted `KiteframeDiagnosticError` with stable code `KF-CAP-002`.
 
 `CapabilityCatalog` validation uses the existing Rust catalog validator; Python must not parse descriptors, negotiate features, compute catalog digests, or select versions. `AdmissionRequest` and `InvocationRequest` preserve the Rust request invariants already enforced by their typed deserializers.
 
@@ -581,7 +598,7 @@ async def test_client_does_not_follow_redirects() -> None:
     )
     client = ProviderHttpClient("https://provider.test", transport=transport)
     with pytest.raises(ProviderTransportError, match="redirect"):
-        await client.catalog(CatalogRequest.default())
+        await client.catalog(valid_catalog_request())
 
 
 @pytest.mark.asyncio
@@ -591,6 +608,14 @@ async def test_invalid_result_never_reaches_caller() -> None:
     with pytest.raises(KiteframeDiagnosticError) as error:
         await client.invoke(valid_invocation_request())
     assert error.value.code == "KF-CAP-002"
+
+
+@pytest.mark.asyncio
+async def test_status_propagates_native_trace_context() -> None:
+    transport, captured = capturing_status_transport("valid-invocation-status.json")
+    client = ProviderHttpClient("https://provider.test", transport=transport)
+    await client.status(valid_status_request())
+    assert captured.headers["traceparent"] == VALID_TRACEPARENT
 
 
 def test_baggage_drops_sensitive_and_unlisted_keys() -> None:
@@ -619,9 +644,9 @@ class AdmissionProvider(Protocol):
 class CapabilityInvoker(Protocol):
     async def invoke(self, request: InvocationRequest) -> InvocationOutcome: ...
 
-    # V1 status lookups carry only an invocation ID and are exempt from caller
-    # trace propagation; no ambient trace state may be invented.
-    async def status(self, invocation_id: str) -> InvocationStatus: ...
+    # Status is a fully traced provider call. The native request carries the
+    # invocation ID and W3C context; no ambient trace state may be invented.
+    async def status(self, request: StatusRequest) -> InvocationStatus: ...
 ```
 
 Protocols accept and return native immutable classes; they do not accept unvalidated dictionaries.
@@ -650,13 +675,13 @@ class ProviderHttpClient:
         self._baggage_allowlist = baggage_allowlist
 ```
 
-Implement only the four V1 routes. Reject every 3xx response, cap response bodies at the provider-response limit, parse structured diagnostic bodies for non-2xx statuses, and send canonical JSON bytes from native request objects. Non-2xx exceptions retain only enum-controlled diagnostic fields and the stable code; all provider free-form values, raw bodies, and exception causes are removed. Restrict status IDs to the native nonblank grammar and reject HTTP dot segments. Accept only W3C traceparent version `00` and an explicitly documented canonical tracestate subset.
+Implement only the four V1 routes. Reject every 3xx response, cap response bodies at the provider-response limit, parse structured diagnostic bodies for non-2xx statuses, and send canonical JSON bytes from native request objects where the profile has a body. Status derives its encoded path ID and W3C headers from `StatusRequest`. Non-2xx exceptions retain only enum-controlled diagnostic fields and the stable code; all provider free-form values, raw bodies, and exception causes are removed. Restrict status IDs to the native nonblank grammar and reject HTTP dot segments. Accept only W3C traceparent version `00` and an explicitly documented canonical tracestate subset.
 
 - [ ] **Step 5: Run client tests**
 
 Run from `python/kiteframe`: `rtk uv run --project . pytest tests/provider/test_http_client.py -q`
 
-Expected: PASS for catalog ETag, admission, invocation, status, redirects, TLS and mock-transport restrictions, body limits, W3C syntax and propagation, baggage filtering, redacted structured diagnostics without retained causes, and invalid response bodies.
+Expected: PASS for catalog ETag, admission, invocation, status, redirects, TLS and mock-transport restrictions, body limits, W3C syntax and propagation on all four calls, baggage filtering, redacted structured diagnostics without retained causes, and invalid response bodies.
 
 - [ ] **Step 6: Commit the provider client boundary**
 
@@ -754,8 +779,15 @@ rtk git commit -m "test: gate cross-language contract integrity"
 ## Wave 3 Exit Criteria
 
 - Every Python-visible IR, grant, outcome, and status object is frozen, non-constructible, and backed by a validated Rust value.
+- Outcomes and statuses expose structured native variants and fields; consumers never need `json.loads(canonical_json())` to interpret them.
 - Canonical IR and all four digest values round-trip byte-for-byte through Python.
 - Generated stubs and JSON Schemas fail CI on drift.
 - A frozen component registry rejects duplicate, absent, and wrong-kind symbols and does not leak values across instances.
-- The HTTP client implements only the four standardized routes, never follows redirects, requires TLS, filters baggage, and parses all responses through Rust.
+- The HTTP client implements only the four standardized routes, never follows redirects, requires TLS, filters baggage, propagates native W3C context on all four calls including `StatusRequest`, and parses all responses through Rust.
 - Provider-native invalid outputs and sensitive diagnostic inputs never reach adapter code or public error text.
+
+## Post-Implementation Exit Status
+
+This exit is **unpassed** at merged implementation `54a2175`. Wave 3R owns the mandatory repairs and supersedes the provisional Wave 3 consumer freeze with `ResolvedRuntimeInputs`; `ResolvedCapabilityRequirement` embedding its exact `LockedCapability` and exposing descriptor/digests; structured native outcomes/statuses; `EffectiveCapabilityGrant`; `AuthorityRevisionSet`; `StatusRequest`; `CatalogFetchResult`; `ProviderAuthenticator`; and `Suspension` carrying checkpoint reference, evidence kind, protected evidence-request reference, and proposal digest.
+
+Waves 4 and 5 MUST NOT start until [`Wave 3R`](2026-07-28-kiteframe-v1-wave-3r-contract-closure.md) passes. This note records the failed exit and closure owner; it does not rewrite the historical Wave 3 implementation as if those repairs were already present.
