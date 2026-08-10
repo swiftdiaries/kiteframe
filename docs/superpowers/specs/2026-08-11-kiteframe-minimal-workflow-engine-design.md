@@ -1,6 +1,6 @@
 # Kiteframe Minimal Workflow Engine Design
 
-- **Status:** Approved in brainstorming; pending written-spec review
+- **Status:** Approved; implementation not started
 - **Date:** 2026-08-11
 - **Repository:** `swiftdiaries/kiteframe`
 - **Scope:** Clean replacement of the current Kiteframe architecture
@@ -45,8 +45,8 @@ model-authored per-request graph direction recorded by the 2026-08-04 design
 state audit. It does not claim that this replacement is already implemented.
 
 The current implementation remains historical evidence until the replacement
-lands. Implementation planning begins only after this written specification is
-reviewed and approved.
+lands. The user approved autonomous implementation planning on 2026-08-11;
+that approval does not authorize implementation itself.
 
 ## Normative language
 
@@ -274,6 +274,10 @@ coercions, or arbitrary JSON escape hatch. Literals are limited to strings,
 numbers, booleans, and `null` for optional values. An omitted optional argument
 is bound as `null`.
 
+On strict function-tool wires, every object property is listed as required.
+`T?` is encoded as the single permitted type union, `[T, "null"]`; omission is
+normalized to an explicit `null` before a value reaches the provider.
+
 Tool input and output JSON Schemas MUST fit the same closed subset: objects with
 named properties, required fields, primitive values, homogeneous arrays, and
 string or numeric enums. Unsupported schema features make the tool unavailable
@@ -290,12 +294,13 @@ Every task declares:
 - one or more named, typed outcome clauses.
 
 At inference time Kiteframe adds one internal `complete_task` function tool.
-Its portable wire schema is one closed object containing an `outcome` string
-enum plus the union of every outcome field as optional properties. Kiteframe
-then validates that exactly the fields required by the selected outcome are
-present and that fields belonging only to other outcomes are absent. This
-represents a task-local tagged union without requiring provider support for
-JSON Schema `oneOf` or discriminators.
+Its portable wire schema is one closed object containing a required `outcome`
+string enum plus the union of every outcome field. Every union field is required
+but nullable. Kiteframe then validates that fields required by the selected
+outcome are non-null, its optional fields have their declared value or `null`,
+and fields belonging only to other outcomes are `null`. This represents a
+task-local tagged union without requiring provider support for JSON Schema
+`oneOf` or discriminators.
 
 A task remains active across ordinary model and tool turns until the model
 calls `complete_task` with a valid outcome. Invalid output is returned to the
@@ -848,8 +853,6 @@ advance.
 
 ## Implementation-planning boundary
 
-This specification defines the replacement contract. It does not authorize
-implementation before written review. After approval, the implementation plan
-should deliver the replacement in cumulative, independently reviewable slices,
-fully detailing only the next active slice rather than recreating the previous
-large speculative wave structure.
+This specification defines the approved replacement contract. Its implementation
+plan should deliver the replacement in cumulative, independently reviewable
+slices rather than recreating the previous large speculative wave structure.
