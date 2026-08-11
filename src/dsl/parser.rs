@@ -14,17 +14,18 @@ pub struct ParseLimits {
 }
 
 pub fn parse(source: &str, limits: ParseLimits) -> Result<SourceFile, Vec<Diagnostic>> {
-    if limits.max_diagnostics == 0 {
-        return Err(Vec::new());
-    }
     if source.len() > limits.max_source_bytes {
-        return Err(vec![Diagnostic::new(
-            "source exceeds configured byte limit",
-            Span {
-                start: limits.max_source_bytes,
-                end: source.len(),
-            },
-        )]);
+        return Err(if limits.max_diagnostics == 0 {
+            Vec::new()
+        } else {
+            vec![Diagnostic::new(
+                "source exceeds configured byte limit",
+                Span {
+                    start: limits.max_source_bytes,
+                    end: source.len(),
+                },
+            )]
+        });
     }
     let tokens = lex(
         source,
@@ -37,20 +38,13 @@ pub fn parse(source: &str, limits: ParseLimits) -> Result<SourceFile, Vec<Diagno
         position: 0,
         diagnostics: Vec::new(),
         limits,
+        had_error: false,
     };
     let value = parser.source_file(source.len());
-    if parser.diagnostics.is_empty() {
-        value.ok_or_else(|| {
-            vec![Diagnostic::new(
-                "missing workflow declaration",
-                Span {
-                    start: 0,
-                    end: source.len(),
-                },
-            )]
-        })
-    } else {
+    if parser.had_error {
         Err(parser.diagnostics)
+    } else {
+        value.ok_or_else(Vec::new)
     }
 }
 
@@ -59,12 +53,14 @@ struct Parser {
     position: usize,
     diagnostics: Vec<Diagnostic>,
     limits: ParseLimits,
+    had_error: bool,
 }
 
 impl Parser {
     fn source_file(&mut self, source_len: usize) -> Option<SourceFile> {
         let mut records = Vec::new();
         let mut workflow = None;
+        let mut saw_workflow = false;
         let mut tasks = Vec::new();
         while !self.at_eof() {
             if self.keyword("type") {
@@ -72,14 +68,16 @@ impl Parser {
                     records.push(record);
                 }
             } else if self.keyword("workflow") {
+                let declaration_span = self.previous_span();
                 let item = self.workflow();
-                if workflow.is_some() {
+                if saw_workflow {
                     self.error(
                         "a source file contains exactly one workflow",
-                        self.previous_span(),
+                        declaration_span,
                     );
                 } else {
                     workflow = item;
+                    saw_workflow = true;
                 }
             } else if self.keyword("task") {
                 if let Some(task) = self.task() {
@@ -93,7 +91,18 @@ impl Parser {
                 self.advance();
             }
         }
-        let workflow = workflow?;
+        let Some(workflow) = workflow else {
+            if !saw_workflow {
+                self.error(
+                    "a source file contains exactly one workflow",
+                    Span {
+                        start: 0,
+                        end: source_len,
+                    },
+                );
+            }
+            return None;
+        };
         if tasks.is_empty() {
             self.error("a source file requires at least one task", workflow.span);
         }
@@ -192,7 +201,16 @@ impl Parser {
             }
         }
         self.expect_rbrace();
-        let entry = entry?;
+        let Some(entry) = entry else {
+            self.error(
+                "workflow requires a start declaration",
+                Span {
+                    start,
+                    end: self.previous_span().end,
+                },
+            );
+            return None;
+        };
         Some(WorkflowAst {
             name,
             inputs,
@@ -637,6 +655,7 @@ impl Parser {
         }
     }
     fn error(&mut self, message: &str, span: Span) {
+        self.had_error = true;
         if self.diagnostics.len() < self.limits.max_diagnostics {
             self.diagnostics.push(Diagnostic::new(message, span));
         }

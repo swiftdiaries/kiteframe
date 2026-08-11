@@ -61,17 +61,43 @@ fn parses_the_approved_support_workflow_with_every_control_operation() {
 }
 
 #[test]
+fn parses_valid_workflows_when_diagnostics_are_suppressed() {
+    assert!(parse(
+        "workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }",
+        ParseLimits {
+            max_diagnostics: 0,
+            ..limits()
+        },
+    )
+    .is_ok());
+}
+
+#[test]
+fn rejects_a_second_workflow_even_when_the_first_is_incomplete() {
+    let errors = parse(
+        "workflow incomplete() -> string {} workflow valid() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }",
+        limits(),
+    )
+    .expect_err("workflow cardinality is based on declarations, not successful AST construction");
+
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.message.contains("exactly one workflow"))
+    );
+}
+
+#[test]
 fn rejects_hostile_inputs_with_bounded_diagnostics() {
     let errors = parse(
         r#"workflow one() -> string { start task() }
-workflow two() -> string { start task() }
-task task() -> string { prompt \"\"\"unterminated tools [] on ok() { done \"x\" } }"#,
+task task() -> string { prompt """unterminated tools [] on ok() { done "x" } }"#,
         ParseLimits {
             max_diagnostics: 2,
             ..limits()
         },
     )
-    .expect_err("duplicate workflows and unterminated prompts are invalid");
+    .expect_err("unterminated triple-quoted prompts are invalid");
 
     assert!(!errors.is_empty());
     assert!(errors.len() <= 2);
@@ -80,12 +106,22 @@ task task() -> string { prompt \"\"\"unterminated tools [] on ok() { done \"x\" 
             .iter()
             .all(|error| error.span.start <= error.span.end)
     );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.message.contains("unterminated triple-quoted prompt"))
+    );
 
-    assert!(parse(
-        r#"workflow w() -> string { start t() } task t() -> string { prompt \"bad\\q\" tools [] on ok() { done \"x\" } }"#,
+    let invalid_escape = parse(
+        r#"workflow w() -> string { start t() } task t() -> string { prompt "bad\q" tools [] on ok() { done "x" } }"#,
         limits(),
     )
-    .is_err());
+    .expect_err("invalid quoted escapes are invalid");
+    assert!(
+        invalid_escape
+            .iter()
+            .any(|error| error.message.contains("invalid string escape"))
+    );
 
     let zero_budget = parse(
         "source that is longer than the configured limit",

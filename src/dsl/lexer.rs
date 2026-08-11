@@ -40,12 +40,13 @@ pub(crate) fn lex(
         max_tokens,
         max_identifier_bytes,
         max_diagnostics,
+        had_error: false,
     };
     lexer.run();
-    if lexer.diagnostics.is_empty() {
-        Ok(lexer.tokens)
-    } else {
+    if lexer.had_error {
         Err(lexer.diagnostics)
+    } else {
+        Ok(lexer.tokens)
     }
 }
 
@@ -57,11 +58,12 @@ struct Lexer<'a> {
     max_tokens: usize,
     max_identifier_bytes: usize,
     max_diagnostics: usize,
+    had_error: bool,
 }
 
 impl Lexer<'_> {
     fn run(&mut self) {
-        while self.offset < self.source.len() && self.diagnostics.len() < self.max_diagnostics {
+        while self.offset < self.source.len() {
             self.skip_whitespace();
             if self.offset == self.source.len() {
                 break;
@@ -149,15 +151,13 @@ impl Lexer<'_> {
                 );
             }
         }
-        if self.diagnostics.is_empty() {
-            self.push(
-                TokenKind::Eof,
-                Span {
-                    start: self.offset,
-                    end: self.offset,
-                },
-            );
-        }
+        self.push(
+            TokenKind::Eof,
+            Span {
+                start: self.offset,
+                end: self.offset,
+            },
+        );
     }
 
     fn skip_whitespace(&mut self) {
@@ -331,6 +331,7 @@ impl Lexer<'_> {
         }
     }
     fn error(&mut self, message: &str, span: Span) {
+        self.had_error = true;
         if self.diagnostics.len() < self.max_diagnostics {
             self.diagnostics.push(Diagnostic::new(message, span));
         }
