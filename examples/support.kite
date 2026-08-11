@@ -1,0 +1,78 @@
+type Evidence {
+  source: string
+  summary: string
+  references: [string]
+}
+
+workflow support(ticket: string) -> string {
+  start triage(ticket: ticket)
+
+  limits {
+    steps: 100
+    model_turns_per_task: 12
+    parallel_branches: 4
+    active_execution_seconds: 300
+  }
+}
+
+task triage(ticket: string, clarification: string?) -> string {
+  prompt """
+  Understand the ticket. Resolve it, request investigation,
+  or ask the user for one missing detail.
+  """
+
+  tools [search_docs]
+
+  on resolved(answer: string) {
+    done answer
+  }
+
+  on investigate(query: string) {
+    parallel {
+      logs = call inspect_logs(query: query)
+      metrics = call inspect_metrics(query: query)
+    }
+
+    goto compose(ticket: ticket, logs: logs, metrics: metrics)
+  }
+
+  on clarify(question: string) {
+    answer = ask string question
+    goto triage(ticket: ticket, clarification: answer)
+  }
+}
+
+task inspect_logs(query: string) -> Evidence {
+  prompt """Find log evidence relevant to the query."""
+  tools [search_logs]
+
+  on found(evidence: Evidence) {
+    done evidence
+  }
+
+  on unavailable(reason: string) {
+    fail "logs_unavailable" reason
+  }
+}
+
+task inspect_metrics(query: string) -> Evidence {
+  prompt """Find metric evidence relevant to the query."""
+  tools [search_metrics]
+
+  on found(evidence: Evidence) {
+    done evidence
+  }
+
+  on unavailable(reason: string) {
+    fail "metrics_unavailable" reason
+  }
+}
+
+task compose(ticket: string, logs: Evidence, metrics: Evidence) -> string {
+  prompt """Compose a concise answer from the supplied evidence."""
+  tools []
+
+  on composed(answer: string) {
+    done answer
+  }
+}
