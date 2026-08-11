@@ -1,1 +1,0 @@
-Shared portable prompt.

@@ -1,1 +1,0 @@
-Manifest collision fixture.
