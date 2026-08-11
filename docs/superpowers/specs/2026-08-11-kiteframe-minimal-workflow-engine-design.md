@@ -1,6 +1,6 @@
 # Kiteframe Minimal Workflow Engine Design
 
-- **Status:** Draft for review; implementation not started
+- **Status:** Approved; implementation not started
 - **Date:** 2026-08-11
 - **Repository:** `swiftdiaries/kiteframe`
 - **Scope:** Clean replacement of the current Kiteframe architecture
