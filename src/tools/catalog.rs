@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use crate::{Capability, CatalogEpochId, ClosedSchema, SessionId, canonical_sha256};
+use async_trait::async_trait;
 
 use super::{BoundTool, CatalogTool, EffectKind, RecoverySupport, ToolError, ToolResolver};
 
@@ -188,6 +189,7 @@ impl InProcessToolRegistry {
     }
 }
 
+#[async_trait]
 impl ToolResolver for InProcessToolRegistry {
     fn bound_tool(
         &self,
@@ -215,6 +217,21 @@ impl ToolResolver for InProcessToolRegistry {
             });
         }
         Ok(Arc::clone(tool))
+    }
+
+    async fn invoke(
+        &self,
+        session: SessionId,
+        qualified_name: &str,
+        descriptor_digest: &str,
+        call: super::ToolCall,
+    ) -> Result<serde_json::Value, ToolError> {
+        if call.session_id != session {
+            return Err(ToolError::UnknownSession(session));
+        }
+        let tool = self.bound_tool(session, qualified_name, descriptor_digest)?;
+        call.verify_target(tool.descriptor())?;
+        tool.invoke(call).await
     }
 }
 

@@ -23,19 +23,41 @@ pub struct ToolCall {
 }
 
 #[derive(Clone, Debug)]
-pub struct ValidatedArguments(Value);
+pub struct ValidatedArguments {
+    target_qualified_name: String,
+    target_descriptor_digest: String,
+    value: Value,
+}
 
 impl ValidatedArguments {
     pub fn for_tool(tool: &CatalogTool, arguments: Value) -> Result<Self, ToolError> {
+        tool.verify_descriptor_digest()?;
         tool.input()
             .validate(&arguments)
             .map_err(ToolError::InvalidArguments)?;
-        Ok(Self(arguments))
+        Ok(Self {
+            target_qualified_name: tool.qualified_name().to_owned(),
+            target_descriptor_digest: tool.descriptor_digest().to_owned(),
+            value: arguments,
+        })
     }
 
     #[must_use]
     pub const fn as_json(&self) -> &Value {
-        &self.0
+        &self.value
+    }
+
+    fn verify_target(&self, tool: &CatalogTool) -> Result<(), ToolError> {
+        tool.verify_descriptor_digest()?;
+        if self.target_qualified_name == tool.qualified_name()
+            && self.target_descriptor_digest == tool.descriptor_digest()
+        {
+            Ok(())
+        } else {
+            Err(ToolError::ToolContractChanged {
+                qualified_name: tool.qualified_name().to_owned(),
+            })
+        }
     }
 }
 
@@ -63,6 +85,10 @@ impl ToolCall {
     #[must_use]
     pub const fn arguments(&self) -> &ValidatedArguments {
         &self.arguments
+    }
+
+    pub(crate) fn verify_target(&self, tool: &CatalogTool) -> Result<(), ToolError> {
+        self.arguments.verify_target(tool)
     }
 }
 
@@ -116,6 +142,7 @@ pub trait BoundTool: Send + Sync {
     async fn status(&self, key: &IdempotencyKey) -> Result<ToolStatus, ToolError>;
 }
 
+#[async_trait]
 pub trait ToolResolver: Send + Sync {
     fn bound_tool(
         &self,
@@ -123,4 +150,12 @@ pub trait ToolResolver: Send + Sync {
         qualified_name: &str,
         descriptor_digest: &str,
     ) -> Result<Arc<dyn BoundTool>, ToolError>;
+
+    async fn invoke(
+        &self,
+        session: SessionId,
+        qualified_name: &str,
+        descriptor_digest: &str,
+        call: ToolCall,
+    ) -> Result<Value, ToolError>;
 }
