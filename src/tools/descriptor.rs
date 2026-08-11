@@ -45,15 +45,15 @@ impl RecoverySupport {
 
 #[derive(Clone, Debug)]
 pub struct CatalogTool {
-    pub qualified_name: String,
-    pub server_alias: String,
-    pub description: String,
-    pub input: ClosedSchema,
-    pub output: ClosedSchema,
-    pub descriptor_digest: String,
-    pub capabilities: BTreeSet<Capability>,
-    pub effect: EffectKind,
-    pub recovery: RecoverySupport,
+    qualified_name: String,
+    server_alias: String,
+    description: String,
+    input: ClosedSchema,
+    output: ClosedSchema,
+    descriptor_digest: String,
+    capabilities: BTreeSet<Capability>,
+    effect: EffectKind,
+    recovery: RecoverySupport,
 }
 
 impl CatalogTool {
@@ -104,7 +104,12 @@ impl CatalogTool {
         self.output
             .validate_definition()
             .map_err(ToolError::UnsupportedSchema)?;
-        if self.effect == EffectKind::Effectful && self.recovery == RecoverySupport::Unsupported {
+        if self.effect == EffectKind::Effectful
+            && !matches!(
+                self.recovery,
+                RecoverySupport::Status | RecoverySupport::Compensation
+            )
+        {
             return Err(ToolError::UnsafeEffectRecovery(self.qualified_name.clone()));
         }
         Ok(())
@@ -141,5 +146,50 @@ impl CatalogTool {
             "effect": self.effect.normalized_name(),
             "recovery": self.recovery.normalized_name(),
         })
+    }
+
+    #[must_use]
+    pub fn qualified_name(&self) -> &str {
+        &self.qualified_name
+    }
+
+    #[must_use]
+    pub fn server_alias(&self) -> &str {
+        &self.server_alias
+    }
+
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+
+    #[must_use]
+    pub const fn input(&self) -> &ClosedSchema {
+        &self.input
+    }
+
+    #[must_use]
+    pub const fn output(&self) -> &ClosedSchema {
+        &self.output
+    }
+
+    #[must_use]
+    pub fn descriptor_digest(&self) -> &str {
+        &self.descriptor_digest
+    }
+
+    #[must_use]
+    pub const fn capabilities(&self) -> &BTreeSet<Capability> {
+        &self.capabilities
+    }
+
+    #[must_use]
+    pub const fn effect(&self) -> EffectKind {
+        self.effect
+    }
+
+    #[must_use]
+    pub const fn recovery(&self) -> RecoverySupport {
+        self.recovery
     }
 }

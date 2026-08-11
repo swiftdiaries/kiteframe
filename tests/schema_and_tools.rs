@@ -1,11 +1,32 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use kiteframe::{
-    Capability, CatalogTool, ClosedSchema, EffectKind, InProcessToolRegistry, RecoverySupport,
-    Secret, SessionId, ToolCatalogSnapshot, canonical_sha256,
+    BoundTool, Capability, CatalogTool, ClosedSchema, EffectKind, FrameId, IdempotencyKey,
+    InProcessToolRegistry, PolicyRevision, RecoverySupport, RunId, Secret, SessionId, ToolCall,
+    ToolCatalogSnapshot, ToolError, ToolResolver, ToolStatus, canonical_sha256,
 };
 use serde_json::json;
 use uuid::Uuid;
+
+struct TestBoundTool {
+    descriptor: CatalogTool,
+}
+
+#[async_trait::async_trait]
+impl BoundTool for TestBoundTool {
+    fn descriptor(&self) -> &CatalogTool {
+        &self.descriptor
+    }
+
+    async fn invoke(&self, _call: ToolCall) -> Result<serde_json::Value, ToolError> {
+        Ok(json!({}))
+    }
+
+    async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
+        Ok(ToolStatus::Succeeded)
+    }
+}
 
 fn object_schema() -> ClosedSchema {
     ClosedSchema::object(
@@ -83,7 +104,7 @@ fn descriptor_digest_is_canonical_across_property_insertion_order() {
     )
     .expect("descriptor is valid");
 
-    assert_eq!(first.descriptor_digest, second.descriptor_digest);
+    assert_eq!(first.descriptor_digest(), second.descriptor_digest());
     assert_eq!(
         canonical_sha256(&json!({"b": 2, "a": 1})).expect("canonical JSON"),
         "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777"
@@ -113,6 +134,21 @@ fn effectful_tools_require_recovery_support() {
 }
 
 #[test]
+fn effectful_tools_reject_not_required_recovery() {
+    let result = CatalogTool::new(
+        "billing/charge",
+        "billing",
+        "Charges a payment method.",
+        object_schema(),
+        ClosedSchema::object("charge_output", BTreeMap::new()),
+        BTreeSet::new(),
+        EffectKind::Effectful,
+        RecoverySupport::NotRequired,
+    );
+    assert!(result.is_err());
+}
+
+#[test]
 fn unknown_mcp_tools_default_to_mcp_unknown() {
     let registry = InProcessToolRegistry::new();
     let tool = registry
@@ -124,8 +160,11 @@ fn unknown_mcp_tools_default_to_mcp_unknown() {
             object_schema(),
         )
         .expect("valid unknown MCP descriptor");
-    assert_eq!(tool.qualified_name, "files/read");
-    assert_eq!(tool.capabilities, BTreeSet::from([Capability::McpUnknown]));
+    assert_eq!(tool.qualified_name(), "files/read");
+    assert_eq!(
+        tool.capabilities(),
+        &BTreeSet::from([Capability::McpUnknown])
+    );
 }
 
 #[test]
@@ -139,7 +178,10 @@ fn model_visible_tools_are_the_intersection_of_visibility_and_pinned_bindings() 
     let tools = catalog
         .model_visible_tools(
             &BTreeSet::from(["docs/search".to_owned()]),
-            &BTreeMap::from([("docs/search".to_owned(), visible.descriptor_digest.clone())]),
+            &BTreeMap::from([(
+                "docs/search".to_owned(),
+                visible.descriptor_digest().to_owned(),
+            )]),
         )
         .expect("visible tool has the immutable binding's exact digest");
 
@@ -170,4 +212,51 @@ fn untrusted_capability_tags_are_rejected() {
 fn secret_debug_is_redacted() {
     let secret = Secret::new("do-not-log-this");
     assert_eq!(format!("{secret:?}"), "Secret([REDACTED])");
+}
+
+#[test]
+fn registry_resolves_only_tools_bound_to_the_requested_session() {
+    let registry = InProcessToolRegistry::new();
+    let tool = lookup_tool("docs/search");
+    let digest = tool.descriptor_digest().to_owned();
+    registry
+        .register(Arc::new(TestBoundTool { descriptor: tool }))
+        .expect("registry accepts a valid descriptor");
+
+    let bound_session = SessionId::new(Uuid::nil());
+    registry
+        .snapshot(
+            bound_session.clone(),
+            Uuid::nil(),
+            &BTreeSet::from(["docs/search".to_owned()]),
+            &BTreeMap::from([("docs/search".to_owned(), digest.clone())]),
+        )
+        .expect("session snapshot is valid");
+
+    assert!(
+        registry
+            .bound_tool(SessionId::new(Uuid::from_u128(1)), "docs/search", &digest)
+            .is_err()
+    );
+    assert!(
+        registry
+            .bound_tool(bound_session, "docs/search", &digest)
+            .is_ok()
+    );
+}
+
+#[test]
+fn tool_calls_reject_arguments_that_do_not_match_the_input_schema() {
+    let tool = lookup_tool("docs/search");
+    let result = ToolCall::new(
+        SessionId::new(Uuid::nil()),
+        RunId::new(Uuid::nil()),
+        FrameId::new(Uuid::nil()),
+        PolicyRevision::new(1),
+        &tool,
+        json!({"query": "first"}),
+        IdempotencyKey::new("call-1").expect("valid idempotency key"),
+    );
+
+    assert!(result.is_err());
 }

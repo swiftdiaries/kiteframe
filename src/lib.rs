@@ -13,5 +13,5 @@ pub use hash::{HashError, canonical_json, canonical_sha256};
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use tools::{
     BoundTool, CatalogTool, EffectKind, InProcessToolRegistry, RecoverySupport, ToolCall,
-    ToolCatalogSnapshot, ToolError, ToolFailure, ToolResolver, ToolStatus,
+    ToolCatalogSnapshot, ToolError, ToolFailure, ToolResolver, ToolStatus, ValidatedArguments,
 };

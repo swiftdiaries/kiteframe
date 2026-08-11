@@ -18,8 +18,52 @@ pub struct ToolCall {
     pub run_id: RunId,
     pub frame_id: FrameId,
     pub policy_revision: PolicyRevision,
-    pub arguments: Value,
+    arguments: ValidatedArguments,
     pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct ValidatedArguments(Value);
+
+impl ValidatedArguments {
+    pub fn for_tool(tool: &CatalogTool, arguments: Value) -> Result<Self, ToolError> {
+        tool.input()
+            .validate(&arguments)
+            .map_err(ToolError::InvalidArguments)?;
+        Ok(Self(arguments))
+    }
+
+    #[must_use]
+    pub const fn as_json(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl ToolCall {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session_id: SessionId,
+        run_id: RunId,
+        frame_id: FrameId,
+        policy_revision: PolicyRevision,
+        tool: &CatalogTool,
+        arguments: Value,
+        idempotency_key: IdempotencyKey,
+    ) -> Result<Self, ToolError> {
+        Ok(Self {
+            session_id,
+            run_id,
+            frame_id,
+            policy_revision,
+            arguments: ValidatedArguments::for_tool(tool, arguments)?,
+            idempotency_key,
+        })
+    }
+
+    #[must_use]
+    pub const fn arguments(&self) -> &ValidatedArguments {
+        &self.arguments
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,6 +97,8 @@ pub enum ToolError {
     ToolContractChanged { qualified_name: String },
     #[error("unknown tool: {0}")]
     UnknownTool(String),
+    #[error("unknown session")]
+    UnknownSession(SessionId),
     #[error("catalog epoch mismatch")]
     CatalogEpochMismatch(CatalogEpochId),
     #[error("invalid tool arguments: {0}")]
