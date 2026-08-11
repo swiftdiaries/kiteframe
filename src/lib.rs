@@ -5,6 +5,7 @@ pub mod dsl;
 pub mod hash;
 pub mod model;
 pub mod schema;
+pub mod store;
 pub mod tools;
 
 pub use domain::{
@@ -17,6 +18,9 @@ pub use model::{
     ResponsesClient, ResponsesConfig,
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
+pub use store::{
+    CreateSession, PolicyUpdate, PostgresStore, PublishedDefinition, SessionView, StoreError,
+};
 pub use tools::{
     BoundTool, CatalogTool, EffectKind, InProcessToolRegistry, RecoverySupport, ToolCall,
     ToolCatalogSnapshot, ToolError, ToolFailure, ToolResolver, ToolStatus, TrustedTool,
