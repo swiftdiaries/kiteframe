@@ -3,6 +3,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod domain;
 pub mod dsl;
 pub mod hash;
+pub mod mcp;
 pub mod model;
 pub mod schema;
 pub mod store;
@@ -13,6 +14,10 @@ pub use domain::{
     PrincipalId, RunId, Secret, SessionId,
 };
 pub use hash::{HashError, canonical_json, canonical_sha256};
+pub use mcp::{
+    AuthenticatedMcpPeer, CatalogRefresh, McpError, McpLimits, McpManager, McpServerConfig,
+    RemoteTool, RmcpPeer, closed_schema,
+};
 pub use model::{
     ModelClient, ModelError, ModelErrorKind, ModelRequest, ModelResponse, ModelResponseItemKind,
     ResponsesClient, ResponsesConfig,
