@@ -1,10 +1,10 @@
 # Kiteframe Minimal Workflow Engine Design
 
-- **Status:** Approved; implementation not started
+- **Status:** Draft for review; implementation not started
 - **Date:** 2026-08-11
 - **Repository:** `swiftdiaries/kiteframe`
 - **Scope:** Clean replacement of the current Kiteframe architecture
-- **Deployment:** One Rust service process and one PostgreSQL database
+- **Deployment:** One Rust harness process and one PostgreSQL database
 
 ## Executive summary
 
@@ -19,23 +19,33 @@ the current task and may finish that task only through one of its author-defined
 typed outcomes. Authors, not models, choose the task graph and every legal
 transition.
 
-V1 is one Rust binary with ordinary internal modules and PostgreSQL as its sole
-workflow authority. The model boundary is a deliberately narrow,
-OpenAI-compatible Responses protocol that can target any provider passing
-Kiteframe's conformance tests. Kiteframe sends stateless `store: false`
-requests and persists the complete ordered response-item history itself.
+V1 is one Rust harness binary with ordinary internal modules and PostgreSQL as
+its sole workflow authority. Python and TypeScript applications use first-party
+thin clients that bundle and launch that binary for local `stdio` use or connect
+to the same binary remotely. They do not embed, reimplement, or extend workflow
+semantics.
+
+The client boundary is Agent Client Protocol (ACP). Kiteframe negotiates stable
+ACP v1 and draft ACP v2 per connection, uses the official Rust SDK, and exposes
+the same Kiteframe extension methods over `stdio`, WebSocket, or Streamable HTTP.
+The model boundary remains a deliberately narrow, OpenAI-compatible Responses
+protocol. Kiteframe sends stateless `store: false` requests and persists the
+complete ordered response-item history itself.
 
 The runtime provides sequential calls, tail transitions, bounded parallel
-calls with mandatory joins, durable human questions, cancellation, typed
-failures, and crash recovery around model and tool calls. It does not provide
-distributed workers, detached agents, model-authored graphs, arbitrary code,
-provider-specific features, or a general-purpose programming language.
+calls with mandatory joins, durable human questions and permissions,
+cancellation, typed failures, principal-scoped MCP tool discovery, session
+capability policy through embedded Cedar, and crash recovery around model and
+tool calls. It does not provide distributed workers, detached agents,
+model-authored graphs, arbitrary code, provider-specific model features, or a
+general-purpose programming language.
 
 This is a clean replacement. The existing package resolver, multi-crate runtime
-architecture, Python and PyO3 layers, Deep Agents adapter, LangGraph direction,
-OpenFGA integration, and related compatibility surfaces are not carried
-forward. Historical documents and commits remain evidence of what was built;
-they are not contracts for the replacement.
+architecture, PyO3 bindings, Deep Agents adapter, LangGraph direction, OpenFGA
+integration, and related compatibility surfaces are not carried forward. The
+new Python and TypeScript packages are protocol clients for the Rust harness,
+not continuations of those runtime adapters. Historical documents and commits
+remain evidence of what was built; they are not contracts for the replacement.
 
 ## Status and supersession
 
@@ -56,7 +66,7 @@ the contracts in this document.
 
 ## Product goals
 
-V1 has seven goals:
+V1 has ten goals:
 
 1. Let an author define a typed agent workflow in one readable source file.
 2. Keep each task a small, focused model-with-tools loop with isolated context.
@@ -66,6 +76,11 @@ V1 has seven goals:
 6. Suspend durably for human input and resume idempotently.
 7. Use a small Responses-compatible model protocol without adopting an agent
    framework as the semantic core.
+8. Run one identical Rust harness behind Python, TypeScript, editor, local, and
+   remote client surfaces.
+9. Use one ACP message model over `stdio`, WebSocket, and Streamable HTTP.
+10. Apply default-deny, session-scoped Cedar policy to principal-visible MCP
+    tools before every invocation.
 
 ## Non-goals
 
@@ -78,11 +93,15 @@ V1 does not provide:
 - multiple service replicas, distributed workers, leases, fencing, or queues;
 - S3-backed workflow state or event-notification scheduling;
 - automatic transcript summarization or provider-specific compaction;
-- Python bindings, PyO3, Deep Agents, LangGraph, LangChain, or MCP integration;
+- Python or TypeScript workflow runtimes, PyO3, Deep Agents, LangGraph, or
+  LangChain integration;
 - an agent package manager, capability lockfile, or public registry;
-- OpenFGA, multi-tenant identity, or end-user account management;
+- OpenFGA, organization relationships, multi-tenant identity, deployment or
+  workspace policy scopes, or end-user account management;
 - provider-hosted tools, provider conversations, background mode, or WebSocket
   model sessions;
+- in-flight steering; steering is a separate feature with its own design and
+  implementation plan;
 - a web UI, replay debugger, or visual workflow editor;
 - automatic compensation or exactly-once effects in arbitrary external
   systems; or
@@ -110,6 +129,21 @@ Kiteframe owns task frames, transitions, joins, suspension, retries, and
 durability. A Responses-compatible provider supplies model inference and tool
 call proposals; it does not own workflow state.
 
+### One harness, many clients
+
+The Rust binary owns compilation, orchestration, persistence, model calls, tool
+dispatch, and policy enforcement. Clients own process launch, transport,
+presentation, permission interaction, and client-native MCP servers. The only
+cross-language boundary is ACP plus explicitly advertised `_kiteframe/*`
+extensions.
+
+### Discovery is not permission
+
+An authenticated MCP server decides which tools a principal can discover.
+Workflow source decides which discovered tools a task can request. Cedar then
+decides whether the current session may invoke a requested tool with validated
+arguments. A tool MUST pass all three boundaries.
+
 ### Structured concurrency only
 
 Parallel children are born under one explicit join. A parent cannot advance
@@ -128,7 +162,7 @@ compiled, versioned, deployed, and operated as one service.
 
 ## System architecture
 
-Kiteframe consists of one Rust package with these internal modules:
+Kiteframe consists of one Rust harness package with these internal modules:
 
 | Module | Responsibility |
 |---|---|
@@ -136,32 +170,274 @@ Kiteframe consists of one Rust package with these internal modules:
 | `engine` | Schedule durable turns and interpret task transitions. |
 | `store` | Own PostgreSQL transactions, migrations, claims, and recovery. |
 | `model` | Implement the Responses-compatible inference boundary. |
-| `tools` | Register descriptors, constrain presentation, dispatch calls, and recover effects. |
-| `api` | Publish workflows, start and control runs, inspect state, and stream events. |
-| `config` | Load deployment-owned database, provider, limits, credentials, and tool registry settings. |
+| `tools` | Resolve in-process and principal-scoped MCP tools, constrain presentation, dispatch calls, and recover effects. |
+| `mcp` | Connect authenticated servers, snapshot visible catalogs, receive change notifications, and call bound tools. |
+| `policy` | Compile typed session rules to Cedar, validate them against visible tool schemas, and authorize invocations. |
+| `protocol` | Negotiate ACP v1/v2, translate `_kiteframe/*` methods, and serve all transports. |
+| `config` | Load deployment-owned database, provider, limits, credentials, and trusted capability mappings. |
 
 The source tree SHOULD remain a single package:
 
 ```text
 src/
   main.rs
-  api.rs
   config.rs
   dsl/
   engine/
-  model.rs
-  store.rs
-  tools.rs
+  mcp/
+  model/
+  policy/
+  protocol/
+  store/
+  tools/
 migrations/
+clients/
+  python/
+  typescript/
 examples/
 tests/
 ```
 
-The service starts by validating configuration, applying its embedded
-PostgreSQL migrations, loading the trusted tool registry, and checking database
-readiness. It then recovers interrupted work and begins serving HTTP. Because
-V1 permits only one service process, it needs no distributed lease or fencing
-protocol.
+The harness starts by validating configuration, applying its embedded
+PostgreSQL migrations, loading in-process tools and trusted capability
+mappings, and checking database readiness. It then recovers interrupted work
+and serves either one local ACP connection over `stdio` or remote ACP
+connections on `/acp`, plus health endpoints. Because V1 permits only one
+harness process, it needs no distributed lease or fencing protocol.
+
+## Harness and client protocol
+
+### ACP versions and Rust SDK
+
+Kiteframe pins `agent-client-protocol = "=2.0.0"` and
+`agent-client-protocol-http = "=2.0.0"`. It uses the SDK protocol router to keep
+ACP v1 and v2 wire types separate while mapping both into one version-neutral
+application command layer.
+
+ACP v1 remains enabled for ecosystem compatibility. ACP v2 support is additive,
+selected only through `initialize` negotiation, and guarded by explicit runtime
+configuration while the overall v2 surface remains draft. One connection
+speaks exactly one negotiated ACP version. Unknown extension values and `_meta`
+are preserved where ACP requires forwarding or durable replay.
+
+Kiteframe advertises its custom surface in initialization metadata. Custom
+requests and notifications use the `_kiteframe/` namespace:
+
+```text
+_kiteframe/workflow/publish
+_kiteframe/run/start
+_kiteframe/run/get
+_kiteframe/run/answer
+_kiteframe/run/cancel
+_kiteframe/session/policy/update
+_kiteframe/run/event
+```
+
+Steering is intentionally absent. It will be designed as a separate extension
+without changing the V1 policy or transport contracts.
+
+### Transports
+
+All transports carry the same ACP JSON-RPC messages and lifecycle:
+
+- `stdio` is the local default. A thin client launches its bundled harness as a
+  child process and exchanges newline-delimited ACP messages.
+- WebSocket is the preferred remote profile on `GET /acp` with an upgrade.
+- Streamable HTTP is the remote fallback on the same `/acp` endpoint, using
+  POST requests and the SDK's streaming response channel.
+
+Clients try WebSocket first and fall back to Streamable HTTP only for transport
+or upgrade incompatibility. Authentication failure, policy denial, malformed
+messages, and application errors MUST NOT trigger fallback. Durable run and
+session identities survive transport disconnects; connection-local MCP
+credentials do not.
+
+### First-party thin clients and bundled binary
+
+PyPI publishes `kiteframe`, installed with `uv add kiteframe`. Each supported
+platform wheel contains the matching Rust harness executable. The Python API
+offers `Kiteframe.local(...)` for bundled `stdio` launch and
+`Kiteframe.connect(...)` for remote ACP.
+
+The npm package is also named `kiteframe`, installed with `bun add kiteframe`.
+It exports its typed API from `kiteframe/client` and resolves the harness from a
+version-matched platform package. It offers the same local and remote behavior.
+
+Client and bundled-binary versions MUST match. Initialization verifies client,
+harness, ACP, and `_kiteframe` extension versions before creating a session.
+The clients handle process lifecycle, transport fallback, typed request and
+event mapping, and permission prompts. They contain no DSL compiler, scheduler,
+model loop, policy authorizer, or durable workflow state. Bundling the binary
+does not bundle PostgreSQL; local launch still requires valid harness
+configuration and a reachable database.
+
+## Sessions, MCP catalogs, and capability policy
+
+### Durable ACP sessions
+
+ACP v1 `session/new` and `session/load`, and ACP v2 `session/new`,
+`session/list`, `session/resume`, and `session/close`, map to a version-neutral
+`HarnessSession` stored in PostgreSQL. ACP v1 has no standard list or close
+method; a v1 client retains a known session ID for `session/load`, and the
+harness applies deployment-owned retention rather than inventing incompatible
+replacement methods. A session owns its principal binding, working directory,
+MCP server bindings, catalog epochs, typed capability policy, accumulated
+permission decisions, and runs. One session has one validated principal
+binding in V1; changing the principal or MCP credentials requires reconnecting
+and creating a fresh catalog epoch.
+
+Secrets used to authenticate MCP connections are connection-local. They MUST
+NOT be written to PostgreSQL, events, diagnostics, or logs. A resumed client
+must supply fresh MCP connection configuration. The harness reconnects and
+re-lists tools before allowing affected runs to advance.
+
+### Principal-scoped MCP discovery
+
+`tools/list` is evaluated through the authenticated MCP connection and MAY
+return a different catalog for each invoking principal. Kiteframe MUST NOT
+fetch an administrator or global superset and then rely on Cedar to hide it.
+Tool names, descriptions, and schemas may themselves be sensitive.
+
+For every configured MCP server, session creation or resume:
+
+1. establishes an authenticated connection without taking identity from tool
+   arguments or mutable request data;
+2. follows every `tools/list` pagination cursor under configured count and byte
+   limits;
+3. qualifies each name as `<server-alias>/<tool-name>` and rejects collisions;
+4. validates each descriptor against Kiteframe's closed schema subset;
+5. stores a canonical descriptor snapshot and digest as a new catalog epoch;
+6. generates and validates the session's Cedar action schema from exactly that
+   visible snapshot; and
+7. records only a non-secret connection binding identity with the epoch.
+
+Visibility is not invocation permission. The model-visible tool surface for a
+task is the intersection of the principal-visible catalog and the immutable
+workflow definition's declared tools and descriptor hashes. Cedar is evaluated
+only after the model proposes a validated call, immediately before invocation.
+This lets an otherwise requestable, default-denied tool produce a permission
+request. A tool is actually invoked only when discovery, workflow binding, and
+the current Cedar decision all allow it.
+
+When a server advertises tool-list change notifications, Kiteframe subscribes
+and re-lists through the same authenticated connection. Additions become
+eligible only for publications or runs created after the resulting automatic or
+explicit catalog refresh. Removal revokes future calls immediately. A
+descriptor change never mutates an active run's binding; an affected attempted
+call fails closed with `tool_contract_changed`. The MCP server remains
+responsible for authorizing every `tools/call`; Cedar is an additional
+client-side boundary, not a cache or replacement for server authorization.
+
+### Trusted capability classification
+
+Every tool has one or more capability tags, such as `fs_read`, `fs_write`,
+`shell`, `web_fetch`, `mcp`, or `mcp_unknown`. Capability policy can target a
+tag once and cover every mapped tool.
+
+An MCP descriptor's metadata MAY suggest tags but MUST NOT establish them as a
+security fact. The session configuration or deployment-owned mapping confirms
+the tags before the model sees the tool. An unmapped MCP tool receives only
+`mcp_unknown` and therefore requires an explicit exact-tool grant before use.
+The model cannot change tool tags, server bindings, policy rules, or catalog
+epochs.
+
+### Typed session policy
+
+Python and TypeScript callers submit the same versioned structure rather than
+raw Cedar text:
+
+```json
+{
+  "version": 1,
+  "rules": [
+    {
+      "ruleId": "allow-project-reads",
+      "effect": "permit",
+      "target": {
+        "type": "capability",
+        "names": ["fs_read"]
+      },
+      "input": {
+        "/root": { "oneOf": ["src", "tests"] }
+      }
+    },
+    {
+      "ruleId": "deny-shell",
+      "effect": "forbid",
+      "target": {
+        "type": "tool",
+        "names": ["workspace/run_shell"]
+      }
+    }
+  ]
+}
+```
+
+`effect` is exactly `permit` or `forbid`. `target` is a tagged union selecting
+one or more exact capability names or qualified tool names. Optional `input`
+constraints map RFC 6901 JSON Pointers to non-empty `oneOf` lists containing
+only string, integer, number, boolean, or `null` values. Every rule has a unique
+caller-chosen `ruleId`; empty selectors, unknown capabilities, invisible tools,
+unsupported input paths, duplicate IDs, and values outside the referenced tool
+schema are validation errors.
+
+The Rust harness deterministically compiles this structure into Cedar policies,
+entities, and a schema. It pins `cedar-policy = 4.12.0` and
+`cedar-policy-mcp-schema-generator = 0.6.0`. It adopts the schema-generation,
+session-context, consent, and input-restriction patterns from
+`cedar-policy/cedar-for-agents`, but does not depend on the unpublished
+`cedar-policy-agent-builder` crate.
+
+An exact-tool rule is compiled against both the qualified name and the
+descriptor digest visible when the rule is accepted. If that tool disappears,
+the rule becomes inactive; a different descriptor later using the same name
+does not inherit it. After every catalog refresh, Kiteframe deterministically
+rebuilds the active Cedar artifact: exact-tool rules activate only on their
+captured digest, while capability rules cover the current visible tools whose
+tags were confirmed by trusted configuration. Historical typed rules remain
+immutable for audit.
+
+The Cedar request uses `Kiteframe::Session::<session-id>` as principal, the
+qualified tool and descriptor digest as resource, and the exact tool action
+under its trusted capability parent actions. Context contains the validated
+input and durable run, frame, tool-call, policy-revision, and session counters.
+Cedar is default deny, and any matching `forbid` overrides permits.
+
+The immutable workflow tool list and Rust safety invariants are authority
+ceilings outside Cedar. A Cedar permit cannot add an undeclared tool, accept an
+invalid argument, bypass effect recovery, or widen an MCP server's visible
+catalog.
+
+### Permission decisions
+
+Before every ordinary tool invocation, Kiteframe evaluates the current policy
+revision. An allow proceeds. A deny caused by a matching `forbid` returns a
+stable denied tool result to the model without prompting. A default deny with
+no matching forbid creates a durable permission request and moves only that
+frame to `waiting_for_permission`; other structured parallel work may continue.
+
+The client receives the version-appropriate ACP permission request with four
+Kiteframe-defined choices:
+
+```text
+allow_once | allow_tool_for_session |
+deny_once  | deny_tool_for_session
+```
+
+An `allow_once` decision creates a permit scoped to the exact durable tool-call
+identity. `allow_tool_for_session` appends a permit for that exact qualified
+tool, its current descriptor digest, and all schema-valid inputs for the
+remainder of the session.
+`deny_once` resolves only the pending call as denied.
+`deny_tool_for_session` appends an exact-tool `forbid`. Capability-wide or
+input-constrained changes use `_kiteframe/session/policy/update` so the client
+must present the complete typed rule explicitly.
+
+Permission decisions and policy updates require client-generated idempotency
+keys. They append immutable rules, increment a monotonic policy revision, record
+metadata-only events, and wake affected frames transactionally. Policy changes
+apply to future calls and calls not yet externally invoked; they cannot cancel
+or reinterpret an external effect already in flight.
 
 ## Workflow source
 
@@ -373,9 +649,10 @@ in V1.
 
 ## Compilation and publication
 
-`POST /v1/workflows` accepts workflow source. Publication performs all parsing,
-name resolution, type checking, graph validation, limit validation, and tool
-resolution before inserting anything.
+`_kiteframe/workflow/publish` accepts workflow source inside an ACP session.
+Publication performs all parsing, name resolution, type checking, graph
+validation, limit validation, and principal-visible tool resolution before
+inserting anything.
 
 The compiler MUST reject:
 
@@ -395,19 +672,27 @@ The compiler MUST reject:
 - source or compiled definitions exceeding deployment limits.
 
 Publication stores the source, compiled definition, definition hash, and the
-descriptor hash of each referenced tool in one transaction. The definition
-hash is SHA-256 over RFC 8785 canonical JSON containing the exact UTF-8 source
-the fixed DSL version `1`, and the referenced tool descriptors ordered by tool
-name. Tool descriptor hashes use the same canonical JSON and SHA-256 rule.
-Re-publishing identical source under identical tool descriptors for the same
-workflow name returns the existing definition. A source or descriptor change
-creates the next version.
+qualified server/tool identity, catalog epoch, and descriptor hash of each
+referenced tool in one transaction. The definition hash is SHA-256 over RFC
+8785 canonical JSON containing the exact UTF-8 source, the fixed DSL version
+`1`, and the referenced tool descriptors ordered by qualified tool name. Tool
+descriptor hashes use the same canonical JSON and SHA-256 rule. Re-publishing
+identical source under identical tool descriptors for the same workflow name
+returns the existing definition. A source or descriptor change creates the
+next version.
 
-A run can start only if the active tool registry still contains every captured
-descriptor hash. A mismatch rejects run creation as an API validation error; it
-does not silently substitute a different tool contract. On restart, a mismatch
-for an active run makes readiness fail and prevents that run from advancing
-until the exact registered contract is restored.
+A definition is reusable by another session only when that session's
+principal-scoped visible catalog contains every qualified tool with the exact
+captured descriptor hash. A run stores its own immutable tool bindings. A
+mismatch rejects run creation as a `_kiteframe` validation error; it does not
+reveal other tools, silently substitute a contract, or reuse another
+principal's catalog.
+
+On restart or ACP session resume, the harness reconnects affected MCP servers
+with freshly supplied credentials and rebuilds catalog epochs. Active runs
+advance only after every bound tool is visible with the exact captured
+descriptor. A removal or digest change fails the affected call closed rather
+than making global readiness fail for unrelated sessions and runs.
 
 Compiled definitions are immutable. Existing runs always reference the exact
 definition version selected when they started.
@@ -471,26 +756,28 @@ content by default.
 A run has one of these states:
 
 ```text
-queued | running | waiting_for_answer | outcome_unknown |
-succeeded | failed | cancelled
+queued | running | waiting_for_answer | waiting_for_permission |
+outcome_unknown | succeeded | failed | cancelled
 ```
 
 A task frame has one of these states:
 
 ```text
 runnable | waiting_for_model | waiting_for_tool |
-waiting_for_children | waiting_for_answer |
+waiting_for_children | waiting_for_answer | waiting_for_permission |
 outcome_unknown | completed | failed | cancelled
 ```
 
 Only persisted state may make work runnable. In-memory futures are execution
 mechanisms, not state.
 
-Parallel branches may independently reach `ask`, so a run can have multiple
-open suspensions. The run remains `running` while any frame can still advance
-and becomes `waiting_for_answer` only when no executable work remains and one
-or more frames await answers. `GET /v1/runs/{run_id}` returns the complete list
-of open suspensions.
+Parallel branches may independently reach `ask` or a permission request, so a
+run can have multiple open suspensions. The run remains `running` while any
+frame can still advance. When no executable work remains, it becomes
+`waiting_for_answer` if only human answers are pending or
+`waiting_for_permission` if any permission is pending. `_kiteframe/run/get`
+returns every open suspension without exposing policy or tool content to a
+different session.
 
 ### Durable turn pattern
 
@@ -535,8 +822,9 @@ reports success.
 
 ### Tool interface
 
-Trusted deployment code registers tools at process startup. Each tool exposes
-three conceptual operations:
+The engine consumes one internal `BoundTool` interface implemented by either a
+trusted in-process tool or a session/principal-scoped MCP adapter. Each bound
+tool exposes three conceptual operations:
 
 ```text
 descriptor() -> ToolDescriptor
@@ -544,13 +832,24 @@ invoke(ToolCall) -> ToolResult
 status(IdempotencyKey) -> ToolStatus
 ```
 
-`ToolDescriptor` contains the stable name, description, closed input and output
-schemas, effect classification, and recovery support. `ToolCall` includes the
-run and frame identities, validated arguments, and idempotency key. `ToolResult`
-and `ToolStatus` are typed and validated before entering model context.
+`ToolDescriptor` contains the qualified stable name, visible MCP descriptor or
+in-process schema, trusted capability tags, effect classification, and recovery
+support. `ToolCall` includes session, run, frame, policy revision, validated
+arguments, and idempotency key. `ToolResult` and `ToolStatus` are typed and
+validated before entering model context.
 
-The model has no generic filesystem, shell, HTTP, code execution, or MCP tool.
-External access exists only inside trusted registered tool implementations.
+MCP does not standardize effect recovery. An MCP binding therefore needs a
+trusted session/deployment recovery profile that classifies the tool as
+read-only, idempotent, status-recoverable, or unsafe-to-retry. Server-provided
+metadata is a hint only. An effectful tool without idempotent invocation or a
+declared status operation cannot be referenced by a published workflow.
+
+An MCP invocation uses the same authenticated server binding that produced the
+principal-visible catalog. Kiteframe evaluates Cedar immediately before
+`tools/call`; the MCP server then performs its own authorization. The model has
+no generic filesystem, shell, HTTP, code execution, or unrestricted MCP
+surface. It sees only exact tools surviving discovery, workflow binding, and
+session policy.
 
 ### Structured parallelism
 
@@ -593,28 +892,41 @@ run. Cancellation performs no compensation.
 
 ## PostgreSQL persistence
 
-PostgreSQL is the only V1 workflow authority. The schema has six logical
+PostgreSQL is the only V1 workflow authority. The schema has eleven logical
 tables:
 
 | Table | Durable responsibility |
 |---|---|
+| `sessions` | ACP identity, validated principal binding, lifecycle state, working-directory metadata, current catalog and policy revisions, and timestamps. |
+| `session_policy_rules` | Immutable typed rules, their compiled Cedar form, caller idempotency key, policy revision, source, and decision metadata. |
+| `mcp_catalog_epochs` | Per-session, per-server visible descriptor snapshot, canonical digest, trusted capability mapping, and non-secret connection-binding identity. |
 | `workflow_definitions` | Immutable source, compiled form, name, version, definition hash, and tool descriptor hashes. |
-| `runs` | Definition reference, typed input, current state, revision, limits, output or failure, and timestamps. |
+| `runs` | Session and definition references, typed input, current state, revision, limits, output or failure, and timestamps. |
+| `run_tool_bindings` | Immutable qualified tool, server, catalog epoch, descriptor digest, capabilities, and recovery profile selected for a run. |
 | `frames` | Task identity, parent and join identity, bindings, state, result, suspension, and revision. |
 | `model_items` | Complete ordered Responses items and attempt identity for each frame. |
 | `tool_calls` | Validated arguments, idempotency identity, state, result, error, and recovery metadata. |
+| `permission_requests` | Pending invocation, requested tool and input digest, policy revision, offered choices, idempotent resolution, and resulting rule reference. |
 | `events` | Append-only, per-run ordered operational history. |
 
-Join and human-suspension state live on `frames`; they do not require separate
-subsystems. Constraints MUST enforce:
+Join and human-answer suspension state live on `frames`; permission requests
+are separate because their resolution may append a durable session policy
+rule. Constraints MUST enforce:
 
+- immutable session principal binding;
+- unique policy rule ID and update idempotency key within a session;
+- monotonic session policy revision;
+- catalog epochs scoped to one session and authenticated server binding;
+- unique canonical catalog digest per session, server, and refresh identity;
 - unique workflow name and version;
 - idempotent same-source publication;
 - immutable definition contents;
 - one run per workflow-scoped start idempotency key;
+- immutable run-to-session and run-to-tool bindings;
 - one ordered item position per frame;
 - one tool call per stable idempotency key;
 - one resolution per human suspension;
+- one idempotent resolution per permission request;
 - monotonic frame and run revisions; and
 - monotonic event sequence per run.
 
@@ -624,8 +936,11 @@ entire event log.
 
 Startup recovery changes interrupted model attempts back to runnable. It
 recovers interrupted tool attempts through their declared status/idempotency
-contract. It reconstructs runnable joins and frames solely from committed
-PostgreSQL state.
+contract. It reconstructs runnable joins, questions, permission requests, and
+frames solely from committed PostgreSQL state. MCP-dependent work remains
+blocked after restart until a resumed client supplies fresh connection
+configuration, principal-visible catalogs are rebuilt, and every immutable run
+binding is verified against the new catalog epoch.
 
 S3 MAY later store large immutable attachments or archives, but it MUST NOT
 decide V1 workflow state or scheduling.
@@ -637,6 +952,11 @@ decide V1 workflow state or scheduling.
 Deployment configuration defines ceilings for:
 
 - source and compiled-definition size;
+- sessions and active runs per process;
+- MCP servers per session, catalog pages, visible tools, descriptor bytes, and
+  total catalog bytes;
+- typed policy rule count, policy bytes, Cedar evaluation time, and unresolved
+  permission requests;
 - workflow steps;
 - active model turns per task;
 - tool calls per model response;
@@ -664,6 +984,7 @@ Run failures use this small stable taxonomy:
 | `model_unavailable` | The configured provider remained unavailable after allowed retries. |
 | `model_output_invalid` | The model repeatedly failed the task's response contract. |
 | `tool_failed` | A tool returned a definitive terminal failure. |
+| `tool_contract_changed` | A bound MCP tool disappeared or its visible descriptor no longer matches the immutable run binding. |
 | `outcome_unknown` | An external effect may have occurred but cannot be resolved safely. |
 | `limit_exceeded` | A deployment or workflow budget was exhausted. |
 | `cancelled` | A client cancelled the run. |
@@ -676,63 +997,46 @@ Transient model and tool transport errors use capped exponential backoff with
 jitter. Retry counts and delays are deployment configuration, not DSL syntax.
 Author-defined catch blocks and retry policies are excluded from V1.
 
-## HTTP API
+## ACP application surface
 
-The core API is:
+ACP provides initialization, authentication negotiation, session lifecycle,
+MCP server attachment, permission requests, and transport-independent JSON-RPC
+framing. Kiteframe adds only workflow-specific methods:
 
-```text
-POST /v1/workflows
-POST /v1/workflows/{name}/runs
-GET  /v1/runs/{run_id}
-GET  /v1/runs/{run_id}/events?after={sequence}
-POST /v1/runs/{run_id}/answers
-POST /v1/runs/{run_id}/cancel
-GET  /healthz
-GET  /readyz
-```
+| Method | Semantics |
+|---|---|
+| `_kiteframe/workflow/publish` | Compile and atomically publish source against the calling session's current visible catalog. |
+| `_kiteframe/run/start` | Start a selected immutable definition with typed input and a client-generated idempotency key. |
+| `_kiteframe/run/get` | Return current state, definition identity, open questions and permissions, result, or stable failure for a run owned by the session. |
+| `_kiteframe/run/answer` | Resolve one human question with a typed answer and idempotency key. |
+| `_kiteframe/run/cancel` | Cooperatively cancel one run with an idempotency key and optional reason. |
+| `_kiteframe/session/policy/update` | Validate and append typed rules using an idempotency key and expected policy revision. |
+| `_kiteframe/run/event` | Notify the client of one durable run event with an exclusive sequence cursor. |
 
-### Publish workflow
+With no requested workflow version, `_kiteframe/run/start` selects the latest
+successfully published version in the start transaction. Repeating an
+idempotency key with the same normalized request returns the original result;
+reusing it with different content returns a conflict. Answer, permission,
+policy-update, and cancellation operations follow the same rule.
 
-`POST /v1/workflows` accepts the DSL source. It returns the workflow name,
-assigned version, definition hash, and compiler diagnostics. Publication is
-atomic: no definition exists when validation fails.
+Each ACP version adapter maps its session and permission wire types to the same
+version-neutral application commands. `_kiteframe/run/event` carries the
+durable sequence number; after reconnect or `session/resume`, the client
+supplies its last observed sequence and receives missing persisted events
+before live notifications. Event correctness never depends on a transport
+connection remaining open.
 
-### Start run
+Remote deployments expose ACP on `/acp` using WebSocket upgrade or Streamable
+HTTP and expose only `GET /healthz` and `GET /readyz` outside ACP. There is no
+parallel REST control API or product-specific SSE endpoint in V1.
 
-`POST /v1/workflows/{name}/runs` accepts typed workflow input and an optional
-definition version. It requires an `Idempotency-Key` header scoped to the
-workflow name. With no version, the transaction selects the latest successfully
-published version at that instant. Repeating the same key and request returns
-the original run; reusing the key with different input or version returns a
-conflict. The response contains the run identity and selected definition
-version.
-
-### Inspect and stream
-
-`GET /v1/runs/{run_id}` returns the current run state, selected definition,
-all open suspensions, final output, or stable failure.
-
-The events endpoint returns historical JSON by default. With
-`Accept: text/event-stream`, it sends the same events over SSE and continues
-waiting for new events. `after` is an exclusive durable sequence cursor, so a
-client can reconnect without gaps or dependence on process memory.
-
-### Answer and cancel
-
-The answers endpoint accepts a suspension identity, typed answer, and
-an `Idempotency-Key` header. The cancellation endpoint accepts the same header
-and an optional reason. Both operations are transactional and safe to repeat.
-
-### Trust boundary
-
-V1 assumes one trusted deployment boundary. TLS termination and caller
-authentication belong to deployment infrastructure. Kiteframe stores provider
-credentials only in process configuration and never in workflow source or the
-database.
-
-This boundary does not authorize a public, unauthenticated deployment. It means
-that tenant identity, user accounts, and fine-grained API policy are outside the
-V1 product rather than partially implemented inside it.
+For local `stdio`, the thin client creates the process and the session principal
+from local authenticated client context. Remote ACP requires deployment-owned
+TLS and caller authentication; the harness derives the session principal from
+validated connection identity, never workflow input, tool arguments, an MCP
+descriptor, or a caller-supplied principal field. V1 deliberately excludes
+user-directory, tenant-relationship, and deployment authorization products,
+but it does not permit anonymous remote sessions.
 
 ## Observability
 
@@ -740,8 +1044,9 @@ V1 provides:
 
 - ordered run events;
 - structured JSON service logs;
-- stable run, frame, model-attempt, and tool-call correlation identities; and
-- liveness and database/tool-registry readiness endpoints.
+- stable session, catalog-epoch, policy-revision, permission-request, run,
+  frame, model-attempt, and tool-call correlation identities; and
+- liveness and database readiness endpoints plus per-session MCP binding status.
 
 Logs and events contain metadata, status, timing, token usage when supplied,
 and stable error codes. They exclude prompt content, model content, reasoning,
@@ -757,7 +1062,8 @@ implementation plan will delete the current:
 
 - multi-crate workspace structure;
 - agent package manifest, resolver, lock, and compiled package IR;
-- Python packages and PyO3 projections;
+- old Python runtime packages and PyO3 projections, replaced by a thin Python
+  ACP client that bundles the harness;
 - Deep Agents adapter and LangGraph coupling;
 - OpenFGA and multi-layer admission machinery;
 - runtime-provider abstraction layers; and
@@ -776,7 +1082,8 @@ lands.
 
 There is no old-database migration, compatibility endpoint, dual-write period,
 or gradual runtime cutover. The replacement starts with a new PostgreSQL schema
-and new V1 API.
+and new ACP application surface. The TypeScript client is new; neither thin
+client preserves an old runtime contract.
 
 ## Verification strategy
 
@@ -787,14 +1094,19 @@ and new V1 API.
 - Type, reachability, recursive-call, binding, outcome, and parallel-join
   adversarial tests.
 - Deterministic definition hash and same-definition publication tests.
+- Principal-visible tool resolution, exact descriptor binding, and catalog
+  mismatch rejection tests.
 
 ### Engine tests
 
-- State-machine tests with fake `ModelClient` and tool registry implementations.
+- State-machine tests with fake `ModelClient`, `BoundTool`, MCP catalog, and
+  Cedar authorizer implementations.
 - Ordinary tool loops and typed `complete_task` validation.
 - `call`, `goto`, `done`, `fail`, and bounded-cycle behavior.
 - Parallel completion in every ordering, failure propagation, and cancellation.
 - Typed `ask`, duplicate answer, conflicting answer, and resume tests.
+- Default-deny permission waits, explicit-forbid tool results, idempotent
+  decisions, and policy-revision race tests.
 
 ### Persistence and crash tests
 
@@ -802,8 +1114,45 @@ and new V1 API.
 - Restart after intent commit and before result commit for model and tool calls.
 - Idempotent tool retry, status recovery, and `outcome_unknown` behavior.
 - Restart while children run, while a join waits, and while a run awaits a
-  human answer.
-- SSE cursor reconnect without gaps or duplicate state transitions.
+  human answer or permission.
+- Session, policy-rule, catalog-epoch, and permission-resolution constraint
+  tests.
+- ACP event-cursor resume without gaps or duplicate state transitions.
+
+### ACP and transport conformance
+
+- ACP v1 initialize, `session/new`, `session/load`, tool-call permission, and
+  connection-teardown fixtures.
+- ACP v2 initialize, required session lifecycle, generic permission, resume,
+  and close fixtures.
+- Extension version negotiation and rejection of incompatible client/harness
+  combinations.
+- Identical application behavior over `stdio`, WebSocket, and Streamable HTTP.
+- WebSocket-to-HTTP fallback only on transport or upgrade incompatibility.
+- Reconnect and session resume with fresh MCP connection configuration and a
+  durable event cursor.
+
+### MCP and Cedar policy tests
+
+- Two principals receiving different paginated `tools/list` results without
+  catalog, descriptor, event, or error leakage.
+- Catalog additions, removals, descriptor changes, and
+  `notifications/tools/list_changed` handling.
+- Generated Cedar schema validation against the exact visible catalog.
+- Trusted capability mappings, `mcp_unknown`, exact-tool rules, input
+  constraints, default deny, and forbid-overrides-permit behavior.
+- Proof that Cedar cannot widen workflow bindings and that every permitted MCP
+  call is still authorized by its server.
+
+### Thin-client and binary packaging tests
+
+- Python wheels and npm platform packages contain the expected version-matched
+  executable for every supported target.
+- Python and TypeScript local clients launch the bundled binary, negotiate ACP,
+  propagate shutdown, and surface startup diagnostics.
+- Remote clients prefer WebSocket, fall back to Streamable HTTP under the
+  defined conditions, and never fall back on authentication or application
+  errors.
 
 ### Provider conformance
 
@@ -816,18 +1165,34 @@ gates and not a substitute for protocol conformance tests.
 
 ## V1 acceptance scenario
 
-V1 is complete only when one end-to-end test proves all of the following:
+V1 is complete only when one PostgreSQL-backed acceptance suite proves all of
+the following:
 
-1. An author publishes the example-style workflow through the HTTP API.
-2. A caller starts a run with typed input.
-3. The engine executes persisted model and ordinary tool turns.
-4. The workflow starts bounded parallel task calls and joins their typed
+1. A Python application installed with `uv add kiteframe` launches the bundled
+   harness over `stdio`, negotiates ACP, and creates a durable session.
+2. A TypeScript application installed with `bun add kiteframe` and importing
+   `kiteframe/client` connects remotely over WebSocket; a second test forces
+   only the valid Streamable HTTP fallback condition.
+3. Two authenticated principals see different MCP catalogs, and neither can
+   infer the other's hidden tool names, descriptions, or schemas.
+4. An author publishes the example-style workflow through
+   `_kiteframe/workflow/publish`; publication binds exact visible tool
+   descriptors and a caller starts a run with typed input.
+5. The engine executes persisted model and ordinary tool turns only after the
+   declared workflow binding and current Cedar policy both allow them.
+6. A default-denied call creates a durable permission request; an idempotent
+   typed decision updates the session policy and resumes the frame, while an
+   explicit forbid returns a denial without prompting.
+7. The workflow starts bounded parallel task calls and joins their typed
    results in source order.
-5. The workflow durably asks for human input and resumes idempotently.
-6. Forced process restarts during model, tool, parallel, and suspended states do
-   not corrupt or double-advance the run.
-7. The caller observes ordered events and receives a typed final result.
-8. An uncertain external effect produces `outcome_unknown`, never guessed
+8. The workflow durably asks for human input and resumes idempotently.
+9. Forced process restarts during model, tool, parallel, catalog refresh, human
+   question, and permission states do not corrupt or double-advance the run.
+10. ACP v1 and gated v2 clients observe the same ordered durable events and
+    receive the same typed final result.
+11. Removal or descriptor mutation of a bound tool prevents future invocation
+    and produces `tool_contract_changed` without mutating the run contract.
+12. An uncertain external effect produces `outcome_unknown`, never guessed
    success or an unsafe blind retry.
 
 Passing unit tests without this PostgreSQL-backed scenario is insufficient.
@@ -841,8 +1206,13 @@ The following may be considered only after V1 evidence shows a need:
 - multiple model profiles;
 - distributed service replicas and workers;
 - artifact storage in S3;
-- MCP tool adapters;
-- richer authorization and tenant isolation;
+- in-flight steering, including queue ordering, inference interruption,
+  durability, and cross-transport semantics, in a separate design and plan;
+- workspace, deployment, organization, and multi-tenant policy scopes;
+- OpenFGA or another relationship-authorization service;
+- richer Cedar conditions and public raw-Cedar authoring;
+- ACP v2-only operation after the protocol becomes stable and ecosystem support
+  makes v1 compatibility unnecessary;
 - OpenTelemetry or Prometheus export;
 - author-defined retry/catch/compensation behavior;
 - workflow visualization; and
@@ -853,6 +1223,30 @@ advance.
 
 ## Implementation-planning boundary
 
-This specification defines the approved replacement contract. Its implementation
-plan should deliver the replacement in cumulative, independently reviewable
-slices rather than recreating the previous large speculative wave structure.
+After approval, this specification defines the replacement contract. Its
+implementation plan should deliver the replacement in cumulative,
+independently reviewable slices rather than recreating the previous large
+speculative wave structure.
+The minimal workflow engine, ACP harness, clients, principal-scoped MCP
+catalogs, and session capability policy belong in one revised V1 plan because
+they form one invocation authority boundary. Steering remains a separate
+feature and MUST have a separate design and implementation plan.
+
+## Current external contracts
+
+This design is grounded in the following current upstream material:
+
+- [Kiro: One Agent, Everywhere](https://kiro.dev/blog/one-agent/) for the
+  single-harness, thin-client, ACP, transport, client-tool, and steering model;
+- [ACP protocol](https://agentclientprotocol.com/) and the
+  [ACP v2 migration guide](https://agentclientprotocol.com/protocol/v2/migration)
+  for negotiated v1/v2 wire contracts;
+- the official Rust crates
+  [`agent-client-protocol`](https://crates.io/crates/agent-client-protocol) and
+  [`agent-client-protocol-http`](https://crates.io/crates/agent-client-protocol-http);
+- the [MCP tools specification](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)
+  and [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization)
+  for principal-scoped discovery and server-side authorization; and
+- [`cedar-for-agents`](https://github.com/cedar-policy/cedar-for-agents/tree/main)
+  and its [Rust workspace](https://github.com/cedar-policy/cedar-for-agents/tree/main/rust)
+  for agent policy patterns and MCP-to-Cedar schema generation.
