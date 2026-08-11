@@ -1,0 +1,27 @@
+{
+  "definition_hash": "f0384e48a7a8d4ff2a70f4d5d72622f08c92db945365cdb1bfe81ed1e0fac454",
+  "entry": {
+    "arguments": {
+      "clarification": { "kind": "null" },
+      "ticket": { "kind": "binding", "value": "ticket" }
+    },
+    "task": "triage"
+  },
+  "tool_bindings": [
+    {
+      "catalog_epoch_id": "00000000-0000-0000-0000-000000000007",
+      "descriptor_digest": "27fa3f3928481ab91a648b222a215189f2f415bcf4055eb7ee47f69b0e31b19e",
+      "qualified_name": "docs/search_docs"
+    },
+    {
+      "catalog_epoch_id": "00000000-0000-0000-0000-000000000007",
+      "descriptor_digest": "2c05f0dc12b60e90451ff40745a68d9c2f5aee5a5d8e512c8371f8580a98ed57",
+      "qualified_name": "logs/search_logs"
+    },
+    {
+      "catalog_epoch_id": "00000000-0000-0000-0000-000000000007",
+      "descriptor_digest": "a4d1e70d5903c5eea1398497a4c137b647d3d3209efa67fdf42dae98277fb180",
+      "qualified_name": "metrics/search_metrics"
+    }
+  ]
+}
