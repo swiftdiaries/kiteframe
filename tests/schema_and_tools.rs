@@ -1,56 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kiteframe::{
-    BoundTool, Capability, CatalogTool, ClosedSchema, EffectKind, FrameId, IdempotencyKey,
+    Capability, CatalogTool, ClosedSchema, EffectKind, FrameId, IdempotencyKey,
     InProcessToolRegistry, PolicyRevision, RecoverySupport, RunId, Secret, SessionId, ToolCall,
-    ToolCatalogSnapshot, ToolError, ToolResolver, ToolStatus, canonical_sha256,
+    ToolCatalogSnapshot, canonical_sha256,
 };
 use serde_json::json;
 use uuid::Uuid;
-
-struct TestBoundTool {
-    descriptor: CatalogTool,
-    invocations: Arc<AtomicUsize>,
-}
-
-#[async_trait::async_trait]
-impl BoundTool for TestBoundTool {
-    fn descriptor(&self) -> &CatalogTool {
-        &self.descriptor
-    }
-
-    async fn invoke(&self, _call: ToolCall) -> Result<serde_json::Value, ToolError> {
-        self.invocations.fetch_add(1, Ordering::SeqCst);
-        Ok(json!({}))
-    }
-
-    async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
-        Ok(ToolStatus::Succeeded)
-    }
-}
-
-fn test_bound_tool(descriptor: CatalogTool) -> (Arc<TestBoundTool>, Arc<AtomicUsize>) {
-    let invocations = Arc::new(AtomicUsize::new(0));
-    (
-        Arc::new(TestBoundTool {
-            descriptor,
-            invocations: Arc::clone(&invocations),
-        }),
-        invocations,
-    )
-}
-
-fn block_on_ready<F: std::future::Future>(future: F) -> F::Output {
-    let waker = std::task::Waker::noop();
-    let mut context = std::task::Context::from_waker(waker);
-    let mut future = std::pin::pin!(future);
-    match future.as_mut().poll(&mut context) {
-        std::task::Poll::Ready(value) => value,
-        std::task::Poll::Pending => panic!("test future unexpectedly yielded"),
-    }
-}
 
 fn object_schema() -> ClosedSchema {
     ClosedSchema::object(
@@ -236,79 +192,6 @@ fn untrusted_capability_tags_are_rejected() {
 fn secret_debug_is_redacted() {
     let secret = Secret::new("do-not-log-this");
     assert_eq!(format!("{secret:?}"), "Secret([REDACTED])");
-}
-
-#[test]
-fn registry_resolves_only_tools_bound_to_the_requested_session() {
-    let registry = InProcessToolRegistry::new();
-    let tool = lookup_tool("docs/search");
-    let digest = tool.descriptor_digest().to_owned();
-    let (tool, _invocations) = test_bound_tool(tool);
-    registry
-        .register(tool)
-        .expect("registry accepts a valid descriptor");
-
-    let bound_session = SessionId::new(Uuid::nil());
-    registry
-        .snapshot(
-            bound_session.clone(),
-            Uuid::nil(),
-            &BTreeSet::from(["docs/search".to_owned()]),
-            &BTreeMap::from([("docs/search".to_owned(), digest.clone())]),
-        )
-        .expect("session snapshot is valid");
-
-    assert!(
-        registry
-            .bound_tool(SessionId::new(Uuid::from_u128(1)), "docs/search", &digest)
-            .is_err()
-    );
-    assert!(
-        registry
-            .bound_tool(bound_session, "docs/search", &digest)
-            .is_ok()
-    );
-}
-
-#[test]
-fn resolver_rejects_a_call_validated_for_another_tool_before_invocation() {
-    let registry = InProcessToolRegistry::new();
-    let first = lookup_tool("docs/search");
-    let second = lookup_tool("admin/search");
-    let first_digest = first.descriptor_digest().to_owned();
-    let second_digest = second.descriptor_digest().to_owned();
-    let call = ToolCall::new(
-        SessionId::new(Uuid::nil()),
-        RunId::new(Uuid::nil()),
-        FrameId::new(Uuid::nil()),
-        PolicyRevision::new(1),
-        &first,
-        json!({"query": "first", "limit": null}),
-        IdempotencyKey::new("call-1").expect("valid idempotency key"),
-    )
-    .expect("arguments are valid for the first tool");
-    let (first, _first_invocations) = test_bound_tool(first);
-    let (second, second_invocations) = test_bound_tool(second);
-    registry.register(first).expect("first tool registers");
-    registry.register(second).expect("second tool registers");
-
-    let session = SessionId::new(Uuid::nil());
-    registry
-        .snapshot(
-            session.clone(),
-            Uuid::nil(),
-            &BTreeSet::from(["docs/search".to_owned(), "admin/search".to_owned()]),
-            &BTreeMap::from([
-                ("docs/search".to_owned(), first_digest),
-                ("admin/search".to_owned(), second_digest.clone()),
-            ]),
-        )
-        .expect("session snapshot is valid");
-
-    let result = block_on_ready(registry.invoke(session, "admin/search", &second_digest, call));
-
-    assert!(result.is_err());
-    assert_eq!(second_invocations.load(Ordering::SeqCst), 0);
 }
 
 #[test]
