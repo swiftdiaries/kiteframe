@@ -81,12 +81,28 @@ impl Engine {
     }
 
     pub async fn resolve_permission(&self, request: ResolvePermission) -> Result<(), EngineError> {
-        let suspension = self.store.permission_suspension(request.session_id, request.run_id, request.permission_request_id.clone()).await?;
+        if matches!(request.choice, PermissionChoice::AllowToolForSession | PermissionChoice::DenyToolForSession) {
+            return Err(StoreError::InvalidData("session-wide permission choices require immutable policy update support".to_owned()).into());
+        }
+        let pending = self.store.pending_permission(request.session_id.clone(), request.run_id.clone(), request.permission_request_id.clone()).await?;
         self.store.resolve_permission(
-            suspension.frame_id, request.permission_request_id, suspension.revision,
+            pending.frame_id.clone(), request.permission_request_id, pending.revision,
             json!({"choice": match request.choice { PermissionChoice::AllowOnce => "allow_once", PermissionChoice::AllowToolForSession => "allow_tool_for_session", PermissionChoice::DenyOnce => "deny_once", PermissionChoice::DenyToolForSession => "deny_tool_for_session" }}),
             request.idempotency_key.as_str().to_owned(),
         ).await?;
+        let revision = pending.revision + 1;
+        match request.choice {
+            PermissionChoice::AllowOnce => {
+                let binding = self.store.run_tool_binding(request.run_id.clone(), &pending.qualified_name).await?;
+                let tool = self.tools.bound_tool(request.session_id.clone(), &binding.qualified_name, &binding.descriptor_digest).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let policy_revision = self.store.policy_revision(request.session_id.clone()).await?;
+                let call = ToolCall::new(request.session_id, request.run_id, pending.frame_id.clone(), policy_revision, tool.descriptor(), pending.arguments, IdempotencyKey::new(format!("permission:{}", pending.tool_call_id)).map_err(|error| StoreError::InvalidData(error.to_string()))?).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let result = tool.invoke(call).await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
+                self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, result).await?;
+            }
+            PermissionChoice::DenyOnce => self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, Err(json!({"code":"permission_denied","message":"Tool invocation denied by user"}))).await?,
+            PermissionChoice::AllowToolForSession | PermissionChoice::DenyToolForSession => unreachable!("checked above"),
+        }
         Ok(())
     }
 

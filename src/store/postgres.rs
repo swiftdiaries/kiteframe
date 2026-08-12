@@ -362,6 +362,13 @@ impl PostgresStore {
         Ok(super::SuspensionFrame { frame_id: crate::FrameId::new(row.get("id")), revision: row.get::<i64, _>("revision") as u64 })
     }
 
+    pub async fn pending_permission(&self, session_id: crate::SessionId, run_id: crate::RunId, request_id: crate::PermissionRequestId) -> Result<super::PendingPermission, StoreError> {
+        let row = sqlx::query("SELECT f.id, f.revision, t.id AS tool_call_id, p.provider_call_id, p.qualified_tool, p.descriptor_digest, t.arguments FROM permission_requests p JOIN frames f ON f.id = p.frame_id JOIN runs r ON r.id = p.run_id JOIN tool_calls t ON t.frame_id = p.frame_id AND t.provider_call_id = p.provider_call_id WHERE p.id = $1 AND p.run_id = $2 AND r.session_id = $3 AND p.state = 'pending'")
+            .bind(*request_id.as_uuid()).bind(*run_id.as_uuid()).bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?
+            .ok_or(StoreError::SessionNotFound)?;
+        Ok(super::PendingPermission { tool_call_id: row.get("tool_call_id"), frame_id: crate::FrameId::new(row.get("id")), revision: row.get::<i64, _>("revision") as u64, provider_call_id: row.get("provider_call_id"), qualified_name: row.get("qualified_tool"), descriptor_digest: row.get("descriptor_digest"), arguments: row.get("arguments") })
+    }
+
     pub async fn question_suspension(&self, session_id: crate::SessionId, run_id: crate::RunId, question_id: uuid::Uuid) -> Result<super::SuspensionFrame, StoreError> {
         let row = sqlx::query("SELECT f.id, f.revision FROM questions q JOIN frames f ON f.id = q.frame_id JOIN runs r ON r.id = q.run_id WHERE q.id = $1 AND q.run_id = $2 AND r.session_id = $3 AND q.state IN ('pending', 'answered')")
             .bind(question_id).bind(*run_id.as_uuid()).bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?

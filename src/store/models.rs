@@ -84,6 +84,17 @@ pub struct SuspensionFrame {
     pub revision: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct PendingPermission {
+    pub tool_call_id: uuid::Uuid,
+    pub frame_id: FrameId,
+    pub revision: u64,
+    pub provider_call_id: String,
+    pub qualified_name: String,
+    pub descriptor_digest: String,
+    pub arguments: Value,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunState {
     Runnable,
