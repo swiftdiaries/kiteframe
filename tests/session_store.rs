@@ -41,6 +41,18 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         .append_catalog_epoch(&catalog)
         .await
         .expect("append catalog");
+    let restored = store
+        .current_catalog(session.id.clone())
+        .await
+        .expect("restore catalog");
+    assert_eq!(restored.digest(), catalog.digest());
+    assert_eq!(
+        restored
+            .resolve("docs/search", catalog.tools()["docs/search"].descriptor_digest())
+            .expect("restored descriptor")
+            .descriptor_digest(),
+        catalog.tools()["docs/search"].descriptor_digest()
+    );
     assert!(
         store
             .resume_session(session.id.clone(), &principal)

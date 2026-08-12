@@ -142,9 +142,22 @@ impl PostgresStore {
             .and_then(Value::as_array)
             .ok_or_else(|| StoreError::InvalidData("catalog snapshot tools are malformed".to_owned()))?
             .iter()
-            .map(CatalogTool::from_normalized)
+            .map(|entry| {
+                let descriptor = entry.get("descriptor").ok_or_else(|| {
+                    StoreError::InvalidData("catalog entry descriptor is malformed".to_owned())
+                })?;
+                let tool = CatalogTool::from_normalized(descriptor)
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                if entry.get("qualified_name").and_then(Value::as_str) != Some(tool.qualified_name())
+                    || entry.get("descriptor_digest").and_then(Value::as_str)
+                        != Some(tool.descriptor_digest())
+                {
+                    return Err(StoreError::CatalogScopeViolation);
+                }
+                Ok(tool)
+            })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            ?;
         ToolCatalogSnapshot::new(session_id, epoch_id, tools)
             .map_err(|error| StoreError::InvalidData(error.to_string()))
     }

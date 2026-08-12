@@ -91,8 +91,8 @@ impl CatalogTool {
             qualified_name: String,
             server_alias: String,
             description: String,
-            input: ClosedSchema,
-            output: ClosedSchema,
+            input: Value,
+            output: Value,
             capabilities: BTreeSet<Capability>,
             effect: EffectKind,
             recovery: RecoverySupport,
@@ -103,8 +103,10 @@ impl CatalogTool {
             stored.qualified_name,
             stored.server_alias,
             stored.description,
-            stored.input,
-            stored.output,
+            ClosedSchema::from_normalized(&stored.input)
+                .map_err(ToolError::InvalidStoredDescriptor)?,
+            ClosedSchema::from_normalized(&stored.output)
+                .map_err(ToolError::InvalidStoredDescriptor)?,
             stored.capabilities,
             stored.effect,
             stored.recovery,
