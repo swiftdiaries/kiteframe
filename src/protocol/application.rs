@@ -14,12 +14,16 @@ impl Application {
     pub fn new(store: Arc<PostgresStore>, engine: Arc<Engine>) -> Self { Self { store, engine } }
 
     pub async fn dispatch(&self, context: &ApplicationContext, command: ApplicationCommand) -> Result<ApplicationResult, ProtocolError> {
+        if matches!(command, ApplicationCommand::ListSessions) {
+            return Ok(ApplicationResult::Sessions(self.store.list_sessions(&context.principal).await?));
+        }
         let session_id = context.session_id.as_ref().ok_or(ProtocolError::MissingSession)?;
         self.store.resume_session(session_id.clone(), &context.principal).await?;
         if let Some(command_session) = command_session(&command) && command_session != session_id {
             return Err(ProtocolError::SessionMismatch);
         }
         match command {
+            ApplicationCommand::ListSessions => unreachable!("handled before session requirement"),
             ApplicationCommand::Start(request) => Ok(ApplicationResult::Run(self.store.start_run(request).await?)),
             ApplicationCommand::Get(request) => Ok(ApplicationResult::Run(self.store.get_run(session_id.clone(), request.run_id).await?)),
             ApplicationCommand::Answer(request) => {

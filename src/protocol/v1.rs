@@ -9,6 +9,7 @@ pub struct V1Adapter;
 impl V1Adapter {
     pub fn decode_extension(method: &str, payload: Value) -> Result<ApplicationCommand, ProtocolError> {
         match method {
+            "session/list" => Ok(ApplicationCommand::ListSessions),
             "_kiteframe/run/start" => decode(payload, ApplicationCommand::Start),
             "_kiteframe/run/get" => decode(payload, ApplicationCommand::Get),
             "_kiteframe/run/answer" => decode(payload, ApplicationCommand::Answer),
@@ -39,6 +40,7 @@ mod tests {
         })).expect("start command");
         assert!(matches!(command, ApplicationCommand::Start(_)));
         assert!(matches!(V1Adapter::decode_extension("_kiteframe/run/get", json!({"run_id":"019ff3d8-9d86-7de0-9070-0f0185d5f413"})), Ok(ApplicationCommand::Get(_))));
+        assert!(matches!(V1Adapter::decode_extension("session/list", json!({})), Ok(ApplicationCommand::ListSessions)));
         assert!(V1Adapter::decode_extension("tool/call", json!({})).is_err());
     }
 }

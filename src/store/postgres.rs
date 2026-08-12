@@ -71,6 +71,15 @@ impl PostgresStore {
         })
     }
 
+    pub async fn list_sessions(&self, principal: &PrincipalId) -> Result<Vec<SessionView>, StoreError> {
+        let rows = sqlx::query("SELECT id, principal, current_policy_revision, current_catalog_epoch FROM sessions WHERE principal = $1 AND state = 'active' ORDER BY updated_at DESC, id")
+            .bind(principal.as_str()).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| SessionView {
+            id: SessionId::new(row.get("id")), principal: principal.clone(), policy_revision: PolicyRevision::new(row.get::<i64, _>("current_policy_revision") as u64),
+            current_catalog_epoch: row.get::<Option<uuid::Uuid>, _>("current_catalog_epoch").map(CatalogEpochId::new), mcp_attached: row.get::<Option<uuid::Uuid>, _>("current_catalog_epoch").is_some(),
+        }).collect())
+    }
+
     pub async fn append_catalog_epoch(
         &self,
         epoch: &ToolCatalogSnapshot,

@@ -23,6 +23,7 @@ pub struct EventCursor {
 
 #[derive(Clone, Debug)]
 pub enum ApplicationCommand {
+    ListSessions,
     Start(StartRun),
     Get(GetRun),
     Answer(AnswerQuestion),
@@ -33,6 +34,7 @@ pub enum ApplicationCommand {
 
 #[derive(Clone, Debug)]
 pub enum ApplicationResult {
+    Sessions(Vec<crate::SessionView>),
     Run(RunView),
     Events(Vec<RunEvent>),
     Ack,
@@ -62,6 +64,7 @@ impl From<crate::EngineError> for ProtocolError {
 
 pub fn command_session(command: &ApplicationCommand) -> Option<&SessionId> {
     match command {
+        ApplicationCommand::ListSessions => None,
         ApplicationCommand::Start(request) => Some(&request.session_id),
         ApplicationCommand::Answer(request) => Some(&request.session_id),
         ApplicationCommand::ResolvePermission(request) => Some(&request.session_id),
