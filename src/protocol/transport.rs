@@ -1,16 +1,45 @@
-use http::{HeaderMap, header::AUTHORIZATION};
-use std::sync::Mutex;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
+use agent_client_protocol::{
+    Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, HandleDispatchFrom, Handled,
+};
+use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
+use axum::{
+    Router,
+    body::Body,
+    extract::{Request, State},
+    response::{IntoResponse, Response},
+    routing::{any, get},
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use http::{
+    HeaderMap, HeaderValue, Method, StatusCode,
+    header::{
+        AUTHORIZATION, CONNECTION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE,
+        WWW_AUTHENTICATE,
+    },
+};
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sqlx::Row;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tower::ServiceExt;
 
 use super::{NegotiatedProtocol, ProtocolAdapter, ProtocolNegotiation};
-use crate::PrincipalId;
+use crate::{PrincipalId, Secret};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TransportKind {
     Stdio,
     WebSocket,
@@ -174,39 +203,101 @@ impl ProtocolConnection {
             *bound = None;
         }
     }
+
+    fn bound_session(&self) -> Option<crate::SessionId> {
+        self.session_id
+            .lock()
+            .expect("session lock poisoned")
+            .clone()
+    }
 }
 
 pub trait ConnectionAuthenticator: Send + Sync {
     fn authenticate(&self, headers: &HeaderMap) -> Result<PrincipalId, AuthError>;
 }
 
-#[derive(Clone, Debug)]
-pub struct StaticBearerAuthenticator {
-    token: String,
+#[derive(Clone)]
+struct HashedBearerBinding {
+    digest: [u8; 32],
     principal: PrincipalId,
 }
 
-impl StaticBearerAuthenticator {
-    #[must_use]
-    pub fn new(token: String, principal: PrincipalId) -> Self {
-        Self { token, principal }
+#[derive(Clone)]
+pub struct BearerAuthenticator {
+    bindings: Vec<HashedBearerBinding>,
+}
+
+impl BearerAuthenticator {
+    pub fn new(
+        bindings: impl IntoIterator<Item = (Secret, PrincipalId)>,
+    ) -> Result<Self, AuthError> {
+        let mut digests = HashSet::new();
+        let bindings = bindings
+            .into_iter()
+            .map(|(secret, principal)| {
+                let digest: [u8; 32] = Sha256::digest(secret.expose().as_bytes()).into();
+                if !digests.insert(digest) {
+                    return Err(AuthError::DuplicateBinding);
+                }
+                Ok(HashedBearerBinding { digest, principal })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if bindings.is_empty() {
+            return Err(AuthError::NoBindings);
+        }
+        Ok(Self { bindings })
     }
 }
 
-impl ConnectionAuthenticator for StaticBearerAuthenticator {
+impl fmt::Debug for BearerAuthenticator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BearerAuthenticator")
+            .field("binding_count", &self.bindings.len())
+            .finish()
+    }
+}
+
+impl ConnectionAuthenticator for BearerAuthenticator {
     fn authenticate(&self, headers: &HeaderMap) -> Result<PrincipalId, AuthError> {
         let value = headers
             .get(AUTHORIZATION)
             .ok_or(AuthError::MissingAuthorization)?
             .to_str()
             .map_err(|_| AuthError::InvalidAuthorization)?;
-        let token = value
-            .strip_prefix("Bearer ")
+        let (_, token) = value
+            .split_once(' ')
+            .filter(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer") && !token.is_empty())
             .ok_or(AuthError::InvalidAuthorization)?;
-        if self.token.as_bytes().ct_eq(token.as_bytes()).unwrap_u8() != 1 {
-            return Err(AuthError::Unauthorized);
+        let candidate: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let mut principal = None;
+        for binding in &self.bindings {
+            if binding.digest.ct_eq(&candidate).unwrap_u8() == 1 {
+                principal = Some(binding.principal.clone());
+            }
         }
-        Ok(self.principal.clone())
+        principal.ok_or(AuthError::Unauthorized)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StaticBearerAuthenticator {
+    inner: BearerAuthenticator,
+}
+
+impl StaticBearerAuthenticator {
+    #[must_use]
+    pub fn new(token: String, principal: PrincipalId) -> Self {
+        Self {
+            inner: BearerAuthenticator::new([(Secret::new(token), principal)])
+                .expect("a single bearer binding is valid"),
+        }
+    }
+}
+
+impl ConnectionAuthenticator for StaticBearerAuthenticator {
+    fn authenticate(&self, headers: &HeaderMap) -> Result<PrincipalId, AuthError> {
+        self.inner.authenticate(headers)
     }
 }
 
@@ -218,6 +309,904 @@ pub enum AuthError {
     InvalidAuthorization,
     #[error("authorization is not accepted")]
     Unauthorized,
+    #[error("at least one bearer binding is required")]
+    NoBindings,
+    #[error("bearer secrets must be unique")]
+    DuplicateBinding,
+}
+
+#[derive(Clone)]
+pub struct AcpService {
+    application: Arc<crate::Application>,
+    store: Arc<crate::PostgresStore>,
+    authenticated: AuthenticatedConnection,
+    v2_runtime_enabled: bool,
+    accepting: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+}
+
+impl AcpService {
+    #[must_use]
+    pub fn new(
+        application: Arc<crate::Application>,
+        store: Arc<crate::PostgresStore>,
+        authenticated: AuthenticatedConnection,
+        v2_runtime_enabled: bool,
+    ) -> Self {
+        Self {
+            application,
+            store,
+            authenticated,
+            v2_runtime_enabled,
+            accepting: Arc::new(AtomicBool::new(true)),
+            healthy: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn with_accepting(mut self, accepting: Arc<AtomicBool>) -> Self {
+        self.accepting = accepting;
+        self
+    }
+
+    fn with_health(mut self, healthy: Arc<AtomicBool>) -> Self {
+        self.healthy = healthy;
+        self
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.accepting.store(false, Ordering::Release);
+    }
+
+    fn v1_builder(self) -> impl ConnectTo<Client> {
+        self.builder_with(Agent.builder())
+    }
+
+    #[cfg(feature = "acp-v2")]
+    fn v2_builder(self) -> impl ConnectTo<Client> {
+        self.builder_with(Agent.v2())
+    }
+
+    fn builder_with<H, R, C>(
+        self,
+        builder: agent_client_protocol::Builder<Agent, H, R, C>,
+    ) -> impl ConnectTo<Client>
+    where
+        H: HandleDispatchFrom<Client> + 'static,
+        R: agent_client_protocol::RunWithConnectionTo<Client> + 'static,
+        C: agent_client_protocol::HandleConnectionClose<Client> + 'static,
+    {
+        let connection = Arc::new(ProtocolConnection::new(
+            self.authenticated,
+            self.v2_runtime_enabled,
+        ));
+        let permission_wake = Arc::new(tokio::sync::Notify::new());
+        builder
+            .with_handler(SemanticHandler {
+                application: self.application.clone(),
+                connection: connection.clone(),
+                accepting: self.accepting.clone(),
+                healthy: self.healthy.clone(),
+                permission_wake: permission_wake.clone(),
+            })
+            .with_spawned(move |client| {
+                observe_permissions(
+                    PermissionObserver {
+                        application: self.application,
+                        store: self.store,
+                        connection,
+                        wake: permission_wake,
+                        accepting: self.accepting,
+                        healthy: self.healthy,
+                    },
+                    client,
+                )
+            })
+    }
+}
+
+impl ConnectTo<Client> for AcpService {
+    async fn connect_to(self, client: impl ConnectTo<Agent>) -> agent_client_protocol::Result<()> {
+        let accepting = self.accepting.clone();
+        let connecting = async move {
+            #[cfg(feature = "acp-v2")]
+            {
+                let v2_runtime_enabled = self.v2_runtime_enabled;
+                let mut router = Agent.protocol_router().with_v1(self.clone().v1_builder());
+                if v2_runtime_enabled {
+                    router = router.with_v2(self.v2_builder());
+                }
+                router.connect_to(client).await
+            }
+            #[cfg(not(feature = "acp-v2"))]
+            {
+                self.v1_builder().connect_to(client).await
+            }
+        };
+        tokio::pin!(connecting);
+        tokio::select! {
+            result = &mut connecting => result,
+            () = wait_until_draining(accepting) => Ok(()),
+        }
+    }
+}
+
+async fn wait_until_draining(accepting: Arc<AtomicBool>) {
+    while accepting.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+fn connection_accepting(accepting: &AtomicBool, healthy: &AtomicBool) -> bool {
+    accepting.load(Ordering::Acquire) && healthy.load(Ordering::Acquire)
+}
+
+pub async fn serve_acp_stream<R, W>(
+    reader: R,
+    writer: W,
+    application: Arc<crate::Application>,
+    store: Arc<crate::PostgresStore>,
+    connection: AuthenticatedConnection,
+    v2_runtime_enabled: bool,
+) -> agent_client_protocol::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    AcpService::new(application, store, connection, v2_runtime_enabled)
+        .connect_to(ByteStreams::new(writer.compat_write(), reader.compat()))
+        .await
+}
+
+#[derive(Clone)]
+struct SemanticHandler {
+    application: Arc<crate::Application>,
+    connection: Arc<ProtocolConnection>,
+    accepting: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+    permission_wake: Arc<tokio::sync::Notify>,
+}
+
+const PERMISSION_ALLOW_ONCE: &str = "allow-once";
+const PERMISSION_ALLOW_SESSION: &str = "allow-session";
+const PERMISSION_DENY_ONCE: &str = "deny-once";
+const PERMISSION_DENY_SESSION: &str = "deny-session";
+
+struct PermissionObserver {
+    application: Arc<crate::Application>,
+    store: Arc<crate::PostgresStore>,
+    connection: Arc<ProtocolConnection>,
+    wake: Arc<tokio::sync::Notify>,
+    accepting: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+}
+
+async fn observe_permissions(
+    observer: PermissionObserver,
+    client: ConnectionTo<Client>,
+) -> agent_client_protocol::Result<()> {
+    let PermissionObserver {
+        application,
+        store,
+        connection,
+        wake: permission_wake,
+        accepting,
+        healthy,
+    } = observer;
+    let mut last_offered = HashMap::<crate::PermissionRequestId, std::time::Instant>::new();
+    let inflight = Arc::new(Mutex::new(HashMap::<
+        crate::PermissionRequestId,
+        tokio::sync::oneshot::Sender<()>,
+    >::new()));
+    loop {
+        if client.is_incoming_closed() || !accepting.load(Ordering::Acquire) {
+            cancel_inflight_permissions(&inflight);
+            return Ok(());
+        }
+        if !healthy.load(Ordering::Acquire) {
+            wait_for_permission_wake(&permission_wake).await;
+            continue;
+        }
+        let Some(session_id) = connection.bound_session() else {
+            cancel_inflight_permissions(&inflight);
+            last_offered.clear();
+            wait_for_permission_wake(&permission_wake).await;
+            continue;
+        };
+        let pending = unresolved_permissions(&store, &session_id).await?;
+        let unresolved = pending
+            .iter()
+            .map(|delivery| delivery.request_id.clone())
+            .collect::<HashSet<_>>();
+        last_offered.retain(|request_id, _| unresolved.contains(request_id));
+        cancel_resolved_permissions(&inflight, &unresolved);
+        for delivery in pending {
+            let request_id = delivery.request_id.clone();
+            if inflight
+                .lock()
+                .expect("permission inflight lock poisoned")
+                .contains_key(&request_id)
+                || last_offered
+                    .get(&request_id)
+                    .is_some_and(|instant| instant.elapsed() < std::time::Duration::from_secs(1))
+            {
+                continue;
+            }
+            if !accepting.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if !healthy.load(Ordering::Acquire) {
+                break;
+            }
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+            inflight
+                .lock()
+                .expect("permission inflight lock poisoned")
+                .insert(request_id.clone(), cancel_tx);
+            last_offered.insert(request_id.clone(), std::time::Instant::now());
+            if let Err(error) = send_permission_request(
+                PermissionRuntime {
+                    application: application.clone(),
+                    connection: connection.clone(),
+                    client: client.clone(),
+                    inflight: inflight.clone(),
+                    accepting: accepting.clone(),
+                    healthy: healthy.clone(),
+                    cancel: cancel_rx,
+                },
+                session_id.clone(),
+                delivery,
+            ) {
+                inflight
+                    .lock()
+                    .expect("permission inflight lock poisoned")
+                    .remove(&request_id);
+                return Err(error);
+            }
+        }
+        wait_for_permission_wake(&permission_wake).await;
+    }
+}
+
+type InflightPermissions =
+    Arc<Mutex<HashMap<crate::PermissionRequestId, tokio::sync::oneshot::Sender<()>>>>;
+
+fn cancel_resolved_permissions(
+    inflight: &InflightPermissions,
+    unresolved: &HashSet<crate::PermissionRequestId>,
+) {
+    let cancellations = {
+        let mut inflight = inflight.lock().expect("permission inflight lock poisoned");
+        let resolved = inflight
+            .keys()
+            .filter(|request_id| !unresolved.contains(*request_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        resolved
+            .into_iter()
+            .filter_map(|request_id| inflight.remove(&request_id))
+            .collect::<Vec<_>>()
+    };
+    for cancel in cancellations {
+        let _ = cancel.send(());
+    }
+}
+
+fn cancel_inflight_permissions(inflight: &InflightPermissions) {
+    let cancellations = {
+        let mut inflight = inflight.lock().expect("permission inflight lock poisoned");
+        std::mem::take(&mut *inflight)
+            .into_values()
+            .collect::<Vec<_>>()
+    };
+    for cancel in cancellations {
+        let _ = cancel.send(());
+    }
+}
+
+async fn wait_for_permission_wake(wake: &tokio::sync::Notify) {
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+        () = wake.notified() => {}
+    }
+}
+
+struct PermissionDelivery {
+    request_id: crate::PermissionRequestId,
+    run_id: crate::RunId,
+    pending: crate::PendingPermission,
+}
+
+async fn unresolved_permissions(
+    store: &crate::PostgresStore,
+    session_id: &crate::SessionId,
+) -> agent_client_protocol::Result<Vec<PermissionDelivery>> {
+    let rows = sqlx::query(
+        "SELECT p.id AS request_id, p.run_id, f.id AS frame_id, f.revision, \
+         t.id AS tool_call_id, p.provider_call_id, p.qualified_tool, \
+         p.descriptor_digest, t.arguments \
+         FROM permission_requests p \
+         JOIN runs r ON r.id = p.run_id \
+         JOIN frames f ON f.id = p.frame_id \
+         JOIN tool_calls t ON t.frame_id = p.frame_id \
+            AND t.provider_call_id = p.provider_call_id \
+         WHERE r.session_id = $1 AND p.state = 'pending' \
+         ORDER BY p.created_at, p.id LIMIT 256",
+    )
+    .bind(*session_id.as_uuid())
+    .fetch_all(store.pool())
+    .await
+    .map_err(|_| agent_client_protocol::Error::internal_error())?;
+    Ok(rows
+        .into_iter()
+        .map(|row| PermissionDelivery {
+            request_id: crate::PermissionRequestId::new(row.get("request_id")),
+            run_id: crate::RunId::new(row.get("run_id")),
+            pending: crate::PendingPermission {
+                tool_call_id: row.get("tool_call_id"),
+                frame_id: crate::FrameId::new(row.get("frame_id")),
+                revision: row.get::<i64, _>("revision") as u64,
+                provider_call_id: row.get("provider_call_id"),
+                qualified_name: row.get("qualified_tool"),
+                descriptor_digest: row.get("descriptor_digest"),
+                arguments: row.get("arguments"),
+                resolved: false,
+                resolution_idempotency_key: None,
+            },
+        })
+        .collect())
+}
+
+fn permission_context(
+    session_id: crate::SessionId,
+    run_id: crate::RunId,
+    request_id: crate::PermissionRequestId,
+) -> Result<crate::PermissionResponseContext, crate::ProtocolError> {
+    Ok(crate::PermissionResponseContext::new(
+        session_id,
+        run_id,
+        request_id.clone(),
+        crate::IdempotencyKey::new(format!("acp-permission-{}", request_id.as_uuid()))
+            .map_err(|error| crate::ProtocolError::InvalidPayload(error.to_string()))?,
+    )
+    .with_option(PERMISSION_ALLOW_ONCE, crate::PermissionChoice::AllowOnce)
+    .with_option(
+        PERMISSION_ALLOW_SESSION,
+        crate::PermissionChoice::AllowToolForSession,
+    )
+    .with_option(PERMISSION_DENY_ONCE, crate::PermissionChoice::DenyOnce)
+    .with_option(
+        PERMISSION_DENY_SESSION,
+        crate::PermissionChoice::DenyToolForSession,
+    ))
+}
+
+struct PermissionRuntime {
+    application: Arc<crate::Application>,
+    connection: Arc<ProtocolConnection>,
+    client: ConnectionTo<Client>,
+    inflight: InflightPermissions,
+    accepting: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+}
+
+fn send_permission_request(
+    runtime: PermissionRuntime,
+    session_id: crate::SessionId,
+    delivery: PermissionDelivery,
+) -> agent_client_protocol::Result<()> {
+    let PermissionDelivery {
+        request_id,
+        run_id,
+        pending,
+    } = delivery;
+    let PermissionRuntime {
+        application,
+        connection,
+        client,
+        inflight,
+        accepting,
+        healthy,
+        cancel,
+    } = runtime;
+    let context = permission_context(session_id.clone(), run_id, request_id.clone())
+        .map_err(protocol_sdk_error)?;
+    match connection.selected().map_err(protocol_sdk_error)? {
+        NegotiatedProtocol::V1 => {
+            use agent_client_protocol::schema::v1 as acp;
+            let request = acp::RequestPermissionRequest::new(
+                acp::SessionId::new(session_id.as_uuid().to_string()),
+                acp::ToolCall::new(pending.provider_call_id, pending.qualified_name)
+                    .status(acp::ToolCallStatus::Pending)
+                    .raw_input(pending.arguments)
+                    .into(),
+                vec![
+                    acp::PermissionOption::new(
+                        PERMISSION_ALLOW_ONCE,
+                        "Allow once",
+                        acp::PermissionOptionKind::AllowOnce,
+                    ),
+                    acp::PermissionOption::new(
+                        PERMISSION_ALLOW_SESSION,
+                        "Allow for session",
+                        acp::PermissionOptionKind::AllowAlways,
+                    ),
+                    acp::PermissionOption::new(
+                        PERMISSION_DENY_ONCE,
+                        "Deny once",
+                        acp::PermissionOptionKind::RejectOnce,
+                    ),
+                    acp::PermissionOption::new(
+                        PERMISSION_DENY_SESSION,
+                        "Deny for session",
+                        acp::PermissionOptionKind::RejectAlways,
+                    ),
+                ],
+            );
+            let sent = client.send_request(request);
+            let cancelled_request_id = request_id.clone();
+            client.spawn(async move {
+                tokio::select! {
+                    result = sent.block_task() => {
+                        resolve_permission_response(
+                            application,
+                            connection,
+                            result,
+                            context,
+                            inflight,
+                            accepting,
+                            healthy,
+                        )
+                        .await
+                    }
+                    _ = cancel => {
+                        inflight
+                            .lock()
+                            .expect("permission inflight lock poisoned")
+                            .remove(&cancelled_request_id);
+                        Ok(())
+                    }
+                }
+            })?;
+        }
+        #[cfg(feature = "acp-v2")]
+        NegotiatedProtocol::V2 => {
+            use agent_client_protocol::schema::v2 as acp;
+            let request = acp::RequestPermissionRequest::new(
+                acp::SessionId::new(session_id.as_uuid().to_string()),
+                format!("Allow {}?", pending.qualified_name),
+                vec![
+                    acp::PermissionOption::new(
+                        PERMISSION_ALLOW_ONCE,
+                        "Allow once",
+                        acp::PermissionOptionKind::AllowOnce,
+                    ),
+                    acp::PermissionOption::new(
+                        PERMISSION_ALLOW_SESSION,
+                        "Allow for session",
+                        acp::PermissionOptionKind::AllowAlways,
+                    ),
+                    acp::PermissionOption::new(
+                        PERMISSION_DENY_ONCE,
+                        "Deny once",
+                        acp::PermissionOptionKind::RejectOnce,
+                    ),
+                    acp::PermissionOption::new(
+                        PERMISSION_DENY_SESSION,
+                        "Deny for session",
+                        acp::PermissionOptionKind::RejectAlways,
+                    ),
+                ],
+            )
+            .subject(acp::RequestPermissionSubject::from(
+                acp::ToolCallUpdate::new(pending.provider_call_id)
+                    .title(pending.qualified_name)
+                    .status(acp::ToolCallStatus::Pending)
+                    .raw_input(pending.arguments),
+            ));
+            let sent = client.send_request(request);
+            let cancelled_request_id = request_id.clone();
+            client.spawn(async move {
+                tokio::select! {
+                    result = sent.block_task() => {
+                        resolve_permission_response(
+                            application,
+                            connection,
+                            result,
+                            context,
+                            inflight,
+                            accepting,
+                            healthy,
+                        )
+                        .await
+                    }
+                    _ = cancel => {
+                        inflight
+                            .lock()
+                            .expect("permission inflight lock poisoned")
+                            .remove(&cancelled_request_id);
+                        Ok(())
+                    }
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+async fn resolve_permission_response<R: serde::Serialize>(
+    application: Arc<crate::Application>,
+    connection: Arc<ProtocolConnection>,
+    result: agent_client_protocol::Result<R>,
+    context: crate::PermissionResponseContext,
+    inflight: InflightPermissions,
+    accepting: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+) -> agent_client_protocol::Result<()> {
+    inflight
+        .lock()
+        .expect("permission inflight lock poisoned")
+        .remove(&context.permission_request_id);
+    let result = match result {
+        Ok(result) => serde_json::to_value(result).map_err(|error| {
+            agent_client_protocol::Error::internal_error().data(error.to_string())
+        })?,
+        Err(error) => {
+            tracing::warn!(code = ?error.code, "ACP permission request failed");
+            return Ok(());
+        }
+    };
+    let command = match connection.decode_permission_response(result, context) {
+        Ok(command) => command,
+        Err(_) => {
+            tracing::warn!("ACP permission response was rejected");
+            return Ok(());
+        }
+    };
+    if !connection_accepting(&accepting, &healthy) {
+        return Ok(());
+    }
+    if application
+        .dispatch(&connection.application_context(), command)
+        .await
+        .is_err()
+    {
+        tracing::warn!("ACP permission response application failed");
+    }
+    Ok(())
+}
+
+impl HandleDispatchFrom<Client> for SemanticHandler {
+    async fn handle_dispatch_from(
+        &mut self,
+        dispatch: Dispatch,
+        _client: ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<Handled<Dispatch>> {
+        match dispatch {
+            Dispatch::Request(request, responder) => {
+                let method = request.method.clone();
+                let result = if connection_accepting(&self.accepting, &self.healthy) {
+                    dispatch_application(
+                        &self.application,
+                        &self.connection,
+                        method.as_str(),
+                        request.params,
+                    )
+                    .await
+                    .map_err(protocol_sdk_error)
+                } else {
+                    Err(agent_client_protocol::Error::request_cancelled()
+                        .data("service is shutting down"))
+                };
+                let succeeded = result.is_ok();
+                tracing::info!(
+                    method = logged_method(&method),
+                    transport = ?self.connection.authenticated.transport,
+                    success = result.is_ok(),
+                    "ACP request handled"
+                );
+                responder.respond_with_result(result.map(|outcome| outcome.value))?;
+                if succeeded {
+                    self.permission_wake.notify_one();
+                }
+                Ok(Handled::Yes)
+            }
+            Dispatch::Notification(notification) => {
+                if connection_accepting(&self.accepting, &self.healthy) {
+                    let _ = dispatch_application(
+                        &self.application,
+                        &self.connection,
+                        notification.method.as_str(),
+                        notification.params,
+                    )
+                    .await;
+                }
+                tracing::info!(
+                    method = logged_method(&notification.method),
+                    transport = ?self.connection.authenticated.transport,
+                    "ACP notification handled"
+                );
+                Ok(Handled::Yes)
+            }
+            Dispatch::Response(_, _) => Ok(Handled::No {
+                message: dispatch,
+                retry: false,
+            }),
+        }
+    }
+
+    fn describe_chain(&self) -> impl fmt::Debug {
+        "kiteframe semantic dispatcher"
+    }
+}
+
+fn logged_method(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize",
+        "session/new" => "session/new",
+        "session/load" => "session/load",
+        "session/list" => "session/list",
+        "session/resume" => "session/resume",
+        "session/close" => "session/close",
+        "_kiteframe/workflow/publish" => "_kiteframe/workflow/publish",
+        "_kiteframe/run/start" => "_kiteframe/run/start",
+        "_kiteframe/run/get" => "_kiteframe/run/get",
+        "_kiteframe/run/answer" => "_kiteframe/run/answer",
+        "_kiteframe/run/cancel" => "_kiteframe/run/cancel",
+        "_kiteframe/session/policy/update" => "_kiteframe/session/policy/update",
+        "_kiteframe/run/event" => "_kiteframe/run/event",
+        _ => "unknown",
+    }
+}
+
+fn protocol_sdk_error(error: crate::ProtocolError) -> agent_client_protocol::Error {
+    match error {
+        crate::ProtocolError::UnsupportedMethod(_) => {
+            agent_client_protocol::Error::method_not_found()
+        }
+        crate::ProtocolError::InvalidPayload(_) | crate::ProtocolError::UnsupportedVersion(_) => {
+            agent_client_protocol::Error::invalid_params()
+        }
+        crate::ProtocolError::UnexpectedResult(_) => agent_client_protocol::Error::internal_error(),
+        crate::ProtocolError::PermissionCancelled => {
+            agent_client_protocol::Error::request_cancelled()
+        }
+        _ => agent_client_protocol::Error::new(-32000, "application request failed"),
+    }
+}
+
+#[derive(Clone)]
+pub struct RemoteService {
+    state: Arc<RemoteState>,
+}
+
+struct RemoteState {
+    application: Arc<crate::Application>,
+    store: Arc<crate::PostgresStore>,
+    authenticator: Arc<dyn ConnectionAuthenticator>,
+    ready: Arc<AtomicBool>,
+    model_ready: Arc<AtomicBool>,
+    v2_runtime_enabled: bool,
+    routers: tokio::sync::RwLock<HashMap<RouterKey, Router>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RouterKey {
+    principal: PrincipalId,
+    transport: TransportKind,
+}
+
+impl RemoteService {
+    #[must_use]
+    pub fn new(
+        application: Arc<crate::Application>,
+        authenticator: Arc<dyn ConnectionAuthenticator>,
+        store: Arc<crate::PostgresStore>,
+        model_ready: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_v2(application, authenticator, store, model_ready, false)
+    }
+
+    #[must_use]
+    pub fn with_v2(
+        application: Arc<crate::Application>,
+        authenticator: Arc<dyn ConnectionAuthenticator>,
+        store: Arc<crate::PostgresStore>,
+        model_ready: Arc<AtomicBool>,
+        v2_runtime_enabled: bool,
+    ) -> Self {
+        Self {
+            state: Arc::new(RemoteState {
+                application,
+                store,
+                authenticator,
+                ready: Arc::new(AtomicBool::new(false)),
+                model_ready,
+                v2_runtime_enabled,
+                routers: tokio::sync::RwLock::new(HashMap::new()),
+            }),
+        }
+    }
+
+    pub fn router(&self) -> Router {
+        Router::new()
+            .route("/acp", any(handle_acp))
+            .route("/healthz", get(healthz))
+            .route("/readyz", get(readyz))
+            .with_state(self.state.clone())
+    }
+
+    pub fn mark_ready(&self) {
+        self.state.ready.store(true, Ordering::Release);
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.state.ready.store(false, Ordering::Release);
+    }
+}
+
+async fn healthz() -> &'static str {
+    "ok"
+}
+
+async fn readyz(State(state): State<Arc<RemoteState>>) -> Response {
+    if !state.ready.load(Ordering::Acquire) || !state.model_ready.load(Ordering::Acquire) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(state.store.pool())
+        .await
+    {
+        Ok(1) => StatusCode::OK.into_response(),
+        Ok(_) | Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<Body>) -> Response {
+    let principal = match state.authenticator.authenticate(request.headers()) {
+        Ok(principal) => principal,
+        Err(error) => return auth_response(error),
+    };
+    request.headers_mut().remove(AUTHORIZATION);
+    if !state.ready.load(Ordering::Acquire) || !state.model_ready.load(Ordering::Acquire) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    let transport = match classify_transport(request.method(), request.headers()) {
+        Ok(transport) => transport,
+        Err(error) => return error.into_response(),
+    };
+    let key = RouterKey {
+        principal: principal.clone(),
+        transport,
+    };
+    let router = if let Some(router) = state.routers.read().await.get(&key).cloned() {
+        router
+    } else {
+        let mut routers = state.routers.write().await;
+        routers
+            .entry(key)
+            .or_insert_with(|| {
+                let application = state.application.clone();
+                let store = state.store.clone();
+                let authenticated = AuthenticatedConnection {
+                    principal,
+                    transport,
+                };
+                let v2_runtime_enabled = state.v2_runtime_enabled;
+                let accepting = state.ready.clone();
+                let healthy = state.model_ready.clone();
+                AcpHttpServer::new(move || {
+                    AcpService::new(
+                        application.clone(),
+                        store.clone(),
+                        authenticated.clone(),
+                        v2_runtime_enabled,
+                    )
+                    .with_accepting(accepting.clone())
+                    .with_health(healthy.clone())
+                })
+                .with_options(ServerOptions {
+                    path: "/acp".to_owned(),
+                    cors: CorsOptions::disabled(),
+                    health_endpoint: false,
+                })
+                .into_router()
+            })
+            .clone()
+    };
+    router
+        .oneshot(request)
+        .await
+        .expect("the ACP SDK router is infallible")
+}
+
+fn auth_response(error: AuthError) -> Response {
+    match error {
+        AuthError::MissingAuthorization | AuthError::InvalidAuthorization => {
+            let mut response =
+                (StatusCode::UNAUTHORIZED, "Bearer authorization is required").into_response();
+            response
+                .headers_mut()
+                .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            response
+        }
+        AuthError::Unauthorized => StatusCode::FORBIDDEN.into_response(),
+        AuthError::NoBindings | AuthError::DuplicateBinding => {
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UpgradeIncompatible;
+
+impl IntoResponse for UpgradeIncompatible {
+    fn into_response(self) -> Response {
+        let mut response = (
+            StatusCode::UPGRADE_REQUIRED,
+            "A valid WebSocket upgrade is required",
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(UPGRADE, HeaderValue::from_static("websocket"));
+        response
+            .headers_mut()
+            .insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+        response
+    }
+}
+
+fn classify_transport(
+    method: &Method,
+    headers: &HeaderMap,
+) -> Result<TransportKind, UpgradeIncompatible> {
+    if !websocket_intent(headers) {
+        return Ok(TransportKind::StreamableHttp);
+    }
+    let valid = method == Method::GET
+        && header_eq(headers, UPGRADE, "websocket")
+        && header_contains_token(headers, CONNECTION, "upgrade")
+        && header_eq(headers, SEC_WEBSOCKET_VERSION, "13")
+        && headers
+            .get(SEC_WEBSOCKET_KEY)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| STANDARD.decode(value).ok())
+            .is_some_and(|nonce| nonce.len() == 16);
+    if valid {
+        Ok(TransportKind::WebSocket)
+    } else {
+        Err(UpgradeIncompatible)
+    }
+}
+
+fn websocket_intent(headers: &HeaderMap) -> bool {
+    headers.contains_key(UPGRADE)
+        || header_contains_token(headers, CONNECTION, "upgrade")
+        || headers.contains_key(SEC_WEBSOCKET_KEY)
+        || headers.contains_key(SEC_WEBSOCKET_VERSION)
+}
+
+fn header_eq(headers: &HeaderMap, name: http::header::HeaderName, expected: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn header_contains_token(
+    headers: &HeaderMap,
+    name: http::header::HeaderName,
+    expected: &str,
+) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -231,6 +1220,9 @@ pub struct NdjsonRequest {
     pub params: Value,
 }
 
+/// Compatibility helper for existing in-process tests. The executable uses the
+/// SDK `Stdio` component and all semantic dispatch still goes through
+/// `dispatch_method` below.
 pub async fn serve_ndjson<R, W>(
     reader: R,
     mut writer: W,
@@ -283,11 +1275,7 @@ async fn handle_line(
     if !valid_envelope || !valid_id {
         return Some(error_response(request_id, RpcError::invalid_request()));
     }
-    let response = if request.method == "initialize" {
-        connection.initialize(request.params)
-    } else {
-        dispatch_request(application, connection, request).await
-    };
+    let response = dispatch_method(application, connection, &request.method, request.params).await;
     if notification {
         return None;
     }
@@ -351,16 +1339,46 @@ fn error_response(id: Value, error: RpcError) -> Value {
     })
 }
 
-async fn dispatch_request(
+async fn dispatch_method(
     application: &crate::Application,
     connection: &ProtocolConnection,
-    request: NdjsonRequest,
+    method: &str,
+    params: Value,
 ) -> Result<Value, crate::ProtocolError> {
-    let is_session_method = request.method.starts_with("session/");
+    dispatch_application(application, connection, method, params)
+        .await
+        .map(|outcome| outcome.value)
+}
+
+struct DispatchOutcome {
+    value: Value,
+}
+
+async fn dispatch_application(
+    application: &crate::Application,
+    connection: &ProtocolConnection,
+    method: &str,
+    params: Value,
+) -> Result<DispatchOutcome, crate::ProtocolError> {
+    if params.as_object().is_some_and(|params| {
+        params
+            .keys()
+            .any(|key| key == "principal" || key == "principalId")
+    }) {
+        return Err(crate::ProtocolError::InvalidPayload(
+            "connection principal is supplied only by authenticated transport context".to_owned(),
+        ));
+    }
+    if method == "initialize" {
+        return connection
+            .initialize(params)
+            .map(|value| DispatchOutcome { value });
+    }
+    let is_session_method = method.starts_with("session/");
     let command = if is_session_method {
-        connection.decode_session(&request.method, request.params)
+        connection.decode_session(method, params)
     } else {
-        connection.decode_extension(&request.method, request.params)
+        connection.decode_extension(method, params)
     }?;
     let closing_session = match &command {
         crate::ApplicationCommand::CloseSession(close) => Some(close.session_id.clone()),
@@ -375,17 +1393,18 @@ async fn dispatch_request(
     if let Some(session_id) = closing_session {
         connection.clear_session(&session_id);
     }
-    if is_session_method {
-        connection.encode_session_result(&request.method, result)
+    let value = if is_session_method {
+        connection.encode_session_result(method, result)
     } else {
         connection.encode_result(result)
-    }
+    }?;
+    Ok(DispatchOutcome { value })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionAuthenticator, StaticBearerAuthenticator};
-    use crate::PrincipalId;
+    use super::{BearerAuthenticator, ConnectionAuthenticator, StaticBearerAuthenticator};
+    use crate::{PrincipalId, Secret};
     use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
 
     #[test]
@@ -395,8 +1414,34 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
         assert_eq!(auth.authenticate(&headers).unwrap().as_str(), "alice");
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("bearer token"));
+        assert_eq!(auth.authenticate(&headers).unwrap().as_str(), "alice");
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer wrong"));
         assert!(auth.authenticate(&headers).is_err());
+    }
+
+    #[test]
+    fn bearer_binding_set_selects_the_authenticated_principal_without_debug_leakage() {
+        let auth = BearerAuthenticator::new([
+            (
+                Secret::new("first-secret"),
+                PrincipalId::new("alice").unwrap(),
+            ),
+            (
+                Secret::new("second-secret"),
+                PrincipalId::new("bob").unwrap(),
+            ),
+        ])
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer second-secret"),
+        );
+        assert_eq!(auth.authenticate(&headers).unwrap().as_str(), "bob");
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("first-secret"));
+        assert!(!debug.contains("second-secret"));
     }
 
     #[test]

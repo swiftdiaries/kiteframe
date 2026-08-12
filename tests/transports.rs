@@ -1,0 +1,1394 @@
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    io::Write,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+use agent_client_protocol::{
+    Channel, Client, ConnectTo, RawJsonRpcMessage, TransportFrame, schema::v1::RequestId,
+};
+use agent_client_protocol_http::HttpClient;
+use async_trait::async_trait;
+use async_tungstenite::{
+    WebSocketStream,
+    tokio::{ConnectStream, connect_async},
+    tungstenite::{Message as WsMessage, client::IntoClientRequest},
+};
+use futures::StreamExt;
+use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+use kiteframe::protocol::transport::{
+    AcpService, BearerAuthenticator, RemoteService, serve_acp_stream,
+};
+use kiteframe::{
+    Application, AuthenticatedConnection, CatalogTool, ClosedSchema, EffectKind, Engine,
+    EngineConfig, InProcessToolRegistry, ModelClient, ModelError, ModelRequest, ModelResponse,
+    PermissionRequestId, PersistedAuthorizer, PostgresStore, PrincipalId, RecoverySupport, RunId,
+    RunState, Secret, SessionId, ToolCatalogSnapshot, TransportKind,
+};
+use serde_json::{Value, json};
+use sqlx::Row;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
+use uuid::Uuid;
+
+struct UnusedModel;
+
+struct ScriptedModel(Mutex<VecDeque<Vec<Value>>>);
+
+#[derive(Clone)]
+struct CaptureLogs(Arc<Mutex<Vec<u8>>>);
+
+impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CaptureLogs {
+    type Writer = Self;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl Write for CaptureLogs {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log capture poisoned").extend(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ModelClient for UnusedModel {
+    async fn respond(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        Err(ModelError::Protocol(
+            "model is not used by transport tests".to_owned(),
+        ))
+    }
+}
+
+#[async_trait]
+impl ModelClient for ScriptedModel {
+    async fn respond(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        Ok(ModelResponse {
+            items: self
+                .0
+                .lock()
+                .expect("scripted model lock poisoned")
+                .pop_front()
+                .expect("scripted model response"),
+        })
+    }
+}
+
+fn principal(label: &str) -> PrincipalId {
+    PrincipalId::new(format!("transport-{label}-{}", Uuid::now_v7())).unwrap()
+}
+
+fn ready_model() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
+}
+
+async fn application() -> (Arc<Application>, Arc<PostgresStore>) {
+    let (application, store, _) = application_with_model(Arc::new(UnusedModel)).await;
+    (application, store)
+}
+
+async fn application_with_model(
+    model: Arc<dyn ModelClient>,
+) -> (Arc<Application>, Arc<PostgresStore>, Arc<Engine>) {
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL is required for transport conformance");
+    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let engine = Arc::new(Engine {
+        store: store.clone(),
+        model,
+        tools: Arc::new(InProcessToolRegistry::new()),
+        authorizer: Arc::new(PersistedAuthorizer::new(store.clone())),
+        config: EngineConfig::default(),
+    });
+    (
+        Arc::new(Application::new(store.clone(), engine.clone())),
+        store,
+        engine,
+    )
+}
+
+#[async_trait]
+trait RpcPeer {
+    async fn request(&mut self, method: &str, params: Value) -> Value;
+    async fn next_message(&mut self) -> Value;
+    async fn respond(&mut self, id: Value, result: Value);
+    async fn close(&mut self);
+}
+
+struct StdioPeer {
+    lines: Lines<BufReader<ReadHalf<tokio::io::DuplexStream>>>,
+    writer: WriteHalf<tokio::io::DuplexStream>,
+    server: Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>,
+    next_id: i64,
+}
+
+impl StdioPeer {
+    fn new(
+        application: Arc<Application>,
+        store: Arc<PostgresStore>,
+        principal: PrincipalId,
+    ) -> Self {
+        Self::with_v2(application, store, principal, false)
+    }
+
+    fn with_v2(
+        application: Arc<Application>,
+        store: Arc<PostgresStore>,
+        principal: PrincipalId,
+        v2_runtime_enabled: bool,
+    ) -> Self {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let server = tokio::spawn(serve_acp_stream(
+            server_reader,
+            server_writer,
+            application,
+            store,
+            AuthenticatedConnection {
+                principal,
+                transport: TransportKind::Stdio,
+            },
+            v2_runtime_enabled,
+        ));
+        Self {
+            lines: BufReader::new(reader).lines(),
+            writer,
+            server: Some(server),
+            next_id: 1,
+        }
+    }
+
+    async fn next_message(&mut self) -> Value {
+        let line = self
+            .lines
+            .next_line()
+            .await
+            .expect("read stdio message")
+            .expect("stdio message before EOF");
+        serde_json::from_str(&line).expect("JSON-RPC message")
+    }
+
+    async fn respond(&mut self, id: Value, result: Value) {
+        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        self.writer
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write stdio response");
+        self.writer.flush().await.expect("flush stdio response");
+    }
+
+    async fn respond_error(&mut self, id: Value) {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32800, "message": "client declined response"}
+        });
+        self.writer
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write stdio error response");
+        self.writer
+            .flush()
+            .await
+            .expect("flush stdio error response");
+    }
+}
+
+#[async_trait]
+impl RpcPeer for StdioPeer {
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write stdio request");
+        self.writer.flush().await.expect("flush stdio request");
+        let response = self.next_message().await;
+        assert_eq!(response["id"], id);
+        response
+    }
+
+    async fn next_message(&mut self) -> Value {
+        StdioPeer::next_message(self).await
+    }
+
+    async fn respond(&mut self, id: Value, result: Value) {
+        StdioPeer::respond(self, id, result).await;
+    }
+
+    async fn close(&mut self) {
+        self.writer.shutdown().await.expect("close stdio input");
+        self.server
+            .take()
+            .expect("stdio server")
+            .await
+            .expect("join stdio server")
+            .expect("serve stdio");
+    }
+}
+
+struct HttpPeer {
+    channel: Channel,
+    driver: Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>,
+    next_id: i64,
+}
+
+impl HttpPeer {
+    fn new(address: std::net::SocketAddr, token: &str) -> Self {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .expect("HTTP client");
+        let transport = HttpClient::with_endpoint_and_client(format!("http://{address}/acp"), http)
+            .expect("ACP HTTP client");
+        let (channel, driver) = ConnectTo::<Client>::into_channel_and_future(transport);
+        Self {
+            channel,
+            driver: Some(tokio::spawn(driver)),
+            next_id: 1,
+        }
+    }
+
+    async fn receive(&mut self) -> Value {
+        let frame = self
+            .channel
+            .rx
+            .next()
+            .await
+            .expect("HTTP message before close");
+        serde_json::from_str(&frame.to_json().expect("serialize HTTP message"))
+            .expect("JSON-RPC HTTP message")
+    }
+}
+
+#[async_trait]
+impl RpcPeer for HttpPeer {
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = RawJsonRpcMessage::request(method.to_owned(), params, RequestId::Number(id))
+            .expect("JSON-RPC request");
+        self.channel
+            .tx
+            .unbounded_send(TransportFrame::Single(message))
+            .expect("send HTTP request");
+        let response = self.receive().await;
+        assert_eq!(response["id"], id);
+        response
+    }
+
+    async fn next_message(&mut self) -> Value {
+        self.receive().await
+    }
+
+    async fn respond(&mut self, id: Value, result: Value) {
+        let id = serde_json::from_value(id).expect("JSON-RPC request id");
+        self.channel
+            .tx
+            .unbounded_send(TransportFrame::Single(RawJsonRpcMessage::response(
+                id,
+                Ok(result),
+            )))
+            .expect("send HTTP response");
+    }
+
+    async fn close(&mut self) {
+        self.channel.tx.close_channel();
+        self.driver
+            .take()
+            .expect("HTTP driver")
+            .await
+            .expect("join HTTP driver")
+            .expect("drive HTTP transport");
+    }
+}
+
+struct WebSocketPeer {
+    socket: WebSocketStream<ConnectStream>,
+    next_id: i64,
+}
+
+impl WebSocketPeer {
+    async fn connect(address: std::net::SocketAddr, token: &str) -> Self {
+        let mut request = format!("ws://{address}/acp")
+            .into_client_request()
+            .expect("WebSocket request");
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let (socket, response) = connect_async(request).await.expect("connect WebSocket");
+        assert_eq!(response.status(), http::StatusCode::SWITCHING_PROTOCOLS);
+        Self { socket, next_id: 1 }
+    }
+
+    async fn receive(&mut self) -> Value {
+        loop {
+            match self.socket.next().await.expect("WebSocket message") {
+                Ok(WsMessage::Text(text)) => {
+                    return serde_json::from_str(&text).expect("JSON-RPC WebSocket message");
+                }
+                Ok(WsMessage::Ping(_) | WsMessage::Pong(_)) => {}
+                Ok(other) => panic!("unexpected WebSocket frame: {other:?}"),
+                Err(error) => panic!("WebSocket receive failed: {error}"),
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl RpcPeer for WebSocketPeer {
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.socket
+            .send(WsMessage::Text(request.to_string().into()))
+            .await
+            .expect("send WebSocket request");
+        let response = self.receive().await;
+        assert_eq!(response["id"], id);
+        response
+    }
+
+    async fn next_message(&mut self) -> Value {
+        self.receive().await
+    }
+
+    async fn respond(&mut self, id: Value, result: Value) {
+        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        self.socket
+            .send(WsMessage::Text(response.to_string().into()))
+            .await
+            .expect("send WebSocket response");
+    }
+
+    async fn close(&mut self) {
+        self.socket.close(None).await.expect("close WebSocket");
+    }
+}
+
+struct TestServer {
+    address: std::net::SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl TestServer {
+    async fn start(service: &RemoteService) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ACP server");
+        let address = listener.local_addr().expect("ACP server address");
+        let (shutdown, receiver) = oneshot::channel();
+        let router = service.router();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let _ = receiver.await;
+                })
+                .await
+        });
+        Self {
+            address,
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+
+    async fn stop(mut self) {
+        let _ = self.shutdown.take().expect("shutdown sender").send(());
+        self.task
+            .await
+            .expect("join ACP server")
+            .expect("serve ACP");
+    }
+}
+
+fn success(response: Value) -> Value {
+    assert!(
+        response.get("error").is_none(),
+        "JSON-RPC error: {response}"
+    );
+    response["result"].clone()
+}
+
+struct PendingPermissionFixture {
+    session: Value,
+    session_id: SessionId,
+    run_id: RunId,
+    request_id: PermissionRequestId,
+}
+
+async fn create_pending_permission<P: RpcPeer + Send>(
+    peer: &mut P,
+    store: &PostgresStore,
+    engine: &Engine,
+    protocol_version: u16,
+) -> PendingPermissionFixture {
+    let initialize = if protocol_version == 1 {
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "permission-test", "version": "1.0.0"}
+        })
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "capabilities": {},
+            "info": {"name": "permission-test", "version": "2.0.0"}
+        })
+    };
+    success(peer.request("initialize", initialize).await);
+    let new_session = if protocol_version == 1 {
+        json!({"cwd": "/tmp/kiteframe-permission", "mcpServers": []})
+    } else {
+        json!({"cwd": "/tmp/kiteframe-permission"})
+    };
+    let session = success(peer.request("session/new", new_session).await);
+    let session_id = SessionId::new(
+        Uuid::parse_str(session["sessionId"].as_str().expect("session id")).unwrap(),
+    );
+    let descriptor = CatalogTool::new(
+        "docs/search",
+        "docs",
+        "Search records",
+        ClosedSchema::object("input", BTreeMap::new()),
+        ClosedSchema::object("output", BTreeMap::new()),
+        BTreeSet::new(),
+        EffectKind::ReadOnly,
+        RecoverySupport::NotRequired,
+    )
+    .expect("permission tool");
+    let catalog = ToolCatalogSnapshot::new(session_id.clone(), Uuid::now_v7(), [descriptor])
+        .expect("permission catalog");
+    store
+        .append_catalog_epoch(&catalog)
+        .await
+        .expect("append permission catalog");
+    let workflow_name = format!("permission{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {workflow_name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"permission\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}"
+    );
+    let definition = success(
+        peer.request("_kiteframe/workflow/publish", json!({"source": source}))
+            .await,
+    );
+    let started = success(
+        peer.request(
+            "_kiteframe/run/start",
+            json!({
+                "sessionId": session["sessionId"],
+                "workflowName": workflow_name,
+                "version": definition["version"],
+                "input": {},
+                "idempotencyKey": format!("permission-{}", Uuid::now_v7())
+            }),
+        )
+        .await,
+    );
+    let run_id = RunId::new(
+        Uuid::parse_str(started["id"].as_str().expect("started run id")).expect("run UUID"),
+    );
+    assert_eq!(engine.tick_run(run_id.clone()).await.expect("tick run"), 1);
+    assert_eq!(
+        store
+            .get_run(session_id.clone(), run_id.clone())
+            .await
+            .expect("waiting run")
+            .state,
+        RunState::WaitingForPermission
+    );
+    let request_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM permission_requests WHERE run_id = $1 AND state = 'pending'",
+    )
+    .bind(*run_id.as_uuid())
+    .fetch_one(store.pool())
+    .await
+    .expect("pending permission id");
+    let request_id = PermissionRequestId::new(request_id);
+    PendingPermissionFixture {
+        session,
+        session_id,
+        run_id,
+        request_id,
+    }
+}
+
+async fn exercise_permission<P: RpcPeer + Send>(
+    peer: &mut P,
+    store: &PostgresStore,
+    engine: &Engine,
+    protocol_version: u16,
+) {
+    let PendingPermissionFixture {
+        session,
+        session_id,
+        run_id,
+        request_id,
+    } = create_pending_permission(peer, store, engine, protocol_version).await;
+    let permission = tokio::time::timeout(Duration::from_secs(2), peer.next_message())
+        .await
+        .expect("transport must emit an unsolicited permission request");
+    assert_eq!(permission["method"], "session/request_permission");
+    assert_eq!(permission["params"]["sessionId"], session["sessionId"]);
+    if protocol_version == 1 {
+        assert_eq!(permission["params"]["toolCall"]["status"], "pending");
+    } else {
+        assert!(permission["params"]["title"].is_string());
+        assert_eq!(permission["params"]["subject"]["type"], "tool_call");
+    }
+    assert!(
+        permission["params"]["options"]
+            .as_array()
+            .expect("permission options")
+            .iter()
+            .any(|option| option["optionId"] == "deny-once")
+    );
+
+    peer.respond(
+        json!(format!("unknown-{}", Uuid::now_v7())),
+        json!({"outcome": {"outcome": "selected", "optionId": "deny-once"}}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !store
+            .pending_permission(session_id.clone(), run_id.clone(), request_id.clone())
+            .await
+            .expect("unknown response leaves permission pending")
+            .resolved
+    );
+
+    peer.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "deny-once"}}),
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store
+                .pending_permission(session_id.clone(), run_id.clone(), request_id.clone())
+                .await
+                .expect("read permission")
+                .resolved
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("permission response must resolve the durable request");
+
+    peer.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "allow-once"}}),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let row = sqlx::query(
+        "SELECT t.state, t.error, f.state AS frame_state \
+         FROM tool_calls t JOIN frames f ON f.id = t.frame_id \
+         WHERE f.run_id = $1",
+    )
+    .bind(*run_id.as_uuid())
+    .fetch_one(store.pool())
+    .await
+    .expect("denied tool call");
+    assert_eq!(row.get::<String, _>("state"), "failed");
+    assert_eq!(row.get::<String, _>("frame_state"), "runnable");
+    assert_eq!(
+        row.get::<Option<Value>, _>("error"),
+        Some(json!({
+            "code": "permission_denied",
+            "message": "Tool invocation denied by user"
+        }))
+    );
+    assert_eq!(
+        store
+            .get_run(session_id.clone(), run_id.clone())
+            .await
+            .expect("denied run")
+            .state,
+        RunState::Running
+    );
+    let event_kinds = store
+        .events_after(session_id, run_id, 0, 64)
+        .await
+        .expect("permission events")
+        .into_iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    let requested = event_kinds
+        .iter()
+        .position(|kind| kind == "permission.requested")
+        .expect("permission.requested event");
+    let resolved = event_kinds
+        .iter()
+        .position(|kind| kind == "permission.resolved")
+        .expect("permission.resolved event");
+    let failed = event_kinds
+        .iter()
+        .position(|kind| kind == "tool.failed")
+        .expect("tool.failed event");
+    assert!(requested < resolved && resolved < failed);
+    assert_eq!(
+        event_kinds
+            .iter()
+            .filter(|kind| kind.as_str() == "permission.resolved")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn all_transports_correlate_unsolicited_permission_responses() {
+    let scripted = VecDeque::from([
+        vec![
+            json!({"type":"function_call","call_id":"permission-call","name":"docs/search","arguments":{}}),
+        ],
+        vec![
+            json!({"type":"function_call","call_id":"permission-call","name":"docs/search","arguments":{}}),
+        ],
+        vec![
+            json!({"type":"function_call","call_id":"permission-call","name":"docs/search","arguments":{}}),
+        ],
+        vec![
+            json!({"type":"function_call","call_id":"permission-call","name":"docs/search","arguments":{}}),
+        ],
+    ]);
+    let (application, store, engine) =
+        application_with_model(Arc::new(ScriptedModel(Mutex::new(scripted)))).await;
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([
+            (Secret::new("permission-http"), principal("permission-http")),
+            (
+                Secret::new("permission-websocket"),
+                principal("permission-websocket"),
+            ),
+        ])
+        .expect("permission bearer bindings"),
+    );
+    let remote = RemoteService::new(
+        application.clone(),
+        authenticator,
+        store.clone(),
+        ready_model(),
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+
+    let mut stdio = StdioPeer::new(
+        application.clone(),
+        store.clone(),
+        principal("permission-stdio"),
+    );
+    exercise_permission(&mut stdio, &store, &engine, 1).await;
+    stdio.close().await;
+
+    let mut http = HttpPeer::new(server.address, "permission-http");
+    exercise_permission(&mut http, &store, &engine, 1).await;
+    http.close().await;
+
+    let mut websocket = WebSocketPeer::connect(server.address, "permission-websocket").await;
+    exercise_permission(&mut websocket, &store, &engine, 1).await;
+    websocket.close().await;
+
+    #[cfg(feature = "acp-v2")]
+    {
+        let mut v2 = StdioPeer::with_v2(
+            application.clone(),
+            store.clone(),
+            principal("permission-v2"),
+            true,
+        );
+        exercise_permission(&mut v2, &store, &engine, 2).await;
+        v2.close().await;
+    }
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn externally_resolved_permissions_cancel_outstanding_sdk_requests() {
+    let scripted = VecDeque::from([vec![json!({
+        "type": "function_call",
+        "call_id": "permission-external-resolution",
+        "name": "docs/search",
+        "arguments": {}
+    })]]);
+    let (application, store, engine) =
+        application_with_model(Arc::new(ScriptedModel(Mutex::new(scripted)))).await;
+    let owner = principal("permission-external-resolution");
+    let mut first = StdioPeer::new(application.clone(), store.clone(), owner.clone());
+    let PendingPermissionFixture {
+        session,
+        session_id,
+        run_id,
+        request_id,
+    } = create_pending_permission(&mut first, &store, &engine, 1).await;
+    let first_request = tokio::time::timeout(Duration::from_secs(2), first.next_message())
+        .await
+        .expect("first connection permission request");
+
+    let mut second = StdioPeer::new(application, store.clone(), owner);
+    success(
+        second
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "permission-resolver", "version": "1.0.0"}
+                }),
+            )
+            .await,
+    );
+    success(
+        second
+            .request(
+                "session/load",
+                json!({
+                    "sessionId": session["sessionId"],
+                    "cwd": "/tmp/kiteframe-permission",
+                    "mcpServers": []
+                }),
+            )
+            .await,
+    );
+    let second_request = tokio::time::timeout(Duration::from_secs(2), second.next_message())
+        .await
+        .expect("second connection permission request");
+    second
+        .respond(
+            second_request["id"].clone(),
+            json!({"outcome": {"outcome": "selected", "optionId": "deny-once"}}),
+        )
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store
+                .pending_permission(session_id.clone(), run_id.clone(), request_id.clone())
+                .await
+                .expect("externally resolved permission")
+                .resolved
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second connection must resolve permission");
+
+    let cancellation = tokio::time::timeout(Duration::from_secs(3), first.next_message())
+        .await
+        .expect("first connection SDK request must be cancelled");
+    assert_eq!(cancellation["method"], "$/cancel_request");
+    assert_eq!(cancellation["params"]["requestId"], first_request["id"]);
+    assert!(cancellation.get("id").is_none());
+
+    second.close().await;
+    first.close().await;
+}
+
+#[cfg(feature = "acp-v2")]
+#[tokio::test]
+async fn closing_a_session_cancels_its_outstanding_sdk_requests() {
+    let scripted = VecDeque::from([vec![json!({
+        "type": "function_call",
+        "call_id": "permission-session-close",
+        "name": "docs/search",
+        "arguments": {}
+    })]]);
+    let (application, store, engine) =
+        application_with_model(Arc::new(ScriptedModel(Mutex::new(scripted)))).await;
+    let mut peer = StdioPeer::with_v2(
+        application,
+        store.clone(),
+        principal("permission-session-close"),
+        true,
+    );
+    let PendingPermissionFixture { session, .. } =
+        create_pending_permission(&mut peer, &store, &engine, 2).await;
+    let permission = tokio::time::timeout(Duration::from_secs(2), peer.next_message())
+        .await
+        .expect("session permission request");
+
+    success(
+        peer.request("session/close", json!({"sessionId": session["sessionId"]}))
+            .await,
+    );
+    let cancellation = tokio::time::timeout(Duration::from_secs(2), peer.next_message())
+        .await
+        .expect("closing a session must cancel its permission request");
+    assert_eq!(cancellation["method"], "$/cancel_request");
+    assert_eq!(cancellation["params"]["requestId"], permission["id"]);
+
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn permission_replays_after_errors_cancellation_and_reconnect() {
+    let scripted = VecDeque::from([vec![json!({
+        "type": "function_call",
+        "call_id": "permission-reconnect",
+        "name": "docs/search",
+        "arguments": {}
+    })]]);
+    let (application, store, engine) =
+        application_with_model(Arc::new(ScriptedModel(Mutex::new(scripted)))).await;
+    let owner = principal("permission-reconnect");
+    let mut first = StdioPeer::new(application.clone(), store.clone(), owner.clone());
+    let PendingPermissionFixture {
+        session,
+        session_id,
+        run_id,
+        request_id,
+    } = create_pending_permission(&mut first, &store, &engine, 1).await;
+
+    let first_request = tokio::time::timeout(Duration::from_secs(2), first.next_message())
+        .await
+        .expect("initial permission request");
+    first.respond_error(first_request["id"].clone()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !store
+            .pending_permission(session_id.clone(), run_id.clone(), request_id.clone())
+            .await
+            .expect("error response leaves permission pending")
+            .resolved
+    );
+
+    let second_request = tokio::time::timeout(Duration::from_secs(2), first.next_message())
+        .await
+        .expect("permission retry after error response");
+    assert_ne!(second_request["id"], first_request["id"]);
+    first
+        .respond(
+            second_request["id"].clone(),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !store
+            .pending_permission(session_id.clone(), run_id.clone(), request_id.clone())
+            .await
+            .expect("cancelled outcome leaves permission pending")
+            .resolved
+    );
+
+    let disconnected_request = tokio::time::timeout(Duration::from_secs(2), first.next_message())
+        .await
+        .expect("permission retry after cancelled outcome");
+    first.close().await;
+
+    let mut resumed = StdioPeer::new(application, store.clone(), owner);
+    success(
+        resumed
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "permission-resume", "version": "1.0.0"}
+                }),
+            )
+            .await,
+    );
+    success(
+        resumed
+            .request(
+                "session/load",
+                json!({
+                    "sessionId": session["sessionId"],
+                    "cwd": "/tmp/kiteframe-permission",
+                    "mcpServers": []
+                }),
+            )
+            .await,
+    );
+    let replayed = tokio::time::timeout(Duration::from_secs(2), resumed.next_message())
+        .await
+        .expect("unresolved permission must replay after reconnect");
+    assert_eq!(replayed["method"], "session/request_permission");
+    assert_ne!(replayed["id"], disconnected_request["id"]);
+    resumed
+        .respond(
+            replayed["id"].clone(),
+            json!({"outcome": {"outcome": "selected", "optionId": "deny-once"}}),
+        )
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store
+                .pending_permission(session_id.clone(), run_id.clone(), request_id.clone())
+                .await
+                .expect("replayed permission")
+                .resolved
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("replayed permission response must resolve");
+    assert_eq!(
+        store
+            .events_after(session_id, run_id, 0, 64)
+            .await
+            .expect("reconnect events")
+            .into_iter()
+            .filter(|event| event.kind == "permission.resolved")
+            .count(),
+        1
+    );
+    resumed.close().await;
+}
+
+async fn exercise<P: RpcPeer + Send>(peer: &mut P, store: &PostgresStore) -> Value {
+    let initialized = success(
+        peer.request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "transport-test", "version": "1.0.0"}
+            }),
+        )
+        .await,
+    );
+    let session = success(
+        peer.request(
+            "session/new",
+            json!({"cwd": "/tmp/kiteframe-transport", "mcpServers": []}),
+        )
+        .await,
+    );
+    let session_id = SessionId::new(
+        Uuid::parse_str(session["sessionId"].as_str().expect("session id")).unwrap(),
+    );
+    store
+        .append_catalog_epoch(
+            &ToolCatalogSnapshot::new(session_id.clone(), Uuid::now_v7(), [])
+                .expect("empty catalog"),
+        )
+        .await
+        .expect("append empty catalog");
+
+    let source = "workflow transport() -> string { start t() } task t() -> string { prompt \"\"\"transport sentinel content\"\"\" tools [] on ok(answer: string) { done answer } }";
+    let published = success(
+        peer.request("_kiteframe/workflow/publish", json!({"source": source}))
+            .await,
+    );
+    let started = success(
+        peer.request(
+            "_kiteframe/run/start",
+            json!({
+                "sessionId": session["sessionId"],
+                "workflowName": "transport",
+                "version": published["version"],
+                "input": {},
+                "idempotencyKey": "transport-start"
+            }),
+        )
+        .await,
+    );
+    let current = success(
+        peer.request("_kiteframe/run/get", json!({"runId": started["id"]}))
+            .await,
+    );
+    let events = success(
+        peer.request(
+            "_kiteframe/run/event",
+            json!({"runId": started["id"], "after": 0, "limit": 64}),
+        )
+        .await,
+    );
+
+    json!({
+        "protocolVersion": initialized["protocolVersion"],
+        "published": {
+            "name": published["name"],
+            "version": published["version"],
+            "definitionHash": published["definitionHash"],
+        },
+        "started": {
+            "workflowName": started["workflowName"],
+            "version": started["version"],
+            "state": started["state"],
+            "revision": started["revision"],
+        },
+        "current": {
+            "workflowName": current["workflowName"],
+            "version": current["version"],
+            "state": current["state"],
+            "revision": current["revision"],
+        },
+        "events": events["events"].as_array().expect("events").iter().map(|event| {
+            json!({"sequence": event["sequence"], "kind": event["kind"]})
+        }).collect::<Vec<_>>(),
+    })
+}
+
+#[tokio::test]
+async fn stdio_websocket_and_streamable_http_are_application_equivalent() {
+    let (application, store) = application().await;
+    let stdio_principal = principal("stdio");
+    let http_principal = principal("http");
+    let websocket_principal = principal("websocket");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([
+            (Secret::new("http-secret"), http_principal),
+            (Secret::new("websocket-secret"), websocket_principal),
+        ])
+        .expect("bearer bindings"),
+    );
+    let remote = RemoteService::new(
+        application.clone(),
+        authenticator,
+        store.clone(),
+        ready_model(),
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+
+    let mut stdio = StdioPeer::new(application, store.clone(), stdio_principal);
+    let stdio_result = exercise(&mut stdio, &store).await;
+    stdio.close().await;
+
+    let mut http = HttpPeer::new(server.address, "http-secret");
+    let http_result = exercise(&mut http, &store).await;
+    http.close().await;
+
+    let mut websocket = WebSocketPeer::connect(server.address, "websocket-secret").await;
+    let websocket_result = exercise(&mut websocket, &store).await;
+    websocket.close().await;
+
+    assert_eq!(http_result, stdio_result);
+    assert_eq!(websocket_result, stdio_result);
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_env_filter("info,agent_client_protocol=off,agent_client_protocol_http=off")
+        .with_writer(CaptureLogs(captured.clone()))
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("install transport log capture");
+    let (application, store) = application().await;
+    let owner = principal("remote-owner");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(Secret::new("sentinel-bearer-secret"), owner.clone())])
+            .expect("bearer binding"),
+    );
+    assert!(!format!("{authenticator:?}").contains("sentinel-bearer-secret"));
+    let model_ready = Arc::new(AtomicBool::new(false));
+    let remote = RemoteService::new(
+        application,
+        authenticator,
+        store.clone(),
+        model_ready.clone(),
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+    let base = format!("http://{}", server.address);
+    let client = reqwest::Client::new();
+
+    assert_eq!(
+        client
+            .get(format!("{base}/readyz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    model_ready.store(true, Ordering::Release);
+
+    assert_eq!(
+        client
+            .get(format!("{base}/acp"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/acp"))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/acp"))
+            .bearer_auth("sentinel-bearer-secret")
+            .header("Upgrade", "websocket")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UPGRADE_REQUIRED
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/acp"))
+            .bearer_auth("sentinel-bearer-secret")
+            .header("Connection", "Upgrade")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UPGRADE_REQUIRED
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/acp"))
+            .bearer_auth("sentinel-bearer-secret")
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "!!!!!!!!!!!!!!!!!!!!!!!!")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UPGRADE_REQUIRED
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/acp"))
+            .bearer_auth("sentinel-bearer-secret")
+            .header("Content-Type", "application/json")
+            .body("{")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/readyz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::OK
+    );
+    for absent in ["/health", "/workflows", "/events"] {
+        assert_eq!(
+            client
+                .get(format!("{base}{absent}"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::NOT_FOUND
+        );
+    }
+
+    let mut peer = HttpPeer::new(server.address, "sentinel-bearer-secret");
+    success(
+        peer.request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "auth-test", "version": "1.0.0"}
+            }),
+        )
+        .await,
+    );
+    let injected = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": "/tmp/kiteframe-auth",
+                "mcpServers": [],
+                "principal": "attacker"
+            }),
+        )
+        .await;
+    assert_eq!(injected["error"]["code"], -32602);
+    let hostile_key = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": "/tmp/kiteframe-auth",
+                "mcpServers": [{
+                    "name": "sentinel-private-content",
+                    "command": "/bin/false",
+                    "args": [],
+                    "env": []
+                }]
+            }),
+        )
+        .await;
+    assert_eq!(hostile_key["error"]["code"], -32602, "{hostile_key}");
+    assert!(!hostile_key.to_string().contains("sentinel-private-content"));
+    let hostile_method = peer.request("sentinel-private-content", json!({})).await;
+    assert_eq!(hostile_method["error"]["code"], -32601);
+    assert!(
+        !hostile_method
+            .to_string()
+            .contains("sentinel-private-content")
+    );
+    let no_session = peer
+        .request("_kiteframe/run/get", json!({"runId": Uuid::now_v7()}))
+        .await;
+    assert_eq!(no_session["error"]["code"], -32000);
+    let created = success(
+        peer.request(
+            "session/new",
+            json!({"cwd": "/tmp/kiteframe-auth", "mcpServers": []}),
+        )
+        .await,
+    );
+    let session_id =
+        SessionId::new(Uuid::parse_str(created["sessionId"].as_str().unwrap()).unwrap());
+    assert_eq!(
+        store
+            .resume_session(session_id.clone(), &owner)
+            .await
+            .expect("owner session")
+            .principal,
+        owner
+    );
+    assert!(
+        store
+            .resume_session(session_id.clone(), &PrincipalId::new("attacker").unwrap(),)
+            .await
+            .is_err()
+    );
+    store
+        .append_catalog_epoch(
+            &ToolCatalogSnapshot::new(session_id.clone(), Uuid::now_v7(), [])
+                .expect("empty catalog"),
+        )
+        .await
+        .expect("append empty catalog");
+    success(
+        peer.request(
+            "_kiteframe/workflow/publish",
+            json!({
+                "source": "workflow redaction() -> string { start t() } task t() -> string { prompt \"\"\"sentinel-private-content\"\"\" tools [] on ok(answer: string) { done answer } }"
+            }),
+        )
+        .await,
+    );
+    peer.close().await;
+
+    let mut draining_websocket =
+        WebSocketPeer::connect(server.address, "sentinel-bearer-secret").await;
+    success(
+        draining_websocket
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "shutdown-test", "version": "1.0.0"}
+                }),
+            )
+            .await,
+    );
+    model_ready.store(false, Ordering::Release);
+    let unhealthy = draining_websocket
+        .request(
+            "session/new",
+            json!({"cwd": "/tmp/kiteframe-model-unready", "mcpServers": []}),
+        )
+        .await;
+    assert_eq!(unhealthy["error"]["code"], -32800);
+    model_ready.store(true, Ordering::Release);
+    remote.begin_shutdown();
+    let stopped = draining_websocket
+        .request(
+            "session/new",
+            json!({"cwd": "/tmp/kiteframe-after-shutdown", "mcpServers": []}),
+        )
+        .await;
+    assert_eq!(stopped["error"]["code"], -32800);
+    assert_eq!(
+        client
+            .get(format!("{base}/readyz"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    tokio::time::timeout(Duration::from_secs(1), server.stop())
+        .await
+        .expect("idle WebSocket must not block graceful shutdown");
+    drop(draining_websocket);
+
+    let logs = String::from_utf8(captured.lock().expect("log capture poisoned").clone())
+        .expect("logs are UTF-8");
+    assert!(logs.contains("ACP request handled"));
+    assert!(!logs.contains("sentinel-bearer-secret"));
+    assert!(!logs.contains("sentinel-private-content"));
+}
+
+#[test]
+fn acp_service_is_an_sdk_agent_component() {
+    fn assert_component<T: ConnectTo<Client>>() {}
+    assert_component::<AcpService>();
+}
