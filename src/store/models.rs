@@ -1,4 +1,5 @@
 use serde_json::Value;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -38,7 +39,7 @@ pub struct PublishedDefinition {
     pub definition_hash: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct StartRun {
     pub session_id: SessionId,
     pub workflow_name: String,
