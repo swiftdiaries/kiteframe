@@ -188,6 +188,12 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .await
         .expect("start cancellable run");
     store.cancel_run(cancellable.id, 0).await.expect("cancel run");
+    let recoverable = store
+        .start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name.clone(), version: Some(definition.version), input: json!({"query": "recover"}), idempotency_key: IdempotencyKey::new(format!("recover-{}", Uuid::now_v7())).unwrap() })
+        .await.expect("start recoverable run");
+    store.begin_model_attempt(recoverable.root_frame_id.clone(), 0, json!({"prompt":"recover"})).await.expect("interrupted model intent");
+    assert!(store.requeue_uncommitted_model_attempts(256).await.expect("recover model intent") >= 1);
+    assert!(store.runnable_frames_for_run(recoverable.id.clone(), 8).await.expect("requeued frame").iter().any(|frame| frame.id == recoverable.root_frame_id));
     let completable = store
         .start_run(StartRun {
             session_id: session.id.clone(),

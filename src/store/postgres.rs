@@ -389,6 +389,23 @@ impl PostgresStore {
         Ok(rows.into_iter().map(|row| super::RunEvent { sequence: row.get::<i64, _>("sequence") as u64, kind: row.get("kind"), metadata: row.get("metadata"), created_at: row.get("created_at") }).collect())
     }
 
+    pub async fn requeue_uncommitted_model_attempts(&self, limit: i64) -> Result<u64, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frames = sqlx::query("SELECT f.id, f.run_id FROM frames f WHERE f.state = 'running' AND EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'input') AND NOT EXISTS (SELECT 1 FROM tool_calls t WHERE t.frame_id = f.id AND t.state IN ('intent', 'running', 'waiting_for_permission')) AND NOT EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'output') ORDER BY f.updated_at LIMIT $1 FOR UPDATE SKIP LOCKED")
+            .bind(limit.clamp(1, 256)).fetch_all(&mut *tx).await?;
+        for frame in &frames {
+            let frame_id = frame.get::<uuid::Uuid, _>("id");
+            let run_id = frame.get::<uuid::Uuid, _>("run_id");
+            sqlx::query("UPDATE frames SET state = 'runnable', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+                .bind(frame_id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE runs SET state = 'runnable', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND state = 'running'")
+                .bind(run_id).execute(&mut *tx).await?;
+            append_event(&mut tx, run_id, "model.requeued", json!({"frame_id": frame_id})).await?;
+        }
+        tx.commit().await?;
+        Ok(frames.len() as u64)
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,

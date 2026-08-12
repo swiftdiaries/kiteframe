@@ -1,6 +1,8 @@
 mod transition;
+mod recovery;
 
 pub use transition::{FrameSnapshot, TransitionError, next_command};
+pub use recovery::RecoveryReport;
 
 use std::sync::Arc;
 
@@ -74,6 +76,10 @@ pub enum EngineError {
 }
 
 impl Engine {
+    pub async fn recover(&self) -> Result<RecoveryReport, EngineError> {
+        Ok(recovery::recover_model_attempts(&self.store).await?)
+    }
+
     pub async fn cancel_run(&self, request: CancelRun) -> Result<(), EngineError> {
         let revision = self.store.run_revision(request.session_id, request.run_id.clone()).await?;
         self.store.cancel_run(request.run_id, revision).await?;
