@@ -16,6 +16,7 @@ pub use domain::{
     PrincipalId, RunId, Secret, SessionId,
 };
 pub use hash::{HashError, canonical_json, canonical_sha256};
+pub use engine::{Engine, EngineConfig, EngineError};
 pub use mcp::{
     AuthenticatedMcpPeer, CatalogRefresh, McpError, McpLimits, McpManager, McpServerConfig,
     RemoteTool, RmcpPeer, closed_schema,
