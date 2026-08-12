@@ -1,6 +1,7 @@
 mod application;
 mod types;
 pub mod v1;
+pub mod transport;
 #[cfg(feature = "acp-v2")]
 pub mod v2;
 
@@ -10,3 +11,4 @@ pub use types::{
     ProtocolError,
 };
 pub(crate) use types::command_session;
+pub use transport::{AuthError, AuthenticatedConnection, ConnectionAuthenticator, StaticBearerAuthenticator, TransportKind};

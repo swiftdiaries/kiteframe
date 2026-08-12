@@ -1333,6 +1333,7 @@ dependencies = [
  "serde_json_canonicalizer",
  "sha2",
  "sqlx",
+ "subtle",
  "thiserror",
  "time",
  "tokio",

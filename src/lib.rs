@@ -1,5 +1,6 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+pub mod config;
 pub mod domain;
 pub mod dsl;
 pub mod engine;
@@ -16,6 +17,7 @@ pub use domain::{
     Capability, CatalogEpochId, FrameId, IdempotencyKey, PermissionRequestId, PolicyRevision,
     PrincipalId, RunId, Secret, SessionId,
 };
+pub use config::{ConfigError, HarnessConfig, HarnessMode};
 pub use hash::{HashError, canonical_json, canonical_sha256};
 pub use engine::{AnswerQuestion, CancelRun, Engine, EngineConfig, EngineError, PermissionChoice, RecoveryReport, ResolvePermission};
 pub use mcp::{
