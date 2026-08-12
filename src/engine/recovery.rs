@@ -25,6 +25,7 @@ pub(crate) async fn recover_model_attempts(
 pub(crate) async fn recover_tool_statuses(
     store: &crate::PostgresStore,
     tools: &dyn ToolResolver,
+    status_poll_retry_budget: u32,
 ) -> Result<RecoveryReport, StoreError> {
     let mut report = RecoveryReport::default();
     let mut sessions_waiting_for_mcp = BTreeSet::new();
@@ -59,9 +60,21 @@ pub(crate) async fn recover_tool_statuses(
                 continue;
             }
         };
-        let revision = store
-            .begin_tool_status_check(call.frame_id.clone(), call.id, call.revision)
-            .await?;
+        let Some(revision) = store
+            .begin_tool_status_check(
+                call.frame_id.clone(),
+                call.id,
+                call.revision,
+                status_poll_retry_budget,
+            )
+            .await?
+        else {
+            store
+                .mark_tool_call_outcome_unknown(call.frame_id, call.id, call.revision)
+                .await?;
+            report.outcomes_unknown += 1;
+            continue;
+        };
         match tool.status(&call.idempotency_key).await {
             Ok(ToolStatus::Succeeded { result }) => {
                 tool.descriptor()
@@ -80,10 +93,7 @@ pub(crate) async fn recover_tool_statuses(
                 report.tools_recovered += 1;
             }
             Ok(ToolStatus::Pending | ToolStatus::Running | ToolStatus::WaitingForPermission) => {
-                store
-                    .mark_tool_call_outcome_unknown(call.frame_id, call.id, revision)
-                    .await?;
-                report.outcomes_unknown += 1;
+                report.tools_requeued += 1;
             }
             Ok(ToolStatus::NotStarted | ToolStatus::Unknown) | Err(_) => {
                 store

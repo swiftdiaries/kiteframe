@@ -53,6 +53,7 @@ struct UnavailableStatusTool {
 struct PendingStatusTool {
     descriptor: CatalogTool,
     invocations: Arc<AtomicUsize>,
+    status_polls: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -67,6 +68,7 @@ impl TrustedTool for PendingStatusTool {
     }
 
     async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
+        self.status_polls.fetch_add(1, Ordering::SeqCst);
         Ok(ToolStatus::Pending)
     }
 }
@@ -374,7 +376,7 @@ async fn recovery_reports_sessions_that_need_fresh_mcp_attachment() {
 }
 
 #[tokio::test]
-async fn pending_status_is_durably_classified_not_reported_as_requeued() {
+async fn pending_status_is_polled_again_before_retry_budget_exhaustion() {
     let Ok(database_url) = std::env::var("DATABASE_URL") else {
         return;
     };
@@ -399,11 +401,13 @@ async fn pending_status_is_durably_classified_not_reported_as_requeued() {
     )
     .expect("descriptor");
     let invocations = Arc::new(AtomicUsize::new(0));
+    let status_polls = Arc::new(AtomicUsize::new(0));
     let tools = Arc::new(InProcessToolRegistry::new());
     tools
         .register(bind_tool(Arc::new(PendingStatusTool {
             descriptor: descriptor.clone(),
             invocations: invocations.clone(),
+            status_polls: status_polls.clone(),
         })))
         .expect("register tool");
     let catalog = tools
@@ -472,10 +476,20 @@ async fn pending_status_is_durably_classified_not_reported_as_requeued() {
         authorizer: Arc::new(AllowAll),
         config: EngineConfig::default(),
     };
-    let report = engine.recover().await.expect("recover");
-    assert_eq!(report.tools_requeued, 0);
-    assert_eq!(report.outcomes_unknown, 1);
+    let first = engine.recover().await.expect("first recovery");
+    assert_eq!(first.tools_requeued, 1);
+    assert_eq!(first.outcomes_unknown, 0);
+    let second = engine.recover().await.expect("second recovery");
+    assert_eq!(second.tools_requeued, 1);
+    assert_eq!(second.outcomes_unknown, 0);
+    let third = engine.recover().await.expect("third recovery");
+    assert_eq!(third.tools_requeued, 1);
+    assert_eq!(third.outcomes_unknown, 0);
+    let fourth = engine.recover().await.expect("fourth recovery");
+    assert_eq!(fourth.tools_requeued, 0);
+    assert_eq!(fourth.outcomes_unknown, 1);
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(status_polls.load(Ordering::SeqCst), 3);
     let state: String = sqlx::query("SELECT state FROM runs WHERE id = $1")
         .bind(*run.id.as_uuid())
         .fetch_one(store.pool())

@@ -518,7 +518,8 @@ impl PostgresStore {
         frame_id: crate::FrameId,
         tool_call_id: uuid::Uuid,
         expected_revision: u64,
-    ) -> Result<u64, StoreError> {
+        retry_budget: u32,
+    ) -> Result<Option<u64>, StoreError> {
         let mut tx = self.pool.begin().await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
@@ -526,13 +527,19 @@ impl PostgresStore {
             return Err(StoreError::RevisionConflict);
         }
         let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        let call = sqlx::query("SELECT state FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
+        let call = sqlx::query("SELECT state, recovery_attempts FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
             .bind(tool_call_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("tool call was not found for frame".to_owned()))?;
         if call.get::<String, _>("state") != "intent" {
             return Err(StoreError::RevisionConflict);
         }
+        if call.get::<i32, _>("recovery_attempts") as u32 >= retry_budget {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let revision = expected_revision + 1;
+        sqlx::query("UPDATE tool_calls SET recovery_attempts = recovery_attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(tool_call_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE frames SET revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
             .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
         append_event(
@@ -542,7 +549,7 @@ impl PostgresStore {
             json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id}),
         ).await?;
         tx.commit().await?;
-        Ok(revision)
+        Ok(Some(revision))
     }
 
     pub async fn claim_tool_recovery_retry(

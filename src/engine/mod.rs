@@ -64,11 +64,12 @@ pub struct CancelRun {
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
     pub scheduler_batch_size: i64,
+    pub status_poll_retry_budget: u32,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self { scheduler_batch_size: 32 }
+        Self { scheduler_batch_size: 32, status_poll_retry_budget: 3 }
     }
 }
 
@@ -83,7 +84,12 @@ pub enum EngineError {
 impl Engine {
     pub async fn recover(&self) -> Result<RecoveryReport, EngineError> {
         let mut report = recovery::recover_model_attempts(&self.store).await?;
-        let tools = recovery::recover_tool_statuses(&self.store, self.tools.as_ref()).await?;
+        let tools = recovery::recover_tool_statuses(
+            &self.store,
+            self.tools.as_ref(),
+            self.config.status_poll_retry_budget,
+        )
+        .await?;
         report.tools_recovered = tools.tools_recovered;
         report.tools_requeued = tools.tools_requeued;
         report.sessions_waiting_for_mcp = tools.sessions_waiting_for_mcp;
