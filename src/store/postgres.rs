@@ -381,6 +381,31 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn record_completion(
+        &self,
+        frame_id: crate::FrameId,
+        expected_revision: u64,
+        outcome_name: String,
+        fields: Value,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state, bindings FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
+            return Err(StoreError::RevisionConflict);
+        }
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
+        let mut bindings = frame.get::<Value, _>("bindings").as_object().cloned().ok_or_else(|| StoreError::InvalidData("frame bindings are malformed".to_owned()))?;
+        let fields = fields.as_object().ok_or_else(|| StoreError::InvalidData("completion fields must be an object".to_owned()))?;
+        bindings.extend(fields.clone());
+        sqlx::query("UPDATE frames SET state = 'runnable', outcome_name = $1, statement_index = 0, bindings = $2, revision = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4")
+            .bind(&outcome_name).bind(Value::Object(bindings)).bind((expected_revision + 1) as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        append_event(&mut tx, run_id, "model.completed_task", json!({"frame_id": frame_id.as_uuid(), "outcome": outcome_name})).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn begin_tool_call(
         &self,
