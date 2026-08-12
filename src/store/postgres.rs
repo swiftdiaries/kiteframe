@@ -668,6 +668,35 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn cancel_run(
+        &self,
+        run_id: crate::RunId,
+        expected_revision: u64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let run = sqlx::query("SELECT revision, state FROM runs WHERE id = $1 FOR UPDATE")
+            .bind(*run_id.as_uuid()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| StoreError::InvalidData("run was not found".to_owned()))?;
+        if run.get::<i64, _>("revision") as u64 != expected_revision {
+            return Err(StoreError::RevisionConflict);
+        }
+        if matches!(run.get::<String, _>("state").as_str(), "completed" | "failed" | "cancelled") {
+            return Err(StoreError::RevisionConflict);
+        }
+        let revision = expected_revision + 1;
+        sqlx::query("UPDATE runs SET state = 'cancelled', revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(revision as i64).bind(*run_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE frames SET state = 'cancelled', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE run_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled')")
+            .bind(*run_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE questions SET state = 'cancelled' WHERE run_id = $1 AND state = 'pending'")
+            .bind(*run_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE permission_requests SET state = 'cancelled' WHERE run_id = $1 AND state = 'pending'")
+            .bind(*run_id.as_uuid()).execute(&mut *tx).await?;
+        append_event(&mut tx, *run_id.as_uuid(), "run.cancelled", json!({})).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn publish(
         &self,
         session: SessionId,

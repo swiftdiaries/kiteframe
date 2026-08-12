@@ -154,6 +154,17 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         )
         .await
         .expect("complete root frame");
+    let cancellable = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name.clone(),
+            version: Some(definition.version),
+            input: json!({"query": "cancel"}),
+            idempotency_key: IdempotencyKey::new(format!("cancel-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .expect("start cancellable run");
+    store.cancel_run(cancellable.id, 0).await.expect("cancel run");
     assert!(matches!(
         store
             .start_run(StartRun { input: json!({"query": "changed"}), ..StartRun {
