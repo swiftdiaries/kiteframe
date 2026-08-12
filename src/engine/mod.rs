@@ -70,6 +70,10 @@ impl Engine {
 
     async fn run_model_turn(&self, frame: crate::RunnableFrame) -> Result<(), EngineError> {
         let task = frame.workflow.tasks.get(&frame.task_name).ok_or_else(|| StoreError::InvalidData("runnable frame task is absent from workflow".to_owned()))?;
+        let limit = frame.workflow.limits.get("model_turns_per_task").copied().unwrap_or(u64::MAX);
+        if self.store.model_attempt_count(frame.id.clone()).await? >= limit {
+            return Err(StoreError::InvalidData("model turn limit reached for task".to_owned()).into());
+        }
         let attempt = self.store.begin_model_attempt(frame.id.clone(), frame.revision, json!({"bindings": frame.bindings})).await?;
         let mut input = self.store.frame_history(frame.id.clone()).await?;
         input.insert(0, json!({"bindings": frame.bindings}));

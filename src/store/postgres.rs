@@ -349,6 +349,12 @@ impl PostgresStore {
         Ok(items)
     }
 
+    pub async fn model_attempt_count(&self, frame_id: crate::FrameId) -> Result<u64, StoreError> {
+        let row = sqlx::query("SELECT COUNT(DISTINCT attempt) AS count FROM model_items WHERE frame_id = $1")
+            .bind(*frame_id.as_uuid()).fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("count") as u64)
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,

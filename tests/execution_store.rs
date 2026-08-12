@@ -57,6 +57,7 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .expect("persist model intent");
     assert_eq!(attempt.attempt, 1);
     assert_eq!(attempt.revision, 1);
+    assert_eq!(store.model_attempt_count(started.root_frame_id.clone()).await.expect("count attempts"), 1);
     store
         .commit_model_attempt(
             started.root_frame_id.clone(),
