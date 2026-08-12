@@ -1,4 +1,6 @@
 use http::{HeaderMap, header::AUTHORIZATION};
+use serde::Deserialize;
+use serde_json::Value;
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 
@@ -33,6 +35,19 @@ pub enum AuthError {
     #[error("authorization is not accepted")] Unauthorized,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct NdjsonRequest {
+    pub session_id: crate::SessionId,
+    pub method: String,
+    pub payload: Value,
+}
+
+impl NdjsonRequest {
+    pub fn into_command(self) -> Result<(crate::SessionId, crate::ApplicationCommand), crate::ProtocolError> {
+        Ok((self.session_id, super::v1::V1Adapter::decode_extension(&self.method, self.payload)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
@@ -45,5 +60,16 @@ mod tests {
         let mut headers = HeaderMap::new(); headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token"));
         assert_eq!(auth.authenticate(&headers).unwrap().as_str(), "alice");
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer wrong")); assert!(auth.authenticate(&headers).is_err());
+    }
+
+    #[test]
+    fn ndjson_request_keeps_transport_session_separate_from_command_payload() {
+        let request: super::NdjsonRequest = serde_json::from_value(serde_json::json!({
+            "session_id":"019ff3d8-9d86-7de0-9070-0f0185d5f413", "method":"_kiteframe/run/get",
+            "payload":{"run_id":"019ff3d8-9d86-7de0-9070-0f0185d5f413"}
+        })).unwrap();
+        let (session, command) = request.into_command().unwrap();
+        assert_eq!(session.as_uuid().to_string(), "019ff3d8-9d86-7de0-9070-0f0185d5f413");
+        assert!(matches!(command, crate::ApplicationCommand::Get(_)));
     }
 }

@@ -11,4 +11,4 @@ pub use types::{
     ProtocolError,
 };
 pub(crate) use types::command_session;
-pub use transport::{AuthError, AuthenticatedConnection, ConnectionAuthenticator, StaticBearerAuthenticator, TransportKind};
+pub use transport::{AuthError, AuthenticatedConnection, ConnectionAuthenticator, NdjsonRequest, StaticBearerAuthenticator, TransportKind};
