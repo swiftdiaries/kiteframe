@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::{CatalogEpochId, FrameId, IdempotencyKey, PolicyRevision, PrincipalId, RunId, SessionId};
@@ -98,6 +99,15 @@ pub struct Question {
     pub binding: String,
     pub text: String,
     pub schema: crate::ClosedSchema,
+}
+
+pub type Bindings = BTreeMap<String, Value>;
+
+#[derive(Clone, Debug)]
+pub enum FrameCommand {
+    Goto { task_name: String, bindings: Bindings },
+    Complete(Value),
+    Fail { code: String, message: String },
 }
 
 #[derive(Debug, Error)]

@@ -29,7 +29,7 @@ pub use policy::{
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
-    CreateSession, ModelAttempt, NewPermissionRequest, PolicyUpdate, PostgresStore,
+    Bindings, CreateSession, FrameCommand, ModelAttempt, NewPermissionRequest, PolicyUpdate, PostgresStore,
     PublishedDefinition, Question, RunState, RunView, SessionView, StartRun, StoreError, ToolCallIntent,
 };
 pub use tools::{

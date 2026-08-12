@@ -625,6 +625,49 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn apply_frame_command(
+        &self,
+        frame_id: crate::FrameId,
+        expected_revision: u64,
+        command: super::FrameCommand,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, parent_frame_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
+            return Err(StoreError::RevisionConflict);
+        }
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
+        let revision = expected_revision + 1;
+        match command {
+            super::FrameCommand::Goto { task_name, bindings } => {
+                sqlx::query("UPDATE frames SET task_name = $1, bindings = $2, state = 'runnable', revision = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4")
+                    .bind(task_name).bind(serde_json::to_value(bindings).map_err(|error| StoreError::InvalidData(error.to_string()))?).bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+                append_event(&mut tx, run_id, "frame.goto", json!({"frame_id": frame_id.as_uuid()})).await?;
+            }
+            super::FrameCommand::Complete(result) => {
+                sqlx::query("UPDATE frames SET state = 'completed', result = $1, revision = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3")
+                    .bind(result.clone()).bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+                if frame.get::<Option<uuid::Uuid>, _>("parent_frame_id").is_none() {
+                    sqlx::query("UPDATE runs SET state = 'completed', output = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                        .bind(result).bind(run_id).execute(&mut *tx).await?;
+                }
+                append_event(&mut tx, run_id, "frame.completed", json!({"frame_id": frame_id.as_uuid()})).await?;
+            }
+            super::FrameCommand::Fail { code, message } => {
+                let failure = json!({"code": code, "message": message});
+                sqlx::query("UPDATE frames SET state = 'failed', failure = $1, revision = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3")
+                    .bind(&failure).bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+                sqlx::query("UPDATE runs SET state = 'failed', failure = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                    .bind(failure).bind(run_id).execute(&mut *tx).await?;
+                append_event(&mut tx, run_id, "frame.failed", json!({"frame_id": frame_id.as_uuid()})).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn publish(
         &self,
         session: SessionId,
