@@ -31,6 +31,16 @@
       "_meta": { "future.session": "load-v1" }
     }
   },
+  "sessionNewResponse": {
+    "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413"
+  },
+  "sessionLoadResponse": {},
+  "publishedResponse": {
+    "id": "019ff3d8-9d86-7de0-9070-0f0185d5f416",
+    "name": "support",
+    "version": 7,
+    "definitionHash": "sha256:fixture"
+  },
   "permission": {
     "jsonrpc": "2.0",
     "id": 4,
@@ -49,13 +59,20 @@
       "_meta": { "future.permission": ["keep", 1] }
     }
   },
+  "permissionResponse": {
+    "outcome": {
+      "outcome": "selected",
+      "optionId": "allow-once"
+    },
+    "_meta": { "future.permission-response": ["keep", 1] }
+  },
   "extensions": [
-    { "jsonrpc": "2.0", "id": 10, "method": "_kiteframe/workflow/publish", "params": { "source": "workflow support {}" }, "kind": "publish" },
-    { "jsonrpc": "2.0", "id": 11, "method": "_kiteframe/run/start", "params": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "workflowName": "support", "version": 1, "input": {}, "idempotencyKey": "start-1" }, "kind": "start" },
-    { "jsonrpc": "2.0", "id": 12, "method": "_kiteframe/run/get", "params": { "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414" }, "kind": "get" },
-    { "jsonrpc": "2.0", "id": 13, "method": "_kiteframe/run/answer", "params": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "questionId": "019ff3d8-9d86-7de0-9070-0f0185d5f415", "answer": "yes", "idempotencyKey": "answer-1" }, "kind": "answer" },
-    { "jsonrpc": "2.0", "id": 14, "method": "_kiteframe/run/cancel", "params": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "reason": "operator request", "idempotencyKey": "cancel-1" }, "kind": "cancel" },
-    { "jsonrpc": "2.0", "id": 15, "method": "_kiteframe/session/policy/update", "params": { "expectedRevision": 0, "idempotencyKey": "policy-1", "policy": { "version": 1, "rules": [] } }, "kind": "policy" },
-    { "jsonrpc": "2.0", "id": 16, "method": "_kiteframe/run/event", "params": { "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "after": 3, "limit": 64 }, "kind": "events" }
+    { "jsonrpc": "2.0", "id": 10, "method": "_kiteframe/workflow/publish", "params": { "source": "workflow support {}" }, "kind": "publish", "command": { "source": "workflow support {}" } },
+    { "jsonrpc": "2.0", "id": 11, "method": "_kiteframe/run/start", "params": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "workflowName": "support", "version": 1, "input": {}, "idempotencyKey": "start-1" }, "kind": "start", "command": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "workflowName": "support", "version": 1, "input": {}, "idempotencyKey": "start-1" } },
+    { "jsonrpc": "2.0", "id": 12, "method": "_kiteframe/run/get", "params": { "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414" }, "kind": "get", "command": { "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414" } },
+    { "jsonrpc": "2.0", "id": 13, "method": "_kiteframe/run/answer", "params": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "questionId": "019ff3d8-9d86-7de0-9070-0f0185d5f415", "answer": "yes", "idempotencyKey": "answer-1" }, "kind": "answer", "command": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "questionId": "019ff3d8-9d86-7de0-9070-0f0185d5f415", "answer": "yes", "idempotencyKey": "answer-1" } },
+    { "jsonrpc": "2.0", "id": 14, "method": "_kiteframe/run/cancel", "params": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "reason": "operator request", "idempotencyKey": "cancel-1" }, "kind": "cancel", "command": { "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413", "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "reason": "operator request", "idempotencyKey": "cancel-1" } },
+    { "jsonrpc": "2.0", "id": 15, "method": "_kiteframe/session/policy/update", "params": { "expectedRevision": 0, "idempotencyKey": "policy-1", "policy": { "version": 1, "rules": [] } }, "kind": "policy", "command": { "expectedRevision": 0, "idempotencyKey": "policy-1", "policy": { "version": 1, "rules": [] } } },
+    { "jsonrpc": "2.0", "id": 16, "method": "_kiteframe/run/event", "params": { "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "after": 3, "limit": 64 }, "kind": "events", "command": { "runId": "019ff3d8-9d86-7de0-9070-0f0185d5f414", "after": 3, "limit": 64 } }
   ]
 }

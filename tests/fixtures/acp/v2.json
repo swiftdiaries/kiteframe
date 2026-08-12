@@ -46,6 +46,19 @@
       "_meta": { "future.session": "close-v2" }
     }
   },
+  "sessionNewResponse": {
+    "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413"
+  },
+  "sessionListResponse": {
+    "sessions": [
+      {
+        "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413",
+        "cwd": "/tmp/kiteframe-v2"
+      }
+    ]
+  },
+  "sessionResumeResponse": {},
+  "sessionCloseResponse": {},
   "permission": {
     "jsonrpc": "2.0",
     "id": 6,
@@ -64,5 +77,12 @@
       ],
       "_meta": { "future.permission": ["keep", 2] }
     }
+  },
+  "permissionResponse": {
+    "outcome": {
+      "outcome": "selected",
+      "optionId": "allow-once"
+    },
+    "_meta": { "future.permission-response": ["keep", 2] }
   }
 }

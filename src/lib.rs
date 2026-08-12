@@ -39,10 +39,11 @@ pub use policy::{
 #[cfg(feature = "acp-v2")]
 pub use protocol::V2Adapter;
 pub use protocol::{
-    Application, ApplicationCommand, ApplicationContext, ApplicationResult,
+    Application, ApplicationCommand, ApplicationContext, ApplicationResult, ApplicationSession,
     AuthenticatedConnection, CloseSession, EventCursor, GetRun, NegotiatedProtocol, NewSession,
-    ProtocolAdapter, ProtocolError, ProtocolNegotiation, PublishWorkflow, ResumeSession,
-    StaticBearerAuthenticator, TransportKind, UpdateSessionPolicy, V1Adapter, serve_ndjson,
+    PermissionResponseContext, ProtocolAdapter, ProtocolConnection, ProtocolError,
+    ProtocolNegotiation, PublishWorkflow, ResumeSession, StaticBearerAuthenticator, TransportKind,
+    UpdateSessionPolicy, V1Adapter, serve_ndjson,
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{

@@ -7,13 +7,14 @@ pub mod v2;
 
 pub use application::Application;
 pub use transport::{
-    AuthError, AuthenticatedConnection, ConnectionAuthenticator, NdjsonRequest,
+    AuthError, AuthenticatedConnection, ConnectionAuthenticator, NdjsonRequest, ProtocolConnection,
     StaticBearerAuthenticator, TransportKind, serve_ndjson,
 };
 pub use types::{
-    ApplicationCommand, ApplicationContext, ApplicationResult, CloseSession, EventCursor, GetRun,
-    NegotiatedProtocol, NewSession, ProtocolAdapter, ProtocolError, ProtocolNegotiation,
-    PublishWorkflow, ResumeSession, UpdateSessionPolicy,
+    ApplicationCommand, ApplicationContext, ApplicationResult, ApplicationSession, CloseSession,
+    EventCursor, GetRun, NegotiatedProtocol, NewSession, PermissionResponseContext,
+    ProtocolAdapter, ProtocolError, ProtocolNegotiation, PublishWorkflow, ResumeSession,
+    UpdateSessionPolicy,
 };
 pub(crate) use types::{command_session, encode_application_result};
 pub use v1::V1Adapter;

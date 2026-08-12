@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
+
 use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
-    AnswerQuestion, CancelRun, IdempotencyKey, PolicyRevision, PrincipalId, PublishedDefinition,
-    ResolvePermission, RunEvent, RunId, RunView, SessionId, SessionPolicy, SessionView, StartRun,
+    AnswerQuestion, CancelRun, IdempotencyKey, PermissionChoice, PermissionRequestId,
+    PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission, RunEvent, RunId, RunView,
+    SessionId, SessionPolicy, SessionView, StartRun,
 };
 
 #[derive(Clone, Debug)]
@@ -53,6 +56,60 @@ pub struct UpdateSessionPolicy {
 }
 
 #[derive(Clone, Debug)]
+pub struct ApplicationSession {
+    pub view: SessionView,
+    pub working_directory: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PermissionResponseContext {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub permission_request_id: PermissionRequestId,
+    pub idempotency_key: IdempotencyKey,
+    options: BTreeMap<String, PermissionChoice>,
+}
+
+impl PermissionResponseContext {
+    #[must_use]
+    pub fn new(
+        session_id: SessionId,
+        run_id: RunId,
+        permission_request_id: PermissionRequestId,
+        idempotency_key: IdempotencyKey,
+    ) -> Self {
+        Self {
+            session_id,
+            run_id,
+            permission_request_id,
+            idempotency_key,
+            options: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_option(mut self, option_id: impl Into<String>, choice: PermissionChoice) -> Self {
+        self.options.insert(option_id.into(), choice);
+        self
+    }
+
+    pub(crate) fn resolve(self, option_id: &str) -> Result<ApplicationCommand, ProtocolError> {
+        let choice = self.options.get(option_id).copied().ok_or_else(|| {
+            ProtocolError::InvalidPayload(format!(
+                "permission option was not offered by Kiteframe: {option_id}"
+            ))
+        })?;
+        Ok(ApplicationCommand::ResolvePermission(ResolvePermission {
+            session_id: self.session_id,
+            run_id: self.run_id,
+            permission_request_id: self.permission_request_id,
+            choice,
+            idempotency_key: self.idempotency_key,
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum ApplicationCommand {
     NewSession(NewSession),
     ResumeSession(ResumeSession),
@@ -74,8 +131,8 @@ pub enum ApplicationResult {
     Run(RunView),
     PolicyUpdated { revision: PolicyRevision },
     Events(Vec<RunEvent>),
-    Session(SessionView),
-    Sessions(Vec<SessionView>),
+    Session(ApplicationSession),
+    Sessions(Vec<ApplicationSession>),
     Closed,
 }
 
@@ -85,6 +142,18 @@ pub trait ProtocolAdapter: Send + Sync {
         method: &str,
         params: Value,
     ) -> Result<ApplicationCommand, ProtocolError>;
+
+    fn decode_permission_response(
+        &self,
+        result: Value,
+        context: PermissionResponseContext,
+    ) -> Result<ApplicationCommand, ProtocolError>;
+
+    fn encode_session_result(
+        &self,
+        method: &str,
+        result: ApplicationResult,
+    ) -> Result<Value, ProtocolError>;
 
     fn encode_result(&self, result: ApplicationResult) -> Result<Value, ProtocolError>;
 }
@@ -155,6 +224,16 @@ pub enum ProtocolError {
     V2Disabled,
     #[error("this connection has already negotiated an ACP version")]
     AlreadyNegotiated,
+    #[error("this connection has not negotiated an ACP version")]
+    NotNegotiated,
+    #[error("the ACP permission request was cancelled before a choice was made")]
+    PermissionCancelled,
+    #[error("session retention has expired")]
+    SessionExpired,
+    #[error("session working directory does not match the durable session")]
+    WorkingDirectoryMismatch,
+    #[error("application result is not valid for protocol method {0}")]
+    UnexpectedResult(String),
 }
 
 impl From<crate::StoreError> for ProtocolError {
@@ -186,8 +265,8 @@ pub(crate) fn command_session(command: &ApplicationCommand) -> Option<&SessionId
     }
 }
 
-pub(crate) fn encode_application_result(result: ApplicationResult) -> Value {
-    match result {
+pub(crate) fn encode_application_result(result: ApplicationResult) -> Result<Value, ProtocolError> {
+    Ok(match result {
         ApplicationResult::Published(definition) => json!({
             "id": definition.id,
             "name": definition.name,
@@ -213,20 +292,13 @@ pub(crate) fn encode_application_result(result: ApplicationResult) -> Value {
                 "createdAt": event.created_at.to_string(),
             })).collect::<Vec<_>>()
         }),
-        ApplicationResult::Session(session) => session_json(session),
-        ApplicationResult::Sessions(sessions) => json!({
-            "sessions": sessions.into_iter().map(session_json).collect::<Vec<_>>()
-        }),
-        ApplicationResult::Closed => json!({}),
-    }
-}
-
-fn session_json(session: SessionView) -> Value {
-    json!({
-        "sessionId": session.id.as_uuid(),
-        "policyRevision": session.policy_revision.get(),
-        "catalogEpochId": session.current_catalog_epoch.map(|id| *id.as_uuid()),
-        "mcpAttached": session.mcp_attached,
+        ApplicationResult::Session(_)
+        | ApplicationResult::Sessions(_)
+        | ApplicationResult::Closed => {
+            return Err(ProtocolError::UnexpectedResult(
+                "extension result".to_owned(),
+            ));
+        }
     })
 }
 

@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
+use serde_json::json;
+use sqlx::Row;
+
 use crate::{CreateSession, Engine, PostgresStore};
 
 use super::{
-    ApplicationCommand, ApplicationContext, ApplicationResult, ProtocolError, command_session,
+    ApplicationCommand, ApplicationContext, ApplicationResult, ApplicationSession, ProtocolError,
+    command_session,
 };
 
 pub struct Application {
@@ -43,25 +47,40 @@ impl Application {
                         retention_until: time::OffsetDateTime::now_utc() + self.session_retention,
                     })
                     .await?;
-                return Ok(ApplicationResult::Session(session));
+                return Ok(ApplicationResult::Session(ApplicationSession {
+                    view: session,
+                    working_directory: request.working_directory.clone(),
+                }));
             }
             ApplicationCommand::ResumeSession(request) => {
                 let session = self
-                    .store
-                    .resume_session(request.session_id.clone(), &context.connection_principal)
+                    .active_session(
+                        request.session_id.clone(),
+                        &context.connection_principal,
+                        Some(&request.working_directory),
+                    )
                     .await?;
                 return Ok(ApplicationResult::Session(session));
             }
             ApplicationCommand::ListSessions => {
-                return Ok(ApplicationResult::Sessions(
-                    self.store
-                        .list_sessions(&context.connection_principal)
-                        .await?,
-                ));
+                let mut sessions = Vec::new();
+                for view in self
+                    .store
+                    .list_sessions(&context.connection_principal)
+                    .await?
+                {
+                    let metadata = self.session_metadata(&view.id).await?;
+                    if metadata.retention_until > time::OffsetDateTime::now_utc() {
+                        sessions.push(ApplicationSession {
+                            view,
+                            working_directory: metadata.working_directory,
+                        });
+                    }
+                }
+                return Ok(ApplicationResult::Sessions(sessions));
             }
             ApplicationCommand::CloseSession(request) => {
-                self.store
-                    .close_session(request.session_id.clone(), &context.connection_principal)
+                self.close_session(request.session_id.clone(), &context.connection_principal)
                     .await?;
                 return Ok(ApplicationResult::Closed);
             }
@@ -72,8 +91,7 @@ impl Application {
             .session_id
             .as_ref()
             .ok_or(ProtocolError::MissingSession)?;
-        self.store
-            .resume_session(session_id.clone(), &context.connection_principal)
+        self.active_session(session_id.clone(), &context.connection_principal, None)
             .await?;
         if let Some(command_session) = command_session(&command)
             && command_session != session_id
@@ -162,4 +180,143 @@ impl Application {
             }
         }
     }
+
+    async fn active_session(
+        &self,
+        session_id: crate::SessionId,
+        principal: &crate::PrincipalId,
+        working_directory: Option<&str>,
+    ) -> Result<ApplicationSession, ProtocolError> {
+        let view = self
+            .store
+            .resume_session(session_id.clone(), principal)
+            .await?;
+        let metadata = self.session_metadata(&session_id).await?;
+        if metadata.retention_until <= time::OffsetDateTime::now_utc() {
+            return Err(ProtocolError::SessionExpired);
+        }
+        if working_directory.is_some_and(|cwd| cwd != metadata.working_directory) {
+            return Err(ProtocolError::WorkingDirectoryMismatch);
+        }
+        Ok(ApplicationSession {
+            view,
+            working_directory: metadata.working_directory,
+        })
+    }
+
+    async fn session_metadata(
+        &self,
+        session_id: &crate::SessionId,
+    ) -> Result<SessionMetadata, ProtocolError> {
+        let row =
+            sqlx::query("SELECT working_directory, retention_until FROM sessions WHERE id = $1")
+                .bind(*session_id.as_uuid())
+                .fetch_optional(self.store.pool())
+                .await
+                .map_err(crate::StoreError::from)?
+                .ok_or(crate::StoreError::SessionNotFound)?;
+        Ok(SessionMetadata {
+            working_directory: row.get("working_directory"),
+            retention_until: row.get("retention_until"),
+        })
+    }
+
+    async fn close_session(
+        &self,
+        session_id: crate::SessionId,
+        principal: &crate::PrincipalId,
+    ) -> Result<(), ProtocolError> {
+        let mut tx = self
+            .store
+            .pool()
+            .begin()
+            .await
+            .map_err(crate::StoreError::from)?;
+        let session = sqlx::query("SELECT principal, state FROM sessions WHERE id = $1 FOR UPDATE")
+            .bind(*session_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(crate::StoreError::from)?
+            .ok_or(crate::StoreError::SessionNotFound)?;
+        if session.get::<String, _>("principal") != principal.as_str() {
+            return Err(crate::StoreError::PrincipalMismatch.into());
+        }
+        if session.get::<String, _>("state") != "active" {
+            return Err(crate::StoreError::SessionClosed.into());
+        }
+
+        let active_runs = sqlx::query(
+            "SELECT id FROM runs WHERE session_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') FOR UPDATE",
+        )
+        .bind(*session_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(crate::StoreError::from)?;
+        for run in active_runs {
+            let run_id: uuid::Uuid = run.get("id");
+            let sequence: i64 = sqlx::query(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM events WHERE run_id = $1",
+            )
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(crate::StoreError::from)?
+            .get("sequence");
+            sqlx::query(
+                "INSERT INTO events (run_id, sequence, kind, metadata) VALUES ($1, $2, 'run.cancelled', $3)",
+            )
+            .bind(run_id)
+            .bind(sequence)
+            .bind(json!({"reason": "session closed"}))
+            .execute(&mut *tx)
+            .await
+            .map_err(crate::StoreError::from)?;
+        }
+
+        let cancellation_key = format!("session-close:{}", session_id.as_uuid());
+        sqlx::query(
+            "UPDATE runs SET state = 'cancelled', revision = revision + 1, cancellation_idempotency_key = $1, cancellation_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE session_id = $3 AND state NOT IN ('completed', 'failed', 'cancelled')",
+        )
+        .bind(cancellation_key)
+        .bind(json!("session closed"))
+        .bind(*session_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::StoreError::from)?;
+        sqlx::query(
+            "UPDATE frames SET state = 'cancelled', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE run_id IN (SELECT id FROM runs WHERE session_id = $1) AND state NOT IN ('completed', 'failed', 'cancelled')",
+        )
+        .bind(*session_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::StoreError::from)?;
+        sqlx::query(
+            "UPDATE questions SET state = 'cancelled' WHERE run_id IN (SELECT id FROM runs WHERE session_id = $1) AND state = 'pending'",
+        )
+        .bind(*session_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::StoreError::from)?;
+        sqlx::query(
+            "UPDATE permission_requests SET state = 'cancelled' WHERE run_id IN (SELECT id FROM runs WHERE session_id = $1) AND state = 'pending'",
+        )
+        .bind(*session_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::StoreError::from)?;
+        sqlx::query(
+            "UPDATE sessions SET state = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
+        )
+        .bind(*session_id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(crate::StoreError::from)?;
+        tx.commit().await.map_err(crate::StoreError::from)?;
+        Ok(())
+    }
+}
+
+struct SessionMetadata {
+    working_directory: String,
+    retention_until: time::OffsetDateTime,
 }

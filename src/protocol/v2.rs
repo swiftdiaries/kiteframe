@@ -9,8 +9,8 @@ use crate::{
 
 use super::{
     ApplicationCommand, ApplicationResult, CloseSession, EventCursor, GetRun, NewSession,
-    ProtocolAdapter, ProtocolError, PublishWorkflow, ResumeSession, UpdateSessionPolicy,
-    encode_application_result,
+    PermissionResponseContext, ProtocolAdapter, ProtocolError, PublishWorkflow, ResumeSession,
+    UpdateSessionPolicy, encode_application_result,
 };
 
 /// Draft ACP v2 adapter. Constructing the adapter is compile-time gated, and
@@ -134,11 +134,70 @@ impl ProtocolAdapter for V2Adapter {
         }
     }
 
+    fn decode_permission_response(
+        &self,
+        result: Value,
+        context: PermissionResponseContext,
+    ) -> Result<ApplicationCommand, ProtocolError> {
+        if !self.runtime_enabled {
+            return Err(ProtocolError::V2Disabled);
+        }
+        let response: acp::RequestPermissionResponse = decode(result)?;
+        match response.outcome {
+            acp::RequestPermissionOutcome::Selected(selected) => {
+                context.resolve(selected.option_id.0.as_ref())
+            }
+            acp::RequestPermissionOutcome::Cancelled => Err(ProtocolError::PermissionCancelled),
+            _ => Err(ProtocolError::InvalidPayload(
+                "unsupported ACP permission outcome".to_owned(),
+            )),
+        }
+    }
+
+    fn encode_session_result(
+        &self,
+        method: &str,
+        result: ApplicationResult,
+    ) -> Result<Value, ProtocolError> {
+        if !self.runtime_enabled {
+            return Err(ProtocolError::V2Disabled);
+        }
+        let response = match (method, result) {
+            ("session/new", ApplicationResult::Session(session)) => {
+                serde_json::to_value(acp::NewSessionResponse::new(acp::SessionId::new(
+                    session.view.id.as_uuid().to_string(),
+                )))
+            }
+            ("session/list", ApplicationResult::Sessions(sessions)) => {
+                let sessions = sessions
+                    .into_iter()
+                    .map(|session| {
+                        acp::SessionInfo::new(
+                            acp::SessionId::new(session.view.id.as_uuid().to_string()),
+                            acp::AbsolutePath::new(std::path::PathBuf::from(
+                                session.working_directory,
+                            )),
+                        )
+                    })
+                    .collect();
+                serde_json::to_value(acp::ListSessionsResponse::new(sessions))
+            }
+            ("session/resume", ApplicationResult::Session(_)) => {
+                serde_json::to_value(acp::ResumeSessionResponse::new())
+            }
+            ("session/close", ApplicationResult::Closed) => {
+                serde_json::to_value(acp::CloseSessionResponse::new())
+            }
+            _ => return Err(ProtocolError::UnexpectedResult(method.to_owned())),
+        };
+        response.map_err(|error| ProtocolError::InvalidPayload(error.to_string()))
+    }
+
     fn encode_result(&self, result: ApplicationResult) -> Result<Value, ProtocolError> {
         if !self.runtime_enabled {
             return Err(ProtocolError::V2Disabled);
         }
-        Ok(encode_application_result(result))
+        encode_application_result(result)
     }
 }
 
