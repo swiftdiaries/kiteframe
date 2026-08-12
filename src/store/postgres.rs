@@ -632,7 +632,7 @@ impl PostgresStore {
         command: super::FrameCommand,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let frame = sqlx::query("SELECT run_id, parent_frame_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+        let frame = sqlx::query("SELECT run_id, parent_frame_id, parent_binding, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
             return Err(StoreError::RevisionConflict);
@@ -675,6 +675,8 @@ impl PostgresStore {
                 if frame.get::<Option<uuid::Uuid>, _>("parent_frame_id").is_none() {
                     sqlx::query("UPDATE runs SET state = 'completed', output = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
                         .bind(result).bind(run_id).execute(&mut *tx).await?;
+                } else {
+                    resume_parent_after_child(&mut tx, run_id, &frame, result).await?;
                 }
                 append_event(&mut tx, run_id, "frame.completed", json!({"frame_id": frame_id.as_uuid()})).await?;
             }
@@ -851,5 +853,29 @@ async fn insert_child_frame(
 ) -> Result<(), StoreError> {
     sqlx::query("INSERT INTO frames (id, run_id, parent_frame_id, parent_binding, task_name, branch_index, bindings, state) VALUES ($1, $2, $3, $4, $5, $6, $7, 'runnable')")
         .bind(uuid::Uuid::now_v7()).bind(run_id).bind(parent_frame_id).bind(child.binding).bind(child.target).bind(child.branch_index).bind(serde_json::to_value(child.arguments).map_err(|error| StoreError::InvalidData(error.to_string()))?).execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn resume_parent_after_child(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: uuid::Uuid,
+    child: &sqlx::postgres::PgRow,
+    result: Value,
+) -> Result<(), StoreError> {
+    let parent_id = child.get::<Option<uuid::Uuid>, _>("parent_frame_id").ok_or_else(|| StoreError::InvalidData("child frame has no parent".to_owned()))?;
+    let binding = child.get::<Option<String>, _>("parent_binding").ok_or_else(|| StoreError::InvalidData("child frame has no parent binding".to_owned()))?;
+    let parent = sqlx::query("SELECT bindings FROM frames WHERE id = $1 FOR UPDATE")
+        .bind(parent_id).fetch_one(&mut **tx).await?;
+    let mut bindings = parent.get::<Value, _>("bindings").as_object().cloned().ok_or_else(|| StoreError::InvalidData("parent bindings are malformed".to_owned()))?;
+    bindings.insert(binding, result);
+    sqlx::query("UPDATE frames SET bindings = $1, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+        .bind(Value::Object(bindings)).bind(parent_id).execute(&mut **tx).await?;
+    let incomplete = sqlx::query("SELECT 1 FROM frames WHERE parent_frame_id = $1 AND state <> 'completed' LIMIT 1")
+        .bind(parent_id).fetch_optional(&mut **tx).await?;
+    if incomplete.is_none() {
+        sqlx::query("UPDATE frames SET state = 'runnable', updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(parent_id).execute(&mut **tx).await?;
+        append_event(tx, run_id, "frame.children_completed", json!({"parent_frame_id": parent_id})).await?;
+    }
     Ok(())
 }
