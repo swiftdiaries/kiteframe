@@ -358,11 +358,25 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     let client_io = async {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let initialize = v1_fixture().initialize;
+        let messages = [
+            "{".to_owned(),
+            json!({"jsonrpc":"1.0", "id":2, "method":"initialize", "params":{}}).to_string(),
+            v1_fixture().initialize.to_string(),
+            json!({"jsonrpc":"2.0", "method":"_kiteframe/unknown", "params":{}}).to_string(),
+            json!({"jsonrpc":"2.0", "id":3, "method":"_kiteframe/run/get", "params":{}})
+                .to_string(),
+            json!({"jsonrpc":"2.0", "id":4, "method":"_kiteframe/unknown", "params":{}})
+                .to_string(),
+            json!({
+                "jsonrpc":"2.0", "id":5, "method":"_kiteframe/run/get",
+                "params":{"runId":"019ff3d8-9d86-7de0-9070-0f0185d5f414"}
+            })
+            .to_string(),
+        ];
         client
-            .write_all(format!("{}\n", serde_json::to_string(&initialize).unwrap()).as_bytes())
+            .write_all(format!("{}\n", messages.join("\n")).as_bytes())
             .await
-            .expect("write initialize");
+            .expect("write JSON-RPC messages");
         client.shutdown().await.expect("close request stream");
         let mut response = String::new();
         client
@@ -373,12 +387,43 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     };
     let (serve_result, response) = tokio::join!(serve, client_io);
     serve_result.expect("serve standard initialization");
-    let response: Value = serde_json::from_str(response.trim()).expect("JSON-RPC response");
-    assert_eq!(response["jsonrpc"], "2.0");
-    assert_eq!(response["id"], 1);
-    assert_eq!(response["result"]["protocolVersion"], 1);
-    assert!(response.get("ok").is_none());
-    assert!(response["result"].get("kind").is_none());
+    let responses = response
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("JSON-RPC response"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses.len(),
+        6,
+        "notifications must not receive responses"
+    );
+    assert_eq!(
+        responses[0],
+        json!({
+            "jsonrpc":"2.0", "id":null,
+            "error":{"code":-32700, "message":"Parse error"}
+        })
+    );
+    assert_eq!(
+        responses[1],
+        json!({
+            "jsonrpc":"2.0", "id":2,
+            "error":{"code":-32600, "message":"Invalid Request"}
+        })
+    );
+    assert_eq!(responses[2]["jsonrpc"], "2.0");
+    assert_eq!(responses[2]["id"], 1);
+    assert_eq!(responses[2]["result"]["protocolVersion"], 1);
+    assert_eq!(responses[3]["id"], 3);
+    assert_eq!(responses[3]["error"]["code"], -32602);
+    assert_eq!(
+        responses[4],
+        json!({
+            "jsonrpc":"2.0", "id":4,
+            "error":{"code":-32601, "message":"Method not found"}
+        })
+    );
+    assert_eq!(responses[5]["id"], 5);
+    assert_eq!(responses[5]["error"]["code"], -32000);
 
     let ApplicationResult::Session(created) = application
         .dispatch(
@@ -553,17 +598,33 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
         vec![1]
     );
 
-    assert!(matches!(
-        application
-            .dispatch(
-                &alice_context,
-                ApplicationCommand::CloseSession(CloseSession {
-                    session_id: created.view.id.clone(),
-                }),
-            )
-            .await,
-        Ok(ApplicationResult::Closed)
-    ));
+    let mut worker = store.pool().begin().await.expect("worker transaction");
+    sqlx::query("SELECT id FROM frames WHERE id = $1 FOR UPDATE")
+        .bind(*run.root_frame_id.as_uuid())
+        .execute(&mut *worker)
+        .await
+        .expect("worker frame lock");
+    let close = application.dispatch(
+        &alice_context,
+        ApplicationCommand::CloseSession(CloseSession {
+            session_id: created.view.id.clone(),
+        }),
+    );
+    let worker_finishes = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
+            .bind(*run.id.as_uuid())
+            .execute(&mut *worker)
+            .await
+            .expect("worker run lock after frame lock");
+        worker.commit().await.expect("worker commit");
+    };
+    let (close_result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(close, worker_finishes)
+    })
+    .await
+    .expect("close and engine-order transaction must not deadlock");
+    assert!(matches!(close_result, Ok(ApplicationResult::Closed)));
     assert_eq!(
         store
             .get_run(created.view.id.clone(), run.id.clone())

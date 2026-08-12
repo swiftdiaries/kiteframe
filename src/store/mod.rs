@@ -1,5 +1,6 @@
 mod models;
 mod postgres;
+mod session_close;
 
 pub use models::{
     Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest, PendingPermission, PolicyUpdate, PublishedDefinition, Question, RunEvent, RunnableFrame, RunToolBinding, SuspensionFrame,

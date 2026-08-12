@@ -224,7 +224,8 @@ pub enum AuthError {
 #[serde(deny_unknown_fields)]
 pub struct NdjsonRequest {
     pub jsonrpc: String,
-    pub id: Value,
+    #[serde(default)]
+    pub id: Option<Value>,
     pub method: String,
     #[serde(default)]
     pub params: Value,
@@ -243,58 +244,126 @@ where
     let connection = ProtocolConnection::new(connection.clone(), false);
     let mut lines = reader.lines();
     while let Some(line) = lines.next_line().await? {
-        let parsed = serde_json::from_str::<NdjsonRequest>(&line);
-        let request_id = parsed
-            .as_ref()
-            .map(|request| request.id.clone())
-            .unwrap_or(Value::Null);
-        let response = match parsed {
-            Ok(request) if request.jsonrpc != "2.0" => {
-                Err("JSON-RPC version must be 2.0".to_owned())
-            }
-            Ok(request) if request.method == "initialize" => connection
-                .initialize(request.params)
-                .map_err(|error| error.to_string()),
-            Ok(request) => dispatch_request(application, &connection, request).await,
-            Err(error) => Err(format!("invalid JSON-RPC request: {error}")),
-        };
-        let payload = match response {
-            Ok(value) => serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": value}),
-            Err(error) => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "error": {"code": -32000, "message": error}
-            }),
-        };
-        writer
-            .write_all(&serde_json::to_vec(&payload).expect("JSON value serializes"))
-            .await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        if let Some(payload) = handle_line(&line, application, &connection).await {
+            writer
+                .write_all(&serde_json::to_vec(&payload).expect("JSON value serializes"))
+                .await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+        }
     }
     Ok(())
+}
+
+async fn handle_line(
+    line: &str,
+    application: &crate::Application,
+    connection: &ProtocolConnection,
+) -> Option<Value> {
+    let raw = match serde_json::from_str::<Value>(line) {
+        Ok(raw) => raw,
+        Err(_) => return Some(error_response(Value::Null, RpcError::parse_error())),
+    };
+    let Some(object) = raw.as_object() else {
+        return Some(error_response(Value::Null, RpcError::invalid_request()));
+    };
+    let notification = !object.contains_key("id");
+    let request_id = object.get("id").cloned().unwrap_or(Value::Null);
+    let valid_id = request_id.is_null() || request_id.is_string() || request_id.is_number();
+    let request = serde_json::from_value::<NdjsonRequest>(raw);
+    let Ok(request) = request else {
+        return (!notification).then(|| error_response(request_id, RpcError::invalid_request()));
+    };
+    if request.jsonrpc != "2.0" || !valid_id {
+        return (!notification).then(|| error_response(request_id, RpcError::invalid_request()));
+    }
+
+    let response = if request.method == "initialize" {
+        connection.initialize(request.params)
+    } else {
+        dispatch_request(application, connection, request).await
+    };
+    if notification {
+        return None;
+    }
+    Some(match response {
+        Ok(value) => serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": value}),
+        Err(error) => error_response(request_id, RpcError::from(error)),
+    })
+}
+
+#[derive(Debug)]
+struct RpcError {
+    code: i32,
+    message: String,
+}
+
+impl RpcError {
+    fn parse_error() -> Self {
+        Self {
+            code: -32700,
+            message: "Parse error".to_owned(),
+        }
+    }
+
+    fn invalid_request() -> Self {
+        Self {
+            code: -32600,
+            message: "Invalid Request".to_owned(),
+        }
+    }
+}
+
+impl From<crate::ProtocolError> for RpcError {
+    fn from(error: crate::ProtocolError) -> Self {
+        match error {
+            crate::ProtocolError::UnsupportedMethod(_) => Self {
+                code: -32601,
+                message: "Method not found".to_owned(),
+            },
+            crate::ProtocolError::InvalidPayload(_)
+            | crate::ProtocolError::UnsupportedVersion(_) => Self {
+                code: -32602,
+                message: "Invalid params".to_owned(),
+            },
+            crate::ProtocolError::UnexpectedResult(_) => Self {
+                code: -32603,
+                message: "Internal error".to_owned(),
+            },
+            error => Self {
+                code: -32000,
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
+fn error_response(id: Value, error: RpcError) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": error.code, "message": error.message}
+    })
 }
 
 async fn dispatch_request(
     application: &crate::Application,
     connection: &ProtocolConnection,
     request: NdjsonRequest,
-) -> Result<Value, String> {
+) -> Result<Value, crate::ProtocolError> {
     let is_session_method = request.method.starts_with("session/");
     let command = if is_session_method {
         connection.decode_session(&request.method, request.params)
     } else {
         connection.decode_extension(&request.method, request.params)
-    }
-    .map_err(|error| error.to_string())?;
+    }?;
     let closing_session = match &command {
         crate::ApplicationCommand::CloseSession(close) => Some(close.session_id.clone()),
         _ => None,
     };
     let result = application
         .dispatch(&connection.application_context(), command)
-        .await
-        .map_err(|error| error.to_string())?;
+        .await?;
     if let crate::ApplicationResult::Session(session) = &result {
         connection.bind_session(session.view.id.clone());
     }
@@ -306,7 +375,6 @@ async fn dispatch_request(
     } else {
         connection.encode_result(result)
     }
-    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

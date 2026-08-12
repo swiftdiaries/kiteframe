@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use serde_json::json;
 use sqlx::Row;
 
 use crate::{CreateSession, Engine, PostgresStore};
@@ -80,7 +79,11 @@ impl Application {
                 return Ok(ApplicationResult::Sessions(sessions));
             }
             ApplicationCommand::CloseSession(request) => {
-                self.close_session(request.session_id.clone(), &context.connection_principal)
+                self.store
+                    .close_session_and_cancel_work(
+                        request.session_id.clone(),
+                        &context.connection_principal,
+                    )
                     .await?;
                 return Ok(ApplicationResult::Closed);
             }
@@ -219,100 +222,6 @@ impl Application {
             working_directory: row.get("working_directory"),
             retention_until: row.get("retention_until"),
         })
-    }
-
-    async fn close_session(
-        &self,
-        session_id: crate::SessionId,
-        principal: &crate::PrincipalId,
-    ) -> Result<(), ProtocolError> {
-        let mut tx = self
-            .store
-            .pool()
-            .begin()
-            .await
-            .map_err(crate::StoreError::from)?;
-        let session = sqlx::query("SELECT principal, state FROM sessions WHERE id = $1 FOR UPDATE")
-            .bind(*session_id.as_uuid())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(crate::StoreError::from)?
-            .ok_or(crate::StoreError::SessionNotFound)?;
-        if session.get::<String, _>("principal") != principal.as_str() {
-            return Err(crate::StoreError::PrincipalMismatch.into());
-        }
-        if session.get::<String, _>("state") != "active" {
-            return Err(crate::StoreError::SessionClosed.into());
-        }
-
-        let active_runs = sqlx::query(
-            "SELECT id FROM runs WHERE session_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') FOR UPDATE",
-        )
-        .bind(*session_id.as_uuid())
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(crate::StoreError::from)?;
-        for run in active_runs {
-            let run_id: uuid::Uuid = run.get("id");
-            let sequence: i64 = sqlx::query(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM events WHERE run_id = $1",
-            )
-            .bind(run_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(crate::StoreError::from)?
-            .get("sequence");
-            sqlx::query(
-                "INSERT INTO events (run_id, sequence, kind, metadata) VALUES ($1, $2, 'run.cancelled', $3)",
-            )
-            .bind(run_id)
-            .bind(sequence)
-            .bind(json!({"reason": "session closed"}))
-            .execute(&mut *tx)
-            .await
-            .map_err(crate::StoreError::from)?;
-        }
-
-        let cancellation_key = format!("session-close:{}", session_id.as_uuid());
-        sqlx::query(
-            "UPDATE runs SET state = 'cancelled', revision = revision + 1, cancellation_idempotency_key = $1, cancellation_reason = $2, updated_at = CURRENT_TIMESTAMP WHERE session_id = $3 AND state NOT IN ('completed', 'failed', 'cancelled')",
-        )
-        .bind(cancellation_key)
-        .bind(json!("session closed"))
-        .bind(*session_id.as_uuid())
-        .execute(&mut *tx)
-        .await
-        .map_err(crate::StoreError::from)?;
-        sqlx::query(
-            "UPDATE frames SET state = 'cancelled', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE run_id IN (SELECT id FROM runs WHERE session_id = $1) AND state NOT IN ('completed', 'failed', 'cancelled')",
-        )
-        .bind(*session_id.as_uuid())
-        .execute(&mut *tx)
-        .await
-        .map_err(crate::StoreError::from)?;
-        sqlx::query(
-            "UPDATE questions SET state = 'cancelled' WHERE run_id IN (SELECT id FROM runs WHERE session_id = $1) AND state = 'pending'",
-        )
-        .bind(*session_id.as_uuid())
-        .execute(&mut *tx)
-        .await
-        .map_err(crate::StoreError::from)?;
-        sqlx::query(
-            "UPDATE permission_requests SET state = 'cancelled' WHERE run_id IN (SELECT id FROM runs WHERE session_id = $1) AND state = 'pending'",
-        )
-        .bind(*session_id.as_uuid())
-        .execute(&mut *tx)
-        .await
-        .map_err(crate::StoreError::from)?;
-        sqlx::query(
-            "UPDATE sessions SET state = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = $1",
-        )
-        .bind(*session_id.as_uuid())
-        .execute(&mut *tx)
-        .await
-        .map_err(crate::StoreError::from)?;
-        tx.commit().await.map_err(crate::StoreError::from)?;
-        Ok(())
     }
 }
 
