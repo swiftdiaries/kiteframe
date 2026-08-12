@@ -1,0 +1,42 @@
+use std::collections::BTreeMap;
+
+use kiteframe::dsl::{Limits, compile};
+use kiteframe::engine::{FrameSnapshot, TransitionError, next_command};
+use kiteframe::{FrameCommand, SessionId, ToolCatalogSnapshot};
+use serde_json::json;
+use uuid::Uuid;
+
+fn workflow() -> kiteframe::dsl::CompiledWorkflow {
+    let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(1), [])
+        .expect("empty catalog");
+    compile(
+        "workflow w(value: string) -> string { start t(value: value) } task t(value: string) -> string { prompt \"\"\"x\"\"\" tools [] on ok(answer: string) { done answer } on bad(reason: string) { fail \"bad\" reason } }",
+        &catalog,
+        &Limits::default(),
+    )
+    .expect("compile")
+}
+
+#[test]
+fn resolves_terminal_outcomes_without_io() {
+    let workflow = workflow();
+    let done = next_command(
+        &workflow,
+        &FrameSnapshot { task_name: "t".to_owned(), outcome: "ok".to_owned(), statement_index: 0, bindings: BTreeMap::from([("answer".to_owned(), json!("done"))]) },
+    ).expect("done command");
+    assert!(matches!(done, FrameCommand::Complete(value) if value == json!("done")));
+    let failed = next_command(
+        &workflow,
+        &FrameSnapshot { task_name: "t".to_owned(), outcome: "bad".to_owned(), statement_index: 0, bindings: BTreeMap::from([("reason".to_owned(), json!("nope"))]) },
+    ).expect("failure command");
+    assert!(matches!(failed, FrameCommand::Fail { code, message } if code == "bad" && message == "nope"));
+}
+
+#[test]
+fn rejects_missing_bindings_and_corrupt_cursors() {
+    let workflow = workflow();
+    let missing = FrameSnapshot { task_name: "t".to_owned(), outcome: "ok".to_owned(), statement_index: 0, bindings: BTreeMap::new() };
+    assert!(matches!(next_command(&workflow, &missing), Err(TransitionError::MissingBinding(_))));
+    let corrupt = FrameSnapshot { statement_index: 1, ..missing };
+    assert!(matches!(next_command(&workflow, &corrupt), Err(TransitionError::Corrupt(_))));
+}
