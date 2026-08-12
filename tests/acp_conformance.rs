@@ -312,7 +312,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     use kiteframe::{
         Application, ApplicationContext, ApplicationResult, CloseSession, Engine, EngineConfig,
         InProcessToolRegistry, ModelClient, ModelError, ModelRequest, ModelResponse, NewSession,
-        PersistedAuthorizer, PostgresStore, PrincipalId, ResumeSession,
+        PersistedAuthorizer, PostgresStore, PrincipalId, PublishWorkflow, ResumeSession,
     };
 
     struct UnusedModel;
@@ -499,9 +499,11 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
             .any(|session| session.view.id == created.view.id)
     );
 
-    let catalog = kiteframe::ToolCatalogSnapshot::new(created.view.id.clone(), Uuid::now_v7(), [])
-        .expect("empty catalog");
-    store.append_catalog_epoch(&catalog).await.expect("catalog");
+    let catalog = store
+        .current_catalog(created.view.id.clone())
+        .await
+        .expect("new sessions have an empty principal-scoped catalog");
+    assert!(catalog.tools().is_empty());
     let bound_context = ApplicationContext {
         connection_principal: alice.clone(),
         session_id: Some(created.view.id.clone()),
@@ -550,12 +552,16 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     let source = format!(
         "workflow {workflow_name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [] on ok(answer: string) {{ done answer }} }}"
     );
-    let workflow = kiteframe::dsl::compile(&source, &catalog, &kiteframe::dsl::Limits::default())
-        .expect("workflow");
-    let definition = store
-        .publish(created.view.id.clone(), &workflow, &source)
+    let ApplicationResult::Published(definition) = application
+        .dispatch(
+            &bound_context,
+            ApplicationCommand::Publish(PublishWorkflow { source }),
+        )
         .await
-        .expect("definition");
+        .expect("publish workflow after the initial policy")
+    else {
+        panic!("expected published workflow");
+    };
     let start_key = IdempotencyKey::new(format!("start-{}", Uuid::now_v7())).unwrap();
     let start = kiteframe::StartRun {
         session_id: created.view.id.clone(),

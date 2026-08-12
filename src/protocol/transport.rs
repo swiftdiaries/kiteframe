@@ -1077,9 +1077,9 @@ fn protocol_sdk_error(error: crate::ProtocolError) -> agent_client_protocol::Err
         crate::ProtocolError::UnsupportedMethod(_) => {
             agent_client_protocol::Error::method_not_found()
         }
-        crate::ProtocolError::InvalidPayload(_) | crate::ProtocolError::UnsupportedVersion(_) => {
-            agent_client_protocol::Error::invalid_params()
-        }
+        crate::ProtocolError::InvalidPayload(_)
+        | crate::ProtocolError::UnsupportedVersion(_)
+        | crate::ProtocolError::V2Disabled => agent_client_protocol::Error::invalid_params(),
         crate::ProtocolError::UnexpectedResult(_) => agent_client_protocol::Error::internal_error(),
         crate::ProtocolError::PermissionCancelled => {
             agent_client_protocol::Error::request_cancelled()
@@ -1849,7 +1849,8 @@ impl From<crate::ProtocolError> for RpcError {
                 message: "Method not found".to_owned(),
             },
             crate::ProtocolError::InvalidPayload(_)
-            | crate::ProtocolError::UnsupportedVersion(_) => Self {
+            | crate::ProtocolError::UnsupportedVersion(_)
+            | crate::ProtocolError::V2Disabled => Self {
                 code: -32602,
                 message: "Invalid params".to_owned(),
             },
@@ -2144,5 +2145,16 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_disabled_v2_is_reported_as_a_negotiation_error() {
+        let sdk_error =
+            serde_json::to_value(super::protocol_sdk_error(crate::ProtocolError::V2Disabled))
+                .expect("serialize SDK error");
+        assert_eq!(sdk_error["code"], -32602);
+
+        let ndjson_error = super::RpcError::from(crate::ProtocolError::V2Disabled);
+        assert_eq!(ndjson_error.code, -32602);
     }
 }

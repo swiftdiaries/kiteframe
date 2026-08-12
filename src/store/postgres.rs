@@ -33,15 +33,26 @@ impl PostgresStore {
 
     pub async fn create_session(&self, request: CreateSession) -> Result<SessionView, StoreError> {
         let id = uuid::Uuid::now_v7();
+        let session_id = SessionId::new(id);
+        let catalog = ToolCatalogSnapshot::new(session_id.clone(), uuid::Uuid::now_v7(), [])
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let snapshot = catalog_json(&catalog);
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO sessions (id, principal, working_directory, retention_until) VALUES ($1, $2, $3, $4)")
             .bind(id).bind(request.principal.as_str()).bind(request.working_directory).bind(request.retention_until)
-            .execute(&self.pool).await?;
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO mcp_catalog_epochs (epoch_id, session_id, server_alias, refresh_identity, canonical_digest, connection_binding, descriptor_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+            .bind(*catalog.epoch_id().as_uuid()).bind(id).bind("session_initial").bind(catalog.epoch_id().as_uuid().to_string()).bind(catalog.digest()).bind(json!({"kind":"session_initial"})).bind(snapshot)
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE sessions SET current_catalog_epoch = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(*catalog.epoch_id().as_uuid()).bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(SessionView {
-            id: SessionId::new(id),
+            id: session_id,
             principal: request.principal,
             policy_revision: PolicyRevision::new(0),
-            current_catalog_epoch: None,
-            mcp_attached: false,
+            current_catalog_epoch: Some(catalog.epoch_id().clone()),
+            mcp_attached: true,
         })
     }
 

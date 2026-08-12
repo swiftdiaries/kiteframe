@@ -1,4 +1,49 @@
-from .client import KiteframeClient
-from .models import HarnessError, HarnessResult
+from .binary import CLIENT_VERSION as __version__
+from .client import Kiteframe
+from .models import (
+    AuthenticationError,
+    BinaryError,
+    CapabilityTarget,
+    EventPage,
+    HarnessConfig,
+    KiteframeError,
+    OneOfPrimitive,
+    PermissionChoice,
+    PermissionOption,
+    PermissionRequest,
+    PolicyRule,
+    PublishedWorkflow,
+    RpcError,
+    Run,
+    RunEvent,
+    SessionPolicy,
+    ToolTarget,
+    TransportError,
+    VersionMismatchError,
+)
+from .transport import PermissionHandler
 
-__all__ = ["HarnessError", "HarnessResult", "KiteframeClient"]
+__all__ = [
+    "AuthenticationError",
+    "BinaryError",
+    "CapabilityTarget",
+    "EventPage",
+    "HarnessConfig",
+    "Kiteframe",
+    "KiteframeError",
+    "OneOfPrimitive",
+    "PermissionChoice",
+    "PermissionHandler",
+    "PermissionOption",
+    "PermissionRequest",
+    "PolicyRule",
+    "PublishedWorkflow",
+    "RpcError",
+    "Run",
+    "RunEvent",
+    "SessionPolicy",
+    "ToolTarget",
+    "TransportError",
+    "VersionMismatchError",
+    "__version__",
+]

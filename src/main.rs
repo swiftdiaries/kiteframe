@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     io,
     sync::{
         Arc,
@@ -23,6 +24,10 @@ const MODEL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(version) = standalone_version(std::env::args_os()) {
+        println!("{version}");
+        return Ok(());
+    }
     init_logging();
     let config = HarnessConfig::from_env()?;
     let store = Arc::new(PostgresStore::connect(&config.database_url).await?);
@@ -84,6 +89,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         error = process_lock.wait_for_loss() => return Err(error.into()),
     }
     Ok(())
+}
+
+fn standalone_version<I, S>(arguments: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut arguments = arguments.into_iter();
+    let _program = arguments.next()?;
+    match (arguments.next(), arguments.next()) {
+        (Some(argument), None) if argument.as_ref() == OsStr::new("--version") => {
+            Some(format!("kiteframe-harness {}", kiteframe::VERSION))
+        }
+        _ => None,
+    }
 }
 
 struct ModelHealthMonitor {
@@ -400,6 +420,17 @@ mod tests {
     use kiteframe::{ModelError, ModelResponse};
 
     use super::*;
+
+    #[test]
+    fn standalone_version_flag_reports_the_harness_package_version() {
+        let arguments = ["kiteframe-harness", "--version"];
+
+        assert_eq!(
+            standalone_version(arguments.iter().copied()),
+            Some(format!("kiteframe-harness {}", kiteframe::VERSION))
+        );
+        assert_eq!(standalone_version(["kiteframe-harness"].into_iter()), None);
+    }
 
     struct RecoveringModel(AtomicUsize);
 

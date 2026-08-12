@@ -10,6 +10,22 @@ permissions:
 jobs:
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: kiteframe_ci
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kiteframe_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/kiteframe_ci
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -24,4 +40,69 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Test all targets
-        run: cargo test --all-targets --all-features
+        run: cargo test --all-targets --all-features -- --test-threads=1
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      - name: Test Python client
+        run: uv run --project clients/python pytest -q clients/python/tests
+
+      - name: Lint Python client
+        run: uv run ruff check src tests scripts
+        working-directory: clients/python
+
+      - name: Type-check Python client
+        run: uv run --project clients/python pyright
+
+  python-wheels:
+    name: Python wheel (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - name: macOS x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: Linux glibc arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: Linux glibc x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: Windows x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      - name: Build platform wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+          working-directory: clients/python
+
+      - name: Inspect, install, import, and launch wheel
+        shell: bash
+        run: python scripts/inspect_wheel.py "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+        working-directory: clients/python
