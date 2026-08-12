@@ -309,6 +309,13 @@ impl PostgresStore {
         Ok(super::RunToolBinding { qualified_name: row.get("qualified_name"), descriptor_digest: row.get("descriptor_digest"), capabilities })
     }
 
+    pub async fn policy_revision(&self, session_id: crate::SessionId) -> Result<crate::PolicyRevision, StoreError> {
+        let row = sqlx::query("SELECT current_policy_revision FROM sessions WHERE id = $1")
+            .bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?
+            .ok_or(StoreError::SessionNotFound)?;
+        Ok(crate::PolicyRevision::new(row.get::<i64, _>("current_policy_revision") as u64))
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,

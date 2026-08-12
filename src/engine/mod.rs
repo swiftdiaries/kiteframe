@@ -7,7 +7,11 @@ use std::sync::Arc;
 use thiserror::Error;
 use serde_json::{Value, json};
 
-use crate::{ModelClient, ModelRequest, PostgresStore, SessionAuthorizer, StoreError, ToolResolver};
+use crate::{
+    IdempotencyKey, ModelClient, ModelRequest, NewPermissionRequest, PermissionRequestId,
+    PolicyDecision, PolicyRequest, PostgresStore, SessionAuthorizer, StoreError, ToolCall,
+    ToolResolver, canonical_sha256,
+};
 use crate::dsl::CompiledType;
 
 pub struct Engine {
@@ -64,9 +68,57 @@ impl Engine {
             tools: vec![completion_tool(task)],
         }).await.map_err(|error| StoreError::InvalidData(error.to_string()))?;
         self.store.commit_model_attempt(frame.id.clone(), attempt.attempt, attempt.revision, response.items.clone()).await?;
-        let completion = response.items.iter().filter_map(completion_from_item).next_back().ok_or_else(|| StoreError::InvalidData("model response did not contain complete_task".to_owned()))?;
-        validate_completion(task, &completion.0, &completion.1)?;
-        self.store.record_completion(frame.id, attempt.revision + 1, completion.0, completion.1).await?;
+        if let Some(completion) = response.items.iter().filter_map(completion_from_item).next_back() {
+            validate_completion(task, &completion.0, &completion.1)?;
+            self.store.record_completion(frame.id, attempt.revision + 1, completion.0, completion.1).await?;
+        } else if let Some((provider_call_id, qualified_name, arguments)) = response.items.iter().filter_map(tool_call_from_item).next_back() {
+            self.invoke_authorized_tool(&frame, attempt.revision + 1, provider_call_id, qualified_name, arguments).await?;
+        } else {
+            return Err(StoreError::InvalidData("model response did not contain complete_task or a tool call".to_owned()).into());
+        }
+        Ok(())
+    }
+
+    async fn invoke_authorized_tool(
+        &self,
+        frame: &crate::RunnableFrame,
+        expected_revision: u64,
+        provider_call_id: String,
+        qualified_name: String,
+        arguments: Value,
+    ) -> Result<(), EngineError> {
+        let binding = self.store.run_tool_binding(frame.run_id.clone(), &qualified_name).await?;
+        let policy_revision = self.store.policy_revision(frame.session_id.clone()).await?;
+        let intent = self.store.begin_tool_call(
+            frame.id.clone(), expected_revision, provider_call_id.clone(), qualified_name.clone(),
+            binding.descriptor_digest.clone(), arguments.clone(), format!("{}:{}", frame.id.as_uuid(), provider_call_id),
+        ).await?;
+        match self.authorizer.authorize(&PolicyRequest {
+            session: frame.session_id.clone(), qualified_name: binding.qualified_name.clone(),
+            descriptor_digest: binding.descriptor_digest.clone(), capabilities: binding.capabilities,
+        }).await.map_err(|error| StoreError::InvalidData(error.to_string()))? {
+            PolicyDecision::Allow => {
+                let tool = self.tools.bound_tool(frame.session_id.clone(), &binding.qualified_name, &binding.descriptor_digest)
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let call = ToolCall::new(
+                    frame.session_id.clone(), frame.run_id.clone(), frame.id.clone(), policy_revision,
+                    tool.descriptor(), arguments, IdempotencyKey::new(format!("{}:{}", frame.id.as_uuid(), intent.id)).map_err(|error| StoreError::InvalidData(error.to_string()))?,
+                ).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let outcome = self.tools.invoke(frame.session_id.clone(), &binding.qualified_name, &binding.descriptor_digest, call)
+                    .await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
+                self.store.finish_tool_call(frame.id.clone(), intent.id, intent.revision, outcome).await?;
+            }
+            PolicyDecision::Forbid { .. } => {
+                self.store.finish_tool_call(frame.id.clone(), intent.id, intent.revision, Err(json!({"code":"policy_denied","message":"Tool invocation denied by session policy"}))).await?;
+            }
+            PolicyDecision::NeedsPermission => {
+                self.store.create_permission_request(frame.id.clone(), intent.revision, NewPermissionRequest {
+                    id: PermissionRequestId::new(uuid::Uuid::now_v7()), provider_call_id,
+                    qualified_tool: binding.qualified_name, descriptor_digest: binding.descriptor_digest,
+                    input_digest: canonical_sha256(&arguments).map_err(|error| StoreError::InvalidData(error.to_string()))?, policy_revision,
+                }).await?;
+            }
+        }
         Ok(())
     }
 }
@@ -80,6 +132,13 @@ fn completion_from_item(item: &Value) -> Option<(String, Value)> {
     let arguments = item.get("arguments")?;
     let arguments = arguments.as_str().and_then(|text| serde_json::from_str(text).ok()).unwrap_or_else(|| arguments.clone());
     Some((arguments.get("outcome")?.as_str()?.to_owned(), arguments.get("fields")?.clone()))
+}
+
+fn tool_call_from_item(item: &Value) -> Option<(String, String, Value)> {
+    if item.get("type")?.as_str()? != "function_call" || item.get("name")?.as_str()? == "complete_task" { return None; }
+    let arguments = item.get("arguments")?;
+    let arguments = arguments.as_str().and_then(|text| serde_json::from_str(text).ok()).unwrap_or_else(|| arguments.clone());
+    Some((item.get("call_id").or_else(|| item.get("id"))?.as_str()?.to_owned(), item.get("name")?.as_str()?.to_owned(), arguments))
 }
 
 fn validate_completion(task: &crate::dsl::CompiledTask, outcome: &str, fields: &Value) -> Result<(), StoreError> {
@@ -131,5 +190,14 @@ mod tests {
         assert!(validate_completion(&task, "unknown", &json!({"answer":"x"})).is_err());
         assert!(validate_completion(&task, "ok", &json!({"answer":1})).is_err());
         assert!(validate_completion(&task, "ok", &json!({"answer":"x", "extra":true})).is_err());
+    }
+
+    #[test]
+    fn parses_non_completion_function_calls() {
+        assert_eq!(
+            super::tool_call_from_item(&json!({"type":"function_call","call_id":"c1","name":"docs/search","arguments":"{\"query\":\"x\"}"})),
+            Some(("c1".to_owned(), "docs/search".to_owned(), json!({"query":"x"}))),
+        );
+        assert!(super::tool_call_from_item(&json!({"type":"function_call","call_id":"c1","name":"complete_task","arguments":{}})).is_none());
     }
 }
