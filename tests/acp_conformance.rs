@@ -361,6 +361,12 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
         let messages = [
             "{".to_owned(),
             json!({"jsonrpc":"1.0", "id":2, "method":"initialize", "params":{}}).to_string(),
+            json!({"jsonrpc":"1.0", "method":"initialize", "params":{}}).to_string(),
+            json!({"jsonrpc":"2.0", "params":{}}).to_string(),
+            json!({
+                "jsonrpc":"2.0", "id":{"invalid":true}, "method":"initialize", "params":{}
+            })
+            .to_string(),
             v1_fixture().initialize.to_string(),
             json!({"jsonrpc":"2.0", "method":"_kiteframe/unknown", "params":{}}).to_string(),
             json!({"jsonrpc":"2.0", "id":3, "method":"_kiteframe/run/get", "params":{}})
@@ -393,7 +399,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
         .collect::<Vec<_>>();
     assert_eq!(
         responses.len(),
-        6,
+        9,
         "notifications must not receive responses"
     );
     assert_eq!(
@@ -410,20 +416,29 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
             "error":{"code":-32600, "message":"Invalid Request"}
         })
     );
-    assert_eq!(responses[2]["jsonrpc"], "2.0");
-    assert_eq!(responses[2]["id"], 1);
-    assert_eq!(responses[2]["result"]["protocolVersion"], 1);
-    assert_eq!(responses[3]["id"], 3);
-    assert_eq!(responses[3]["error"]["code"], -32602);
+    for response in &responses[2..=4] {
+        assert_eq!(
+            response,
+            &json!({
+                "jsonrpc":"2.0", "id":null,
+                "error":{"code":-32600, "message":"Invalid Request"}
+            })
+        );
+    }
+    assert_eq!(responses[5]["jsonrpc"], "2.0");
+    assert_eq!(responses[5]["id"], 1);
+    assert_eq!(responses[5]["result"]["protocolVersion"], 1);
+    assert_eq!(responses[6]["id"], 3);
+    assert_eq!(responses[6]["error"]["code"], -32602);
     assert_eq!(
-        responses[4],
+        responses[7],
         json!({
             "jsonrpc":"2.0", "id":4,
             "error":{"code":-32601, "message":"Method not found"}
         })
     );
-    assert_eq!(responses[5]["id"], 5);
-    assert_eq!(responses[5]["error"]["code"], -32000);
+    assert_eq!(responses[8]["id"], 5);
+    assert_eq!(responses[8]["error"]["code"], -32000);
 
     let ApplicationResult::Session(created) = application
         .dispatch(
@@ -598,33 +613,44 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
         vec![1]
     );
 
-    let mut worker = store.pool().begin().await.expect("worker transaction");
-    sqlx::query("SELECT id FROM frames WHERE id = $1 FOR UPDATE")
-        .bind(*run.root_frame_id.as_uuid())
-        .execute(&mut *worker)
+    let mut run_blocker = store.pool().begin().await.expect("run blocker transaction");
+    sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
+        .bind(*run.id.as_uuid())
+        .execute(&mut *run_blocker)
         .await
-        .expect("worker frame lock");
-    let close = application.dispatch(
-        &alice_context,
-        ApplicationCommand::CloseSession(CloseSession {
-            session_id: created.view.id.clone(),
-        }),
+        .expect("block run lock");
+    let cancel = store.cancel_run(
+        run.id.clone(),
+        run.revision,
+        Some("operator request".to_owned()),
+        format!("concurrent-cancel-{}", Uuid::now_v7()),
     );
-    let worker_finishes = async {
+    let close_after_cancel_starts = async {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
-            .bind(*run.id.as_uuid())
-            .execute(&mut *worker)
+        application
+            .dispatch(
+                &alice_context,
+                ApplicationCommand::CloseSession(CloseSession {
+                    session_id: created.view.id.clone(),
+                }),
+            )
             .await
-            .expect("worker run lock after frame lock");
-        worker.commit().await.expect("worker commit");
     };
-    let (close_result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        tokio::join!(close, worker_finishes)
-    })
-    .await
-    .expect("close and engine-order transaction must not deadlock");
-    assert!(matches!(close_result, Ok(ApplicationResult::Closed)));
+    let release_run = async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        run_blocker.commit().await.expect("release run lock");
+    };
+    let (cancel_result, close_result, ()) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(cancel, close_after_cancel_starts, release_run)
+        })
+        .await
+        .expect("store cancel and session close must not deadlock");
+    assert!(cancel_result.is_ok(), "cancel failed: {cancel_result:?}");
+    assert!(
+        matches!(close_result, Ok(ApplicationResult::Closed)),
+        "close failed: {close_result:?}"
+    );
     assert_eq!(
         store
             .get_run(created.view.id.clone(), run.id.clone())

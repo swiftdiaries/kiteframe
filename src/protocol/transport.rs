@@ -267,17 +267,22 @@ async fn handle_line(
     let Some(object) = raw.as_object() else {
         return Some(error_response(Value::Null, RpcError::invalid_request()));
     };
-    let notification = !object.contains_key("id");
-    let request_id = object.get("id").cloned().unwrap_or(Value::Null);
-    let valid_id = request_id.is_null() || request_id.is_string() || request_id.is_number();
+    let raw_id = object.get("id");
+    let valid_id = raw_id.is_none_or(|id| id.is_null() || id.is_string() || id.is_number());
+    let request_id = raw_id.filter(|_| valid_id).cloned().unwrap_or(Value::Null);
+    let valid_envelope = object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && object.get("method").is_some_and(Value::is_string)
+        && object
+            .get("params")
+            .is_none_or(|params| params.is_object() || params.is_array());
+    let notification = raw_id.is_none();
     let request = serde_json::from_value::<NdjsonRequest>(raw);
     let Ok(request) = request else {
-        return (!notification).then(|| error_response(request_id, RpcError::invalid_request()));
+        return Some(error_response(request_id, RpcError::invalid_request()));
     };
-    if request.jsonrpc != "2.0" || !valid_id {
-        return (!notification).then(|| error_response(request_id, RpcError::invalid_request()));
+    if !valid_envelope || !valid_id {
+        return Some(error_response(request_id, RpcError::invalid_request()));
     }
-
     let response = if request.method == "initialize" {
         connection.initialize(request.params)
     } else {

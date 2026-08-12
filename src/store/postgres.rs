@@ -1048,6 +1048,10 @@ impl PostgresStore {
         idempotency_key: String,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM frames WHERE run_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') ORDER BY id FOR UPDATE")
+            .bind(*run_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await?;
         let run = sqlx::query("SELECT revision, state, cancellation_idempotency_key FROM runs WHERE id = $1 FOR UPDATE")
             .bind(*run_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("run was not found".to_owned()))?;
@@ -1061,10 +1065,10 @@ impl PostgresStore {
             return Err(StoreError::RevisionConflict);
         }
         let revision = expected_revision + 1;
-        sqlx::query("UPDATE runs SET state = 'cancelled', revision = $1, cancellation_idempotency_key = $2, cancellation_reason = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4")
-            .bind(revision as i64).bind(idempotency_key).bind(reason.clone().map(Value::String)).bind(*run_id.as_uuid()).execute(&mut *tx).await?;
         sqlx::query("UPDATE frames SET state = 'cancelled', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE run_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled')")
             .bind(*run_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE runs SET state = 'cancelled', revision = $1, cancellation_idempotency_key = $2, cancellation_reason = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4")
+            .bind(revision as i64).bind(idempotency_key).bind(reason.clone().map(Value::String)).bind(*run_id.as_uuid()).execute(&mut *tx).await?;
         sqlx::query("UPDATE questions SET state = 'cancelled' WHERE run_id = $1 AND state = 'pending'")
             .bind(*run_id.as_uuid()).execute(&mut *tx).await?;
         sqlx::query("UPDATE permission_requests SET state = 'cancelled' WHERE run_id = $1 AND state = 'pending'")
