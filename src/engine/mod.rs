@@ -107,3 +107,29 @@ fn matches_type(value: &Value, ty: &CompiledType) -> bool {
         CompiledType::Record(_) => value.is_object(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::dsl::{Limits, compile};
+    use crate::{SessionId, ToolCatalogSnapshot};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::validate_completion;
+
+    fn task() -> crate::dsl::CompiledTask {
+        let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(4), [])
+            .expect("catalog");
+        compile("workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok(answer: string) { done answer } }", &catalog, &Limits::default())
+            .expect("compile").tasks.remove("t").expect("task")
+    }
+
+    #[test]
+    fn completion_validation_requires_exact_declared_fields() {
+        let task = task();
+        assert!(validate_completion(&task, "ok", &json!({"answer":"x"})).is_ok());
+        assert!(validate_completion(&task, "unknown", &json!({"answer":"x"})).is_err());
+        assert!(validate_completion(&task, "ok", &json!({"answer":1})).is_err());
+        assert!(validate_completion(&task, "ok", &json!({"answer":"x", "extra":true})).is_err());
+    }
+}
