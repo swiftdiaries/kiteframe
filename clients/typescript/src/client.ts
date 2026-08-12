@@ -12,9 +12,13 @@ export class KiteframeClient {
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>;
   #pending = "";
 
-  constructor(sessionId: string, command: string[] = [Bun.env.KITEFRAME_HARNESS ?? "kiteframe-harness"]) {
+  constructor(
+    sessionId: string,
+    command: string[] = [Bun.env.KITEFRAME_HARNESS ?? "kiteframe-harness"],
+    environment: Record<string, string | undefined> = {},
+  ) {
     this.#sessionId = sessionId;
-    this.#process = Bun.spawn(command, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    this.#process = Bun.spawn(command, { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: { ...process.env, ...environment } });
     this.#stdin = this.#process.stdin;
     this.#reader = this.#process.stdout.getReader();
   }
@@ -44,7 +48,10 @@ export class KiteframeClient {
   async #nextLine(): Promise<string> {
     while (!this.#pending.includes("\n")) {
       const { done, value } = await this.#reader.read();
-      if (done) throw new HarnessError("harness exited without a response");
+      if (done) {
+        const stderr = await new Response(this.#process.stderr).text();
+        throw new HarnessError(`harness exited without a response: ${stderr.trim()}`);
+      }
       this.#pending += new TextDecoder().decode(value, { stream: true });
     }
     const newline = this.#pending.indexOf("\n");
