@@ -102,7 +102,7 @@ impl Engine {
                 let binding = self.store.run_tool_binding(request.run_id.clone(), &pending.qualified_name).await?;
                 let tool = self.tools.bound_tool(request.session_id.clone(), &binding.qualified_name, &binding.descriptor_digest).map_err(|error| StoreError::InvalidData(error.to_string()))?;
                 let policy_revision = self.store.policy_revision(request.session_id.clone()).await?;
-                let call = ToolCall::new(request.session_id, request.run_id, pending.frame_id.clone(), policy_revision, tool.descriptor(), pending.arguments, IdempotencyKey::new(format!("permission:{}", pending.tool_call_id)).map_err(|error| StoreError::InvalidData(error.to_string()))?).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let call = ToolCall::new(request.session_id, request.run_id, pending.frame_id.clone(), policy_revision, tool.descriptor(), pending.arguments, IdempotencyKey::new(format!("{}:{}", pending.frame_id.as_uuid(), pending.provider_call_id)).map_err(|error| StoreError::InvalidData(error.to_string()))?).map_err(|error| StoreError::InvalidData(error.to_string()))?;
                 let result = tool.invoke(call).await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
                 self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, result).await?;
             }
@@ -198,7 +198,7 @@ impl Engine {
                     .map_err(|error| StoreError::InvalidData(error.to_string()))?;
                 let call = ToolCall::new(
                     frame.session_id.clone(), frame.run_id.clone(), frame.id.clone(), policy_revision,
-                    tool.descriptor(), arguments, IdempotencyKey::new(format!("{}:{}", frame.id.as_uuid(), intent.id)).map_err(|error| StoreError::InvalidData(error.to_string()))?,
+                    tool.descriptor(), arguments, IdempotencyKey::new(format!("{}:{}", frame.id.as_uuid(), provider_call_id)).map_err(|error| StoreError::InvalidData(error.to_string()))?,
                 ).map_err(|error| StoreError::InvalidData(error.to_string()))?;
                 let outcome = tool.invoke(call)
                     .await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
