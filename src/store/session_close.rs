@@ -23,16 +23,16 @@ impl PostgresStore {
             return Err(StoreError::SessionClosed);
         }
 
-        // Engine transitions lock one frame before its run. Lock every frame
-        // and run in that same order while the session row blocks new starts.
-        sqlx::query(
-            "SELECT f.id FROM frames f JOIN runs r ON r.id = f.run_id WHERE r.session_id = $1 AND r.state NOT IN ('completed', 'failed', 'cancelled') ORDER BY f.id FOR UPDATE OF f",
+        // The session row blocks new runs. Existing runs are the aggregate
+        // mutexes, so lock them before the frames they own.
+        let active_runs = sqlx::query(
+            "SELECT id FROM runs WHERE session_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') ORDER BY id FOR UPDATE",
         )
         .bind(*session_id.as_uuid())
         .fetch_all(&mut *tx)
         .await?;
-        let active_runs = sqlx::query(
-            "SELECT id FROM runs WHERE session_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') ORDER BY id FOR UPDATE",
+        sqlx::query(
+            "SELECT f.id FROM frames f JOIN runs r ON r.id = f.run_id WHERE r.session_id = $1 AND r.state NOT IN ('completed', 'failed', 'cancelled') ORDER BY f.id FOR UPDATE OF f",
         )
         .bind(*session_id.as_uuid())
         .fetch_all(&mut *tx)

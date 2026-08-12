@@ -480,8 +480,14 @@ impl PostgresStore {
 
     pub async fn requeue_uncommitted_model_attempts(&self, limit: i64) -> Result<u64, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let frames = sqlx::query("SELECT f.id, f.run_id FROM frames f WHERE f.state = 'running' AND EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'input') AND NOT EXISTS (SELECT 1 FROM tool_calls t WHERE t.frame_id = f.id AND t.state IN ('intent', 'running', 'waiting_for_permission')) AND NOT EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'output') ORDER BY f.updated_at LIMIT $1 FOR UPDATE SKIP LOCKED")
-            .bind(limit.clamp(1, 256)).fetch_all(&mut *tx).await?;
+        let limit = limit.clamp(1, 256);
+        let run_ids = sqlx::query_scalar::<_, uuid::Uuid>("SELECT r.id FROM runs r WHERE EXISTS (SELECT 1 FROM frames f WHERE f.run_id = r.id AND f.state = 'running' AND EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'input') AND NOT EXISTS (SELECT 1 FROM tool_calls t WHERE t.frame_id = f.id AND t.state IN ('intent', 'running', 'waiting_for_permission')) AND NOT EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'output')) ORDER BY r.id LIMIT $1 FOR UPDATE OF r SKIP LOCKED")
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?;
+        let frames = sqlx::query("SELECT f.id, f.run_id FROM frames f WHERE f.run_id = ANY($1) AND f.state = 'running' AND EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'input') AND NOT EXISTS (SELECT 1 FROM tool_calls t WHERE t.frame_id = f.id AND t.state IN ('intent', 'running', 'waiting_for_permission')) AND NOT EXISTS (SELECT 1 FROM model_items m WHERE m.frame_id = f.id AND m.direction = 'output') ORDER BY f.id LIMIT $2 FOR UPDATE OF f SKIP LOCKED")
+            .bind(&run_ids)
+            .bind(limit).fetch_all(&mut *tx).await?;
         for frame in &frames {
             let frame_id = frame.get::<uuid::Uuid, _>("id");
             let run_id = frame.get::<uuid::Uuid, _>("run_id");
@@ -520,12 +526,12 @@ impl PostgresStore {
         retry_budget: u32,
     ) -> Result<Option<u64>, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
         let call = sqlx::query("SELECT state, recovery_attempts FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
             .bind(tool_call_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("tool call was not found for frame".to_owned()))?;
@@ -559,6 +565,7 @@ impl PostgresStore {
         retry_budget: u32,
     ) -> Result<Option<u64>, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
@@ -579,7 +586,7 @@ impl PostgresStore {
             .bind(tool_call_id).execute(&mut *tx).await?;
         sqlx::query("UPDATE frames SET revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
             .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
-        append_event(&mut tx, frame.get("run_id"), "tool.recovery_retry", json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id})).await?;
+        append_event(&mut tx, run_id, "tool.recovery_retry", json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id})).await?;
         tx.commit().await?;
         Ok(Some(revision))
     }
@@ -591,12 +598,12 @@ impl PostgresStore {
         expected_revision: u64,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
         let call = sqlx::query("SELECT state FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
             .bind(tool_call_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("tool call was not found for frame".to_owned()))?;
@@ -621,6 +628,7 @@ impl PostgresStore {
         input: Value,
     ) -> Result<super::ModelAttempt, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid())
             .fetch_optional(&mut *tx)
@@ -632,11 +640,6 @@ impl PostgresStore {
         if frame.get::<String, _>("state") != "runnable" {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
-            .bind(run_id)
-            .fetch_one(&mut *tx)
-            .await?;
         let attempt = sqlx::query("SELECT COALESCE(MAX(attempt), 0) + 1 AS attempt FROM model_items WHERE frame_id = $1")
             .bind(*frame_id.as_uuid())
             .fetch_one(&mut *tx)
@@ -662,6 +665,7 @@ impl PostgresStore {
         items: Vec<Value>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid())
             .fetch_optional(&mut *tx)
@@ -672,11 +676,6 @@ impl PostgresStore {
         {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
-            .bind(run_id)
-            .fetch_one(&mut *tx)
-            .await?;
         let intent = sqlx::query("SELECT 1 FROM model_items WHERE frame_id = $1 AND attempt = $2 AND position = 0 AND direction = 'input'")
             .bind(*frame_id.as_uuid()).bind(attempt as i32).fetch_optional(&mut *tx).await?;
         if intent.is_none() {
@@ -702,13 +701,12 @@ impl PostgresStore {
         fields: Value,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state, bindings FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision || !matches!(frame.get::<String, _>("state").as_str(), "running" | "runnable") {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         let mut bindings = frame.get::<Value, _>("bindings").as_object().cloned().ok_or_else(|| StoreError::InvalidData("frame bindings are malformed".to_owned()))?;
         let fields = fields.as_object().ok_or_else(|| StoreError::InvalidData("completion fields must be an object".to_owned()))?;
         bindings.extend(fields.clone());
@@ -731,16 +729,12 @@ impl PostgresStore {
         idempotency_key: String,
     ) -> Result<super::ToolCallIntent, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid())
             .fetch_optional(&mut *tx)
             .await?
             .ok_or(StoreError::FrameNotFound)?;
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
-            .bind(run_id)
-            .fetch_one(&mut *tx)
-            .await?;
         if let Some(existing) = sqlx::query("SELECT id, provider_call_id, qualified_name, descriptor_digest, arguments FROM tool_calls WHERE frame_id = $1 AND idempotency_key = $2")
             .bind(*frame_id.as_uuid()).bind(&idempotency_key).fetch_optional(&mut *tx).await?
         {
@@ -789,6 +783,7 @@ impl PostgresStore {
         outcome: Result<Value, Value>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision
@@ -796,8 +791,6 @@ impl PostgresStore {
         {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         let call = sqlx::query("SELECT state FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
             .bind(tool_call_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("tool call was not found for frame".to_owned()))?;
@@ -829,17 +822,26 @@ impl PostgresStore {
         request: super::NewPermissionRequest,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let frame = sqlx::query("SELECT f.run_id, f.revision, f.state, r.session_id FROM frames f JOIN runs r ON r.id = f.run_id WHERE f.id = $1 FOR UPDATE")
+        let ownership = sqlx::query("SELECT f.run_id, r.session_id FROM frames f JOIN runs r ON r.id = f.run_id WHERE f.id = $1")
+            .bind(*frame_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::FrameNotFound)?;
+        let run_id: uuid::Uuid = ownership.get("run_id");
+        let session_id: uuid::Uuid = ownership.get("session_id");
+        let policy =
+            sqlx::query("SELECT current_policy_revision FROM sessions WHERE id = $1 FOR UPDATE")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        lock_run(&mut tx, run_id).await?;
+        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision
             || frame.get::<String, _>("state") != "running"
         {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
-        let policy = sqlx::query("SELECT current_policy_revision FROM sessions WHERE id = $1")
-            .bind(frame.get::<uuid::Uuid, _>("session_id")).fetch_one(&mut *tx).await?;
         if policy.get::<i64, _>("current_policy_revision") as u64 != request.policy_revision.get() {
             return Err(StoreError::RevisionConflict);
         }
@@ -874,10 +876,9 @@ impl PostgresStore {
         idempotency_key: String,
     ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         let request = sqlx::query("SELECT state, resolution_idempotency_key FROM permission_requests WHERE id = $1 AND frame_id = $2 FOR UPDATE")
             .bind(*request_id.as_uuid()).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("permission request was not found for frame".to_owned()))?;
@@ -914,13 +915,12 @@ impl PostgresStore {
         question: super::Question,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision || !matches!(frame.get::<String, _>("state").as_str(), "running" | "runnable") {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         question.schema.validate_definition().map_err(|error| StoreError::InvalidData(error.to_string()))?;
         let schema = serde_json::to_value(&question.schema).map_err(|error| StoreError::InvalidData(error.to_string()))?;
         sqlx::query("INSERT INTO questions (id, run_id, frame_id, binding, text, schema, state) VALUES ($1, $2, $3, $4, $5, $6, 'pending')")
@@ -943,10 +943,9 @@ impl PostgresStore {
         idempotency_key: String,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state, bindings FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         let question = sqlx::query("SELECT binding, schema, state, answer_idempotency_key FROM questions WHERE id = $1 AND frame_id = $2 FOR UPDATE")
             .bind(question_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("question was not found for frame".to_owned()))?;
@@ -979,13 +978,33 @@ impl PostgresStore {
         command: super::FrameCommand,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let frame = sqlx::query("SELECT run_id, parent_frame_id, parent_binding, revision, state FROM frames WHERE id = $1 FOR UPDATE")
-            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        let metadata = sqlx::query("SELECT run_id, parent_frame_id FROM frames WHERE id = $1")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
+            .ok_or(StoreError::FrameNotFound)?;
+        let run_id: uuid::Uuid = metadata.get("run_id");
+        lock_run(&mut tx, run_id).await?;
+        let parent_id = matches!(&command, super::FrameCommand::Complete(_))
+            .then(|| metadata.get::<Option<uuid::Uuid>, _>("parent_frame_id"))
+            .flatten();
+        let mut frame_ids = vec![*frame_id.as_uuid()];
+        frame_ids.extend(parent_id);
+        frame_ids.sort_unstable();
+        frame_ids.dedup();
+        let mut locked_frames = Vec::with_capacity(frame_ids.len());
+        for locked_frame_id in frame_ids {
+            let frame = sqlx::query("SELECT id, run_id, parent_frame_id, parent_binding, bindings, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+                .bind(locked_frame_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::FrameNotFound)?;
+            locked_frames.push(frame);
+        }
+        let frame = locked_frames
+            .iter()
+            .find(|frame| frame.get::<uuid::Uuid, _>("id") == *frame_id.as_uuid()).ok_or(StoreError::FrameNotFound)?;
         if frame.get::<i64, _>("revision") as u64 != expected_revision || !matches!(frame.get::<String, _>("state").as_str(), "running" | "runnable") {
             return Err(StoreError::RevisionConflict);
         }
-        let run_id = frame.get::<uuid::Uuid, _>("run_id");
-        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         let revision = expected_revision + 1;
         match command {
             super::FrameCommand::StartCall(child) => {
@@ -1023,7 +1042,11 @@ impl PostgresStore {
                     sqlx::query("UPDATE runs SET state = 'completed', output = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
                         .bind(result).bind(run_id).execute(&mut *tx).await?;
                 } else {
-                    resume_parent_after_child(&mut tx, run_id, &frame, result).await?;
+                    let parent = locked_frames
+                        .iter()
+                        .find(|parent| Some(parent.get::<uuid::Uuid, _>("id")) == parent_id)
+                        .ok_or(StoreError::FrameNotFound)?;
+                    resume_parent_after_child(&mut tx, run_id, frame, parent, result).await?;
                 }
                 append_event(&mut tx, run_id, "frame.completed", json!({"frame_id": frame_id.as_uuid()})).await?;
             }
@@ -1048,10 +1071,6 @@ impl PostgresStore {
         idempotency_key: String,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT id FROM frames WHERE run_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') ORDER BY id FOR UPDATE")
-            .bind(*run_id.as_uuid())
-            .fetch_all(&mut *tx)
-            .await?;
         let run = sqlx::query("SELECT revision, state, cancellation_idempotency_key FROM runs WHERE id = $1 FOR UPDATE")
             .bind(*run_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("run was not found".to_owned()))?;
@@ -1064,6 +1083,10 @@ impl PostgresStore {
         if run.get::<i64, _>("revision") as u64 != expected_revision || matches!(run.get::<String, _>("state").as_str(), "completed" | "failed") {
             return Err(StoreError::RevisionConflict);
         }
+        sqlx::query("SELECT id FROM frames WHERE run_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') ORDER BY id FOR UPDATE")
+            .bind(*run_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await?;
         let revision = expected_revision + 1;
         sqlx::query("UPDATE frames SET state = 'cancelled', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE run_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled')")
             .bind(*run_id.as_uuid()).execute(&mut *tx).await?;
@@ -1202,6 +1225,32 @@ async fn append_event(
     Ok(())
 }
 
+async fn lock_run_for_frame(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    frame_id: uuid::Uuid,
+) -> Result<uuid::Uuid, StoreError> {
+    // A frame's run is immutable, so discover it before taking the run-level
+    // aggregate mutex. Every caller locks its frame only after this returns.
+    let run_id = sqlx::query_scalar("SELECT run_id FROM frames WHERE id = $1")
+        .bind(frame_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(StoreError::FrameNotFound)?;
+    lock_run(tx, run_id).await?;
+    Ok(run_id)
+}
+
+async fn lock_run(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: uuid::Uuid,
+) -> Result<(), StoreError> {
+    sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
+        .bind(run_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn insert_child_frame(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: uuid::Uuid,
@@ -1217,12 +1266,11 @@ async fn resume_parent_after_child(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     run_id: uuid::Uuid,
     child: &sqlx::postgres::PgRow,
+    parent: &sqlx::postgres::PgRow,
     result: Value,
 ) -> Result<(), StoreError> {
     let parent_id = child.get::<Option<uuid::Uuid>, _>("parent_frame_id").ok_or_else(|| StoreError::InvalidData("child frame has no parent".to_owned()))?;
     let binding = child.get::<Option<String>, _>("parent_binding").ok_or_else(|| StoreError::InvalidData("child frame has no parent binding".to_owned()))?;
-    let parent = sqlx::query("SELECT bindings FROM frames WHERE id = $1 FOR UPDATE")
-        .bind(parent_id).fetch_one(&mut **tx).await?;
     let mut bindings = parent.get::<Value, _>("bindings").as_object().cloned().ok_or_else(|| StoreError::InvalidData("parent bindings are malformed".to_owned()))?;
     bindings.insert(binding, result);
     sqlx::query("UPDATE frames SET bindings = $1, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
