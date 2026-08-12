@@ -1,12 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, IdempotencyKey, PostgresStore,
-    FrameCommand, NewPermissionRequest, PermissionRequestId, PolicyRevision, PrincipalId, Question, RecoverySupport,
+    FrameCommand, NewChild, NewPermissionRequest, PermissionRequestId, PolicyRevision, PrincipalId, Question, RecoverySupport,
     StartRun, StoreError, ToolCatalogSnapshot,
 };
 use serde_json::json;
+use sqlx::Row;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -150,10 +151,26 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .apply_frame_command(
             started.root_frame_id.clone(),
             resumed.revision,
-            FrameCommand::Complete(json!("done")),
+            FrameCommand::StartCall(NewChild {
+                target: "t".to_owned(),
+                binding: "child_result".to_owned(),
+                arguments: BTreeMap::from([("query".to_owned(), json!("child"))]),
+                branch_index: 0,
+            }),
         )
         .await
-        .expect("complete root frame");
+        .expect("start child frame");
+    let child_id = sqlx::query("SELECT id FROM frames WHERE parent_frame_id = $1")
+        .bind(*started.root_frame_id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .expect("find child")
+        .get("id");
+    let child = kiteframe::FrameId::new(child_id);
+    let child_attempt = store.begin_model_attempt(child.clone(), 0, json!({"prompt": "child"})).await.expect("start child");
+    store.apply_frame_command(child, child_attempt.revision, FrameCommand::Complete(json!("child done"))).await.expect("complete child");
+    let final_attempt = store.begin_model_attempt(started.root_frame_id.clone(), 11, json!({"prompt": "finish"})).await.expect("resume parent");
+    store.apply_frame_command(started.root_frame_id.clone(), final_attempt.revision, FrameCommand::Complete(json!("done"))).await.expect("complete root frame");
     let cancellable = store
         .start_run(StartRun {
             session_id: session.id.clone(),
