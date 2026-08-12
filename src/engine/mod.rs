@@ -62,9 +62,11 @@ impl Engine {
     async fn run_model_turn(&self, frame: crate::RunnableFrame) -> Result<(), EngineError> {
         let task = frame.workflow.tasks.get(&frame.task_name).ok_or_else(|| StoreError::InvalidData("runnable frame task is absent from workflow".to_owned()))?;
         let attempt = self.store.begin_model_attempt(frame.id.clone(), frame.revision, json!({"bindings": frame.bindings})).await?;
+        let mut input = self.store.frame_history(frame.id.clone()).await?;
+        input.insert(0, json!({"bindings": frame.bindings}));
         let response = self.model.respond(ModelRequest {
             instructions: task.prompt.clone(),
-            input: vec![json!({"bindings": frame.bindings})],
+            input,
             tools: vec![completion_tool(task)],
         }).await.map_err(|error| StoreError::InvalidData(error.to_string()))?;
         self.store.commit_model_attempt(frame.id.clone(), attempt.attempt, attempt.revision, response.items.clone()).await?;
