@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::ser::SerializeStruct;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::{CatalogEpochId, CatalogTool};
 
@@ -52,7 +52,7 @@ impl Serialize for CompiledToolBinding {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "item")]
 pub enum CompiledType {
     String,
@@ -64,7 +64,7 @@ pub enum CompiledType {
     List(Box<Self>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum CompiledValue {
     Binding(String),
@@ -74,19 +74,19 @@ pub enum CompiledValue {
     Null,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct CompiledCall {
     pub task: String,
     pub arguments: BTreeMap<String, CompiledValue>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct CompiledCallBinding {
     pub binding: String,
     pub call: CompiledCall,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case", tag = "operation")]
 pub enum CompiledStatement {
     Call {
@@ -113,30 +113,31 @@ pub enum CompiledStatement {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct CompiledOutcome {
     pub fields: BTreeMap<String, CompiledType>,
     pub statements: Vec<CompiledStatement>,
 }
 
 /// The closed, tagged-union wire contract for the internal `complete_task` tool.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct CompletionContract {
     pub outcomes: BTreeMap<String, BTreeMap<String, CompiledType>>,
     pub required_nullable_fields: BTreeMap<String, CompiledType>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompiledTask {
     pub inputs: BTreeMap<String, CompiledType>,
     pub result: CompiledType,
     pub prompt: String,
+    #[serde(default, skip_deserializing)]
     pub tools: Vec<CompiledToolBinding>,
     pub outcomes: BTreeMap<String, CompiledOutcome>,
     pub completion: CompletionContract,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompiledWorkflow {
     pub dsl_version: u8,
     pub name: String,
@@ -148,5 +149,6 @@ pub struct CompiledWorkflow {
     pub limits: BTreeMap<String, u64>,
     pub records: BTreeMap<String, BTreeMap<String, CompiledType>>,
     pub tasks: BTreeMap<String, CompiledTask>,
+    #[serde(default, skip_deserializing)]
     pub tool_bindings: Vec<CompiledToolBinding>,
 }
