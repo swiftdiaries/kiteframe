@@ -29,6 +29,17 @@ impl Application {
         match command {
             ApplicationCommand::ListSessions => unreachable!("handled before session requirement"),
             ApplicationCommand::CloseSession => unreachable!("handled before session requirement"),
+            ApplicationCommand::Publish(request) => {
+                let catalog = self.store.current_catalog(session_id.clone()).await?;
+                let workflow = crate::dsl::compile(&request.source, &catalog, &crate::dsl::Limits::default())
+                    .map_err(|errors| ProtocolError::Application(errors.into_iter().map(|error| error.message).collect::<Vec<_>>().join("; ")))?;
+                Ok(ApplicationResult::Published(self.store.publish(session_id.clone(), &workflow, &request.source).await?))
+            }
+            ApplicationCommand::UpdatePolicy(request) => {
+                let catalog = self.store.current_catalog(session_id.clone()).await?;
+                let revision = self.store.append_session_policy(session_id.clone(), request.expected_revision, request.idempotency_key.as_str().to_owned(), &request.policy, &catalog).await?;
+                Ok(ApplicationResult::PolicyUpdated { revision })
+            }
             ApplicationCommand::Start(request) => Ok(ApplicationResult::Run(self.store.start_run(request).await?)),
             ApplicationCommand::Get(request) => Ok(ApplicationResult::Run(self.store.get_run(session_id.clone(), request.run_id).await?)),
             ApplicationCommand::Answer(request) => {

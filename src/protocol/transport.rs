@@ -126,6 +126,8 @@ where
 
 fn application_result_json(result: crate::ApplicationResult) -> Value {
     match result {
+        crate::ApplicationResult::Published(definition) => serde_json::json!({"kind":"published", "id":definition.id, "name":definition.name, "version":definition.version, "definition_hash":definition.definition_hash}),
+        crate::ApplicationResult::PolicyUpdated { revision } => serde_json::json!({"kind":"policy_updated", "revision":revision.get()}),
         crate::ApplicationResult::Run(run) => serde_json::json!({
             "kind": "run", "id": run.id.as_uuid(), "session_id": run.session_id.as_uuid(),
             "workflow_name": run.definition.name, "version": run.definition.version,

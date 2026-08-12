@@ -85,6 +85,32 @@ impl CatalogTool {
         Ok(tool)
     }
 
+    pub fn from_normalized(value: &Value) -> Result<Self, ToolError> {
+        #[derive(Deserialize)]
+        struct StoredTool {
+            qualified_name: String,
+            server_alias: String,
+            description: String,
+            input: ClosedSchema,
+            output: ClosedSchema,
+            capabilities: BTreeSet<Capability>,
+            effect: EffectKind,
+            recovery: RecoverySupport,
+        }
+        let stored: StoredTool = serde_json::from_value(value.clone())
+            .map_err(|error| ToolError::InvalidStoredDescriptor(error.to_string()))?;
+        Self::new(
+            stored.qualified_name,
+            stored.server_alias,
+            stored.description,
+            stored.input,
+            stored.output,
+            stored.capabilities,
+            stored.effect,
+            stored.recovery,
+        )
+    }
+
     pub fn validate(&self) -> Result<(), ToolError> {
         let (alias, name) = self
             .qualified_name

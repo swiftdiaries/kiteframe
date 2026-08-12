@@ -13,4 +13,5 @@ pub use transport::{
 pub(crate) use types::command_session;
 pub use types::{
     ApplicationCommand, ApplicationContext, ApplicationResult, EventCursor, GetRun, ProtocolError,
+    PublishWorkflow, UpdateSessionPolicy,
 };

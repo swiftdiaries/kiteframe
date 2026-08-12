@@ -11,6 +11,8 @@ impl V1Adapter {
         match method {
             "session/list" => Ok(ApplicationCommand::ListSessions),
             "session/close" => Ok(ApplicationCommand::CloseSession),
+            "_kiteframe/workflow/publish" => decode(payload, ApplicationCommand::Publish),
+            "_kiteframe/session/update-policy" => decode(payload, ApplicationCommand::UpdatePolicy),
             "_kiteframe/run/start" => decode(payload, ApplicationCommand::Start),
             "_kiteframe/run/get" => decode(payload, ApplicationCommand::Get),
             "_kiteframe/run/answer" => decode(payload, ApplicationCommand::Answer),
@@ -42,6 +44,14 @@ mod tests {
         assert!(matches!(command, ApplicationCommand::Start(_)));
         assert!(matches!(V1Adapter::decode_extension("_kiteframe/run/get", json!({"run_id":"019ff3d8-9d86-7de0-9070-0f0185d5f413"})), Ok(ApplicationCommand::Get(_))));
         assert!(matches!(V1Adapter::decode_extension("session/list", json!({})), Ok(ApplicationCommand::ListSessions)));
+        assert!(matches!(
+            V1Adapter::decode_extension("_kiteframe/workflow/publish", json!({"source":"workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }"})),
+            Ok(ApplicationCommand::Publish(_))
+        ));
+        assert!(matches!(
+            V1Adapter::decode_extension("_kiteframe/session/update-policy", json!({"expected_revision":0,"idempotency_key":"policy","policy":{"version":1,"rules":[]}})),
+            Ok(ApplicationCommand::UpdatePolicy(_))
+        ));
         assert!(V1Adapter::decode_extension("tool/call", json!({})).is_err());
     }
 }

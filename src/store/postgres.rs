@@ -3,7 +3,8 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 
 use crate::dsl::CompiledWorkflow;
 use crate::{
-    CatalogEpochId, PolicyRevision, PrincipalId, SessionId, ToolCatalogSnapshot, canonical_sha256,
+    CatalogEpochId, CatalogTool, PolicyRevision, PrincipalId, SessionId, ToolCatalogSnapshot,
+    canonical_sha256,
 };
 
 use super::{
@@ -122,6 +123,30 @@ impl PostgresStore {
         sqlx::query("UPDATE sessions SET current_catalog_epoch = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2").bind(*epoch.epoch_id().as_uuid()).bind(*epoch.session_id().as_uuid()).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn current_catalog(&self, session_id: SessionId) -> Result<ToolCatalogSnapshot, StoreError> {
+        let row = sqlx::query("SELECT s.current_catalog_epoch, e.descriptor_snapshot FROM sessions s LEFT JOIN mcp_catalog_epochs e ON e.epoch_id = s.current_catalog_epoch AND e.session_id = s.id WHERE s.id = $1")
+            .bind(*session_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::SessionNotFound)?;
+        let epoch_id = row
+            .get::<Option<uuid::Uuid>, _>("current_catalog_epoch")
+            .ok_or(StoreError::CatalogScopeViolation)?;
+        let snapshot = row
+            .get::<Option<Value>, _>("descriptor_snapshot")
+            .ok_or(StoreError::CatalogScopeViolation)?;
+        let tools = snapshot
+            .get("tools")
+            .and_then(Value::as_array)
+            .ok_or_else(|| StoreError::InvalidData("catalog snapshot tools are malformed".to_owned()))?
+            .iter()
+            .map(CatalogTool::from_normalized)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        ToolCatalogSnapshot::new(session_id, epoch_id, tools)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))
     }
 
     pub async fn append_policy_rules(

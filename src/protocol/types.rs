@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::{AnswerQuestion, CancelRun, PrincipalId, ResolvePermission, RunEvent, RunId, RunView, SessionId, StartRun};
+use crate::{AnswerQuestion, CancelRun, IdempotencyKey, PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission, RunEvent, RunId, RunView, SessionId, SessionPolicy, StartRun};
 
 #[derive(Clone, Debug)]
 pub struct ApplicationContext {
@@ -21,10 +21,24 @@ pub struct EventCursor {
     pub limit: u32,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct PublishWorkflow {
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateSessionPolicy {
+    pub expected_revision: PolicyRevision,
+    pub idempotency_key: IdempotencyKey,
+    pub policy: SessionPolicy,
+}
+
 #[derive(Clone, Debug)]
 pub enum ApplicationCommand {
     ListSessions,
     CloseSession,
+    Publish(PublishWorkflow),
+    UpdatePolicy(UpdateSessionPolicy),
     Start(StartRun),
     Get(GetRun),
     Answer(AnswerQuestion),
@@ -36,6 +50,8 @@ pub enum ApplicationCommand {
 #[derive(Clone, Debug)]
 pub enum ApplicationResult {
     Sessions(Vec<crate::SessionView>),
+    Published(PublishedDefinition),
+    PolicyUpdated { revision: PolicyRevision },
     Run(RunView),
     Events(Vec<RunEvent>),
     Ack,
@@ -71,7 +87,7 @@ pub fn command_session(command: &ApplicationCommand) -> Option<&SessionId> {
         ApplicationCommand::Answer(request) => Some(&request.session_id),
         ApplicationCommand::ResolvePermission(request) => Some(&request.session_id),
         ApplicationCommand::Cancel(request) => Some(&request.session_id),
-        ApplicationCommand::Get(_) | ApplicationCommand::ReplayEvents(_) => None,
+        ApplicationCommand::Publish(_) | ApplicationCommand::UpdatePolicy(_) | ApplicationCommand::Get(_) | ApplicationCommand::ReplayEvents(_) => None,
     }
 }
 

@@ -32,7 +32,7 @@ pub use policy::{
     CedarAuthorizer, OneOfPrimitive, PolicyDecision, PolicyEffect, PolicyError, PolicyRequest,
     PolicyRule, PolicyTarget, Primitive, SessionAuthorizer, SessionPolicy, TypedAuthorizer,
 };
-pub use protocol::{Application, ApplicationCommand, ApplicationContext, ApplicationResult, EventCursor, GetRun, ProtocolError};
+pub use protocol::{Application, ApplicationCommand, ApplicationContext, ApplicationResult, EventCursor, GetRun, ProtocolError, PublishWorkflow, UpdateSessionPolicy};
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
     Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest, PolicyUpdate, PostgresStore,

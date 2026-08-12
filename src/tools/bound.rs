@@ -117,6 +117,8 @@ pub enum ToolFailure {
 pub enum ToolError {
     #[error("invalid qualified tool name: {0}")]
     InvalidQualifiedName(String),
+    #[error("invalid stored tool descriptor: {0}")]
+    InvalidStoredDescriptor(String),
     #[error("duplicate qualified tool name: {0}")]
     DuplicateQualifiedName(String),
     #[error("unsupported closed schema: {0}")]
