@@ -5,6 +5,7 @@ pub use transition::{FrameSnapshot, TransitionError, next_command};
 pub use recovery::RecoveryReport;
 
 use std::sync::Arc;
+use std::collections::BTreeSet;
 
 use thiserror::Error;
 use serde::Deserialize;
@@ -91,9 +92,6 @@ impl Engine {
     }
 
     pub async fn resolve_permission(&self, request: ResolvePermission) -> Result<(), EngineError> {
-        if matches!(request.choice, PermissionChoice::AllowToolForSession | PermissionChoice::DenyToolForSession) {
-            return Err(StoreError::InvalidData("session-wide permission choices require immutable policy update support".to_owned()).into());
-        }
         let pending = self.store.pending_permission(request.session_id.clone(), request.run_id.clone(), request.permission_request_id.clone()).await?;
         if pending.resolved {
             return if pending.resolution_idempotency_key.as_deref() == Some(request.idempotency_key.as_str()) {
@@ -101,6 +99,20 @@ impl Engine {
             } else {
                 Err(StoreError::IdempotencyConflict.into())
             };
+        }
+        if matches!(request.choice, PermissionChoice::AllowToolForSession | PermissionChoice::DenyToolForSession) {
+            let catalog = self.store.current_catalog(request.session_id.clone()).await?;
+            catalog.resolve(&pending.qualified_name, &pending.descriptor_digest)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            let mut policy = self.store.current_session_policy(request.session_id.clone()).await?;
+            policy.rules.push(crate::PolicyRule {
+                rule_id: format!("permission-{}", request.permission_request_id.as_uuid()),
+                effect: match request.choice { PermissionChoice::AllowToolForSession => crate::PolicyEffect::Permit, PermissionChoice::DenyToolForSession => crate::PolicyEffect::Forbid, _ => unreachable!() },
+                target: crate::PolicyTarget::Tool { names: BTreeSet::from([pending.qualified_name.clone()]) },
+                input: Default::default(),
+            });
+            let revision = self.store.policy_revision(request.session_id.clone()).await?;
+            self.store.append_session_policy(request.session_id.clone(), revision, request.idempotency_key.as_str().to_owned(), &policy, &catalog).await?;
         }
         let applied = self.store.resolve_permission(
             pending.frame_id.clone(), request.permission_request_id, pending.revision,
@@ -110,7 +122,7 @@ impl Engine {
         if !applied { return Ok(()); }
         let revision = pending.revision + 1;
         match request.choice {
-            PermissionChoice::AllowOnce => {
+            PermissionChoice::AllowOnce | PermissionChoice::AllowToolForSession => {
                 let binding = self.store.run_tool_binding(request.run_id.clone(), &pending.qualified_name).await?;
                 let tool = self.tools.bound_tool(request.session_id.clone(), &binding.qualified_name, &binding.descriptor_digest).map_err(|error| StoreError::InvalidData(error.to_string()))?;
                 let policy_revision = self.store.policy_revision(request.session_id.clone()).await?;
@@ -118,8 +130,7 @@ impl Engine {
                 let result = tool.invoke(call).await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
                 self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, result).await?;
             }
-            PermissionChoice::DenyOnce => self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, Err(json!({"code":"permission_denied","message":"Tool invocation denied by user"}))).await?,
-            PermissionChoice::AllowToolForSession | PermissionChoice::DenyToolForSession => unreachable!("checked above"),
+            PermissionChoice::DenyOnce | PermissionChoice::DenyToolForSession => self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, Err(json!({"code":"permission_denied","message":"Tool invocation denied by user"}))).await?,
         }
         Ok(())
     }

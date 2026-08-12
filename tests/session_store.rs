@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
-    CatalogTool, ClosedSchema, CreateSession, EffectKind, PolicyRevision, PolicyUpdate,
-    PostgresStore, PrincipalId, RecoverySupport, StoreError, ToolCatalogSnapshot,
+    CatalogTool, ClosedSchema, CreateSession, EffectKind, PersistedAuthorizer, PolicyDecision,
+    PolicyEffect, PolicyRequest, PolicyRevision, PolicyRule, PolicyTarget, PolicyUpdate,
+    PostgresStore, PrincipalId, RecoverySupport, SessionAuthorizer, SessionPolicy, StoreError,
+    ToolCatalogSnapshot,
 };
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
@@ -15,9 +18,9 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         eprintln!("skipping session store test: DATABASE_URL is not configured");
         return;
     };
-    let store = PostgresStore::connect(&database_url)
+    let store = Arc::new(PostgresStore::connect(&database_url)
         .await
-        .expect("connect store");
+        .expect("connect store"));
     let principal = PrincipalId::new(format!("alice-{}", Uuid::now_v7())).expect("principal");
     let session = store
         .create_session(CreateSession {
@@ -95,6 +98,30 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
             .await,
         Err(StoreError::PolicyRevisionConflict)
     ));
+    let permit = SessionPolicy {
+        version: 1,
+        rules: vec![PolicyRule {
+            rule_id: "permit-search".to_owned(),
+            effect: PolicyEffect::Permit,
+            target: PolicyTarget::Tool { names: BTreeSet::from(["docs/search".to_owned()]) },
+            input: Default::default(),
+        }],
+    };
+    store.append_session_policy(session.id.clone(), PolicyRevision::new(1), "permit-search".to_owned(), &permit, &catalog).await.expect("append permit");
+    let authorizer = PersistedAuthorizer::new(store.clone());
+    let request = PolicyRequest { session: session.id.clone(), qualified_name: "docs/search".to_owned(), descriptor_digest: catalog.tools()["docs/search"].descriptor_digest().to_owned(), capabilities: vec![] };
+    assert!(matches!(authorizer.authorize(&request).await, Ok(PolicyDecision::Allow)));
+    let forbid = SessionPolicy {
+        version: 1,
+        rules: vec![PolicyRule {
+            rule_id: "forbid-search".to_owned(),
+            effect: PolicyEffect::Forbid,
+            target: PolicyTarget::Tool { names: BTreeSet::from(["docs/search".to_owned()]) },
+            input: Default::default(),
+        }],
+    };
+    store.append_session_policy(session.id.clone(), PolicyRevision::new(2), "forbid-search".to_owned(), &forbid, &catalog).await.expect("append forbid");
+    assert!(matches!(authorizer.authorize(&request).await, Ok(PolicyDecision::Forbid { .. })));
 
     let source = "workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [search] on ok() { done \"x\" } }";
     let workflow = compile(source, &catalog, &Limits::default()).expect("compile workflow");

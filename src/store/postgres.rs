@@ -218,6 +218,26 @@ impl PostgresStore {
         .await
     }
 
+    pub async fn current_session_policy(&self, session: SessionId) -> Result<crate::SessionPolicy, StoreError> {
+        let exists = sqlx::query("SELECT 1 FROM sessions WHERE id = $1")
+            .bind(*session.as_uuid())
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        if !exists {
+            return Err(StoreError::SessionNotFound);
+        }
+        let source = sqlx::query("SELECT typed_source FROM session_policy_rules WHERE session_id = $1 ORDER BY revision DESC LIMIT 1")
+            .bind(*session.as_uuid())
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| row.get::<Value, _>("typed_source"));
+        match source {
+            Some(source) => serde_json::from_value(source).map_err(|error| StoreError::InvalidData(error.to_string())),
+            None => Ok(crate::SessionPolicy { version: 1, rules: vec![] }),
+        }
+    }
+
     pub async fn start_run(&self, request: StartRun) -> Result<RunView, StoreError> {
         let input_digest = canonical_sha256(&request.input)
             .map_err(|error| StoreError::InvalidData(error.to_string()))?;
