@@ -48,6 +48,12 @@ pub struct AnswerQuestion {
     pub idempotency_key: crate::IdempotencyKey,
 }
 
+#[derive(Clone, Debug)]
+pub struct CancelRun {
+    pub session_id: crate::SessionId,
+    pub run_id: crate::RunId,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
     pub scheduler_batch_size: i64,
@@ -68,6 +74,12 @@ pub enum EngineError {
 }
 
 impl Engine {
+    pub async fn cancel_run(&self, request: CancelRun) -> Result<(), EngineError> {
+        let revision = self.store.run_revision(request.session_id, request.run_id.clone()).await?;
+        self.store.cancel_run(request.run_id, revision).await?;
+        Ok(())
+    }
+
     pub async fn resolve_permission(&self, request: ResolvePermission) -> Result<(), EngineError> {
         let suspension = self.store.permission_suspension(request.session_id, request.run_id, request.permission_request_id.clone()).await?;
         self.store.resolve_permission(

@@ -369,6 +369,13 @@ impl PostgresStore {
         Ok(super::SuspensionFrame { frame_id: crate::FrameId::new(row.get("id")), revision: row.get::<i64, _>("revision") as u64 })
     }
 
+    pub async fn run_revision(&self, session_id: crate::SessionId, run_id: crate::RunId) -> Result<u64, StoreError> {
+        let row = sqlx::query("SELECT revision FROM runs WHERE id = $1 AND session_id = $2")
+            .bind(*run_id.as_uuid()).bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?
+            .ok_or(StoreError::SessionNotFound)?;
+        Ok(row.get::<i64, _>("revision") as u64)
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,
