@@ -1,0 +1,12 @@
+{
+  "name": "kiteframe",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./client": "./src/client.ts",
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "bun test"
+  }
+}
