@@ -56,6 +56,8 @@ pub struct AnswerQuestion {
 pub struct CancelRun {
     pub session_id: crate::SessionId,
     pub run_id: crate::RunId,
+    pub reason: Option<String>,
+    pub idempotency_key: crate::IdempotencyKey,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,7 +86,7 @@ impl Engine {
 
     pub async fn cancel_run(&self, request: CancelRun) -> Result<(), EngineError> {
         let revision = self.store.run_revision(request.session_id, request.run_id.clone()).await?;
-        self.store.cancel_run(request.run_id, revision).await?;
+        self.store.cancel_run(request.run_id, revision, request.reason, request.idempotency_key.as_str().to_owned()).await?;
         Ok(())
     }
 

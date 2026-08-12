@@ -188,7 +188,8 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         })
         .await
         .expect("start cancellable run");
-    store.cancel_run(cancellable.id, 0).await.expect("cancel run");
+    store.cancel_run(cancellable.id.clone(), 0, Some("operator request".to_owned()), "cancel-1".to_owned()).await.expect("cancel run");
+    store.cancel_run(cancellable.id, 0, Some("operator request".to_owned()), "cancel-1".to_owned()).await.expect("replay cancel");
     let recoverable = store
         .start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name.clone(), version: Some(definition.version), input: json!({"query": "recover"}), idempotency_key: IdempotencyKey::new(format!("recover-{}", Uuid::now_v7())).unwrap() })
         .await.expect("start recoverable run");
