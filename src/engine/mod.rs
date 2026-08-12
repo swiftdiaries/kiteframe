@@ -158,6 +158,15 @@ impl Engine {
             input,
             tools: std::iter::once(completion_tool(task)).chain(self.store.run_tool_bindings(frame.run_id.clone()).await?.into_iter().map(model_tool)).collect(),
         }).await.map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let item_limit = frame.workflow.limits.get("response_item_bytes").copied().unwrap_or(u64::MAX);
+        if response.items.iter().any(|item| serde_json::to_vec(item).map_or(true, |bytes| bytes.len() as u64 > item_limit)) {
+            return Err(StoreError::InvalidData("model response item exceeds workflow byte limit".to_owned()).into());
+        }
+        let tool_limit = frame.workflow.limits.get("tool_calls_per_response").copied().unwrap_or(u64::MAX);
+        let tool_calls = response.items.iter().filter(|item| tool_call_from_item(item).is_some()).count() as u64;
+        if tool_calls > tool_limit {
+            return Err(StoreError::InvalidData("model response exceeds workflow tool-call limit".to_owned()).into());
+        }
         self.store.commit_model_attempt(frame.id.clone(), attempt.attempt, attempt.revision, response.items.clone()).await?;
         let calls = response.items.iter().filter_map(action_from_item).collect::<Vec<_>>();
         let [call] = calls.as_slice() else {
