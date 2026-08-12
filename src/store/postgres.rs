@@ -641,8 +641,28 @@ impl PostgresStore {
         sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         let revision = expected_revision + 1;
         match command {
-            super::FrameCommand::StartCall(_) | super::FrameCommand::StartParallel(_) | super::FrameCommand::SuspendAsk(_) => {
-                return Err(StoreError::InvalidData("nonterminal frame commands are not yet persisted".to_owned()));
+            super::FrameCommand::StartCall(child) => {
+                insert_child_frame(&mut tx, run_id, *frame_id.as_uuid(), child).await?;
+                sqlx::query("UPDATE frames SET state = 'waiting_for_children', statement_index = statement_index + 1, revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                    .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+                append_event(&mut tx, run_id, "frame.call_started", json!({"frame_id": frame_id.as_uuid()})).await?;
+            }
+            super::FrameCommand::StartParallel(children) => {
+                if children.is_empty() { return Err(StoreError::InvalidData("parallel command has no children".to_owned())); }
+                for child in children { insert_child_frame(&mut tx, run_id, *frame_id.as_uuid(), child).await?; }
+                sqlx::query("UPDATE frames SET state = 'waiting_for_children', statement_index = statement_index + 1, revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                    .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+                append_event(&mut tx, run_id, "frame.parallel_started", json!({"frame_id": frame_id.as_uuid()})).await?;
+            }
+            super::FrameCommand::SuspendAsk(question) => {
+                question.schema.validate_definition().map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let schema = serde_json::to_value(&question.schema).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                sqlx::query("INSERT INTO questions (id, run_id, frame_id, binding, text, schema, state) VALUES ($1, $2, $3, $4, $5, $6, 'pending')")
+                    .bind(question.id).bind(run_id).bind(*frame_id.as_uuid()).bind(&question.binding).bind(&question.text).bind(schema).execute(&mut *tx).await?;
+                sqlx::query("UPDATE frames SET state = 'waiting_for_answer', suspension_id = $1, statement_index = statement_index + 1, revision = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3")
+                    .bind(question.id).bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+                sqlx::query("UPDATE runs SET state = 'waiting_for_answer', updated_at = CURRENT_TIMESTAMP WHERE id = $1").bind(run_id).execute(&mut *tx).await?;
+                append_event(&mut tx, run_id, "question.requested", json!({"frame_id": frame_id.as_uuid(), "question_id": question.id, "binding": question.binding})).await?;
             }
             super::FrameCommand::Goto { task_name, bindings } => {
                 sqlx::query("UPDATE frames SET task_name = $1, bindings = $2, state = 'runnable', revision = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4")
@@ -820,5 +840,16 @@ async fn append_event(
         .get::<i64, _>("sequence");
     sqlx::query("INSERT INTO events (run_id, sequence, kind, metadata) VALUES ($1, $2, $3, $4)")
         .bind(run_id).bind(sequence).bind(kind).bind(metadata).execute(&mut **tx).await?;
+    Ok(())
+}
+
+async fn insert_child_frame(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    run_id: uuid::Uuid,
+    parent_frame_id: uuid::Uuid,
+    child: super::NewChild,
+) -> Result<(), StoreError> {
+    sqlx::query("INSERT INTO frames (id, run_id, parent_frame_id, parent_binding, task_name, branch_index, bindings, state) VALUES ($1, $2, $3, $4, $5, $6, $7, 'runnable')")
+        .bind(uuid::Uuid::now_v7()).bind(run_id).bind(parent_frame_id).bind(child.binding).bind(child.target).bind(child.branch_index).bind(serde_json::to_value(child.arguments).map_err(|error| StoreError::InvalidData(error.to_string()))?).execute(&mut **tx).await?;
     Ok(())
 }
