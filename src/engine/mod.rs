@@ -8,6 +8,7 @@ use thiserror::Error;
 use serde_json::{Value, json};
 
 use crate::{ModelClient, ModelRequest, PostgresStore, SessionAuthorizer, StoreError, ToolResolver};
+use crate::dsl::CompiledType;
 
 pub struct Engine {
     pub store: Arc<PostgresStore>,
@@ -64,6 +65,7 @@ impl Engine {
         }).await.map_err(|error| StoreError::InvalidData(error.to_string()))?;
         self.store.commit_model_attempt(frame.id.clone(), attempt.attempt, attempt.revision, response.items.clone()).await?;
         let completion = response.items.iter().filter_map(completion_from_item).next_back().ok_or_else(|| StoreError::InvalidData("model response did not contain complete_task".to_owned()))?;
+        validate_completion(task, &completion.0, &completion.1)?;
         self.store.record_completion(frame.id, attempt.revision + 1, completion.0, completion.1).await?;
         Ok(())
     }
@@ -78,4 +80,30 @@ fn completion_from_item(item: &Value) -> Option<(String, Value)> {
     let arguments = item.get("arguments")?;
     let arguments = arguments.as_str().and_then(|text| serde_json::from_str(text).ok()).unwrap_or_else(|| arguments.clone());
     Some((arguments.get("outcome")?.as_str()?.to_owned(), arguments.get("fields")?.clone()))
+}
+
+fn validate_completion(task: &crate::dsl::CompiledTask, outcome: &str, fields: &Value) -> Result<(), StoreError> {
+    let expected = task.completion.outcomes.get(outcome).ok_or_else(|| StoreError::InvalidData("model selected an undeclared outcome".to_owned()))?;
+    let actual = fields.as_object().ok_or_else(|| StoreError::InvalidData("model completion fields must be an object".to_owned()))?;
+    if actual.len() != expected.len() || expected.keys().any(|field| !actual.contains_key(field)) {
+        return Err(StoreError::InvalidData("model completion fields do not match the selected outcome".to_owned()));
+    }
+    for (name, ty) in expected {
+        if !matches_type(&actual[name], ty) {
+            return Err(StoreError::InvalidData(format!("model completion field has the wrong type: {name}")));
+        }
+    }
+    Ok(())
+}
+
+fn matches_type(value: &Value, ty: &CompiledType) -> bool {
+    match ty {
+        CompiledType::String => value.is_string(),
+        CompiledType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
+        CompiledType::Number => value.is_number(),
+        CompiledType::Boolean => value.is_boolean(),
+        CompiledType::Optional(inner) => value.is_null() || matches_type(value, inner),
+        CompiledType::List(inner) => value.as_array().is_some_and(|items| items.iter().all(|item| matches_type(item, inner))),
+        CompiledType::Record(_) => value.is_object(),
+    }
 }
