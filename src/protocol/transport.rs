@@ -93,8 +93,18 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut lines = reader.lines();
+    let mut initialized = false;
     while let Some(line) = lines.next_line().await? {
         let response = match serde_json::from_str::<NdjsonRequest>(&line) {
+            Ok(request) if request.method == "initialize" => {
+                if initialized {
+                    Err("connection is already initialized".to_owned())
+                } else {
+                    initialized = true;
+                    Ok(serde_json::json!({"kind":"initialized", "version": crate::VERSION}))
+                }
+            }
+            Ok(_) if !initialized => Err("connection has not been initialized".to_owned()),
             Ok(request) => match request.into_command() {
                 Ok((session_id, command)) => application
                     .dispatch(

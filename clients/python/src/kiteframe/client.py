@@ -24,6 +24,11 @@ class KiteframeClient:
             text=True,
             bufsize=1,
         )
+        try:
+            self.call("initialize", {})
+        except Exception:
+            self.close()
+            raise
 
     def close(self) -> None:
         if self._process.poll() is None:

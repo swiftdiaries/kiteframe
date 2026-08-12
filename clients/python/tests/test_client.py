@@ -16,8 +16,11 @@ class ClientTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             harness = Path(directory) / "harness.py"
             harness.write_text(
-                "import json, sys\nrequest=json.loads(sys.stdin.readline())\n"
-                "print(json.dumps({'ok': True, 'result': {'kind': 'ack', 'session': request['session_id']}}), flush=True)\n"
+                "import json, sys\n"
+                "for line in sys.stdin:\n"
+                " request=json.loads(line)\n"
+                " kind='initialized' if request['method']=='initialize' else 'ack'\n"
+                " print(json.dumps({'ok': True, 'result': {'kind': kind, 'session': request['session_id']}}), flush=True)\n"
             )
             session = uuid4()
             with KiteframeClient(session, executable=[sys.executable, str(harness)]) as client:

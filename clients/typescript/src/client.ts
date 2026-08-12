@@ -11,6 +11,7 @@ export class KiteframeClient {
   readonly #stdin: ReturnType<typeof Bun.spawn>["stdin"];
   readonly #reader: ReadableStreamDefaultReader<Uint8Array>;
   #pending = "";
+  #initialized = false;
 
   constructor(
     sessionId: string,
@@ -30,6 +31,16 @@ export class KiteframeClient {
   }
 
   async call(method: string, payload: Record<string, unknown>): Promise<HarnessResult> {
+    if (!this.#initialized && method !== "initialize") {
+      await this.#callRaw("initialize", {});
+      this.#initialized = true;
+    }
+    const result = await this.#callRaw(method, payload);
+    if (method === "initialize") this.#initialized = true;
+    return result;
+  }
+
+  async #callRaw(method: string, payload: Record<string, unknown>): Promise<HarnessResult> {
     this.#stdin.write(`${JSON.stringify({ session_id: this.#sessionId, method, payload })}\n`);
     this.#stdin.flush();
     const line = await this.#nextLine();
