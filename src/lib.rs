@@ -7,6 +7,7 @@ pub mod hash;
 pub mod mcp;
 pub mod model;
 pub mod policy;
+pub mod protocol;
 pub mod schema;
 pub mod store;
 pub mod tools;
@@ -29,6 +30,7 @@ pub use policy::{
     CedarAuthorizer, OneOfPrimitive, PolicyDecision, PolicyEffect, PolicyError, PolicyRequest,
     PolicyRule, PolicyTarget, Primitive, SessionAuthorizer, SessionPolicy, TypedAuthorizer,
 };
+pub use protocol::{Application, ApplicationCommand, ApplicationContext, ApplicationResult, EventCursor, GetRun, ProtocolError};
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
     Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest, PolicyUpdate, PostgresStore,
