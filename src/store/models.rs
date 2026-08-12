@@ -1,7 +1,7 @@
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{CatalogEpochId, PolicyRevision, PrincipalId, SessionId};
+use crate::{CatalogEpochId, FrameId, IdempotencyKey, PolicyRevision, PrincipalId, RunId, SessionId};
 
 #[derive(Clone, Debug)]
 pub struct CreateSession {
@@ -37,6 +37,43 @@ pub struct PublishedDefinition {
     pub definition_hash: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct StartRun {
+    pub session_id: SessionId,
+    pub workflow_name: String,
+    pub version: Option<u32>,
+    pub input: Value,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunView {
+    pub id: RunId,
+    pub session_id: SessionId,
+    pub definition: PublishedDefinition,
+    pub root_frame_id: FrameId,
+    pub state: RunState,
+    pub revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunState {
+    Runnable,
+    Running,
+    WaitingForAnswer,
+    WaitingForPermission,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelAttempt {
+    pub frame_id: FrameId,
+    pub attempt: u32,
+    pub revision: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("store database error: {0}")]
@@ -55,6 +92,12 @@ pub enum StoreError {
     PolicyRevisionConflict,
     #[error("workflow references a catalog binding outside the current session catalog")]
     CatalogScopeViolation,
+    #[error("workflow definition was not found")]
+    DefinitionNotFound,
+    #[error("frame was not found")]
+    FrameNotFound,
+    #[error("execution revision conflict")]
+    RevisionConflict,
     #[error("stored data is invalid: {0}")]
     InvalidData(String),
 }

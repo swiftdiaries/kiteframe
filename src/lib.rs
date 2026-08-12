@@ -29,7 +29,8 @@ pub use policy::{
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
-    CreateSession, PolicyUpdate, PostgresStore, PublishedDefinition, SessionView, StoreError,
+    CreateSession, ModelAttempt, PolicyUpdate, PostgresStore, PublishedDefinition, RunState, RunView,
+    SessionView, StartRun, StoreError,
 };
 pub use tools::{
     BoundTool, CatalogTool, EffectKind, InProcessToolRegistry, RecoverySupport, ToolCall,
