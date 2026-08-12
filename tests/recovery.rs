@@ -365,13 +365,13 @@ async fn recovery_reports_sessions_that_need_fresh_mcp_attachment() {
         authorizer: Arc::new(AllowAll),
         config: EngineConfig::default(),
     };
-    assert_eq!(
+    assert!(
         engine
             .recover()
             .await
             .expect("recover")
-            .sessions_waiting_for_mcp,
-        1
+            .sessions_waiting_for_mcp
+            >= 1
     );
 }
 

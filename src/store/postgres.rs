@@ -496,7 +496,7 @@ impl PostgresStore {
     }
 
     pub async fn recoverable_tool_calls(&self, limit: i64) -> Result<Vec<super::RecoverableToolCall>, StoreError> {
-        let rows = sqlx::query("SELECT t.id, t.frame_id, r.id AS run_id, r.session_id, f.revision, t.qualified_name, t.descriptor_digest, t.idempotency_key, t.arguments, b.descriptor ->> 'effect' AS effect, b.recovery_profile FROM tool_calls t JOIN frames f ON f.id = t.frame_id JOIN runs r ON r.id = f.run_id JOIN run_tool_bindings b ON b.run_id = r.id AND b.qualified_name = t.qualified_name AND b.descriptor_digest = t.descriptor_digest WHERE t.state = 'intent' AND f.state = 'running' AND r.state = 'running' ORDER BY t.updated_at, t.id LIMIT $1")
+        let rows = sqlx::query("SELECT t.id, t.frame_id, r.id AS run_id, r.session_id, f.revision, t.qualified_name, t.descriptor_digest, t.idempotency_key, t.arguments, b.recovery_profile FROM tool_calls t JOIN frames f ON f.id = t.frame_id JOIN runs r ON r.id = f.run_id JOIN run_tool_bindings b ON b.run_id = r.id AND b.qualified_name = t.qualified_name AND b.descriptor_digest = t.descriptor_digest WHERE t.state = 'intent' AND f.state = 'running' AND r.state = 'running' ORDER BY t.updated_at, t.id LIMIT $1")
             .bind(limit.clamp(1, 256))
             .fetch_all(&self.pool)
             .await?;
@@ -507,7 +507,6 @@ impl PostgresStore {
                 revision: row.get::<i64, _>("revision") as u64, qualified_name: row.get("qualified_name"),
                 descriptor_digest: row.get("descriptor_digest"), idempotency_key: crate::IdempotencyKey::new(row.get::<String, _>("idempotency_key")).map_err(|error| StoreError::InvalidData(error.to_string()))?,
                 arguments: row.get("arguments"),
-                effect: serde_json::from_value(Value::String(row.get("effect"))).map_err(|error| StoreError::InvalidData(error.to_string()))?,
                 recovery: serde_json::from_value(Value::String(row.get("recovery_profile"))).map_err(|error| StoreError::InvalidData(error.to_string()))?,
             })
         }).collect()

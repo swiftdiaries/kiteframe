@@ -144,7 +144,6 @@ pub struct RecoverableToolCall {
     pub descriptor_digest: String,
     pub idempotency_key: IdempotencyKey,
     pub arguments: Value,
-    pub effect: crate::EffectKind,
     pub recovery: crate::RecoverySupport,
 }
 
