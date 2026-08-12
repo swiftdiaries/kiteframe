@@ -70,6 +70,13 @@ pub struct RunnableFrame {
     pub workflow: crate::dsl::CompiledWorkflow,
 }
 
+#[derive(Clone, Debug)]
+pub struct RunToolBinding {
+    pub qualified_name: String,
+    pub descriptor_digest: String,
+    pub capabilities: Vec<crate::Capability>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunState {
     Runnable,

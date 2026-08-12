@@ -301,6 +301,14 @@ impl PostgresStore {
         })).collect()
     }
 
+    pub async fn run_tool_binding(&self, run_id: crate::RunId, qualified_name: &str) -> Result<super::RunToolBinding, StoreError> {
+        let row = sqlx::query("SELECT qualified_name, descriptor_digest, capabilities FROM run_tool_bindings WHERE run_id = $1 AND qualified_name = $2")
+            .bind(*run_id.as_uuid()).bind(qualified_name).fetch_optional(&self.pool).await?
+            .ok_or(StoreError::CatalogScopeViolation)?;
+        let capabilities = serde_json::from_value(row.get("capabilities")).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        Ok(super::RunToolBinding { qualified_name: row.get("qualified_name"), descriptor_digest: row.get("descriptor_digest"), capabilities })
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,
