@@ -10,7 +10,8 @@ use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, Engine, EngineConfig, IdempotencyKey,
     InProcessToolRegistry, ModelClient, ModelError, ModelRequest, ModelResponse, PolicyDecision,
     PolicyRequest, PostgresStore, PrincipalId, RecoverySupport, SessionAuthorizer, SessionId,
-    StartRun, ToolCall, ToolError, ToolResolver, ToolStatus, TrustedTool, bind_tool,
+    StartRun, ToolCall, ToolCatalogSnapshot, ToolError, ToolResolver, ToolStatus, TrustedTool,
+    bind_tool,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -54,6 +55,77 @@ struct PendingStatusTool {
     descriptor: CatalogTool,
     invocations: Arc<AtomicUsize>,
     status_polls: Arc<AtomicUsize>,
+}
+
+#[tokio::test]
+async fn one_recovery_call_pages_through_more_than_256_model_attempts() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("recovery-page-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .expect("session");
+    let catalog =
+        ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), []).expect("empty catalog");
+    store.append_catalog_epoch(&catalog).await.expect("catalog");
+    let name = format!("recoverpage{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [] on ok(answer: string) {{ done answer }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).expect("workflow");
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .expect("publish");
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .expect("run");
+    store
+        .begin_model_attempt(run.root_frame_id.clone(), 0, json!({}))
+        .await
+        .expect("first model attempt");
+    sqlx::query(
+        "WITH new_runs AS ( \
+           INSERT INTO runs (id, session_id, definition_id, start_idempotency_key, input, input_digest, state) \
+           SELECT gen_random_uuid(), $1, $2, 'bulk-recovery-' || n || '-' || $3, '{}'::jsonb, 'bulk-input', 'running' \
+           FROM generate_series(1, 256) AS n RETURNING id \
+         ), new_frames AS ( \
+           INSERT INTO frames (id, run_id, task_name, state, bindings, revision) \
+           SELECT gen_random_uuid(), id, $4, 'running', '{}'::jsonb, 1 FROM new_runs RETURNING id \
+         ) \
+         INSERT INTO model_items (frame_id, attempt, position, direction, item) \
+         SELECT id, 1, 0, 'input', '{}'::jsonb FROM new_frames",
+    )
+    .bind(*session.id.as_uuid())
+    .bind(definition.id)
+    .bind(Uuid::now_v7().to_string())
+    .bind(workflow.entry.task)
+    .execute(store.pool())
+    .await
+    .expect("bulk interrupted attempts");
+    let engine = Engine {
+        store,
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::new()))),
+        tools: Arc::new(InProcessToolRegistry::new()),
+        authorizer: Arc::new(AllowAll),
+        config: EngineConfig::default(),
+    };
+
+    let report = engine.recover().await.expect("paged recovery");
+    assert_eq!(report.model_attempts_requeued, 257);
 }
 
 #[async_trait]
@@ -477,17 +549,8 @@ async fn pending_status_is_polled_again_before_retry_budget_exhaustion() {
         config: EngineConfig::default(),
     };
     let first = engine.recover().await.expect("first recovery");
-    assert_eq!(first.tools_requeued, 1);
-    assert_eq!(first.outcomes_unknown, 0);
-    let second = engine.recover().await.expect("second recovery");
-    assert_eq!(second.tools_requeued, 1);
-    assert_eq!(second.outcomes_unknown, 0);
-    let third = engine.recover().await.expect("third recovery");
-    assert_eq!(third.tools_requeued, 1);
-    assert_eq!(third.outcomes_unknown, 0);
-    let fourth = engine.recover().await.expect("fourth recovery");
-    assert_eq!(fourth.tools_requeued, 0);
-    assert_eq!(fourth.outcomes_unknown, 1);
+    assert_eq!(first.tools_requeued, 3);
+    assert_eq!(first.outcomes_unknown, 1);
     assert_eq!(invocations.load(Ordering::SeqCst), 0);
     assert_eq!(status_polls.load(Ordering::SeqCst), 3);
     let state: String = sqlx::query("SELECT state FROM runs WHERE id = $1")

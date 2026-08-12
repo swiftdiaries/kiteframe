@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     sync::{
         Arc, Mutex,
@@ -323,6 +323,7 @@ pub struct AcpService {
     v2_runtime_enabled: bool,
     accepting: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    admission_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 impl AcpService {
@@ -340,6 +341,7 @@ impl AcpService {
             v2_runtime_enabled,
             accepting: Arc::new(AtomicBool::new(true)),
             healthy: Arc::new(AtomicBool::new(true)),
+            admission_permit: None,
         }
     }
 
@@ -350,6 +352,11 @@ impl AcpService {
 
     fn with_health(mut self, healthy: Arc<AtomicBool>) -> Self {
         self.healthy = healthy;
+        self
+    }
+
+    fn with_admission_permit(mut self, permit: Arc<tokio::sync::OwnedSemaphorePermit>) -> Self {
+        self.admission_permit = Some(permit);
         self
     }
 
@@ -387,6 +394,7 @@ impl AcpService {
                 accepting: self.accepting.clone(),
                 healthy: self.healthy.clone(),
                 permission_wake: permission_wake.clone(),
+                _admission_permit: self.admission_permit.clone(),
             })
             .with_spawned(move |client| {
                 observe_permissions(
@@ -464,6 +472,7 @@ struct SemanticHandler {
     accepting: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
     permission_wake: Arc<tokio::sync::Notify>,
+    _admission_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
 const PERMISSION_ALLOW_ONCE: &str = "allow-once";
@@ -495,7 +504,7 @@ async fn observe_permissions(
     let mut last_offered = HashMap::<crate::PermissionRequestId, std::time::Instant>::new();
     let inflight = Arc::new(Mutex::new(HashMap::<
         crate::PermissionRequestId,
-        tokio::sync::oneshot::Sender<()>,
+        InflightPermission,
     >::new()));
     loop {
         if client.is_incoming_closed() || !accepting.load(Ordering::Acquire) {
@@ -512,13 +521,16 @@ async fn observe_permissions(
             wait_for_permission_wake(&permission_wake).await;
             continue;
         };
-        let pending = unresolved_permissions(&store, &session_id).await?;
-        let unresolved = pending
-            .iter()
-            .map(|delivery| delivery.request_id.clone())
+        cancel_resolved_permissions(&store, &inflight).await?;
+        last_offered.retain(|_, instant| instant.elapsed() < std::time::Duration::from_secs(1));
+        let excluded = inflight
+            .lock()
+            .expect("permission inflight lock poisoned")
+            .keys()
+            .cloned()
+            .chain(last_offered.keys().cloned())
             .collect::<HashSet<_>>();
-        last_offered.retain(|request_id, _| unresolved.contains(request_id));
-        cancel_resolved_permissions(&inflight, &unresolved);
+        let pending = unresolved_permissions(&store, &session_id, &excluded).await?;
         for delivery in pending {
             let request_id = delivery.request_id.clone();
             if inflight
@@ -541,7 +553,7 @@ async fn observe_permissions(
             inflight
                 .lock()
                 .expect("permission inflight lock poisoned")
-                .insert(request_id.clone(), cancel_tx);
+                .insert(request_id.clone(), InflightPermission { cancel: cancel_tx });
             last_offered.insert(request_id.clone(), std::time::Instant::now());
             if let Err(error) = send_permission_request(
                 PermissionRuntime {
@@ -567,18 +579,40 @@ async fn observe_permissions(
     }
 }
 
-type InflightPermissions =
-    Arc<Mutex<HashMap<crate::PermissionRequestId, tokio::sync::oneshot::Sender<()>>>>;
+struct InflightPermission {
+    cancel: tokio::sync::oneshot::Sender<()>,
+}
 
-fn cancel_resolved_permissions(
+type InflightPermissions = Arc<Mutex<HashMap<crate::PermissionRequestId, InflightPermission>>>;
+
+async fn cancel_resolved_permissions(
+    store: &crate::PostgresStore,
     inflight: &InflightPermissions,
-    unresolved: &HashSet<crate::PermissionRequestId>,
-) {
+) -> agent_client_protocol::Result<()> {
+    let request_ids = inflight
+        .lock()
+        .expect("permission inflight lock poisoned")
+        .keys()
+        .map(|request_id| *request_id.as_uuid())
+        .collect::<Vec<_>>();
+    if request_ids.is_empty() {
+        return Ok(());
+    }
+    let pending = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM permission_requests WHERE id = ANY($1) AND state = 'pending'",
+    )
+    .bind(&request_ids)
+    .fetch_all(store.pool())
+    .await
+    .map_err(|_| agent_client_protocol::Error::internal_error())?
+    .into_iter()
+    .map(crate::PermissionRequestId::new)
+    .collect::<HashSet<_>>();
     let cancellations = {
         let mut inflight = inflight.lock().expect("permission inflight lock poisoned");
         let resolved = inflight
             .keys()
-            .filter(|request_id| !unresolved.contains(*request_id))
+            .filter(|request_id| !pending.contains(*request_id))
             .cloned()
             .collect::<Vec<_>>();
         resolved
@@ -587,8 +621,9 @@ fn cancel_resolved_permissions(
             .collect::<Vec<_>>()
     };
     for cancel in cancellations {
-        let _ = cancel.send(());
+        let _ = cancel.cancel.send(());
     }
+    Ok(())
 }
 
 fn cancel_inflight_permissions(inflight: &InflightPermissions) {
@@ -599,7 +634,7 @@ fn cancel_inflight_permissions(inflight: &InflightPermissions) {
             .collect::<Vec<_>>()
     };
     for cancel in cancellations {
-        let _ = cancel.send(());
+        let _ = cancel.cancel.send(());
     }
 }
 
@@ -619,7 +654,12 @@ struct PermissionDelivery {
 async fn unresolved_permissions(
     store: &crate::PostgresStore,
     session_id: &crate::SessionId,
+    excluded: &HashSet<crate::PermissionRequestId>,
 ) -> agent_client_protocol::Result<Vec<PermissionDelivery>> {
+    let excluded = excluded
+        .iter()
+        .map(|request_id| *request_id.as_uuid())
+        .collect::<Vec<_>>();
     let rows = sqlx::query(
         "SELECT p.id AS request_id, p.run_id, f.id AS frame_id, f.revision, \
          t.id AS tool_call_id, p.provider_call_id, p.qualified_tool, \
@@ -630,9 +670,11 @@ async fn unresolved_permissions(
          JOIN tool_calls t ON t.frame_id = p.frame_id \
             AND t.provider_call_id = p.provider_call_id \
          WHERE r.session_id = $1 AND p.state = 'pending' \
+            AND NOT (p.id = ANY($2)) \
          ORDER BY p.created_at, p.id LIMIT 256",
     )
     .bind(*session_id.as_uuid())
+    .bind(excluded)
     .fetch_all(store.pool())
     .await
     .map_err(|_| agent_client_protocol::Error::internal_error())?;
@@ -856,6 +898,7 @@ async fn resolve_permission_response<R: serde::Serialize>(
             return Ok(());
         }
     };
+    let response_session = context.session_id.clone();
     let command = match connection.decode_permission_response(result, context) {
         Ok(command) => command,
         Err(_) => {
@@ -867,7 +910,13 @@ async fn resolve_permission_response<R: serde::Serialize>(
         return Ok(());
     }
     if application
-        .dispatch(&connection.application_context(), command)
+        .dispatch(
+            &crate::ApplicationContext {
+                connection_principal: connection.authenticated.principal.clone(),
+                session_id: Some(response_session),
+            },
+            command,
+        )
         .await
         .is_err()
     {
@@ -988,6 +1037,9 @@ struct RemoteState {
     model_ready: Arc<AtomicBool>,
     v2_runtime_enabled: bool,
     routers: tokio::sync::RwLock<HashMap<RouterKey, Router>>,
+    admission: Arc<tokio::sync::Semaphore>,
+    admission_gate: tokio::sync::Mutex<()>,
+    reservations: Mutex<HashMap<RouterKey, VecDeque<tokio::sync::OwnedSemaphorePermit>>>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1004,7 +1056,7 @@ impl RemoteService {
         store: Arc<crate::PostgresStore>,
         model_ready: Arc<AtomicBool>,
     ) -> Self {
-        Self::with_v2(application, authenticator, store, model_ready, false)
+        Self::with_v2_and_limit(application, authenticator, store, model_ready, false, 64)
     }
 
     #[must_use]
@@ -1015,6 +1067,25 @@ impl RemoteService {
         model_ready: Arc<AtomicBool>,
         v2_runtime_enabled: bool,
     ) -> Self {
+        Self::with_v2_and_limit(
+            application,
+            authenticator,
+            store,
+            model_ready,
+            v2_runtime_enabled,
+            64,
+        )
+    }
+
+    #[must_use]
+    pub fn with_v2_and_limit(
+        application: Arc<crate::Application>,
+        authenticator: Arc<dyn ConnectionAuthenticator>,
+        store: Arc<crate::PostgresStore>,
+        model_ready: Arc<AtomicBool>,
+        v2_runtime_enabled: bool,
+        max_connections: usize,
+    ) -> Self {
         Self {
             state: Arc::new(RemoteState {
                 application,
@@ -1024,6 +1095,9 @@ impl RemoteService {
                 model_ready,
                 v2_runtime_enabled,
                 routers: tokio::sync::RwLock::new(HashMap::new()),
+                admission: Arc::new(tokio::sync::Semaphore::new(max_connections.max(1))),
+                admission_gate: tokio::sync::Mutex::new(()),
+                reservations: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1043,6 +1117,11 @@ impl RemoteService {
     pub fn begin_shutdown(&self) {
         self.state.ready.store(false, Ordering::Release);
     }
+
+    #[must_use]
+    pub fn available_connection_capacity(&self) -> usize {
+        self.state.admission.available_permits()
+    }
 }
 
 async fn healthz() -> &'static str {
@@ -1053,13 +1132,10 @@ async fn readyz(State(state): State<Arc<RemoteState>>) -> Response {
     if !state.ready.load(Ordering::Acquire) || !state.model_ready.load(Ordering::Acquire) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(state.store.pool())
-        .await
-    {
-        Ok(1) => StatusCode::OK.into_response(),
-        Ok(_) | Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    if !database_healthy(&state).await {
+        return retryable_response(StatusCode::SERVICE_UNAVAILABLE);
     }
+    StatusCode::OK.into_response()
 }
 
 async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<Body>) -> Response {
@@ -1071,6 +1147,9 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
     if !state.ready.load(Ordering::Acquire) || !state.model_ready.load(Ordering::Acquire) {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
+    if !database_healthy(&state).await {
+        return retryable_response(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let transport = match classify_transport(request.method(), request.headers()) {
         Ok(transport) => transport,
         Err(error) => return error.into_response(),
@@ -1079,12 +1158,37 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
         principal: principal.clone(),
         transport,
     };
+    let creates_connection = transport == TransportKind::WebSocket
+        || (request.method() == Method::POST
+            && !request.headers().contains_key("acp-connection-id"));
+    let _http_admission_guard = if creates_connection && transport == TransportKind::StreamableHttp
+    {
+        Some(state.admission_gate.lock().await)
+    } else {
+        None
+    };
+    if creates_connection && state.admission.available_permits() == 0 {
+        return retryable_response(StatusCode::TOO_MANY_REQUESTS);
+    }
+    if transport == TransportKind::WebSocket {
+        let permit = match state.admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return retryable_response(StatusCode::TOO_MANY_REQUESTS),
+        };
+        state
+            .reservations
+            .lock()
+            .expect("ACP admission reservation lock poisoned")
+            .entry(key.clone())
+            .or_default()
+            .push_back(permit);
+    }
     let router = if let Some(router) = state.routers.read().await.get(&key).cloned() {
         router
     } else {
         let mut routers = state.routers.write().await;
         routers
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| {
                 let application = state.application.clone();
                 let store = state.store.clone();
@@ -1095,15 +1199,31 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
                 let v2_runtime_enabled = state.v2_runtime_enabled;
                 let accepting = state.ready.clone();
                 let healthy = state.model_ready.clone();
+                let state = state.clone();
+                let reservation_key = key.clone();
                 AcpHttpServer::new(move || {
-                    AcpService::new(
+                    let permit = if authenticated.transport == TransportKind::WebSocket {
+                        state
+                            .reservations
+                            .lock()
+                            .expect("ACP admission reservation lock poisoned")
+                            .get_mut(&reservation_key)
+                            .and_then(VecDeque::pop_front)
+                    } else {
+                        state.admission.clone().try_acquire_owned().ok()
+                    };
+                    let service = AcpService::new(
                         application.clone(),
                         store.clone(),
                         authenticated.clone(),
                         v2_runtime_enabled,
                     )
                     .with_accepting(accepting.clone())
-                    .with_health(healthy.clone())
+                    .with_health(healthy.clone());
+                    match permit {
+                        Some(permit) => service.with_admission_permit(Arc::new(permit)),
+                        None => service.with_accepting(Arc::new(AtomicBool::new(false))),
+                    }
                 })
                 .with_options(ServerOptions {
                     path: "/acp".to_owned(),
@@ -1118,6 +1238,25 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
         .oneshot(request)
         .await
         .expect("the ACP SDK router is infallible")
+}
+
+async fn database_healthy(state: &RemoteState) -> bool {
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(state.store.pool()),
+        )
+        .await,
+        Ok(Ok(1))
+    )
+}
+
+fn retryable_response(status: StatusCode) -> Response {
+    let mut response = status.into_response();
+    response
+        .headers_mut()
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 fn auth_response(error: AuthError) -> Response {

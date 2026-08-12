@@ -55,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 run_stdio(application, engine, principal, config.acp_v2_enabled).await?;
             }
             HarnessMode::Server { bind } => {
+                let max_remote_connections = config.max_remote_connections;
                 let model_ready = Arc::new(AtomicBool::new(false));
                 update_model_health(model.as_ref(), &model_ready).await;
                 let _model_health_monitor = ModelHealthMonitor::start(model, model_ready.clone());
@@ -64,12 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .into_iter()
                         .map(|binding| (binding.secret, binding.principal)),
                 )?);
-                let remote = RemoteService::with_v2(
+                let remote = RemoteService::with_v2_and_limit(
                     application,
                     authenticator,
                     store,
                     model_ready,
                     config.acp_v2_enabled,
+                    max_remote_connections,
                 );
                 run_remote(bind, remote, engine).await?;
             }

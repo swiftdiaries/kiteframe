@@ -39,6 +39,7 @@ pub struct HarnessConfig {
     pub bearer_bindings: Vec<BearerBinding>,
     pub model: ResponsesConfig,
     pub acp_v2_enabled: bool,
+    pub max_remote_connections: usize,
 }
 
 impl fmt::Debug for HarnessConfig {
@@ -51,6 +52,7 @@ impl fmt::Debug for HarnessConfig {
             .field("bearer_bindings", &self.bearer_bindings)
             .field("model", &self.model)
             .field("acp_v2_enabled", &self.acp_v2_enabled)
+            .field("max_remote_connections", &self.max_remote_connections)
             .finish()
     }
 }
@@ -125,6 +127,14 @@ impl HarnessConfig {
         if acp_v2_enabled && !cfg!(feature = "acp-v2") {
             return Err(ConfigError::AcpV2Unavailable);
         }
+        let max_remote_connections = value("KITEFRAME_MAX_REMOTE_CONNECTIONS")
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .map_err(|_| ConfigError::InvalidRemoteConnectionLimit)?
+            .unwrap_or(64);
+        if !(1..=4096).contains(&max_remote_connections) {
+            return Err(ConfigError::InvalidRemoteConnectionLimit);
+        }
 
         Ok(Self {
             database_url,
@@ -133,6 +143,7 @@ impl HarnessConfig {
             bearer_bindings,
             model,
             acp_v2_enabled,
+            max_remote_connections,
         })
     }
 }
@@ -211,6 +222,8 @@ pub enum ConfigError {
     MissingModelConfiguration,
     #[error("ACP v2 was requested but the binary was not built with the acp-v2 feature")]
     AcpV2Unavailable,
+    #[error("KITEFRAME_MAX_REMOTE_CONNECTIONS must be between 1 and 4096")]
+    InvalidRemoteConnectionLimit,
 }
 
 #[cfg(test)]
@@ -288,6 +301,29 @@ mod tests {
             "bearer-sentinel-secret",
         ] {
             assert!(!debug.contains(secret), "debug output leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn remote_connection_limit_is_bounded_and_configurable() {
+        let bindings = r#"[{"secret":"secret","principal":"alice"}]"#;
+        let mut values = vec![
+            ("DATABASE_URL", "postgres://localhost/kiteframe"),
+            ("KITEFRAME_BIND", "127.0.0.1:0"),
+            ("KITEFRAME_BEARER_BINDINGS", bindings),
+            ("KITEFRAME_TLS_TERMINATED", "true"),
+            ("KITEFRAME_MAX_REMOTE_CONNECTIONS", "7"),
+        ];
+        values.extend(model_values());
+        assert_eq!(config(&values).unwrap().max_remote_connections, 7);
+        for invalid in ["0", "4097", "not-a-number"] {
+            let mut invalid_values = values.clone();
+            invalid_values.retain(|(key, _)| *key != "KITEFRAME_MAX_REMOTE_CONNECTIONS");
+            invalid_values.push(("KITEFRAME_MAX_REMOTE_CONNECTIONS", invalid));
+            assert!(matches!(
+                config(&invalid_values),
+                Err(ConfigError::InvalidRemoteConnectionLimit)
+            ));
         }
     }
 }

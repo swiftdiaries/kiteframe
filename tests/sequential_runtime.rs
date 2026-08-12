@@ -108,10 +108,46 @@ async fn allow_once_resolves_and_invokes_the_pending_durable_call() {
     let approval = ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::AllowOnce, idempotency_key: approval_key.clone() };
     engine.resolve_permission(approval.clone()).await.unwrap();
     engine.resolve_permission(approval).await.unwrap();
+    let conflict = engine.resolve_permission(ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::DenyToolForSession, idempotency_key: approval_key }).await.expect_err("same key with a conflicting permission choice must be rejected");
+    assert!(matches!(conflict, kiteframe::EngineError::Store(kiteframe::StoreError::IdempotencyConflict)));
+    assert_eq!(store.policy_revision(session.id.clone()).await.unwrap().get(), 0);
     engine.tick_run(run.id.clone()).await.unwrap();
     engine.tick_run(run.id.clone()).await.unwrap();
     let state: String = sqlx::query("SELECT state FROM runs WHERE id = $1").bind(*run.id.as_uuid()).fetch_one(store.pool()).await.unwrap().get("state");
     assert_eq!(state, "completed");
+}
+
+#[tokio::test]
+async fn conflicting_session_permission_choices_commit_one_matching_policy_atomically() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else { return; };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let session = store.create_session(CreateSession { principal: PrincipalId::new(format!("permission-race-{}", Uuid::now_v7())).unwrap(), working_directory: "/work".to_owned(), retention_until: OffsetDateTime::now_utc() + Duration::days(1) }).await.unwrap();
+    let descriptor = CatalogTool::new("docs/search", "docs", "search", ClosedSchema::object("input", BTreeMap::new()), ClosedSchema::object("output", BTreeMap::new()), BTreeSet::new(), EffectKind::ReadOnly, RecoverySupport::NotRequired).unwrap();
+    let registry = Arc::new(InProcessToolRegistry::new());
+    registry.register(bind_tool(Arc::new(SearchTool { descriptor: descriptor.clone() }))).unwrap();
+    let catalog = registry.snapshot(session.id.clone(), Uuid::now_v7(), &BTreeSet::from(["docs/search".to_owned()]), &BTreeMap::from([("docs/search".to_owned(), descriptor.descriptor_digest().to_owned())])).unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("pr{}", Uuid::now_v7().simple());
+    let source = format!("workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}");
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store.publish(session.id.clone(), &workflow, &source).await.unwrap();
+    let run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name, version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
+    let engine = Engine { store: store.clone(), model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([vec![json!({"type":"function_call","call_id":"race-call","name":"docs/search","arguments":{}})]])))), tools: registry, authorizer: Arc::new(RequirePermission), config: EngineConfig::default() };
+    engine.tick_run(run.id.clone()).await.unwrap();
+    let request_id: Uuid = sqlx::query_scalar("SELECT id FROM permission_requests WHERE run_id = $1").bind(*run.id.as_uuid()).fetch_one(store.pool()).await.unwrap();
+    let key = IdempotencyKey::new(format!("permission-race-{}", Uuid::now_v7())).unwrap();
+    let allow = ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::AllowToolForSession, idempotency_key: key.clone() };
+    let deny = ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::DenyToolForSession, idempotency_key: key };
+    let (allow_result, deny_result) = tokio::join!(engine.resolve_permission(allow), engine.resolve_permission(deny));
+    assert_eq!(allow_result.is_ok() as u8 + deny_result.is_ok() as u8, 1);
+    let loser = if allow_result.is_err() { allow_result } else { deny_result };
+    assert!(matches!(loser, Err(kiteframe::EngineError::Store(kiteframe::StoreError::IdempotencyConflict))), "unexpected losing decision result: {loser:?}");
+    let resolution: serde_json::Value = sqlx::query_scalar("SELECT resolution FROM permission_requests WHERE id = $1").bind(request_id).fetch_one(store.pool()).await.unwrap();
+    let policy = store.current_session_policy(session.id.clone()).await.unwrap();
+    assert_eq!(policy.rules.len(), 1);
+    let expected_effect = if resolution["choice"] == "allow_tool_for_session" { kiteframe::PolicyEffect::Permit } else { kiteframe::PolicyEffect::Forbid };
+    assert_eq!(policy.rules[0].effect, expected_effect);
+    assert_eq!(store.policy_revision(session.id).await.unwrap().get(), 1);
 }
 
 #[tokio::test]

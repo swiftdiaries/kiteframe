@@ -501,9 +501,22 @@ impl PostgresStore {
         Ok(frames.len() as u64)
     }
 
-    pub async fn recoverable_tool_calls(&self, limit: i64) -> Result<Vec<super::RecoverableToolCall>, StoreError> {
-        let rows = sqlx::query("SELECT t.id, t.frame_id, r.id AS run_id, r.session_id, f.revision, t.qualified_name, t.descriptor_digest, t.idempotency_key, t.arguments, b.recovery_profile FROM tool_calls t JOIN frames f ON f.id = t.frame_id JOIN runs r ON r.id = f.run_id JOIN run_tool_bindings b ON b.run_id = r.id AND b.qualified_name = t.qualified_name AND b.descriptor_digest = t.descriptor_digest WHERE t.state = 'intent' AND f.state = 'running' AND r.state = 'running' ORDER BY t.updated_at, t.id LIMIT $1")
+    pub async fn recoverable_tool_calls(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<super::RecoverableToolCall>, StoreError> {
+        self.recoverable_tool_calls_excluding(limit, &std::collections::BTreeSet::new()).await
+    }
+
+    pub async fn recoverable_tool_calls_excluding(
+        &self,
+        limit: i64,
+        excluded_sessions: &std::collections::BTreeSet<crate::SessionId>,
+    ) -> Result<Vec<super::RecoverableToolCall>, StoreError> {
+        let excluded_sessions = excluded_sessions.iter().map(|session| *session.as_uuid()).collect::<Vec<_>>();
+        let rows = sqlx::query("SELECT t.id, t.frame_id, r.id AS run_id, r.session_id, f.revision, t.qualified_name, t.descriptor_digest, t.idempotency_key, t.arguments, b.recovery_profile FROM tool_calls t JOIN frames f ON f.id = t.frame_id JOIN runs r ON r.id = f.run_id JOIN run_tool_bindings b ON b.run_id = r.id AND b.qualified_name = t.qualified_name AND b.descriptor_digest = t.descriptor_digest WHERE t.state = 'intent' AND f.state = 'running' AND r.state = 'running' AND NOT (r.session_id = ANY($2)) ORDER BY t.updated_at, t.id LIMIT $1")
             .bind(limit.clamp(1, 256))
+            .bind(excluded_sessions)
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(|row| {
@@ -875,6 +888,26 @@ impl PostgresStore {
         resolution: Value,
         idempotency_key: String,
     ) -> Result<bool, StoreError> {
+        self.resolve_permission_with_policy(
+            frame_id,
+            request_id,
+            expected_revision,
+            resolution,
+            idempotency_key,
+            None,
+        )
+        .await
+    }
+
+    pub async fn resolve_permission_with_policy(
+        &self,
+        frame_id: crate::FrameId,
+        request_id: crate::PermissionRequestId,
+        expected_revision: u64,
+        resolution: Value,
+        idempotency_key: String,
+        policy_update: Option<PolicyUpdate>,
+    ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
@@ -893,6 +926,30 @@ impl PostgresStore {
             || request.get::<String, _>("state") != "pending"
         {
             return Err(StoreError::RevisionConflict);
+        }
+        if let Some(update) = policy_update {
+            let digest = canonical_sha256(&update.typed_source)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            let session = sqlx::query("SELECT s.current_policy_revision FROM sessions s JOIN runs r ON r.session_id = s.id WHERE s.id = $1 AND r.id = $2 FOR UPDATE OF s")
+                .bind(*update.session.as_uuid()).bind(run_id).fetch_optional(&mut *tx).await?
+                .ok_or(StoreError::SessionNotFound)?;
+            if let Some(existing) = sqlx::query("SELECT source_digest, revision FROM session_policy_rules WHERE session_id = $1 AND idempotency_key = $2")
+                .bind(*update.session.as_uuid()).bind(&update.idempotency_key).fetch_optional(&mut *tx).await?
+            {
+                if existing.get::<String, _>("source_digest") != digest {
+                    return Err(StoreError::IdempotencyConflict);
+                }
+            } else {
+                let current = session.get::<i64, _>("current_policy_revision") as u64;
+                if current != update.expected_revision.get() {
+                    return Err(StoreError::PolicyRevisionConflict);
+                }
+                let revision = current + 1;
+                sqlx::query("INSERT INTO session_policy_rules (id, session_id, revision, idempotency_key, typed_source, compiled_cedar, source_digest) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+                    .bind(uuid::Uuid::now_v7()).bind(*update.session.as_uuid()).bind(revision as i64).bind(update.idempotency_key).bind(update.typed_source).bind(update.compiled_cedar).bind(digest).execute(&mut *tx).await?;
+                sqlx::query("UPDATE sessions SET current_policy_revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                    .bind(revision as i64).bind(*update.session.as_uuid()).execute(&mut *tx).await?;
+            }
         }
         sqlx::query("UPDATE permission_requests SET state = 'resolved', resolution = $1, resolution_idempotency_key = $2, resolved_at = CURRENT_TIMESTAMP WHERE id = $3")
             .bind(resolution).bind(idempotency_key).bind(*request_id.as_uuid()).execute(&mut *tx).await?;

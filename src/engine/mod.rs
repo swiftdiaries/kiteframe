@@ -104,32 +104,89 @@ impl Engine {
     }
 
     pub async fn resolve_permission(&self, request: ResolvePermission) -> Result<(), EngineError> {
-        let pending = self.store.pending_permission(request.session_id.clone(), request.run_id.clone(), request.permission_request_id.clone()).await?;
+        let resolution_key = permission_resolution_key(&request.idempotency_key, request.choice)?;
+        let pending = self
+            .store
+            .pending_permission(
+                request.session_id.clone(),
+                request.run_id.clone(),
+                request.permission_request_id.clone(),
+            )
+            .await?;
         if pending.resolved {
-            return if pending.resolution_idempotency_key.as_deref() == Some(request.idempotency_key.as_str()) {
+            return if pending.resolution_idempotency_key.as_deref()
+                == Some(resolution_key.as_str())
+            {
                 Ok(())
             } else {
                 Err(StoreError::IdempotencyConflict.into())
             };
         }
-        if matches!(request.choice, PermissionChoice::AllowToolForSession | PermissionChoice::DenyToolForSession) {
-            let catalog = self.store.current_catalog(request.session_id.clone()).await?;
-            catalog.resolve(&pending.qualified_name, &pending.descriptor_digest)
+        let policy_update = if matches!(
+            request.choice,
+            PermissionChoice::AllowToolForSession | PermissionChoice::DenyToolForSession
+        ) {
+            let catalog = self
+                .store
+                .current_catalog(request.session_id.clone())
+                .await?;
+            catalog
+                .resolve(&pending.qualified_name, &pending.descriptor_digest)
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-            let mut policy = self.store.current_session_policy(request.session_id.clone()).await?;
+            let mut policy = self
+                .store
+                .current_session_policy(request.session_id.clone())
+                .await?;
+            let rule_id = format!("permission-{}", request.permission_request_id.as_uuid());
+            if policy.rules.iter().any(|rule| rule.rule_id == rule_id) {
+                let resolved = self.store.pending_permission(
+                    request.session_id.clone(),
+                    request.run_id.clone(),
+                    request.permission_request_id.clone(),
+                ).await?;
+                return if resolved.resolution_idempotency_key.as_deref()
+                    == Some(resolution_key.as_str())
+                {
+                    Ok(())
+                } else {
+                    Err(StoreError::IdempotencyConflict.into())
+                };
+            }
             policy.rules.push(crate::PolicyRule {
-                rule_id: format!("permission-{}", request.permission_request_id.as_uuid()),
-                effect: match request.choice { PermissionChoice::AllowToolForSession => crate::PolicyEffect::Permit, PermissionChoice::DenyToolForSession => crate::PolicyEffect::Forbid, _ => unreachable!() },
-                target: crate::PolicyTarget::Tool { names: BTreeSet::from([pending.qualified_name.clone()]) },
+                rule_id,
+                effect: match request.choice {
+                    PermissionChoice::AllowToolForSession => crate::PolicyEffect::Permit,
+                    PermissionChoice::DenyToolForSession => crate::PolicyEffect::Forbid,
+                    _ => unreachable!(),
+                },
+                target: crate::PolicyTarget::Tool {
+                    names: BTreeSet::from([pending.qualified_name.clone()]),
+                },
                 input: Default::default(),
             });
-            let revision = self.store.policy_revision(request.session_id.clone()).await?;
-            self.store.append_session_policy(request.session_id.clone(), revision, request.idempotency_key.as_str().to_owned(), &policy, &catalog).await?;
-        }
-        let applied = self.store.resolve_permission(
+            let revision = self
+                .store
+                .policy_revision(request.session_id.clone())
+                .await?;
+            let compiled = crate::policy::compile(&policy, &catalog)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            Some(crate::PolicyUpdate {
+                session: request.session_id.clone(),
+                expected_revision: revision,
+                idempotency_key: resolution_key.clone(),
+                typed_source: serde_json::to_value(policy)
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+                compiled_cedar: serde_json::to_string(&compiled)
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+            })
+        } else {
+            None
+        };
+        let applied = self.store.resolve_permission_with_policy(
             pending.frame_id.clone(), request.permission_request_id, pending.revision,
             json!({"choice": match request.choice { PermissionChoice::AllowOnce => "allow_once", PermissionChoice::AllowToolForSession => "allow_tool_for_session", PermissionChoice::DenyOnce => "deny_once", PermissionChoice::DenyToolForSession => "deny_tool_for_session" }}),
-            request.idempotency_key.as_str().to_owned(),
+            resolution_key,
+            policy_update,
         ).await?;
         if !applied { return Ok(()); }
         let revision = pending.revision + 1;
@@ -261,6 +318,19 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+fn permission_resolution_key(
+    base: &crate::IdempotencyKey,
+    choice: PermissionChoice,
+) -> Result<String, StoreError> {
+    let choice = match choice {
+        PermissionChoice::AllowOnce => "allow_once",
+        PermissionChoice::AllowToolForSession => "allow_tool_for_session",
+        PermissionChoice::DenyOnce => "deny_once",
+        PermissionChoice::DenyToolForSession => "deny_tool_for_session",
+    };
+    Ok(format!("{}:{choice}", base.as_str()))
 }
 
 fn completion_tool(task: &crate::dsl::CompiledTask) -> Value {

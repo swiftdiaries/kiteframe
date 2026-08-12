@@ -825,6 +825,114 @@ async fn externally_resolved_permissions_cancel_outstanding_sdk_requests() {
     first.close().await;
 }
 
+#[tokio::test]
+async fn session_rebinding_preserves_an_already_correlated_permission_response() {
+    let scripted = VecDeque::from([vec![json!({
+        "type": "function_call",
+        "call_id": "permission-rebind",
+        "name": "docs/search",
+        "arguments": {}
+    })]]);
+    let (application, store, engine) =
+        application_with_model(Arc::new(ScriptedModel(Mutex::new(scripted)))).await;
+    let mut peer = StdioPeer::new(application, store.clone(), principal("permission-rebind"));
+    let PendingPermissionFixture {
+        session_id,
+        run_id,
+        request_id,
+        ..
+    } = create_pending_permission(&mut peer, &store, &engine, 1).await;
+    let permission = tokio::time::timeout(Duration::from_secs(2), peer.next_message())
+        .await
+        .expect("permission request before session rebind");
+
+    success(
+        peer.request(
+            "session/new",
+            json!({"cwd": "/tmp/kiteframe-rebound", "mcpServers": []}),
+        )
+        .await,
+    );
+    peer.respond(
+        permission["id"].clone(),
+        json!({"outcome": {"outcome": "selected", "optionId": "deny-once"}}),
+    )
+    .await;
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if store
+                .pending_permission(session_id.clone(), run_id.clone(), request_id.clone())
+                .await
+                .expect("original permission")
+                .resolved
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("captured response must resolve its original session permission");
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
+    let scripted = VecDeque::from([vec![json!({
+        "type": "function_call",
+        "call_id": "permission-page-root",
+        "name": "docs/search",
+        "arguments": {}
+    })]]);
+    let (application, store, engine) =
+        application_with_model(Arc::new(ScriptedModel(Mutex::new(scripted)))).await;
+    let mut peer = StdioPeer::new(application, store.clone(), principal("permission-page"));
+    let fixture = create_pending_permission(&mut peer, &store, &engine, 1).await;
+    let frame_id: Uuid =
+        sqlx::query_scalar("SELECT frame_id FROM permission_requests WHERE id = $1")
+            .bind(*fixture.request_id.as_uuid())
+            .fetch_one(store.pool())
+            .await
+            .expect("permission frame");
+    let descriptor_digest: String =
+        sqlx::query_scalar("SELECT descriptor_digest FROM permission_requests WHERE id = $1")
+            .bind(*fixture.request_id.as_uuid())
+            .fetch_one(store.pool())
+            .await
+            .expect("permission descriptor");
+    sqlx::query(
+        "WITH calls AS ( \
+           INSERT INTO tool_calls (id, frame_id, provider_call_id, qualified_name, descriptor_digest, idempotency_key, arguments, state, created_at, updated_at) \
+           SELECT gen_random_uuid(), $1, 'overflow-' || n, 'docs/search', $2, 'overflow-key-' || n, '{}'::jsonb, 'waiting_for_permission', CURRENT_TIMESTAMP + n * INTERVAL '1 millisecond', CURRENT_TIMESTAMP \
+           FROM generate_series(1, 256) AS n \
+           RETURNING provider_call_id, created_at \
+         ) \
+         INSERT INTO permission_requests (id, run_id, frame_id, provider_call_id, qualified_tool, descriptor_digest, input_digest, policy_revision, state, created_at) \
+         SELECT gen_random_uuid(), $3, $1, provider_call_id, 'docs/search', $2, 'overflow-input', 0, 'pending', created_at FROM calls",
+    )
+    .bind(frame_id)
+    .bind(descriptor_digest)
+    .bind(*fixture.run_id.as_uuid())
+    .execute(store.pool())
+    .await
+    .expect("overflow permission rows");
+
+    let found = tokio::time::timeout(Duration::from_secs(4), async {
+        for _ in 0..257 {
+            let message = peer.next_message().await;
+            if message["params"]["toolCall"]["toolCallId"] == "overflow-256" {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("permission pagination must continue");
+    assert!(found, "the 257th pending permission must be offered");
+    peer.close().await;
+}
+
 #[cfg(feature = "acp-v2")]
 #[tokio::test]
 async fn closing_a_session_cancels_its_outstanding_sdk_requests() {
@@ -1103,6 +1211,82 @@ async fn stdio_websocket_and_streamable_http_are_application_equivalent() {
 
     assert_eq!(http_result, stdio_result);
     assert_eq!(websocket_result, stdio_result);
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn remote_admission_is_bounded_and_database_gated() {
+    let (application, store) = application().await;
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(Secret::new("bounded-secret"), principal("bounded"))])
+            .expect("bearer binding"),
+    );
+    let remote = RemoteService::with_v2_and_limit(
+        application,
+        authenticator,
+        store.clone(),
+        ready_model(),
+        false,
+        1,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+    let mut first = WebSocketPeer::connect(server.address, "bounded-secret").await;
+    success(
+        first
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "admission-holder", "version": "1.0.0"}
+                }),
+            )
+            .await,
+    );
+    assert_eq!(remote.available_connection_capacity(), 0);
+
+    let mut request = format!("ws://{}/acp", server.address)
+        .into_client_request()
+        .expect("overload WebSocket request");
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_static("Bearer bounded-secret"),
+    );
+    let error = connect_async(request)
+        .await
+        .expect_err("connection limit must reject excess work");
+    let response = match error {
+        async_tungstenite::tungstenite::Error::Http(response) => response,
+        other => panic!("expected HTTP overload response, got {other:?}"),
+    };
+    assert_eq!(response.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[http::header::RETRY_AFTER], "1");
+    success(
+        first
+            .request(
+                "session/new",
+                json!({"cwd": "/tmp/kiteframe-at-capacity", "mcpServers": []}),
+            )
+            .await,
+    );
+
+    first.close().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut retried = WebSocketPeer::connect(server.address, "bounded-secret").await;
+    retried.close().await;
+
+    store.pool().close().await;
+    let response = reqwest::Client::new()
+        .get(format!("http://{}/acp", server.address))
+        .bearer_auth("bounded-secret")
+        .send()
+        .await
+        .expect("database-gated ACP response");
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[reqwest::header::RETRY_AFTER], "1");
 
     remote.begin_shutdown();
     server.stop().await;

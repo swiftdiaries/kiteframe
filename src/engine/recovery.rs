@@ -16,8 +16,16 @@ pub struct RecoveryReport {
 pub(crate) async fn recover_model_attempts(
     store: &crate::PostgresStore,
 ) -> Result<RecoveryReport, StoreError> {
+    let mut requeued = 0;
+    loop {
+        let page = store.requeue_uncommitted_model_attempts(256).await?;
+        requeued += page;
+        if page < 256 {
+            break;
+        }
+    }
     Ok(RecoveryReport {
-        model_attempts_requeued: store.requeue_uncommitted_model_attempts(256).await?,
+        model_attempts_requeued: requeued,
         ..RecoveryReport::default()
     })
 }
@@ -29,7 +37,14 @@ pub(crate) async fn recover_tool_statuses(
 ) -> Result<RecoveryReport, StoreError> {
     let mut report = RecoveryReport::default();
     let mut sessions_waiting_for_mcp = BTreeSet::new();
-    for call in store.recoverable_tool_calls(256).await? {
+    loop {
+        let calls = store
+            .recoverable_tool_calls_excluding(256, &sessions_waiting_for_mcp)
+            .await?;
+        if calls.is_empty() {
+            break;
+        }
+        for call in calls {
         let tool = match tools.bound_tool(
             call.session_id.clone(),
             &call.qualified_name,
@@ -101,6 +116,7 @@ pub(crate) async fn recover_tool_statuses(
                     .await?;
                 report.outcomes_unknown += 1;
             }
+        }
         }
     }
     report.sessions_waiting_for_mcp = sessions_waiting_for_mcp.len() as u64;
