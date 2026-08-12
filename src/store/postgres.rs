@@ -496,7 +496,7 @@ impl PostgresStore {
     }
 
     pub async fn recoverable_tool_calls(&self, limit: i64) -> Result<Vec<super::RecoverableToolCall>, StoreError> {
-        let rows = sqlx::query("SELECT t.id, t.frame_id, r.id AS run_id, r.session_id, f.revision, t.qualified_name, t.descriptor_digest, t.idempotency_key FROM tool_calls t JOIN frames f ON f.id = t.frame_id JOIN runs r ON r.id = f.run_id WHERE t.state = 'intent' AND f.state = 'running' AND r.state = 'running' ORDER BY t.updated_at, t.id LIMIT $1")
+        let rows = sqlx::query("SELECT t.id, t.frame_id, r.id AS run_id, r.session_id, f.revision, t.qualified_name, t.descriptor_digest, t.idempotency_key, t.arguments, b.descriptor ->> 'effect' AS effect, b.recovery_profile FROM tool_calls t JOIN frames f ON f.id = t.frame_id JOIN runs r ON r.id = f.run_id JOIN run_tool_bindings b ON b.run_id = r.id AND b.qualified_name = t.qualified_name AND b.descriptor_digest = t.descriptor_digest WHERE t.state = 'intent' AND f.state = 'running' AND r.state = 'running' ORDER BY t.updated_at, t.id LIMIT $1")
             .bind(limit.clamp(1, 256))
             .fetch_all(&self.pool)
             .await?;
@@ -506,8 +506,74 @@ impl PostgresStore {
                 run_id: crate::RunId::new(row.get("run_id")), session_id: crate::SessionId::new(row.get("session_id")),
                 revision: row.get::<i64, _>("revision") as u64, qualified_name: row.get("qualified_name"),
                 descriptor_digest: row.get("descriptor_digest"), idempotency_key: crate::IdempotencyKey::new(row.get::<String, _>("idempotency_key")).map_err(|error| StoreError::InvalidData(error.to_string()))?,
+                arguments: row.get("arguments"),
+                effect: serde_json::from_value(Value::String(row.get("effect"))).map_err(|error| StoreError::InvalidData(error.to_string()))?,
+                recovery: serde_json::from_value(Value::String(row.get("recovery_profile"))).map_err(|error| StoreError::InvalidData(error.to_string()))?,
             })
         }).collect()
+    }
+
+    pub async fn claim_tool_recovery_retry(
+        &self,
+        frame_id: crate::FrameId,
+        tool_call_id: uuid::Uuid,
+        expected_revision: u64,
+        retry_budget: u32,
+    ) -> Result<Option<u64>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
+            return Err(StoreError::RevisionConflict);
+        }
+        let call = sqlx::query("SELECT state, recovery_attempts FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
+            .bind(tool_call_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| StoreError::InvalidData("tool call was not found for frame".to_owned()))?;
+        if call.get::<String, _>("state") != "intent" {
+            return Err(StoreError::RevisionConflict);
+        }
+        if call.get::<i32, _>("recovery_attempts") as u32 >= retry_budget {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let revision = expected_revision + 1;
+        sqlx::query("UPDATE tool_calls SET recovery_attempts = recovery_attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(tool_call_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE frames SET revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        append_event(&mut tx, frame.get("run_id"), "tool.recovery_retry", json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id})).await?;
+        tx.commit().await?;
+        Ok(Some(revision))
+    }
+
+    pub async fn mark_tool_call_outcome_unknown(
+        &self,
+        frame_id: crate::FrameId,
+        tool_call_id: uuid::Uuid,
+        expected_revision: u64,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
+            return Err(StoreError::RevisionConflict);
+        }
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        let call = sqlx::query("SELECT state FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
+            .bind(tool_call_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| StoreError::InvalidData("tool call was not found for frame".to_owned()))?;
+        if call.get::<String, _>("state") != "intent" {
+            return Err(StoreError::RevisionConflict);
+        }
+        sqlx::query("UPDATE tool_calls SET state = 'outcome_unknown', updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(tool_call_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE frames SET state = 'outcome_unknown', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE runs SET state = 'outcome_unknown', revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(run_id).execute(&mut *tx).await?;
+        append_event(&mut tx, run_id, "tool.outcome_unknown", json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id})).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn begin_model_attempt(
@@ -1070,6 +1136,7 @@ fn run_state(value: &str) -> Result<RunState, StoreError> {
         "running" => Ok(RunState::Running),
         "waiting_for_answer" => Ok(RunState::WaitingForAnswer),
         "waiting_for_permission" => Ok(RunState::WaitingForPermission),
+        "outcome_unknown" => Ok(RunState::OutcomeUnknown),
         "completed" => Ok(RunState::Completed),
         "failed" => Ok(RunState::Failed),
         "cancelled" => Ok(RunState::Cancelled),

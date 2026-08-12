@@ -159,6 +159,7 @@ fn run_state_name(state: crate::RunState) -> &'static str {
         crate::RunState::Running => "running",
         crate::RunState::WaitingForAnswer => "waiting_for_answer",
         crate::RunState::WaitingForPermission => "waiting_for_permission",
+        crate::RunState::OutcomeUnknown => "outcome_unknown",
         crate::RunState::Completed => "completed",
         crate::RunState::Failed => "failed",
         crate::RunState::Cancelled => "cancelled",

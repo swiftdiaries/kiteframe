@@ -112,6 +112,7 @@ pub enum RunState {
     Running,
     WaitingForAnswer,
     WaitingForPermission,
+    OutcomeUnknown,
     Completed,
     Failed,
     Cancelled,
@@ -142,6 +143,9 @@ pub struct RecoverableToolCall {
     pub qualified_name: String,
     pub descriptor_digest: String,
     pub idempotency_key: IdempotencyKey,
+    pub arguments: Value,
+    pub effect: crate::EffectKind,
+    pub recovery: crate::RecoverySupport,
 }
 
 #[derive(Clone, Debug)]

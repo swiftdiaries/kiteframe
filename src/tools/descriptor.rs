@@ -27,6 +27,7 @@ impl EffectKind {
 #[serde(rename_all = "snake_case")]
 pub enum RecoverySupport {
     NotRequired,
+    Idempotent,
     Status,
     Compensation,
     Unsupported,
@@ -36,6 +37,7 @@ impl RecoverySupport {
     const fn normalized_name(self) -> &'static str {
         match self {
             Self::NotRequired => "not_required",
+            Self::Idempotent => "idempotent",
             Self::Status => "status",
             Self::Compensation => "compensation",
             Self::Unsupported => "unsupported",
@@ -135,7 +137,9 @@ impl CatalogTool {
         if self.effect == EffectKind::Effectful
             && !matches!(
                 self.recovery,
-                RecoverySupport::Status | RecoverySupport::Compensation
+                RecoverySupport::Idempotent
+                    | RecoverySupport::Status
+                    | RecoverySupport::Compensation
             )
         {
             return Err(ToolError::UnsafeEffectRecovery(self.qualified_name.clone()));

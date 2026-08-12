@@ -1,4 +1,8 @@
-use crate::{StoreError, ToolResolver, ToolStatus};
+use std::collections::BTreeSet;
+
+use serde_json::json;
+
+use crate::{StoreError, ToolError, ToolResolver, ToolStatus};
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RecoveryReport {
@@ -20,9 +24,25 @@ pub(crate) async fn recover_tool_statuses(
     tools: &dyn ToolResolver,
 ) -> Result<RecoveryReport, StoreError> {
     let mut report = RecoveryReport::default();
+    let mut sessions_waiting_for_mcp = BTreeSet::new();
     for call in store.recoverable_tool_calls(256).await? {
-        let tool = tools.bound_tool(call.session_id.clone(), &call.qualified_name, &call.descriptor_digest)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let tool = match tools.bound_tool(call.session_id.clone(), &call.qualified_name, &call.descriptor_digest) {
+            Ok(tool) => tool,
+            Err(ToolError::UnknownSession(_)) => {
+                sessions_waiting_for_mcp.insert(call.session_id);
+                continue;
+            }
+            Err(ToolError::ToolContractChanged { .. } | ToolError::UnknownTool(_)) => {
+                store.finish_tool_call(call.frame_id, call.id, call.revision, Err(json!({"code":"tool_contract_changed"}))).await?;
+                report.tools_recovered += 1;
+                continue;
+            }
+            Err(_) => {
+                store.mark_tool_call_outcome_unknown(call.frame_id, call.id, call.revision).await?;
+                report.outcomes_unknown += 1;
+                continue;
+            }
+        };
         match tool.status(&call.idempotency_key).await {
             Ok(ToolStatus::Succeeded { result }) => {
                 tool.descriptor().output().validate(&result).map_err(|error| StoreError::InvalidData(error.to_string()))?;
@@ -36,8 +56,12 @@ pub(crate) async fn recover_tool_statuses(
             Ok(ToolStatus::Pending | ToolStatus::Running | ToolStatus::WaitingForPermission) => {
                 report.tools_requeued += 1;
             }
-            Err(_) => report.outcomes_unknown += 1,
+            Ok(ToolStatus::NotStarted | ToolStatus::Unknown) | Err(_) => {
+                store.mark_tool_call_outcome_unknown(call.frame_id, call.id, call.revision).await?;
+                report.outcomes_unknown += 1;
+            }
         }
     }
+    report.sessions_waiting_for_mcp = sessions_waiting_for_mcp.len() as u64;
     Ok(report)
 }
