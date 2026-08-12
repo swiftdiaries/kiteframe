@@ -94,6 +94,8 @@ pub struct PendingPermission {
     pub qualified_name: String,
     pub descriptor_digest: String,
     pub arguments: Value,
+    pub resolved: bool,
+    pub resolution_idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]

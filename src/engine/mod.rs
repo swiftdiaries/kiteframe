@@ -93,11 +93,19 @@ impl Engine {
             return Err(StoreError::InvalidData("session-wide permission choices require immutable policy update support".to_owned()).into());
         }
         let pending = self.store.pending_permission(request.session_id.clone(), request.run_id.clone(), request.permission_request_id.clone()).await?;
-        self.store.resolve_permission(
+        if pending.resolved {
+            return if pending.resolution_idempotency_key.as_deref() == Some(request.idempotency_key.as_str()) {
+                Ok(())
+            } else {
+                Err(StoreError::IdempotencyConflict.into())
+            };
+        }
+        let applied = self.store.resolve_permission(
             pending.frame_id.clone(), request.permission_request_id, pending.revision,
             json!({"choice": match request.choice { PermissionChoice::AllowOnce => "allow_once", PermissionChoice::AllowToolForSession => "allow_tool_for_session", PermissionChoice::DenyOnce => "deny_once", PermissionChoice::DenyToolForSession => "deny_tool_for_session" }}),
             request.idempotency_key.as_str().to_owned(),
         ).await?;
+        if !applied { return Ok(()); }
         let revision = pending.revision + 1;
         match request.choice {
             PermissionChoice::AllowOnce => {

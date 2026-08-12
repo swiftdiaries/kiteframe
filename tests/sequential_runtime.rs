@@ -69,7 +69,7 @@ async fn permitted_model_tool_call_replays_output_then_completes() {
     let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
     let definition = store.publish(session.id.clone(), &workflow, &source).await.unwrap();
     let run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name, version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
-    assert_eq!(store.runnable_frames(16).await.unwrap().into_iter().find(|frame| frame.id == run.root_frame_id).unwrap().session_id, session.id);
+    assert_eq!(store.runnable_frames_for_run(run.id.clone(), 16).await.unwrap().into_iter().find(|frame| frame.id == run.root_frame_id).unwrap().session_id, session.id);
     registry.bound_tool(session.id.clone(), "docs/search", descriptor.descriptor_digest()).unwrap();
     let model = Arc::new(ScriptedModel(Mutex::new(VecDeque::from([
         vec![json!({"type":"function_call","call_id":"call-1","name":"docs/search","arguments":{}})],
@@ -104,7 +104,10 @@ async fn allow_once_resolves_and_invokes_the_pending_durable_call() {
     ])))), tools: registry, authorizer: Arc::new(RequirePermission), config: EngineConfig::default() };
     engine.tick_run(run.id.clone()).await.unwrap();
     let request_id: Uuid = sqlx::query("SELECT id FROM permission_requests WHERE run_id = $1").bind(*run.id.as_uuid()).fetch_one(store.pool()).await.unwrap().get("id");
-    engine.resolve_permission(ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::AllowOnce, idempotency_key: IdempotencyKey::new(format!("approval-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
+    let approval_key = IdempotencyKey::new(format!("approval-{}", Uuid::now_v7())).unwrap();
+    let approval = ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::AllowOnce, idempotency_key: approval_key.clone() };
+    engine.resolve_permission(approval.clone()).await.unwrap();
+    engine.resolve_permission(approval).await.unwrap();
     engine.tick_run(run.id.clone()).await.unwrap();
     engine.tick_run(run.id.clone()).await.unwrap();
     let state: String = sqlx::query("SELECT state FROM runs WHERE id = $1").bind(*run.id.as_uuid()).fetch_one(store.pool()).await.unwrap().get("state");
