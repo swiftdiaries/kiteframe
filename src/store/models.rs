@@ -75,6 +75,7 @@ pub struct RunToolBinding {
     pub qualified_name: String,
     pub descriptor_digest: String,
     pub capabilities: Vec<crate::Capability>,
+    pub descriptor: Value,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

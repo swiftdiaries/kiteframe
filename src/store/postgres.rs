@@ -267,8 +267,8 @@ impl PostgresStore {
                     && entry.get("descriptor_digest")?.as_str() == Some(descriptor_digest))
                     .then_some(descriptor)
             }).ok_or(StoreError::CatalogScopeViolation)?;
-            sqlx::query("INSERT INTO run_tool_bindings (run_id, qualified_name, server_alias, catalog_epoch_id, descriptor_digest, capabilities, recovery_profile) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-                .bind(run_id).bind(qualified_name).bind(tool.get("server_alias").and_then(Value::as_str).ok_or_else(|| StoreError::InvalidData("catalog tool server alias is malformed".to_owned()))?).bind(catalog_epoch).bind(descriptor_digest).bind(tool.get("capabilities").cloned().ok_or_else(|| StoreError::InvalidData("catalog tool capabilities are malformed".to_owned()))?).bind(tool.get("recovery").and_then(Value::as_str).ok_or_else(|| StoreError::InvalidData("catalog tool recovery profile is malformed".to_owned()))?).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO run_tool_bindings (run_id, qualified_name, server_alias, catalog_epoch_id, descriptor_digest, capabilities, recovery_profile, descriptor) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)")
+                .bind(run_id).bind(qualified_name).bind(tool.get("server_alias").and_then(Value::as_str).ok_or_else(|| StoreError::InvalidData("catalog tool server alias is malformed".to_owned()))?).bind(catalog_epoch).bind(descriptor_digest).bind(tool.get("capabilities").cloned().ok_or_else(|| StoreError::InvalidData("catalog tool capabilities are malformed".to_owned()))?).bind(tool.get("recovery").and_then(Value::as_str).ok_or_else(|| StoreError::InvalidData("catalog tool recovery profile is malformed".to_owned()))?).bind(tool.clone()).execute(&mut *tx).await?;
         }
         let frame_id = uuid::Uuid::now_v7();
         let compiled_definition = definition.get::<Value, _>("compiled_definition");
@@ -312,11 +312,21 @@ impl PostgresStore {
     }
 
     pub async fn run_tool_binding(&self, run_id: crate::RunId, qualified_name: &str) -> Result<super::RunToolBinding, StoreError> {
-        let row = sqlx::query("SELECT qualified_name, descriptor_digest, capabilities FROM run_tool_bindings WHERE run_id = $1 AND qualified_name = $2")
+        let row = sqlx::query("SELECT qualified_name, descriptor_digest, capabilities, descriptor FROM run_tool_bindings WHERE run_id = $1 AND qualified_name = $2")
             .bind(*run_id.as_uuid()).bind(qualified_name).fetch_optional(&self.pool).await?
             .ok_or(StoreError::CatalogScopeViolation)?;
         let capabilities = serde_json::from_value(row.get("capabilities")).map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        Ok(super::RunToolBinding { qualified_name: row.get("qualified_name"), descriptor_digest: row.get("descriptor_digest"), capabilities })
+        Ok(super::RunToolBinding { qualified_name: row.get("qualified_name"), descriptor_digest: row.get("descriptor_digest"), capabilities, descriptor: row.get::<Option<Value>, _>("descriptor").ok_or_else(|| StoreError::InvalidData("run tool descriptor is absent".to_owned()))? })
+    }
+
+    pub async fn run_tool_bindings(&self, run_id: crate::RunId) -> Result<Vec<super::RunToolBinding>, StoreError> {
+        let rows = sqlx::query("SELECT qualified_name, descriptor_digest, capabilities, descriptor FROM run_tool_bindings WHERE run_id = $1 ORDER BY qualified_name")
+            .bind(*run_id.as_uuid()).fetch_all(&self.pool).await?;
+        rows.into_iter().map(|row| {
+            let capabilities = serde_json::from_value(row.get("capabilities")).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            let descriptor = row.get::<Option<Value>, _>("descriptor").ok_or_else(|| StoreError::InvalidData("run tool descriptor is absent".to_owned()))?;
+            Ok(super::RunToolBinding { qualified_name: row.get("qualified_name"), descriptor_digest: row.get("descriptor_digest"), capabilities, descriptor })
+        }).collect()
     }
 
     pub async fn policy_revision(&self, session_id: crate::SessionId) -> Result<crate::PolicyRevision, StoreError> {

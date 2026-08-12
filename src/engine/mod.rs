@@ -76,7 +76,7 @@ impl Engine {
         let response = self.model.respond(ModelRequest {
             instructions: task.prompt.clone(),
             input,
-            tools: vec![completion_tool(task)],
+            tools: std::iter::once(completion_tool(task)).chain(self.store.run_tool_bindings(frame.run_id.clone()).await?.into_iter().map(model_tool)).collect(),
         }).await.map_err(|error| StoreError::InvalidData(error.to_string()))?;
         self.store.commit_model_attempt(frame.id.clone(), attempt.attempt, attempt.revision, response.items.clone()).await?;
         if let Some(completion) = response.items.iter().filter_map(completion_from_item).next_back() {
@@ -136,6 +136,10 @@ impl Engine {
 
 fn completion_tool(task: &crate::dsl::CompiledTask) -> Value {
     json!({"type":"function", "name":"complete_task", "description":"Complete the current task with one declared outcome.", "parameters":{"type":"object", "additionalProperties":false, "properties":{"outcome":{"type":"string"}, "fields":{"type":"object"}}, "required":["outcome", "fields"]}, "outcomes": task.completion.outcomes})
+}
+
+fn model_tool(binding: crate::RunToolBinding) -> Value {
+    json!({"type":"function", "name": binding.qualified_name, "description": binding.descriptor.get("description").and_then(Value::as_str).unwrap_or(""), "parameters": binding.descriptor.get("input").cloned().unwrap_or_else(|| json!({"type":"object","properties":{},"additionalProperties":false}))})
 }
 
 fn completion_from_item(item: &Value) -> Option<(String, Value)> {
