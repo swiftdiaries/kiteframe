@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     fmt,
     sync::{
         Arc, Mutex,
@@ -1101,12 +1101,21 @@ struct RemoteState {
     routers: tokio::sync::RwLock<HashMap<RouterKey, Router>>,
     admission: Arc<tokio::sync::Semaphore>,
     admission_gate: Arc<tokio::sync::Mutex<()>>,
-    reservations: Mutex<HashMap<RouterKey, VecDeque<Arc<AdmissionReservation>>>>,
 }
 
 struct AdmissionReservation {
-    permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
-    gate: Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
+    state: Mutex<AdmissionReservationState>,
+}
+
+// A request-local reservation is the only pre-factory owner. Its state becomes
+// unclaimable before either admission resource is released.
+enum AdmissionReservationState {
+    Reserved {
+        permit: tokio::sync::OwnedSemaphorePermit,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+    },
+    Claimed,
+    Cancelled,
 }
 
 impl AdmissionReservation {
@@ -1115,24 +1124,57 @@ impl AdmissionReservation {
         gate: tokio::sync::OwnedMutexGuard<()>,
     ) -> Self {
         Self {
-            permit: Mutex::new(Some(permit)),
-            gate: Mutex::new(Some(gate)),
+            state: Mutex::new(AdmissionReservationState::Reserved { permit, gate }),
         }
     }
 
-    fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.gate
-            .lock()
-            .expect("ACP admission gate reservation poisoned")
-            .take();
-        self.permit
-            .lock()
-            .expect("ACP admission reservation poisoned")
-            .take()
+    fn claim(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.claim_before_gate_release(|| {})
     }
 
-    fn release(&self) {
-        self.take();
+    fn claim_before_gate_release(
+        &self,
+        before_gate_release: impl FnOnce(),
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ACP admission reservation poisoned");
+        if !matches!(*state, AdmissionReservationState::Reserved { .. }) {
+            return None;
+        }
+        let AdmissionReservationState::Reserved { permit, gate } =
+            std::mem::replace(&mut *state, AdmissionReservationState::Claimed)
+        else {
+            unreachable!("reservation state checked above");
+        };
+        drop(state);
+        before_gate_release();
+        drop(gate);
+        Some(permit)
+    }
+
+    fn cancel(&self) {
+        self.cancel_before_gate_release(|| {});
+    }
+
+    fn cancel_before_gate_release(&self, before_gate_release: impl FnOnce()) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("ACP admission reservation poisoned");
+        if !matches!(*state, AdmissionReservationState::Reserved { .. }) {
+            return;
+        }
+        let AdmissionReservationState::Reserved { permit, gate } =
+            std::mem::replace(&mut *state, AdmissionReservationState::Cancelled)
+        else {
+            unreachable!("reservation state checked above");
+        };
+        drop(state);
+        drop(permit);
+        before_gate_release();
+        drop(gate);
     }
 }
 
@@ -1191,7 +1233,6 @@ impl RemoteService {
                 routers: tokio::sync::RwLock::new(HashMap::new()),
                 admission: Arc::new(tokio::sync::Semaphore::new(max_connections.max(1))),
                 admission_gate: Arc::new(tokio::sync::Mutex::new(())),
-                reservations: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -1255,7 +1296,7 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
     let creates_connection = transport == TransportKind::WebSocket
         || (request.method() == Method::POST
             && !request.headers().contains_key("acp-connection-id"));
-    let admission_guard = if creates_connection {
+    let mut admission_guard = if creates_connection {
         Some(state.admission_gate.clone().lock_owned().await)
     } else {
         None
@@ -1263,81 +1304,39 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
     if creates_connection && state.admission.available_permits() == 0 {
         return retryable_response(StatusCode::TOO_MANY_REQUESTS);
     }
-    let reservation = if transport == TransportKind::WebSocket {
+    let authenticated = AuthenticatedConnection {
+        principal,
+        transport,
+    };
+    let (router, mut cleanup) = if transport == TransportKind::WebSocket {
         let permit = match state.admission.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => return retryable_response(StatusCode::TOO_MANY_REQUESTS),
         };
-        let reservation = Arc::new(AdmissionReservation::new(
+        // The exact factory token and its cleanup guard are armed together,
+        // before dispatch introduces the next cancellation point.
+        let (reservation, cleanup) = AdmissionCleanup::new(
             permit,
-            admission_guard.expect("WebSocket admission owns the gate"),
-        ));
-        state
-            .reservations
-            .lock()
-            .expect("ACP admission reservation lock poisoned")
-            .entry(key.clone())
-            .or_default()
-            .push_back(reservation.clone());
-        Some(reservation)
+            admission_guard
+                .take()
+                .expect("WebSocket admission owns the gate"),
+        );
+        (
+            acp_connection_router(state.clone(), authenticated, Some(reservation)),
+            Some(cleanup),
+        )
     } else {
-        None
+        let router = if let Some(router) = state.routers.read().await.get(&key).cloned() {
+            router
+        } else {
+            let mut routers = state.routers.write().await;
+            routers
+                .entry(key)
+                .or_insert_with(|| acp_connection_router(state.clone(), authenticated, None))
+                .clone()
+        };
+        (router, None)
     };
-    let router = if let Some(router) = state.routers.read().await.get(&key).cloned() {
-        router
-    } else {
-        let mut routers = state.routers.write().await;
-        routers
-            .entry(key.clone())
-            .or_insert_with(|| {
-                let application = state.application.clone();
-                let store = state.store.clone();
-                let authenticated = AuthenticatedConnection {
-                    principal,
-                    transport,
-                };
-                let v2_runtime_enabled = state.v2_runtime_enabled;
-                let accepting = state.ready.clone();
-                let healthy = state.model_ready.clone();
-                let state = state.clone();
-                let reservation_key = key.clone();
-                AcpHttpServer::new(move || {
-                    let permit = if authenticated.transport == TransportKind::WebSocket {
-                        state
-                            .reservations
-                            .lock()
-                            .expect("ACP admission reservation lock poisoned")
-                            .get_mut(&reservation_key)
-                            .and_then(VecDeque::pop_front)
-                            .and_then(|reservation| reservation.take())
-                    } else {
-                        state.admission.clone().try_acquire_owned().ok()
-                    };
-                    let service = AcpService::new(
-                        application.clone(),
-                        store.clone(),
-                        authenticated.clone(),
-                        v2_runtime_enabled,
-                    )
-                    .with_accepting(accepting.clone())
-                    .with_health(healthy.clone());
-                    match permit {
-                        Some(permit) => service.with_admission_permit(Arc::new(permit)),
-                        None => service.with_accepting(Arc::new(AtomicBool::new(false))),
-                    }
-                })
-                .with_options(ServerOptions {
-                    path: "/acp".to_owned(),
-                    cors: CorsOptions::disabled(),
-                    health_endpoint: false,
-                })
-                .into_router()
-            })
-            .clone()
-    };
-    let mut cleanup = reservation
-        .as_ref()
-        .map(|reservation| AdmissionCleanup::new(state.clone(), key.clone(), reservation.clone()));
     let response = router
         .oneshot(request)
         .await
@@ -1350,53 +1349,85 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
     response
 }
 
-struct AdmissionCleanup {
+fn acp_connection_router(
     state: Arc<RemoteState>,
-    key: RouterKey,
+    authenticated: AuthenticatedConnection,
+    reservation: Option<Arc<AdmissionReservation>>,
+) -> Router {
+    let application = state.application.clone();
+    let store = state.store.clone();
+    let v2_runtime_enabled = state.v2_runtime_enabled;
+    let accepting = state.ready.clone();
+    let healthy = state.model_ready.clone();
+    AcpHttpServer::new(move || {
+        let permit = match &reservation {
+            Some(reservation) => reservation.claim(),
+            None => state.admission.clone().try_acquire_owned().ok(),
+        };
+        let service = AcpService::new(
+            application.clone(),
+            store.clone(),
+            authenticated.clone(),
+            v2_runtime_enabled,
+        )
+        .with_accepting(accepting.clone())
+        .with_health(healthy.clone());
+        match permit {
+            Some(permit) => service.with_admission_permit(Arc::new(permit)),
+            None => service.with_accepting(Arc::new(AtomicBool::new(false))),
+        }
+    })
+    .with_options(ServerOptions {
+        path: "/acp".to_owned(),
+        cors: CorsOptions::disabled(),
+        health_endpoint: false,
+    })
+    .into_router()
+}
+
+struct AdmissionCleanup {
     reservation: Arc<AdmissionReservation>,
     armed: bool,
 }
 
 impl AdmissionCleanup {
     fn new(
-        state: Arc<RemoteState>,
-        key: RouterKey,
-        reservation: Arc<AdmissionReservation>,
-    ) -> Self {
-        Self { state, key, reservation, armed: true }
+        permit: tokio::sync::OwnedSemaphorePermit,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+    ) -> (Arc<AdmissionReservation>, Self) {
+        let reservation = Arc::new(AdmissionReservation::new(permit, gate));
+        (
+            reservation.clone(),
+            Self {
+                reservation,
+                armed: true,
+            },
+        )
     }
 
-    fn reap_after(mut self, delay: std::time::Duration) {
-        self.armed = false;
-        tokio::spawn(async move {
+    fn reap_after(self, delay: std::time::Duration) {
+        let _reaper = self.reap_when(async move {
             tokio::time::sleep(delay).await;
-            release_admission_reservation(&self.state, &self.key, &self.reservation);
         });
+    }
+
+    fn reap_when(
+        mut self,
+        ready: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        self.armed = false;
+        let reservation = self.reservation.clone();
+        tokio::spawn(async move {
+            ready.await;
+            reservation.cancel();
+        })
     }
 }
 
 impl Drop for AdmissionCleanup {
     fn drop(&mut self) {
         if self.armed {
-            release_admission_reservation(&self.state, &self.key, &self.reservation);
-        }
-    }
-}
-
-fn release_admission_reservation(
-    state: &RemoteState,
-    key: &RouterKey,
-    reservation: &Arc<AdmissionReservation>,
-) {
-    reservation.release();
-    let mut reservations = state
-        .reservations
-        .lock()
-        .expect("ACP admission reservation lock poisoned");
-    if let Some(queue) = reservations.get_mut(key) {
-        queue.retain(|queued| !Arc::ptr_eq(queued, reservation));
-        if queue.is_empty() {
-            reservations.remove(key);
+            self.reservation.cancel();
         }
     }
 }
@@ -1703,9 +1734,156 @@ async fn dispatch_application(
 
 #[cfg(test)]
 mod tests {
-    use super::{BearerAuthenticator, ConnectionAuthenticator, StaticBearerAuthenticator};
+    use std::sync::Arc;
+
+    use super::{
+        AdmissionCleanup, BearerAuthenticator, ConnectionAuthenticator, StaticBearerAuthenticator,
+    };
     use crate::{PrincipalId, Secret};
     use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    async fn admission_reservation() -> (
+        Arc<super::AdmissionReservation>,
+        AdmissionCleanup,
+        Arc<tokio::sync::Semaphore>,
+        Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let permit = admission
+            .clone()
+            .try_acquire_owned()
+            .expect("admission permit");
+        let gate_guard = gate.clone().lock_owned().await;
+        let (reservation, cleanup) = AdmissionCleanup::new(permit, gate_guard);
+        (reservation, cleanup, admission, gate)
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_websocket_dispatch_releases_permit_and_gate() {
+        let (reservation, cleanup, admission, gate) = admission_reservation().await;
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+        let waiter_admission = admission.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_tx.send(()).expect("signal waiter");
+            let _gate = gate.lock_owned().await;
+            assert!(reservation.claim().is_none());
+            assert_eq!(waiter_admission.available_permits(), 1);
+            waiter_admission
+                .try_acquire_owned()
+                .expect("permit must be restored before gate release")
+        });
+
+        waiting_rx.await.expect("waiter started");
+        assert!(
+            !waiter.is_finished(),
+            "the reservation must still own the gate"
+        );
+        drop(cleanup);
+        let permit = waiter.await.expect("admission waiter");
+        assert_eq!(admission.available_permits(), 0);
+        drop(permit);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn factory_claim_before_cleanup_transfers_the_permit_exactly_once() {
+        let (reservation, cleanup, admission, gate) = admission_reservation().await;
+
+        let permit = reservation
+            .claim_before_gate_release(|| {
+                assert!(reservation.claim().is_none());
+                assert_eq!(admission.available_permits(), 0);
+                assert!(gate.clone().try_lock_owned().is_err());
+                drop(cleanup);
+            })
+            .expect("factory claims reservation");
+
+        assert!(reservation.claim().is_none());
+        assert_eq!(admission.available_permits(), 0);
+        assert!(gate.clone().try_lock_owned().is_ok());
+        drop(permit);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_before_factory_makes_the_reservation_unclaimable() {
+        let (reservation, cleanup, admission, gate) = admission_reservation().await;
+
+        reservation.cancel_before_gate_release(|| {
+            assert!(reservation.claim().is_none());
+            assert_eq!(admission.available_permits(), 1);
+            assert!(gate.clone().try_lock_owned().is_err());
+        });
+        drop(cleanup);
+
+        assert!(reservation.claim().is_none());
+        assert_eq!(admission.available_permits(), 1);
+        assert!(gate.try_lock_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn late_factory_cannot_claim_the_next_websocket_reservation() {
+        let (old_reservation, old_cleanup, admission, gate) = admission_reservation().await;
+        drop(old_cleanup);
+
+        let next_gate = gate.clone().lock_owned().await;
+        let next_permit = admission
+            .clone()
+            .try_acquire_owned()
+            .expect("next admission permit");
+        let (next_reservation, next_cleanup) = AdmissionCleanup::new(next_permit, next_gate);
+
+        assert!(old_reservation.claim().is_none());
+        assert_eq!(admission.available_permits(), 0);
+        let claimed = next_reservation
+            .claim()
+            .expect("next factory claims only its own reservation");
+        drop(next_cleanup);
+        assert_eq!(admission.available_permits(), 0);
+        drop(claimed);
+        assert_eq!(admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_upgrade_reaper_wins_before_a_delayed_factory() {
+        let (old_reservation, old_cleanup, admission, gate) = admission_reservation().await;
+        let (reap_tx, reap_rx) = tokio::sync::oneshot::channel::<()>();
+        let reaper = old_cleanup.reap_when(async move {
+            reap_rx.await.expect("release orphan reaper");
+        });
+        let (next_waiting_tx, next_waiting_rx) = tokio::sync::oneshot::channel();
+        let next_admission = admission.clone();
+        let next_gate = gate.clone();
+        let next = tokio::spawn(async move {
+            next_waiting_tx.send(()).expect("signal next reservation");
+            let gate_guard = next_gate.lock_owned().await;
+            let permit = next_admission
+                .clone()
+                .try_acquire_owned()
+                .expect("reaper restores capacity before releasing the gate");
+            AdmissionCleanup::new(permit, gate_guard)
+        });
+
+        next_waiting_rx.await.expect("next reservation waiting");
+        assert!(
+            !next.is_finished(),
+            "orphan reservation still owns the gate"
+        );
+        reap_tx.send(()).expect("run orphan reaper");
+        reaper.await.expect("orphan reaper");
+        let (next_reservation, next_cleanup) = next.await.expect("next reservation");
+
+        assert!(old_reservation.claim().is_none());
+        assert_eq!(admission.available_permits(), 0);
+        let permit = next_reservation
+            .claim()
+            .expect("next factory claims its exact reservation");
+        drop(next_cleanup);
+        assert_eq!(admission.available_permits(), 0);
+        drop(permit);
+        assert_eq!(admission.available_permits(), 1);
+    }
 
     #[test]
     fn static_bearer_authenticator_accepts_only_the_configured_token() {

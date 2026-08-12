@@ -3,7 +3,7 @@ use std::{
     io::Write,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -903,9 +903,16 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
             .await
             .expect("permission descriptor");
     sqlx::query(
+        "UPDATE permission_requests SET created_at = CURRENT_TIMESTAMP - INTERVAL '10 minutes' WHERE id = $1",
+    )
+    .bind(*fixture.request_id.as_uuid())
+    .execute(store.pool())
+    .await
+    .expect("age root permission");
+    sqlx::query(
         "WITH calls AS ( \
            INSERT INTO tool_calls (id, frame_id, provider_call_id, qualified_name, descriptor_digest, idempotency_key, arguments, state, created_at, updated_at) \
-           SELECT gen_random_uuid(), $1, 'overflow-' || n, 'docs/search', $2, 'overflow-key-' || n, '{}'::jsonb, 'waiting_for_permission', CURRENT_TIMESTAMP + n * INTERVAL '1 millisecond', CURRENT_TIMESTAMP \
+           SELECT gen_random_uuid(), $1, 'overflow-' || n, 'docs/search', $2, 'overflow-key-' || n, '{}'::jsonb, 'waiting_for_permission', CURRENT_TIMESTAMP - INTERVAL '9 minutes' + n * INTERVAL '1 millisecond', CURRENT_TIMESTAMP \
            FROM generate_series(1, 256) AS n \
            RETURNING provider_call_id, created_at \
          ) \
@@ -936,41 +943,55 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
 
     let first_page = outstanding
         .iter()
-        .map(|message| message["params"]["toolCall"]["toolCallId"].as_str().unwrap().to_owned())
+        .map(|message| {
+            message["params"]["toolCall"]["toolCallId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
         .collect::<BTreeSet<_>>();
     let abandoned = outstanding[0]["params"]["toolCall"]["toolCallId"]
         .as_str()
         .unwrap()
         .to_owned();
     peer.close().await;
-    let mut peer = StdioPeer::new(application, store.clone(), owner);
-    success(
-        peer.request(
-            "initialize",
-            json!({"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "fairness-resume", "version": "1.0.0"}}),
-        )
-        .await,
-    );
-    success(
-        peer.request(
-            "session/load",
-            json!({"sessionId": fixture.session["sessionId"], "cwd": "/tmp/kiteframe-permission", "mcpServers": []}),
-        )
-        .await,
-    );
-    outstanding.clear();
-    for _ in 0..32 {
-        outstanding.push(peer.next_message().await);
-    }
-    assert!(outstanding.iter().any(|message| {
-        !first_page.contains(message["params"]["toolCall"]["toolCallId"].as_str().unwrap())
-    }), "a reconnect must continue the durable fair rotation");
 
+    let mut lock_tx = store.pool().begin().await.expect("permission row lock");
+    let locked = sqlx::query(
+        "SELECT id, provider_call_id FROM permission_requests \
+         WHERE run_id = $1 AND state = 'pending' AND last_offered_at IS NULL \
+         ORDER BY created_at, id LIMIT 1 FOR UPDATE",
+    )
+    .bind(*fixture.run_id.as_uuid())
+    .fetch_one(&mut *lock_tx)
+    .await
+    .expect("oldest unoffered permission");
+    let locked_id: Uuid = locked.get("id");
+    let locked_provider_call_id: String = locked.get("provider_call_id");
+    sqlx::query(
+        "UPDATE permission_requests SET state = 'resolved', resolution = $1, \
+         resolution_idempotency_key = $2, resolved_at = CURRENT_TIMESTAMP WHERE id = $3",
+    )
+    .bind(json!({"kind": "denied"}))
+    .bind(format!("locked-resolution-{locked_id}"))
+    .bind(locked_id)
+    .execute(&mut *lock_tx)
+    .await
+    .expect("resolve permission while retaining its row lock");
+
+    let producing = Arc::new(AtomicBool::new(true));
+    let inserted = Arc::new(AtomicUsize::new(0));
+    let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(0_usize);
     let live_store = store.clone();
     let live_run = fixture.run_id.clone();
     let live_descriptor = descriptor_digest.clone();
+    let live_producing = producing.clone();
+    let live_inserted = inserted.clone();
     let live_inserter = tokio::spawn(async move {
-        for n in 1..=160 {
+        let producer = Uuid::now_v7().simple().to_string();
+        while live_producing.load(Ordering::Acquire) {
+            let n = live_inserted.fetch_add(1, Ordering::AcqRel) + 1;
+            let provider_call_id = format!("live-{producer}-{n}");
             sqlx::query(
                 "WITH call AS ( \
                    INSERT INTO tool_calls (id, frame_id, provider_call_id, qualified_name, descriptor_digest, idempotency_key, arguments, state) \
@@ -980,48 +1001,206 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
                  VALUES (gen_random_uuid(), $5, $1, $2, 'docs/search', $3, 'live-input', 0, 'pending')",
             )
             .bind(frame_id)
-            .bind(format!("live-{n}"))
+            .bind(&provider_call_id)
             .bind(&live_descriptor)
-            .bind(format!("live-key-{n}"))
+            .bind(format!("live-key-{producer}-{n}"))
             .bind(*live_run.as_uuid())
             .execute(live_store.pool())
             .await
-            .expect("insert live permission");
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            .expect("insert sustained permission");
+            progress_tx.send_replace(n);
+            tokio::task::yield_now().await;
         }
     });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while *progress_rx.borrow() < 32 {
+            progress_rx.changed().await.expect("producer progress");
+        }
+    })
+    .await
+    .expect("sustained producer must start");
 
-    let (found_tail, retried_abandoned) = tokio::time::timeout(Duration::from_secs(8), async {
-        let mut found_tail = false;
-        let mut retried_abandoned = false;
-        loop {
-            for message in outstanding.drain(..) {
-                if message["params"]["toolCall"]["toolCallId"] == "overflow-256" {
-                    found_tail = true;
-                }
-                if message["params"]["toolCall"]["toolCallId"] == abandoned {
-                    retried_abandoned = true;
-                }
-                if found_tail && retried_abandoned {
-                    return (true, true);
-                }
-                peer.respond(
+    let mut first = StdioPeer::new(application.clone(), store.clone(), owner.clone());
+    let mut second = StdioPeer::new(application, store.clone(), owner);
+    let (first_initialize, second_initialize) = tokio::join!(
+        first.request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "fairness-first", "version": "1.0.0"}}),
+        ),
+        second.request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "fairness-second", "version": "1.0.0"}}),
+        ),
+    );
+    success(first_initialize);
+    success(second_initialize);
+    let session = fixture.session["sessionId"].clone();
+    let (first_load, second_load) = tokio::join!(
+        first.request(
+            "session/load",
+            json!({"sessionId": session, "cwd": "/tmp/kiteframe-permission", "mcpServers": []}),
+        ),
+        second.request(
+            "session/load",
+            json!({"sessionId": session, "cwd": "/tmp/kiteframe-permission", "mcpServers": []}),
+        ),
+    );
+    success(first_load);
+    success(second_load);
+
+    let (mut first_window, mut second_window) =
+        tokio::time::timeout(Duration::from_secs(4), async {
+            tokio::join!(
+                async {
+                    let mut window = Vec::with_capacity(32);
+                    for _ in 0..32 {
+                        window.push(first.next_message().await);
+                    }
+                    window
+                },
+                async {
+                    let mut window = Vec::with_capacity(32);
+                    for _ in 0..32 {
+                        window.push(second.next_message().await);
+                    }
+                    window
+                },
+            )
+        })
+        .await
+        .expect("both observers must claim around the locked row");
+    assert_eq!(first_window.len(), 32);
+    assert_eq!(second_window.len(), 32);
+    assert!(
+        first_window.iter().chain(&second_window).all(|message| {
+            message["params"]["toolCall"]["toolCallId"] != locked_provider_call_id
+        }),
+        "the locked row must be skipped by both concurrent observers"
+    );
+    assert!(
+        first_window.iter().chain(&second_window).any(|message| {
+            !first_page.contains(
+                message["params"]["toolCall"]["toolCallId"]
+                    .as_str()
+                    .unwrap(),
+            )
+        }),
+        "concurrent observers must continue beyond the abandoned window"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), first.next_message())
+            .await
+            .is_err(),
+        "the first observer must retain at most 32 requests"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), second.next_message())
+            .await
+            .is_err(),
+        "the second observer must retain at most 32 requests"
+    );
+
+    lock_tx.commit().await.expect("commit locked resolution");
+    let locked_state: String =
+        sqlx::query_scalar("SELECT state FROM permission_requests WHERE id = $1")
+            .bind(locked_id)
+            .fetch_one(store.pool())
+            .await
+            .expect("resolved locked permission");
+    assert_eq!(locked_state, "resolved");
+
+    let mut found_tail = false;
+    let mut retried_abandoned = false;
+    let observe = |message: &Value| {
+        let provider_call_id = message["params"]["toolCall"]["toolCallId"]
+            .as_str()
+            .expect("provider call id");
+        (
+            provider_call_id == "overflow-256",
+            provider_call_id == abandoned,
+        )
+    };
+    for message in first_window.iter().chain(&second_window) {
+        let (tail, abandoned) = observe(message);
+        found_tail |= tail;
+        retried_abandoned |= abandoned;
+    }
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while !(found_tail && retried_abandoned) {
+            let message = first_window.pop().expect("full first observer window");
+            first
+                .respond(
                     message["id"].clone(),
                     json!({"outcome": {"outcome": "cancelled"}}),
                 )
                 .await;
-            }
-            for _ in 0..32 {
-                outstanding.push(peer.next_message().await);
-            }
+            let replacement = first.next_message().await;
+            let (tail, abandoned) = observe(&replacement);
+            found_tail |= tail;
+            retried_abandoned |= abandoned;
+            first_window.push(replacement);
+            assert_eq!(first_window.len(), 32);
+
+            let message = second_window.pop().expect("full second observer window");
+            second
+                .respond(
+                    message["id"].clone(),
+                    json!({"outcome": {"outcome": "cancelled"}}),
+                )
+                .await;
+            let replacement = second.next_message().await;
+            let (tail, abandoned) = observe(&replacement);
+            found_tail |= tail;
+            retried_abandoned |= abandoned;
+            second_window.push(replacement);
+            assert_eq!(second_window.len(), 32);
         }
     })
     .await
-    .expect("permission pagination must continue");
+    .expect("old permissions must progress under sustained arrivals");
     assert!(found_tail, "the 257th pending permission must be offered");
-    assert!(retried_abandoned, "an abandoned old permission must be retried during sustained inserts");
-    live_inserter.await.expect("live permission inserter");
-    peer.close().await;
+    assert!(
+        retried_abandoned,
+        "an abandoned old permission must be retried during sustained inserts"
+    );
+    assert!(producing.load(Ordering::Acquire));
+    let progress_at_targets = *progress_rx.borrow();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while *progress_rx.borrow() <= progress_at_targets {
+            progress_rx.changed().await.expect("producer remains live");
+        }
+    })
+    .await
+    .expect("producer must insert after both historical targets are observed");
+    let pending_tail: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM permission_requests WHERE run_id = $1 AND state = 'pending'",
+    )
+    .bind(*fixture.run_id.as_uuid())
+    .fetch_one(store.pool())
+    .await
+    .expect("pending tail size");
+    assert!(
+        pending_tail > 64,
+        "the producer must keep a nonempty tail beyond both observer windows"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), first.next_message())
+            .await
+            .is_err(),
+        "the first observer must remain bounded during rotation"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), second.next_message())
+            .await
+            .is_err(),
+        "the second observer must remain bounded during rotation"
+    );
+
+    producing.store(false, Ordering::Release);
+    live_inserter.await.expect("sustained permission producer");
+    assert!(inserted.load(Ordering::Acquire) > progress_at_targets);
+    first.close().await;
+    second.close().await;
 }
 
 #[cfg(feature = "acp-v2")]
@@ -1363,7 +1542,10 @@ async fn remote_admission_is_bounded_and_database_gated() {
         .expect("send accepted WebSocket upgrade");
     let mut failed_upgrade = BufReader::new(failed_upgrade);
     let mut status = String::new();
-    failed_upgrade.read_line(&mut status).await.expect("upgrade status");
+    failed_upgrade
+        .read_line(&mut status)
+        .await
+        .expect("upgrade status");
     assert!(status.contains("101"), "accepted upgrade status: {status}");
     drop(failed_upgrade);
     tokio::time::timeout(Duration::from_secs(2), async {
