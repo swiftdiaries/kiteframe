@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde_json::{Number, Value};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::dsl::{CompiledStatement, CompiledType, CompiledValue, CompiledWorkflow};
@@ -73,7 +73,8 @@ fn resolve(value: &CompiledValue, bindings: &Bindings) -> Result<Value, Transiti
     match value {
         CompiledValue::Binding(name) => bindings.get(name).cloned().ok_or_else(|| TransitionError::MissingBinding(name.clone())),
         CompiledValue::String(value) => Ok(Value::String(value.clone())),
-        CompiledValue::Number(value) => value.parse::<f64>().ok().and_then(Number::from_f64).map(Value::Number).ok_or_else(|| TransitionError::Corrupt("numeric literal is invalid".to_owned())),
+        CompiledValue::Number(value) => serde_json::from_str(value)
+            .map_err(|_| TransitionError::Corrupt("numeric literal is invalid".to_owned())),
         CompiledValue::Boolean(value) => Ok(Value::Bool(*value)),
         CompiledValue::Null => Ok(Value::Null),
     }

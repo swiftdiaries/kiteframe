@@ -58,3 +58,16 @@ fn emits_call_parallel_and_ask_commands_in_source_order() {
     let ask = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "ask_one".to_owned(), statement_index: 0, bindings }).expect("ask");
     assert!(matches!(ask, FrameCommand::SuspendAsk(question) if question.text == "q"));
 }
+
+#[test]
+fn preserves_large_numeric_literals() {
+    let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(3), [])
+        .expect("empty catalog");
+    let workflow = compile(
+        "workflow w() -> integer { start t() } task t() -> integer { prompt \"\"\"x\"\"\" tools [] on ok() { done 9007199254740993 } }",
+        &catalog,
+        &Limits::default(),
+    ).expect("compile");
+    let command = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "ok".to_owned(), statement_index: 0, bindings: BTreeMap::new() }).expect("number");
+    assert!(matches!(command, FrameCommand::Complete(value) if value == json!(9_007_199_254_740_993_u64)));
+}
