@@ -355,6 +355,20 @@ impl PostgresStore {
         Ok(row.get::<i64, _>("count") as u64)
     }
 
+    pub async fn permission_suspension(&self, session_id: crate::SessionId, run_id: crate::RunId, request_id: crate::PermissionRequestId) -> Result<super::SuspensionFrame, StoreError> {
+        let row = sqlx::query("SELECT f.id, f.revision FROM permission_requests p JOIN frames f ON f.id = p.frame_id JOIN runs r ON r.id = p.run_id WHERE p.id = $1 AND p.run_id = $2 AND r.session_id = $3 AND p.state IN ('pending', 'resolved')")
+            .bind(*request_id.as_uuid()).bind(*run_id.as_uuid()).bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?
+            .ok_or(StoreError::SessionNotFound)?;
+        Ok(super::SuspensionFrame { frame_id: crate::FrameId::new(row.get("id")), revision: row.get::<i64, _>("revision") as u64 })
+    }
+
+    pub async fn question_suspension(&self, session_id: crate::SessionId, run_id: crate::RunId, question_id: uuid::Uuid) -> Result<super::SuspensionFrame, StoreError> {
+        let row = sqlx::query("SELECT f.id, f.revision FROM questions q JOIN frames f ON f.id = q.frame_id JOIN runs r ON r.id = q.run_id WHERE q.id = $1 AND q.run_id = $2 AND r.session_id = $3 AND q.state IN ('pending', 'answered')")
+            .bind(question_id).bind(*run_id.as_uuid()).bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?
+            .ok_or(StoreError::SessionNotFound)?;
+        Ok(super::SuspensionFrame { frame_id: crate::FrameId::new(row.get("id")), revision: row.get::<i64, _>("revision") as u64 })
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,

@@ -23,6 +23,32 @@ pub struct Engine {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub enum PermissionChoice {
+    AllowOnce,
+    AllowToolForSession,
+    DenyOnce,
+    DenyToolForSession,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvePermission {
+    pub session_id: crate::SessionId,
+    pub run_id: crate::RunId,
+    pub permission_request_id: crate::PermissionRequestId,
+    pub choice: PermissionChoice,
+    pub idempotency_key: crate::IdempotencyKey,
+}
+
+#[derive(Clone, Debug)]
+pub struct AnswerQuestion {
+    pub session_id: crate::SessionId,
+    pub run_id: crate::RunId,
+    pub question_id: uuid::Uuid,
+    pub answer: Value,
+    pub idempotency_key: crate::IdempotencyKey,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct EngineConfig {
     pub scheduler_batch_size: i64,
 }
@@ -42,6 +68,22 @@ pub enum EngineError {
 }
 
 impl Engine {
+    pub async fn resolve_permission(&self, request: ResolvePermission) -> Result<(), EngineError> {
+        let suspension = self.store.permission_suspension(request.session_id, request.run_id, request.permission_request_id.clone()).await?;
+        self.store.resolve_permission(
+            suspension.frame_id, request.permission_request_id, suspension.revision,
+            json!({"choice": match request.choice { PermissionChoice::AllowOnce => "allow_once", PermissionChoice::AllowToolForSession => "allow_tool_for_session", PermissionChoice::DenyOnce => "deny_once", PermissionChoice::DenyToolForSession => "deny_tool_for_session" }}),
+            request.idempotency_key.as_str().to_owned(),
+        ).await?;
+        Ok(())
+    }
+
+    pub async fn answer_question(&self, request: AnswerQuestion) -> Result<(), EngineError> {
+        let suspension = self.store.question_suspension(request.session_id, request.run_id, request.question_id).await?;
+        self.store.answer(suspension.frame_id, request.question_id, suspension.revision, request.answer, request.idempotency_key.as_str().to_owned()).await?;
+        Ok(())
+    }
+
     pub async fn tick_until_idle(&self) -> Result<usize, EngineError> {
         let frames = self.store.runnable_frames(self.config.scheduler_batch_size).await?;
         self.tick_frames(frames).await

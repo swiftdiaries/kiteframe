@@ -78,6 +78,12 @@ pub struct RunToolBinding {
     pub descriptor: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct SuspensionFrame {
+    pub frame_id: FrameId,
+    pub revision: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunState {
     Runnable,

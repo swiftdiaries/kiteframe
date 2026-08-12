@@ -16,7 +16,7 @@ pub use domain::{
     PrincipalId, RunId, Secret, SessionId,
 };
 pub use hash::{HashError, canonical_json, canonical_sha256};
-pub use engine::{Engine, EngineConfig, EngineError};
+pub use engine::{AnswerQuestion, Engine, EngineConfig, EngineError, PermissionChoice, ResolvePermission};
 pub use mcp::{
     AuthenticatedMcpPeer, CatalogRefresh, McpError, McpLimits, McpManager, McpServerConfig,
     RemoteTool, RmcpPeer, closed_schema,
@@ -32,7 +32,7 @@ pub use policy::{
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
     Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest, PolicyUpdate, PostgresStore,
-    PublishedDefinition, Question, RunState, RunToolBinding, RunView, RunnableFrame, SessionView, StartRun, StoreError, ToolCallIntent,
+    PublishedDefinition, Question, RunState, RunToolBinding, RunView, RunnableFrame, SessionView, StartRun, StoreError, SuspensionFrame, ToolCallIntent,
 };
 pub use tools::{
     BoundTool, CatalogTool, EffectKind, InProcessToolRegistry, RecoverySupport, ToolCall,
