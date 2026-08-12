@@ -32,7 +32,7 @@ use kiteframe::{
 use serde_json::{Value, json};
 use sqlx::Row;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -887,7 +887,8 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
     })]]);
     let (application, store, engine) =
         application_with_model(Arc::new(ScriptedModel(Mutex::new(scripted)))).await;
-    let mut peer = StdioPeer::new(application, store.clone(), principal("permission-page"));
+    let owner = principal("permission-page");
+    let mut peer = StdioPeer::new(application.clone(), store.clone(), owner.clone());
     let fixture = create_pending_permission(&mut peer, &store, &engine, 1).await;
     let frame_id: Uuid =
         sqlx::query_scalar("SELECT frame_id FROM permission_requests WHERE id = $1")
@@ -912,7 +913,7 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
          SELECT gen_random_uuid(), $3, $1, provider_call_id, 'docs/search', $2, 'overflow-input', 0, 'pending', created_at FROM calls",
     )
     .bind(frame_id)
-    .bind(descriptor_digest)
+    .bind(&descriptor_digest)
     .bind(*fixture.run_id.as_uuid())
     .execute(store.pool())
     .await
@@ -933,11 +934,76 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
         "an unanswered client must have a bounded outstanding permission window"
     );
 
-    let found = tokio::time::timeout(Duration::from_secs(6), async {
+    let first_page = outstanding
+        .iter()
+        .map(|message| message["params"]["toolCall"]["toolCallId"].as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    let abandoned = outstanding[0]["params"]["toolCall"]["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    peer.close().await;
+    let mut peer = StdioPeer::new(application, store.clone(), owner);
+    success(
+        peer.request(
+            "initialize",
+            json!({"protocolVersion": 1, "clientCapabilities": {}, "clientInfo": {"name": "fairness-resume", "version": "1.0.0"}}),
+        )
+        .await,
+    );
+    success(
+        peer.request(
+            "session/load",
+            json!({"sessionId": fixture.session["sessionId"], "cwd": "/tmp/kiteframe-permission", "mcpServers": []}),
+        )
+        .await,
+    );
+    outstanding.clear();
+    for _ in 0..32 {
+        outstanding.push(peer.next_message().await);
+    }
+    assert!(outstanding.iter().any(|message| {
+        !first_page.contains(message["params"]["toolCall"]["toolCallId"].as_str().unwrap())
+    }), "a reconnect must continue the durable fair rotation");
+
+    let live_store = store.clone();
+    let live_run = fixture.run_id.clone();
+    let live_descriptor = descriptor_digest.clone();
+    let live_inserter = tokio::spawn(async move {
+        for n in 1..=160 {
+            sqlx::query(
+                "WITH call AS ( \
+                   INSERT INTO tool_calls (id, frame_id, provider_call_id, qualified_name, descriptor_digest, idempotency_key, arguments, state) \
+                   VALUES (gen_random_uuid(), $1, $2, 'docs/search', $3, $4, '{}'::jsonb, 'waiting_for_permission') \
+                 ) \
+                 INSERT INTO permission_requests (id, run_id, frame_id, provider_call_id, qualified_tool, descriptor_digest, input_digest, policy_revision, state) \
+                 VALUES (gen_random_uuid(), $5, $1, $2, 'docs/search', $3, 'live-input', 0, 'pending')",
+            )
+            .bind(frame_id)
+            .bind(format!("live-{n}"))
+            .bind(&live_descriptor)
+            .bind(format!("live-key-{n}"))
+            .bind(*live_run.as_uuid())
+            .execute(live_store.pool())
+            .await
+            .expect("insert live permission");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    let (found_tail, retried_abandoned) = tokio::time::timeout(Duration::from_secs(8), async {
+        let mut found_tail = false;
+        let mut retried_abandoned = false;
         loop {
             for message in outstanding.drain(..) {
                 if message["params"]["toolCall"]["toolCallId"] == "overflow-256" {
-                    return true;
+                    found_tail = true;
+                }
+                if message["params"]["toolCall"]["toolCallId"] == abandoned {
+                    retried_abandoned = true;
+                }
+                if found_tail && retried_abandoned {
+                    return (true, true);
                 }
                 peer.respond(
                     message["id"].clone(),
@@ -952,7 +1018,9 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
     })
     .await
     .expect("permission pagination must continue");
-    assert!(found, "the 257th pending permission must be offered");
+    assert!(found_tail, "the 257th pending permission must be offered");
+    assert!(retried_abandoned, "an abandoned old permission must be retried during sustained inserts");
+    live_inserter.await.expect("live permission inserter");
     peer.close().await;
 }
 
@@ -1279,6 +1347,32 @@ async fn remote_admission_is_bounded_and_database_gated() {
         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
         assert_eq!(remote.available_connection_capacity(), 1);
     }
+
+    let mut failed_upgrade = TcpStream::connect(server.address)
+        .await
+        .expect("connect raw WebSocket upgrade");
+    failed_upgrade
+        .write_all(
+            format!(
+                "GET /acp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer bounded-secret\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+                server.address
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send accepted WebSocket upgrade");
+    let mut failed_upgrade = BufReader::new(failed_upgrade);
+    let mut status = String::new();
+    failed_upgrade.read_line(&mut status).await.expect("upgrade status");
+    assert!(status.contains("101"), "accepted upgrade status: {status}");
+    drop(failed_upgrade);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while remote.available_connection_capacity() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed downstream upgrade must restore admission capacity");
 
     let mut first = WebSocketPeer::connect(server.address, "bounded-secret").await;
     success(

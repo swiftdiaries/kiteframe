@@ -504,7 +504,6 @@ async fn observe_permissions(
         healthy,
     } = observer;
     let mut last_offered = HashMap::<crate::PermissionRequestId, std::time::Instant>::new();
-    let mut cursor = None;
     let mut discovery_session = None;
     let inflight = Arc::new(Mutex::new(HashMap::<
         crate::PermissionRequestId,
@@ -527,7 +526,6 @@ async fn observe_permissions(
         };
         if discovery_session.as_ref() != Some(&session_id) {
             discovery_session = Some(session_id.clone());
-            cursor = None;
             last_offered.clear();
         }
         cancel_resolved_permissions(&store, &inflight).await?;
@@ -558,12 +556,8 @@ async fn observe_permissions(
             .chain(last_offered.keys().cloned())
             .collect::<HashSet<_>>();
         let available = MAX_INFLIGHT_PERMISSIONS - inflight_count;
-        let pending = unresolved_permissions(&store, &session_id, &excluded, cursor, available).await?;
-        if pending.is_empty() {
-            cursor = None;
-        }
+        let pending = unresolved_permissions(&store, &session_id, &excluded, available).await?;
         for delivery in pending {
-            cursor = Some(delivery.cursor);
             let request_id = delivery.request_id.clone();
             if inflight
                 .lock()
@@ -682,20 +676,12 @@ struct PermissionDelivery {
     request_id: crate::PermissionRequestId,
     run_id: crate::RunId,
     pending: crate::PendingPermission,
-    cursor: PermissionCursor,
-}
-
-#[derive(Clone, Copy)]
-struct PermissionCursor {
-    created_at: time::OffsetDateTime,
-    request_id: uuid::Uuid,
 }
 
 async fn unresolved_permissions(
     store: &crate::PostgresStore,
     session_id: &crate::SessionId,
     excluded: &HashSet<crate::PermissionRequestId>,
-    cursor: Option<PermissionCursor>,
     limit: usize,
 ) -> agent_client_protocol::Result<Vec<PermissionDelivery>> {
     let excluded = excluded
@@ -703,23 +689,28 @@ async fn unresolved_permissions(
         .map(|request_id| *request_id.as_uuid())
         .collect::<Vec<_>>();
     let rows = sqlx::query(
-        "SELECT p.id AS request_id, p.run_id, p.created_at, f.id AS frame_id, f.revision, \
+        "WITH claimed AS ( \
+           SELECT p.id FROM permission_requests p \
+           JOIN runs r ON r.id = p.run_id \
+           WHERE r.session_id = $1 AND p.state = 'pending' \
+             AND NOT (p.id = ANY($2)) \
+           ORDER BY COALESCE(p.last_offered_at, p.created_at), p.created_at, p.id \
+           LIMIT $3 FOR UPDATE OF p SKIP LOCKED \
+         ), offered AS ( \
+           UPDATE permission_requests p SET last_offered_at = CURRENT_TIMESTAMP \
+           FROM claimed WHERE p.id = claimed.id RETURNING p.* \
+         ) \
+         SELECT p.id AS request_id, p.run_id, f.id AS frame_id, f.revision, \
          t.id AS tool_call_id, p.provider_call_id, p.qualified_tool, \
          p.descriptor_digest, t.arguments \
-         FROM permission_requests p \
-         JOIN runs r ON r.id = p.run_id \
+         FROM offered p \
          JOIN frames f ON f.id = p.frame_id \
          JOIN tool_calls t ON t.frame_id = p.frame_id \
             AND t.provider_call_id = p.provider_call_id \
-         WHERE r.session_id = $1 AND p.state = 'pending' \
-            AND NOT (p.id = ANY($2)) \
-            AND ($3::timestamptz IS NULL OR (p.created_at, p.id) > ($3, $4)) \
-         ORDER BY p.created_at, p.id LIMIT $5",
+         ORDER BY p.last_offered_at, p.created_at, p.id",
     )
     .bind(*session_id.as_uuid())
     .bind(excluded)
-    .bind(cursor.map(|cursor| cursor.created_at))
-    .bind(cursor.map(|cursor| cursor.request_id))
     .bind(i64::try_from(limit.min(MAX_INFLIGHT_PERMISSIONS)).unwrap_or(1))
     .fetch_all(store.pool())
     .await
@@ -729,10 +720,6 @@ async fn unresolved_permissions(
         .map(|row| PermissionDelivery {
             request_id: crate::PermissionRequestId::new(row.get("request_id")),
             run_id: crate::RunId::new(row.get("run_id")),
-            cursor: PermissionCursor {
-                created_at: row.get("created_at"),
-                request_id: row.get("request_id"),
-            },
             pending: crate::PendingPermission {
                 tool_call_id: row.get("tool_call_id"),
                 frame_id: crate::FrameId::new(row.get("frame_id")),
@@ -1113,22 +1100,39 @@ struct RemoteState {
     v2_runtime_enabled: bool,
     routers: tokio::sync::RwLock<HashMap<RouterKey, Router>>,
     admission: Arc<tokio::sync::Semaphore>,
-    admission_gate: tokio::sync::Mutex<()>,
+    admission_gate: Arc<tokio::sync::Mutex<()>>,
     reservations: Mutex<HashMap<RouterKey, VecDeque<Arc<AdmissionReservation>>>>,
 }
 
-struct AdmissionReservation(Mutex<Option<tokio::sync::OwnedSemaphorePermit>>);
+struct AdmissionReservation {
+    permit: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    gate: Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
+}
 
 impl AdmissionReservation {
-    fn new(permit: tokio::sync::OwnedSemaphorePermit) -> Self {
-        Self(Mutex::new(Some(permit)))
+    fn new(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        gate: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Self {
+        Self {
+            permit: Mutex::new(Some(permit)),
+            gate: Mutex::new(Some(gate)),
+        }
     }
 
     fn take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.0
+        self.gate
+            .lock()
+            .expect("ACP admission gate reservation poisoned")
+            .take();
+        self.permit
             .lock()
             .expect("ACP admission reservation poisoned")
             .take()
+    }
+
+    fn release(&self) {
+        self.take();
     }
 }
 
@@ -1186,7 +1190,7 @@ impl RemoteService {
                 v2_runtime_enabled,
                 routers: tokio::sync::RwLock::new(HashMap::new()),
                 admission: Arc::new(tokio::sync::Semaphore::new(max_connections.max(1))),
-                admission_gate: tokio::sync::Mutex::new(()),
+                admission_gate: Arc::new(tokio::sync::Mutex::new(())),
                 reservations: Mutex::new(HashMap::new()),
             }),
         }
@@ -1251,8 +1255,8 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
     let creates_connection = transport == TransportKind::WebSocket
         || (request.method() == Method::POST
             && !request.headers().contains_key("acp-connection-id"));
-    let _admission_guard = if creates_connection {
-        Some(state.admission_gate.lock().await)
+    let admission_guard = if creates_connection {
+        Some(state.admission_gate.clone().lock_owned().await)
     } else {
         None
     };
@@ -1264,7 +1268,10 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
             Ok(permit) => permit,
             Err(_) => return retryable_response(StatusCode::TOO_MANY_REQUESTS),
         };
-        let reservation = Arc::new(AdmissionReservation::new(permit));
+        let reservation = Arc::new(AdmissionReservation::new(
+            permit,
+            admission_guard.expect("WebSocket admission owns the gate"),
+        ));
         state
             .reservations
             .lock()
@@ -1328,26 +1335,70 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
             })
             .clone()
     };
+    let mut cleanup = reservation
+        .as_ref()
+        .map(|reservation| AdmissionCleanup::new(state.clone(), key.clone(), reservation.clone()));
     let response = router
         .oneshot(request)
         .await
         .expect("the ACP SDK router is infallible");
-    if response.status() != StatusCode::SWITCHING_PROTOCOLS
-        && let Some(reservation) = reservation
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS
+        && let Some(cleanup) = cleanup.take()
     {
-        reservation.take();
-        let mut reservations = state
-            .reservations
-            .lock()
-            .expect("ACP admission reservation lock poisoned");
-        if let Some(queue) = reservations.get_mut(&key) {
-            queue.retain(|queued| !Arc::ptr_eq(queued, &reservation));
-            if queue.is_empty() {
-                reservations.remove(&key);
-            }
-        }
+        cleanup.reap_after(std::time::Duration::from_secs(1));
     }
     response
+}
+
+struct AdmissionCleanup {
+    state: Arc<RemoteState>,
+    key: RouterKey,
+    reservation: Arc<AdmissionReservation>,
+    armed: bool,
+}
+
+impl AdmissionCleanup {
+    fn new(
+        state: Arc<RemoteState>,
+        key: RouterKey,
+        reservation: Arc<AdmissionReservation>,
+    ) -> Self {
+        Self { state, key, reservation, armed: true }
+    }
+
+    fn reap_after(mut self, delay: std::time::Duration) {
+        self.armed = false;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            release_admission_reservation(&self.state, &self.key, &self.reservation);
+        });
+    }
+}
+
+impl Drop for AdmissionCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            release_admission_reservation(&self.state, &self.key, &self.reservation);
+        }
+    }
+}
+
+fn release_admission_reservation(
+    state: &RemoteState,
+    key: &RouterKey,
+    reservation: &Arc<AdmissionReservation>,
+) {
+    reservation.release();
+    let mut reservations = state
+        .reservations
+        .lock()
+        .expect("ACP admission reservation lock poisoned");
+    if let Some(queue) = reservations.get_mut(key) {
+        queue.retain(|queued| !Arc::ptr_eq(queued, reservation));
+        if queue.is_empty() {
+            reservations.remove(key);
+        }
+    }
 }
 
 async fn database_healthy(state: &RemoteState) -> bool {
