@@ -293,8 +293,18 @@ impl PostgresStore {
     }
 
     pub async fn runnable_frames(&self, limit: i64) -> Result<Vec<super::RunnableFrame>, StoreError> {
-        let rows = sqlx::query("SELECT f.id, f.run_id, r.session_id, f.task_name, f.outcome_name, f.statement_index, f.bindings, f.revision, d.compiled_definition FROM frames f JOIN runs r ON r.id = f.run_id JOIN workflow_definitions d ON d.id = r.definition_id WHERE f.state = 'runnable' AND r.state IN ('runnable', 'running') ORDER BY f.created_at, f.id LIMIT $1")
-            .bind(limit.clamp(1, 256)).fetch_all(&self.pool).await?;
+        self.runnable_frames_query("f.state = 'runnable' AND r.state IN ('runnable', 'running')", None, limit).await
+    }
+
+    pub async fn runnable_frames_for_run(&self, run_id: crate::RunId, limit: i64) -> Result<Vec<super::RunnableFrame>, StoreError> {
+        self.runnable_frames_query("f.state = 'runnable' AND r.state IN ('runnable', 'running') AND f.run_id = $1", Some(run_id), limit).await
+    }
+
+    async fn runnable_frames_query(&self, predicate: &str, run_id: Option<crate::RunId>, limit: i64) -> Result<Vec<super::RunnableFrame>, StoreError> {
+        let sql = format!("SELECT f.id, f.run_id, r.session_id, f.task_name, f.outcome_name, f.statement_index, f.bindings, f.revision, d.compiled_definition FROM frames f JOIN runs r ON r.id = f.run_id JOIN workflow_definitions d ON d.id = r.definition_id WHERE {predicate} ORDER BY f.created_at, f.id LIMIT {}", if run_id.is_some() { "$2" } else { "$1" });
+        let mut query = sqlx::query(&sql);
+        if let Some(run_id) = run_id { query = query.bind(*run_id.as_uuid()); }
+        let rows = query.bind(limit.clamp(1, 256)).fetch_all(&self.pool).await?;
         rows.into_iter().map(|row| Ok(super::RunnableFrame {
             id: crate::FrameId::new(row.get("id")), run_id: crate::RunId::new(row.get("run_id")), session_id: crate::SessionId::new(row.get("session_id")), task_name: row.get("task_name"), outcome_name: row.get("outcome_name"), statement_index: row.get::<i32, _>("statement_index") as usize, bindings: row.get("bindings"), revision: row.get::<i64, _>("revision") as u64,
             workflow: serde_json::from_value(row.get("compiled_definition")).map_err(|error| StoreError::InvalidData(error.to_string()))?,
@@ -696,7 +706,7 @@ impl PostgresStore {
         let mut tx = self.pool.begin().await?;
         let frame = sqlx::query("SELECT run_id, parent_frame_id, parent_binding, revision, state FROM frames WHERE id = $1 FOR UPDATE")
             .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
-        if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || !matches!(frame.get::<String, _>("state").as_str(), "running" | "runnable") {
             return Err(StoreError::RevisionConflict);
         }
         let run_id = frame.get::<uuid::Uuid, _>("run_id");

@@ -44,6 +44,15 @@ pub enum EngineError {
 impl Engine {
     pub async fn tick_until_idle(&self) -> Result<usize, EngineError> {
         let frames = self.store.runnable_frames(self.config.scheduler_batch_size).await?;
+        self.tick_frames(frames).await
+    }
+
+    pub async fn tick_run(&self, run_id: crate::RunId) -> Result<usize, EngineError> {
+        let frames = self.store.runnable_frames_for_run(run_id, self.config.scheduler_batch_size).await?;
+        self.tick_frames(frames).await
+    }
+
+    async fn tick_frames(&self, frames: Vec<crate::RunnableFrame>) -> Result<usize, EngineError> {
         let mut applied = 0;
         for frame in frames {
             let Some(outcome) = frame.outcome_name else {
@@ -94,7 +103,7 @@ impl Engine {
         let intent = self.store.begin_tool_call(
             frame.id.clone(), expected_revision, provider_call_id.clone(), qualified_name.clone(),
             binding.descriptor_digest.clone(), arguments.clone(), format!("{}:{}", frame.id.as_uuid(), provider_call_id),
-        ).await?;
+        ).await.map_err(|error| StoreError::InvalidData(format!("persist tool intent: {error}")))?;
         match self.authorizer.authorize(&PolicyRequest {
             session: frame.session_id.clone(), qualified_name: binding.qualified_name.clone(),
             descriptor_digest: binding.descriptor_digest.clone(), capabilities: binding.capabilities,
@@ -106,12 +115,12 @@ impl Engine {
                     frame.session_id.clone(), frame.run_id.clone(), frame.id.clone(), policy_revision,
                     tool.descriptor(), arguments, IdempotencyKey::new(format!("{}:{}", frame.id.as_uuid(), intent.id)).map_err(|error| StoreError::InvalidData(error.to_string()))?,
                 ).map_err(|error| StoreError::InvalidData(error.to_string()))?;
-                let outcome = self.tools.invoke(frame.session_id.clone(), &binding.qualified_name, &binding.descriptor_digest, call)
+                let outcome = tool.invoke(call)
                     .await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
-                self.store.finish_tool_call(frame.id.clone(), intent.id, intent.revision, outcome).await?;
+                self.store.finish_tool_call(frame.id.clone(), intent.id, intent.revision, outcome).await.map_err(|error| StoreError::InvalidData(format!("persist tool result: {error}")))?;
             }
             PolicyDecision::Forbid { .. } => {
-                self.store.finish_tool_call(frame.id.clone(), intent.id, intent.revision, Err(json!({"code":"policy_denied","message":"Tool invocation denied by session policy"}))).await?;
+                self.store.finish_tool_call(frame.id.clone(), intent.id, intent.revision, Err(json!({"code":"policy_denied","message":"Tool invocation denied by session policy"}))).await.map_err(|error| StoreError::InvalidData(format!("persist denied tool result: {error}")))?;
             }
             PolicyDecision::NeedsPermission => {
                 self.store.create_permission_request(frame.id.clone(), intent.revision, NewPermissionRequest {
