@@ -31,7 +31,7 @@ pub use policy::{
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
     Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest, PolicyUpdate, PostgresStore,
-    PublishedDefinition, Question, RunState, RunView, SessionView, StartRun, StoreError, ToolCallIntent,
+    PublishedDefinition, Question, RunState, RunView, RunnableFrame, SessionView, StartRun, StoreError, ToolCallIntent,
 };
 pub use tools::{
     BoundTool, CatalogTool, EffectKind, InProcessToolRegistry, RecoverySupport, ToolCall,

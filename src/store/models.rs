@@ -57,6 +57,18 @@ pub struct RunView {
     pub revision: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct RunnableFrame {
+    pub id: FrameId,
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub task_name: String,
+    pub outcome_name: Option<String>,
+    pub statement_index: usize,
+    pub bindings: Value,
+    pub revision: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunState {
     Runnable,

@@ -292,6 +292,14 @@ impl PostgresStore {
         })
     }
 
+    pub async fn runnable_frames(&self, limit: i64) -> Result<Vec<super::RunnableFrame>, StoreError> {
+        let rows = sqlx::query("SELECT f.id, f.run_id, r.session_id, f.task_name, f.outcome_name, f.statement_index, f.bindings, f.revision FROM frames f JOIN runs r ON r.id = f.run_id WHERE f.state = 'runnable' AND r.state IN ('runnable', 'running') ORDER BY f.created_at, f.id LIMIT $1")
+            .bind(limit.clamp(1, 256)).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| super::RunnableFrame {
+            id: crate::FrameId::new(row.get("id")), run_id: crate::RunId::new(row.get("run_id")), session_id: crate::SessionId::new(row.get("session_id")), task_name: row.get("task_name"), outcome_name: row.get("outcome_name"), statement_index: row.get::<i32, _>("statement_index") as usize, bindings: row.get("bindings"), revision: row.get::<i64, _>("revision") as u64,
+        }).collect())
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,

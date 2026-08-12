@@ -48,6 +48,8 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
     assert_eq!(started.session_id, session.id);
     assert_eq!(started.state, kiteframe::RunState::Runnable);
     assert_eq!(started.revision, 0);
+    let runnable = store.runnable_frames(256).await.expect("list runnable frames");
+    assert!(runnable.iter().any(|frame| frame.id == started.root_frame_id));
     assert_eq!(store.start_run(request.clone()).await.expect("replay"), started);
     let attempt = store
         .begin_model_attempt(started.root_frame_id.clone(), 0, json!({"prompt": "x"}))
