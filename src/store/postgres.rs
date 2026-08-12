@@ -383,6 +383,12 @@ impl PostgresStore {
         Ok(row.get::<i64, _>("revision") as u64)
     }
 
+    pub async fn events_after(&self, session_id: crate::SessionId, run_id: crate::RunId, after: u64, limit: u32) -> Result<Vec<super::RunEvent>, StoreError> {
+        let rows = sqlx::query("SELECT e.sequence, e.kind, e.metadata, e.created_at FROM events e JOIN runs r ON r.id = e.run_id WHERE e.run_id = $1 AND r.session_id = $2 AND e.sequence > $3 ORDER BY e.sequence LIMIT $4")
+            .bind(*run_id.as_uuid()).bind(*session_id.as_uuid()).bind(after as i64).bind(i64::from(limit.clamp(1, 256))).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(|row| super::RunEvent { sequence: row.get::<i64, _>("sequence") as u64, kind: row.get("kind"), metadata: row.get("metadata"), created_at: row.get("created_at") }).collect())
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,

@@ -95,6 +95,14 @@ pub struct PendingPermission {
     pub arguments: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct RunEvent {
+    pub sequence: u64,
+    pub kind: String,
+    pub metadata: Value,
+    pub created_at: time::OffsetDateTime,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunState {
     Runnable,
