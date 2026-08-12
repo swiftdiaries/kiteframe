@@ -86,6 +86,7 @@ impl Engine {
         let tools = recovery::recover_tool_statuses(&self.store, self.tools.as_ref()).await?;
         report.tools_recovered = tools.tools_recovered;
         report.tools_requeued = tools.tools_requeued;
+        report.sessions_waiting_for_mcp = tools.sessions_waiting_for_mcp;
         report.outcomes_unknown = tools.outcomes_unknown;
         Ok(report)
     }
