@@ -5,6 +5,7 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+use super::ProtocolAdapter;
 use crate::PrincipalId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -109,13 +110,13 @@ where
                 Ok((session_id, command)) => application
                     .dispatch(
                         &crate::ApplicationContext {
-                            principal: connection.principal.clone(),
+                            connection_principal: connection.principal.clone(),
                             session_id: Some(session_id),
                         },
                         command,
                     )
                     .await
-                    .map(application_result_json)
+                    .and_then(|result| super::V1Adapter.encode_result(result))
                     .map_err(|error| error.to_string()),
                 Err(error) => Err(error.to_string()),
             },
@@ -132,38 +133,6 @@ where
         writer.flush().await?;
     }
     Ok(())
-}
-
-fn application_result_json(result: crate::ApplicationResult) -> Value {
-    match result {
-        crate::ApplicationResult::Published(definition) => serde_json::json!({"kind":"published", "id":definition.id, "name":definition.name, "version":definition.version, "definition_hash":definition.definition_hash}),
-        crate::ApplicationResult::PolicyUpdated { revision } => serde_json::json!({"kind":"policy_updated", "revision":revision.get()}),
-        crate::ApplicationResult::Run(run) => serde_json::json!({
-            "kind": "run", "id": run.id.as_uuid(), "session_id": run.session_id.as_uuid(),
-            "workflow_name": run.definition.name, "version": run.definition.version,
-            "state": run_state_name(run.state), "revision": run.revision,
-        }),
-        crate::ApplicationResult::Events(events) => {
-            serde_json::json!({"kind":"events", "events": events.into_iter().map(|event| serde_json::json!({"sequence":event.sequence,"kind":event.kind,"metadata":event.metadata,"created_at":event.created_at.to_string()})).collect::<Vec<_>>() })
-        }
-        crate::ApplicationResult::Sessions(sessions) => {
-            serde_json::json!({"kind":"sessions", "sessions": sessions.into_iter().map(|session| serde_json::json!({"id":session.id.as_uuid(),"principal":session.principal.as_str(),"policy_revision":session.policy_revision.get(),"mcp_attached":session.mcp_attached})).collect::<Vec<_>>() })
-        }
-        crate::ApplicationResult::Ack => serde_json::json!({"kind":"ack"}),
-    }
-}
-
-fn run_state_name(state: crate::RunState) -> &'static str {
-    match state {
-        crate::RunState::Runnable => "runnable",
-        crate::RunState::Running => "running",
-        crate::RunState::WaitingForAnswer => "waiting_for_answer",
-        crate::RunState::WaitingForPermission => "waiting_for_permission",
-        crate::RunState::OutcomeUnknown => "outcome_unknown",
-        crate::RunState::Completed => "completed",
-        crate::RunState::Failed => "failed",
-        crate::RunState::Cancelled => "cancelled",
-    }
 }
 
 #[cfg(test)]
@@ -187,7 +156,7 @@ mod tests {
     fn ndjson_request_keeps_transport_session_separate_from_command_payload() {
         let request: super::NdjsonRequest = serde_json::from_value(serde_json::json!({
             "session_id":"019ff3d8-9d86-7de0-9070-0f0185d5f413", "method":"_kiteframe/run/get",
-            "payload":{"run_id":"019ff3d8-9d86-7de0-9070-0f0185d5f413"}
+            "payload":{"runId":"019ff3d8-9d86-7de0-9070-0f0185d5f413"}
         }))
         .unwrap();
         let (session, command) = request.into_command().unwrap();

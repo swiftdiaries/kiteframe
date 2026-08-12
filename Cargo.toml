@@ -15,9 +15,11 @@ path = "src/main.rs"
 
 [features]
 default = []
-acp-v2 = []
+acp-v2 = ["agent-client-protocol/unstable_protocol_v2"]
 
 [dependencies]
+agent-client-protocol = "=2.0.0"
+agent-client-protocol-http = { version = "=2.0.0", features = ["client", "server"] }
 async-trait = "0.1"
 cedar-policy = "=4.11.0"
 cedar-policy-mcp-schema-generator = { version = "=0.6.0", features = ["serde", "serde_json"] }

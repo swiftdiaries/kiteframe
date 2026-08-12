@@ -13,13 +13,16 @@ pub mod schema;
 pub mod store;
 pub mod tools;
 
+pub use config::{ConfigError, HarnessConfig, HarnessMode};
 pub use domain::{
     Capability, CatalogEpochId, FrameId, IdempotencyKey, PermissionRequestId, PolicyRevision,
     PrincipalId, RunId, Secret, SessionId,
 };
-pub use config::{ConfigError, HarnessConfig, HarnessMode};
+pub use engine::{
+    AnswerQuestion, CancelRun, Engine, EngineConfig, EngineError, PermissionChoice, RecoveryReport,
+    ResolvePermission,
+};
 pub use hash::{HashError, canonical_json, canonical_sha256};
-pub use engine::{AnswerQuestion, CancelRun, Engine, EngineConfig, EngineError, PermissionChoice, RecoveryReport, ResolvePermission};
 pub use mcp::{
     AuthenticatedMcpPeer, CatalogRefresh, McpError, McpLimits, McpManager, McpServerConfig,
     RemoteTool, RmcpPeer, closed_schema,
@@ -29,14 +32,24 @@ pub use model::{
     ResponsesClient, ResponsesConfig,
 };
 pub use policy::{
-    CedarAuthorizer, PersistedAuthorizer, OneOfPrimitive, PolicyDecision, PolicyEffect, PolicyError, PolicyRequest,
-    PolicyRule, PolicyTarget, Primitive, SessionAuthorizer, SessionPolicy, TypedAuthorizer,
+    CedarAuthorizer, OneOfPrimitive, PersistedAuthorizer, PolicyDecision, PolicyEffect,
+    PolicyError, PolicyRequest, PolicyRule, PolicyTarget, Primitive, SessionAuthorizer,
+    SessionPolicy, TypedAuthorizer,
 };
-pub use protocol::{Application, ApplicationCommand, ApplicationContext, ApplicationResult, AuthenticatedConnection, EventCursor, GetRun, ProtocolError, PublishWorkflow, StaticBearerAuthenticator, TransportKind, UpdateSessionPolicy, serve_ndjson};
+#[cfg(feature = "acp-v2")]
+pub use protocol::V2Adapter;
+pub use protocol::{
+    Application, ApplicationCommand, ApplicationContext, ApplicationResult,
+    AuthenticatedConnection, CloseSession, EventCursor, GetRun, NegotiatedProtocol, NewSession,
+    ProtocolAdapter, ProtocolError, ProtocolNegotiation, PublishWorkflow, ResumeSession,
+    StaticBearerAuthenticator, TransportKind, UpdateSessionPolicy, V1Adapter, serve_ndjson,
+};
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
-    Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest, PolicyUpdate, PostgresStore,
-    PendingPermission, PublishedDefinition, Question, RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame, SessionView, StartRun, StoreError, SuspensionFrame, ToolCallIntent,
+    Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest,
+    PendingPermission, PolicyUpdate, PostgresStore, PublishedDefinition, Question,
+    RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame, SessionView,
+    StartRun, StoreError, SuspensionFrame, ToolCallIntent,
 };
 pub use tools::{
     BoundTool, CatalogTool, EffectKind, InProcessToolRegistry, RecoverySupport, ToolCall,

@@ -10,8 +10,12 @@ pub use transport::{
     AuthError, AuthenticatedConnection, ConnectionAuthenticator, NdjsonRequest,
     StaticBearerAuthenticator, TransportKind, serve_ndjson,
 };
-pub(crate) use types::command_session;
 pub use types::{
-    ApplicationCommand, ApplicationContext, ApplicationResult, EventCursor, GetRun, ProtocolError,
-    PublishWorkflow, UpdateSessionPolicy,
+    ApplicationCommand, ApplicationContext, ApplicationResult, CloseSession, EventCursor, GetRun,
+    NegotiatedProtocol, NewSession, ProtocolAdapter, ProtocolError, ProtocolNegotiation,
+    PublishWorkflow, ResumeSession, UpdateSessionPolicy,
 };
+pub(crate) use types::{command_session, encode_application_result};
+pub use v1::V1Adapter;
+#[cfg(feature = "acp-v2")]
+pub use v2::V2Adapter;

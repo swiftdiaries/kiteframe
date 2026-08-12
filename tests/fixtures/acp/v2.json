@@ -1,0 +1,68 @@
+{
+  "initialize": {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": 2,
+      "info": { "name": "fixture-client", "version": "2.0.0" },
+      "capabilities": {},
+      "_meta": { "future.trace": { "id": "trace-v2", "sampled": true } }
+    }
+  },
+  "sessionNew": {
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "session/new",
+    "params": {
+      "cwd": "/tmp/kiteframe-v2",
+      "_meta": { "future.session": "new-v2" }
+    }
+  },
+  "sessionList": {
+    "jsonrpc": "2.0",
+    "id": 3,
+    "method": "session/list",
+    "params": {
+      "_meta": { "future.session": "list-v2" }
+    }
+  },
+  "sessionResume": {
+    "jsonrpc": "2.0",
+    "id": 4,
+    "method": "session/resume",
+    "params": {
+      "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413",
+      "cwd": "/tmp/kiteframe-v2",
+      "_meta": { "future.session": "resume-v2" }
+    }
+  },
+  "sessionClose": {
+    "jsonrpc": "2.0",
+    "id": 5,
+    "method": "session/close",
+    "params": {
+      "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413",
+      "_meta": { "future.session": "close-v2" }
+    }
+  },
+  "permission": {
+    "jsonrpc": "2.0",
+    "id": 6,
+    "method": "session/request_permission",
+    "params": {
+      "sessionId": "019ff3d8-9d86-7de0-9070-0f0185d5f413",
+      "title": "Use protected capability",
+      "description": "The workflow requested a protected operation",
+      "subject": {
+        "type": "_kiteframe/capability",
+        "capability": "record.write",
+        "futureField": { "preserve": true }
+      },
+      "options": [
+        { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" }
+      ],
+      "_meta": { "future.permission": ["keep", 2] }
+    }
+  }
+}

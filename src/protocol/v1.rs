@@ -1,57 +1,283 @@
+use std::path::Path;
+
+use agent_client_protocol::schema::{ProtocolVersion, v1 as acp};
+use serde::Deserialize;
 use serde_json::Value;
 
-use super::{ApplicationCommand, ProtocolError};
+use crate::{
+    AnswerQuestion, CancelRun, IdempotencyKey, PolicyRevision, RunId, SessionId, SessionPolicy,
+    StartRun,
+};
 
-/// Stable ACP V1 extension adapter. The surrounding ACP server owns session lifecycle;
-/// this adapter only accepts Kiteframe's namespaced workflow commands.
+use super::{
+    ApplicationCommand, ApplicationResult, EventCursor, GetRun, NewSession, ProtocolAdapter,
+    ProtocolError, PublishWorkflow, ResumeSession, UpdateSessionPolicy, encode_application_result,
+};
+
+/// Stable ACP v1 adapter. Standard ACP messages use SDK DTOs; private wire DTOs
+/// below exist only to translate Kiteframe extensions into application commands.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct V1Adapter;
 
 impl V1Adapter {
-    pub fn decode_extension(method: &str, payload: Value) -> Result<ApplicationCommand, ProtocolError> {
-        match method {
-            "session/list" => Ok(ApplicationCommand::ListSessions),
-            "session/close" => Ok(ApplicationCommand::CloseSession),
-            "_kiteframe/workflow/publish" => decode(payload, ApplicationCommand::Publish),
-            "_kiteframe/session/update-policy" => decode(payload, ApplicationCommand::UpdatePolicy),
-            "_kiteframe/run/start" => decode(payload, ApplicationCommand::Start),
-            "_kiteframe/run/get" => decode(payload, ApplicationCommand::Get),
-            "_kiteframe/run/answer" => decode(payload, ApplicationCommand::Answer),
-            "_kiteframe/run/resolve-permission" => decode(payload, ApplicationCommand::ResolvePermission),
-            "_kiteframe/run/cancel" => decode(payload, ApplicationCommand::Cancel),
-            "_kiteframe/run/events" => decode(payload, ApplicationCommand::ReplayEvents),
-            _ => Err(ProtocolError::Unsupported),
+    pub fn initialize(&self, params: Value) -> Result<Value, ProtocolError> {
+        let request: acp::InitializeRequest = decode(params)?;
+        if request.protocol_version != ProtocolVersion::V1 {
+            return Err(ProtocolError::UnsupportedVersion(
+                request.protocol_version.as_u16(),
+            ));
         }
+
+        let mut response = acp::InitializeResponse::new(ProtocolVersion::V1)
+            .agent_capabilities(acp::AgentCapabilities::new().load_session(true))
+            .agent_info(acp::Implementation::new("kiteframe", crate::VERSION));
+        response.meta = request.meta;
+        serde_json::to_value(response)
+            .map_err(|error| ProtocolError::InvalidPayload(error.to_string()))
+    }
+
+    pub fn decode_session(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<ApplicationCommand, ProtocolError> {
+        match method {
+            "session/new" => {
+                let request: acp::NewSessionRequest = decode(params)?;
+                ensure_empty_session_attachments(
+                    &request.additional_directories,
+                    &request.mcp_servers,
+                )?;
+                Ok(ApplicationCommand::NewSession(NewSession {
+                    working_directory: path_string(&request.cwd)?,
+                }))
+            }
+            "session/load" => {
+                let request: acp::LoadSessionRequest = decode(params)?;
+                ensure_empty_session_attachments(
+                    &request.additional_directories,
+                    &request.mcp_servers,
+                )?;
+                Ok(ApplicationCommand::ResumeSession(ResumeSession {
+                    session_id: session_id(request.session_id)?,
+                    working_directory: path_string(&request.cwd)?,
+                }))
+            }
+            _ => Err(ProtocolError::UnsupportedMethod(method.to_owned())),
+        }
+    }
+
+    pub fn decode_permission(
+        &self,
+        params: Value,
+    ) -> Result<acp::RequestPermissionRequest, ProtocolError> {
+        decode(params)
+    }
+
+    pub fn decode_extension(
+        method: &str,
+        params: Value,
+    ) -> Result<ApplicationCommand, ProtocolError> {
+        <Self as ProtocolAdapter>::decode_extension(&Self, method, params)
     }
 }
 
-fn decode<T: serde::de::DeserializeOwned>(payload: Value, map: impl FnOnce(T) -> ApplicationCommand) -> Result<ApplicationCommand, ProtocolError> {
-    serde_json::from_value(payload).map(map).map_err(|error| ProtocolError::InvalidPayload(error.to_string()))
+impl ProtocolAdapter for V1Adapter {
+    fn decode_extension(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<ApplicationCommand, ProtocolError> {
+        match method {
+            "_kiteframe/workflow/publish" => decode(params).map(PublishDto::into_command),
+            "_kiteframe/run/start" => decode(params).map(StartDto::into_command),
+            "_kiteframe/run/get" => decode(params).map(GetDto::into_command),
+            "_kiteframe/run/answer" => decode(params).map(AnswerDto::into_command),
+            "_kiteframe/run/cancel" => decode(params).map(CancelDto::into_command),
+            "_kiteframe/session/policy/update" => decode(params).map(UpdatePolicyDto::into_command),
+            "_kiteframe/run/event" => decode(params).map(EventCursorDto::into_command),
+            _ => Err(ProtocolError::UnsupportedMethod(method.to_owned())),
+        }
+    }
+
+    fn encode_result(&self, result: ApplicationResult) -> Result<Value, ProtocolError> {
+        Ok(encode_application_result(result))
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::ApplicationCommand;
-    use serde_json::json;
+fn decode<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, ProtocolError> {
+    serde_json::from_value(params).map_err(|error| ProtocolError::InvalidPayload(error.to_string()))
+}
 
-    use super::V1Adapter;
+fn session_id(id: acp::SessionId) -> Result<SessionId, ProtocolError> {
+    uuid::Uuid::parse_str(&id.0)
+        .map(SessionId::new)
+        .map_err(|error| ProtocolError::InvalidPayload(error.to_string()))
+}
 
-    #[test]
-    fn decodes_namespaced_run_start_only() {
-        let command = V1Adapter::decode_extension("_kiteframe/run/start", json!({
-            "session_id": "019ff3d8-9d86-7de0-9070-0f0185d5f413",
-            "workflow_name": "w", "version": null, "input": {}, "idempotency_key": "start"
-        })).expect("start command");
-        assert!(matches!(command, ApplicationCommand::Start(_)));
-        assert!(matches!(V1Adapter::decode_extension("_kiteframe/run/get", json!({"run_id":"019ff3d8-9d86-7de0-9070-0f0185d5f413"})), Ok(ApplicationCommand::Get(_))));
-        assert!(matches!(V1Adapter::decode_extension("session/list", json!({})), Ok(ApplicationCommand::ListSessions)));
-        assert!(matches!(
-            V1Adapter::decode_extension("_kiteframe/workflow/publish", json!({"source":"workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }"})),
-            Ok(ApplicationCommand::Publish(_))
+fn path_string(path: &Path) -> Result<String, ProtocolError> {
+    if !path.is_absolute() {
+        return Err(ProtocolError::InvalidPayload(
+            "working directory must be absolute".to_owned(),
         ));
-        assert!(matches!(
-            V1Adapter::decode_extension("_kiteframe/session/update-policy", json!({"expected_revision":0,"idempotency_key":"policy","policy":{"version":1,"rules":[]}})),
-            Ok(ApplicationCommand::UpdatePolicy(_))
+    }
+    path.to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| ProtocolError::InvalidPayload("working directory is not UTF-8".to_owned()))
+}
+
+fn ensure_empty_session_attachments<T>(
+    additional_directories: &[std::path::PathBuf],
+    mcp_servers: &[T],
+) -> Result<(), ProtocolError> {
+    if !additional_directories.is_empty() || !mcp_servers.is_empty() {
+        return Err(ProtocolError::InvalidPayload(
+            "session attachments are configured by the authenticated connection".to_owned(),
         ));
-        assert!(V1Adapter::decode_extension("tool/call", json!({})).is_err());
+    }
+    Ok(())
+}
+
+type Meta = Option<serde_json::Map<String, Value>>;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PublishDto {
+    source: String,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl PublishDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::Publish(PublishWorkflow {
+            source: self.source,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StartDto {
+    session_id: SessionId,
+    workflow_name: String,
+    version: Option<u32>,
+    input: Value,
+    idempotency_key: IdempotencyKey,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl StartDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::Start(StartRun {
+            session_id: self.session_id,
+            workflow_name: self.workflow_name,
+            version: self.version,
+            input: self.input,
+            idempotency_key: self.idempotency_key,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetDto {
+    run_id: RunId,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl GetDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::Get(GetRun {
+            run_id: self.run_id,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AnswerDto {
+    session_id: SessionId,
+    run_id: RunId,
+    question_id: uuid::Uuid,
+    answer: Value,
+    idempotency_key: IdempotencyKey,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl AnswerDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::Answer(AnswerQuestion {
+            session_id: self.session_id,
+            run_id: self.run_id,
+            question_id: self.question_id,
+            answer: self.answer,
+            idempotency_key: self.idempotency_key,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelDto {
+    session_id: SessionId,
+    run_id: RunId,
+    reason: Option<String>,
+    idempotency_key: IdempotencyKey,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl CancelDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::Cancel(CancelRun {
+            session_id: self.session_id,
+            run_id: self.run_id,
+            reason: self.reason,
+            idempotency_key: self.idempotency_key,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdatePolicyDto {
+    expected_revision: PolicyRevision,
+    idempotency_key: IdempotencyKey,
+    policy: SessionPolicy,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl UpdatePolicyDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::UpdatePolicy(UpdateSessionPolicy {
+            expected_revision: self.expected_revision,
+            idempotency_key: self.idempotency_key,
+            policy: self.policy,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventCursorDto {
+    run_id: RunId,
+    after: i64,
+    limit: u32,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl EventCursorDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::ReplayEvents(EventCursor {
+            run_id: self.run_id,
+            after: self.after,
+            limit: self.limit,
+        })
     }
 }
