@@ -19,7 +19,10 @@ acp-v2 = []
 
 [dependencies]
 async-trait = "0.1"
+cedar-policy = "=4.11.0"
+cedar-policy-mcp-schema-generator = { version = "=0.6.0", features = ["serde", "serde_json"] }
 http = "1"
+mcp-tools-sdk = "=0.4.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "=3.1.2", default-features = false, features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 serde = { version = "1", features = ["derive"] }

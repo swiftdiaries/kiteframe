@@ -5,6 +5,7 @@ pub mod dsl;
 pub mod hash;
 pub mod mcp;
 pub mod model;
+pub mod policy;
 pub mod schema;
 pub mod store;
 pub mod tools;
@@ -21,6 +22,10 @@ pub use mcp::{
 pub use model::{
     ModelClient, ModelError, ModelErrorKind, ModelRequest, ModelResponse, ModelResponseItemKind,
     ResponsesClient, ResponsesConfig,
+};
+pub use policy::{
+    CedarAuthorizer, OneOfPrimitive, PolicyDecision, PolicyEffect, PolicyError, PolicyRequest,
+    PolicyRule, PolicyTarget, Primitive, SessionAuthorizer, SessionPolicy, TypedAuthorizer,
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{

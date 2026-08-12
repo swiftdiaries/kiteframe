@@ -132,6 +132,33 @@ impl PostgresStore {
         Ok(PolicyRevision::new(revision))
     }
 
+    pub async fn append_session_policy(
+        &self,
+        session: SessionId,
+        expected_revision: PolicyRevision,
+        idempotency_key: String,
+        policy: &crate::SessionPolicy,
+        catalog: &ToolCatalogSnapshot,
+    ) -> Result<PolicyRevision, StoreError> {
+        if catalog.session_id() != &session {
+            return Err(StoreError::CatalogScopeViolation);
+        }
+        let compiled = crate::policy::compile(policy, catalog)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let typed_source = serde_json::to_value(policy)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let compiled_cedar = serde_json::to_string(&compiled)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        self.append_policy_rules(PolicyUpdate {
+            session,
+            expected_revision,
+            idempotency_key,
+            typed_source,
+            compiled_cedar,
+        })
+        .await
+    }
+
     pub async fn publish(
         &self,
         session: SessionId,
