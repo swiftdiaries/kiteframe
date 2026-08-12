@@ -296,6 +296,19 @@ impl PostgresStore {
         self.runnable_frames_query("f.state = 'runnable' AND r.state IN ('runnable', 'running')", None, limit).await
     }
 
+    pub async fn get_run(&self, session_id: crate::SessionId, run_id: crate::RunId) -> Result<super::RunView, StoreError> {
+        let row = sqlx::query("SELECT r.id, r.session_id, r.state, r.revision, d.id AS definition_id, d.name AS definition_name, d.version AS definition_version, d.definition_hash FROM runs r JOIN workflow_definitions d ON d.id = r.definition_id WHERE r.id = $1 AND r.session_id = $2")
+            .bind(*run_id.as_uuid()).bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?
+            .ok_or(StoreError::SessionNotFound)?;
+        let root = sqlx::query("SELECT id FROM frames WHERE run_id = $1 AND parent_frame_id IS NULL")
+            .bind(*run_id.as_uuid()).fetch_one(&self.pool).await?;
+        Ok(super::RunView {
+            id: crate::RunId::new(row.get("id")), session_id: crate::SessionId::new(row.get("session_id")), root_frame_id: crate::FrameId::new(root.get("id")),
+            definition: PublishedDefinition { id: row.get("definition_id"), name: row.get("definition_name"), version: row.get::<i32, _>("definition_version") as u32, definition_hash: row.get("definition_hash") },
+            state: run_state(&row.get::<String, _>("state"))?, revision: row.get::<i64, _>("revision") as u64,
+        })
+    }
+
     pub async fn runnable_frames_for_run(&self, run_id: crate::RunId, limit: i64) -> Result<Vec<super::RunnableFrame>, StoreError> {
         self.runnable_frames_query("f.state = 'runnable' AND r.state IN ('runnable', 'running') AND f.run_id = $1", Some(run_id), limit).await
     }
