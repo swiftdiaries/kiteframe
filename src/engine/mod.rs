@@ -79,13 +79,18 @@ impl Engine {
             tools: std::iter::once(completion_tool(task)).chain(self.store.run_tool_bindings(frame.run_id.clone()).await?.into_iter().map(model_tool)).collect(),
         }).await.map_err(|error| StoreError::InvalidData(error.to_string()))?;
         self.store.commit_model_attempt(frame.id.clone(), attempt.attempt, attempt.revision, response.items.clone()).await?;
-        if let Some(completion) = response.items.iter().filter_map(completion_from_item).next_back() {
-            validate_completion(task, &completion.0, &completion.1)?;
-            self.store.record_completion(frame.id, attempt.revision + 1, completion.0, completion.1).await?;
-        } else if let Some((provider_call_id, qualified_name, arguments)) = response.items.iter().filter_map(tool_call_from_item).next_back() {
-            self.invoke_authorized_tool(&frame, attempt.revision + 1, provider_call_id, qualified_name, arguments).await?;
-        } else {
-            return Err(StoreError::InvalidData("model response did not contain complete_task or a tool call".to_owned()).into());
+        let calls = response.items.iter().filter_map(action_from_item).collect::<Vec<_>>();
+        let [call] = calls.as_slice() else {
+            return Err(StoreError::InvalidData("model response must contain exactly one completion or tool call".to_owned()).into());
+        };
+        match call {
+            ModelAction::Completion(outcome, fields) => {
+                validate_completion(task, outcome, fields)?;
+                self.store.record_completion(frame.id, attempt.revision + 1, outcome.clone(), fields.clone()).await?;
+            }
+            ModelAction::ToolCall(provider_call_id, qualified_name, arguments) => {
+                self.invoke_authorized_tool(&frame, attempt.revision + 1, provider_call_id.clone(), qualified_name.clone(), arguments.clone()).await?;
+            }
         }
         Ok(())
     }
@@ -156,6 +161,16 @@ fn tool_call_from_item(item: &Value) -> Option<(String, String, Value)> {
     Some((item.get("call_id").or_else(|| item.get("id"))?.as_str()?.to_owned(), item.get("name")?.as_str()?.to_owned(), arguments))
 }
 
+enum ModelAction {
+    Completion(String, Value),
+    ToolCall(String, String, Value),
+}
+
+fn action_from_item(item: &Value) -> Option<ModelAction> {
+    completion_from_item(item).map(|(outcome, fields)| ModelAction::Completion(outcome, fields))
+        .or_else(|| tool_call_from_item(item).map(|(id, name, arguments)| ModelAction::ToolCall(id, name, arguments)))
+}
+
 fn validate_completion(task: &crate::dsl::CompiledTask, outcome: &str, fields: &Value) -> Result<(), StoreError> {
     let expected = task.completion.outcomes.get(outcome).ok_or_else(|| StoreError::InvalidData("model selected an undeclared outcome".to_owned()))?;
     let actual = fields.as_object().ok_or_else(|| StoreError::InvalidData("model completion fields must be an object".to_owned()))?;
@@ -214,5 +229,14 @@ mod tests {
             Some(("c1".to_owned(), "docs/search".to_owned(), json!({"query":"x"}))),
         );
         assert!(super::tool_call_from_item(&json!({"type":"function_call","call_id":"c1","name":"complete_task","arguments":{}})).is_none());
+    }
+
+    #[test]
+    fn action_parser_keeps_completion_and_tool_calls_distinct() {
+        let actions = [
+            json!({"type":"function_call","call_id":"call-1","name":"docs/search","arguments":{}}),
+            json!({"type":"function_call","call_id":"done-1","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"x"}}}),
+        ].iter().filter_map(super::action_from_item).count();
+        assert_eq!(actions, 2);
     }
 }
