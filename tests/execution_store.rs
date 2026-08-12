@@ -3,7 +3,8 @@ use std::collections::BTreeSet;
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, IdempotencyKey, PostgresStore,
-    PrincipalId, RecoverySupport, StartRun, StoreError, ToolCatalogSnapshot,
+    NewPermissionRequest, PermissionRequestId, PolicyRevision, PrincipalId, RecoverySupport,
+    StartRun, StoreError, ToolCatalogSnapshot,
 };
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
@@ -62,6 +63,65 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         )
         .await
         .expect("persist ordered model result");
+    let tool_call = store
+        .begin_tool_call(
+            started.root_frame_id.clone(),
+            2,
+            "provider-call-1".to_owned(),
+            "docs/search".to_owned(),
+            catalog.tools()["docs/search"].descriptor_digest().to_owned(),
+            json!({"query": "durable"}),
+            "tool-attempt-1".to_owned(),
+        )
+        .await
+        .expect("persist tool intent");
+    assert_eq!(tool_call.revision, 3);
+    assert_eq!(
+        store
+            .begin_tool_call(
+                started.root_frame_id.clone(),
+                2,
+                "provider-call-1".to_owned(),
+                "docs/search".to_owned(),
+                catalog.tools()["docs/search"].descriptor_digest().to_owned(),
+                json!({"query": "durable"}),
+                "tool-attempt-1".to_owned(),
+            )
+            .await
+            .expect("replay tool intent"),
+        tool_call
+    );
+    let permission = NewPermissionRequest {
+        id: PermissionRequestId::new(Uuid::now_v7()),
+        provider_call_id: tool_call.provider_call_id.clone(),
+        qualified_tool: "docs/search".to_owned(),
+        descriptor_digest: catalog.tools()["docs/search"].descriptor_digest().to_owned(),
+        input_digest: kiteframe::canonical_sha256(&json!({"query": "durable"})).unwrap(),
+        policy_revision: PolicyRevision::new(0),
+    };
+    store
+        .create_permission_request(started.root_frame_id.clone(), tool_call.revision, permission.clone())
+        .await
+        .expect("persist permission request");
+    store
+        .resolve_permission(
+            started.root_frame_id.clone(),
+            permission.id,
+            4,
+            json!({"decision": "allow"}),
+            "approve-1".to_owned(),
+        )
+        .await
+        .expect("resolve permission request");
+    store
+        .finish_tool_call(
+            started.root_frame_id.clone(),
+            tool_call.id,
+            5,
+            Ok(json!({"results": []})),
+        )
+        .await
+        .expect("persist tool result");
     assert!(matches!(
         store
             .start_run(StartRun { input: json!({"query": "changed"}), ..StartRun {

@@ -74,6 +74,24 @@ pub struct ModelAttempt {
     pub revision: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolCallIntent {
+    pub id: uuid::Uuid,
+    pub frame_id: FrameId,
+    pub provider_call_id: String,
+    pub revision: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewPermissionRequest {
+    pub id: crate::PermissionRequestId,
+    pub provider_call_id: String,
+    pub qualified_tool: String,
+    pub descriptor_digest: String,
+    pub input_digest: String,
+    pub policy_revision: PolicyRevision,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("store database error: {0}")]

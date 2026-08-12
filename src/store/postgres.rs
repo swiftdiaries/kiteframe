@@ -372,6 +372,194 @@ impl PostgresStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn begin_tool_call(
+        &self,
+        frame_id: crate::FrameId,
+        expected_revision: u64,
+        provider_call_id: String,
+        qualified_name: String,
+        descriptor_digest: String,
+        arguments: Value,
+        idempotency_key: String,
+    ) -> Result<super::ToolCallIntent, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::FrameNotFound)?;
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if let Some(existing) = sqlx::query("SELECT id, provider_call_id, qualified_name, descriptor_digest, arguments FROM tool_calls WHERE frame_id = $1 AND idempotency_key = $2")
+            .bind(*frame_id.as_uuid()).bind(&idempotency_key).fetch_optional(&mut *tx).await?
+        {
+            let existing_arguments = existing.get::<Value, _>("arguments");
+            if existing.get::<String, _>("provider_call_id") != provider_call_id
+                || existing.get::<String, _>("qualified_name") != qualified_name
+                || existing.get::<String, _>("descriptor_digest") != descriptor_digest
+                || canonical_sha256(&existing_arguments).map_err(|error| StoreError::InvalidData(error.to_string()))?
+                    != canonical_sha256(&arguments).map_err(|error| StoreError::InvalidData(error.to_string()))?
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            return Ok(super::ToolCallIntent {
+                id: existing.get("id"),
+                frame_id,
+                provider_call_id,
+                revision: frame.get::<i64, _>("revision") as u64,
+            });
+        }
+        if frame.get::<i64, _>("revision") as u64 != expected_revision
+            || frame.get::<String, _>("state") != "running"
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        let binding = sqlx::query("SELECT 1 FROM run_tool_bindings WHERE run_id = $1 AND qualified_name = $2 AND descriptor_digest = $3")
+            .bind(run_id).bind(&qualified_name).bind(&descriptor_digest).fetch_optional(&mut *tx).await?;
+        if binding.is_none() {
+            return Err(StoreError::CatalogScopeViolation);
+        }
+        let id = uuid::Uuid::now_v7();
+        sqlx::query("INSERT INTO tool_calls (id, frame_id, provider_call_id, qualified_name, descriptor_digest, idempotency_key, arguments, state) VALUES ($1, $2, $3, $4, $5, $6, $7, 'intent')")
+            .bind(id).bind(*frame_id.as_uuid()).bind(&provider_call_id).bind(&qualified_name).bind(&descriptor_digest).bind(idempotency_key).bind(arguments).execute(&mut *tx).await?;
+        let revision = expected_revision + 1;
+        sqlx::query("UPDATE frames SET revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        append_event(&mut tx, run_id, "tool.intent", json!({"frame_id": frame_id.as_uuid(), "tool_call_id": id, "qualified_name": qualified_name, "descriptor_digest": descriptor_digest})).await?;
+        tx.commit().await?;
+        Ok(super::ToolCallIntent { id, frame_id, provider_call_id, revision })
+    }
+
+    pub async fn finish_tool_call(
+        &self,
+        frame_id: crate::FrameId,
+        tool_call_id: uuid::Uuid,
+        expected_revision: u64,
+        outcome: Result<Value, Value>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision
+            || frame.get::<String, _>("state") != "running"
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
+        let call = sqlx::query("SELECT state FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
+            .bind(tool_call_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| StoreError::InvalidData("tool call was not found for frame".to_owned()))?;
+        if call.get::<String, _>("state") != "intent" {
+            return Err(StoreError::RevisionConflict);
+        }
+        match outcome {
+            Ok(result) => {
+                sqlx::query("UPDATE tool_calls SET state = 'completed', result = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                    .bind(result).bind(tool_call_id).execute(&mut *tx).await?;
+                append_event(&mut tx, run_id, "tool.completed", json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id})).await?;
+            }
+            Err(error) => {
+                sqlx::query("UPDATE tool_calls SET state = 'failed', error = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                    .bind(error).bind(tool_call_id).execute(&mut *tx).await?;
+                append_event(&mut tx, run_id, "tool.failed", json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id})).await?;
+            }
+        }
+        sqlx::query("UPDATE frames SET revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind((expected_revision + 1) as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn create_permission_request(
+        &self,
+        frame_id: crate::FrameId,
+        expected_revision: u64,
+        request: super::NewPermissionRequest,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT f.run_id, f.revision, f.state, r.session_id FROM frames f JOIN runs r ON r.id = f.run_id WHERE f.id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision
+            || frame.get::<String, _>("state") != "running"
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
+        let policy = sqlx::query("SELECT current_policy_revision FROM sessions WHERE id = $1")
+            .bind(frame.get::<uuid::Uuid, _>("session_id")).fetch_one(&mut *tx).await?;
+        if policy.get::<i64, _>("current_policy_revision") as u64 != request.policy_revision.get() {
+            return Err(StoreError::RevisionConflict);
+        }
+        let call = sqlx::query("SELECT arguments, state FROM tool_calls WHERE frame_id = $1 AND provider_call_id = $2 AND qualified_name = $3 AND descriptor_digest = $4 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).bind(&request.provider_call_id).bind(&request.qualified_tool).bind(&request.descriptor_digest).fetch_optional(&mut *tx).await?
+            .ok_or(StoreError::CatalogScopeViolation)?;
+        if call.get::<String, _>("state") != "intent"
+            || canonical_sha256(&call.get::<Value, _>("arguments")).map_err(|error| StoreError::InvalidData(error.to_string()))? != request.input_digest
+        {
+            return Err(StoreError::CatalogScopeViolation);
+        }
+        sqlx::query("INSERT INTO permission_requests (id, run_id, frame_id, provider_call_id, qualified_tool, descriptor_digest, input_digest, policy_revision, state) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')")
+            .bind(*request.id.as_uuid()).bind(run_id).bind(*frame_id.as_uuid()).bind(&request.provider_call_id).bind(&request.qualified_tool).bind(&request.descriptor_digest).bind(&request.input_digest).bind(request.policy_revision.get() as i64).execute(&mut *tx).await?;
+        let revision = expected_revision + 1;
+        sqlx::query("UPDATE frames SET state = 'waiting_for_permission', revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE runs SET state = 'waiting_for_permission', updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(run_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE tool_calls SET state = 'waiting_for_permission', updated_at = CURRENT_TIMESTAMP WHERE frame_id = $1 AND provider_call_id = $2")
+            .bind(*frame_id.as_uuid()).bind(&request.provider_call_id).execute(&mut *tx).await?;
+        append_event(&mut tx, run_id, "permission.requested", json!({"frame_id": frame_id.as_uuid(), "request_id": request.id.as_uuid(), "provider_call_id": request.provider_call_id, "qualified_tool": request.qualified_tool, "descriptor_digest": request.descriptor_digest, "policy_revision": request.policy_revision.get()})).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn resolve_permission(
+        &self,
+        frame_id: crate::FrameId,
+        request_id: crate::PermissionRequestId,
+        expected_revision: u64,
+        resolution: Value,
+        idempotency_key: String,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
+        let request = sqlx::query("SELECT state, resolution_idempotency_key FROM permission_requests WHERE id = $1 AND frame_id = $2 FOR UPDATE")
+            .bind(*request_id.as_uuid()).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| StoreError::InvalidData("permission request was not found for frame".to_owned()))?;
+        if request.get::<String, _>("state") == "resolved" {
+            if request.get::<Option<String>, _>("resolution_idempotency_key") == Some(idempotency_key) {
+                return Ok(());
+            }
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if frame.get::<i64, _>("revision") as u64 != expected_revision
+            || frame.get::<String, _>("state") != "waiting_for_permission"
+            || request.get::<String, _>("state") != "pending"
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        sqlx::query("UPDATE permission_requests SET state = 'resolved', resolution = $1, resolution_idempotency_key = $2, resolved_at = CURRENT_TIMESTAMP WHERE id = $3")
+            .bind(resolution).bind(idempotency_key).bind(*request_id.as_uuid()).execute(&mut *tx).await?;
+        let revision = expected_revision + 1;
+        sqlx::query("UPDATE frames SET state = 'running', revision = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE runs SET state = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(run_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE tool_calls SET state = 'intent', updated_at = CURRENT_TIMESTAMP WHERE frame_id = $1 AND provider_call_id = (SELECT provider_call_id FROM permission_requests WHERE id = $2)")
+            .bind(*frame_id.as_uuid()).bind(*request_id.as_uuid()).execute(&mut *tx).await?;
+        append_event(&mut tx, run_id, "permission.resolved", json!({"frame_id": frame_id.as_uuid(), "request_id": request_id.as_uuid()})).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn publish(
         &self,
         session: SessionId,
