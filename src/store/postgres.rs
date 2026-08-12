@@ -641,6 +641,9 @@ impl PostgresStore {
         sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
         let revision = expected_revision + 1;
         match command {
+            super::FrameCommand::StartCall(_) | super::FrameCommand::StartParallel(_) | super::FrameCommand::SuspendAsk(_) => {
+                return Err(StoreError::InvalidData("nonterminal frame commands are not yet persisted".to_owned()));
+            }
             super::FrameCommand::Goto { task_name, bindings } => {
                 sqlx::query("UPDATE frames SET task_name = $1, bindings = $2, state = 'runnable', revision = $3, updated_at = CURRENT_TIMESTAMP WHERE id = $4")
                     .bind(task_name).bind(serde_json::to_value(bindings).map_err(|error| StoreError::InvalidData(error.to_string()))?).bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde_json::{Number, Value};
 use thiserror::Error;
 
-use crate::dsl::{CompiledStatement, CompiledValue, CompiledWorkflow};
-use crate::{Bindings, FrameCommand};
+use crate::dsl::{CompiledStatement, CompiledType, CompiledValue, CompiledWorkflow};
+use crate::{Bindings, ClosedSchema, FrameCommand, NewChild, Question};
 
 #[derive(Clone, Debug)]
 pub struct FrameSnapshot {
@@ -41,7 +41,27 @@ pub fn next_command(
             code: resolve(code, &frame.bindings)?.as_str().ok_or_else(|| TransitionError::Corrupt("failure code is not a string".to_owned()))?.to_owned(),
             message: resolve(message, &frame.bindings)?.as_str().ok_or_else(|| TransitionError::Corrupt("failure message is not a string".to_owned()))?.to_owned(),
         }),
-        CompiledStatement::Call { .. } | CompiledStatement::Parallel { .. } | CompiledStatement::Ask { .. } => Err(TransitionError::Unsupported),
+        CompiledStatement::Call { binding, call } => Ok(FrameCommand::StartCall(NewChild {
+            target: call.task.clone(), binding: binding.clone(), arguments: resolve_bindings(&call.arguments, &frame.bindings)?, branch_index: 0,
+        })),
+        CompiledStatement::Parallel { calls } => Ok(FrameCommand::StartParallel(calls.iter().enumerate().map(|(branch_index, child)| Ok(NewChild {
+            target: child.call.task.clone(), binding: child.binding.clone(), arguments: resolve_bindings(&child.call.arguments, &frame.bindings)?, branch_index: branch_index as i32,
+        })).collect::<Result<Vec<_>, TransitionError>>()?)),
+        CompiledStatement::Ask { binding, answer_type, question } => Ok(FrameCommand::SuspendAsk(Question {
+            id: uuid::Uuid::now_v7(), binding: binding.clone(), text: resolve(question, &frame.bindings)?.as_str().ok_or_else(|| TransitionError::Corrupt("question is not a string".to_owned()))?.to_owned(), schema: closed_schema(answer_type)?,
+        })),
+    }
+}
+
+fn closed_schema(ty: &CompiledType) -> Result<ClosedSchema, TransitionError> {
+    match ty {
+        CompiledType::String => Ok(ClosedSchema::string()),
+        CompiledType::Integer => Ok(ClosedSchema::integer()),
+        CompiledType::Number => Ok(ClosedSchema::number()),
+        CompiledType::Boolean => Ok(ClosedSchema::boolean()),
+        CompiledType::Optional(inner) => Ok(ClosedSchema::nullable(closed_schema(inner)?)),
+        CompiledType::List(inner) => Ok(ClosedSchema::array(closed_schema(inner)?)),
+        CompiledType::Record(_) => Err(TransitionError::Corrupt("record answer schemas require workflow record expansion".to_owned())),
     }
 }
 

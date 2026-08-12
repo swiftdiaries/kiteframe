@@ -101,10 +101,21 @@ pub struct Question {
     pub schema: crate::ClosedSchema,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewChild {
+    pub target: String,
+    pub binding: String,
+    pub arguments: Bindings,
+    pub branch_index: i32,
+}
+
 pub type Bindings = BTreeMap<String, Value>;
 
 #[derive(Clone, Debug)]
 pub enum FrameCommand {
+    StartCall(NewChild),
+    StartParallel(Vec<NewChild>),
+    SuspendAsk(Question),
     Goto { task_name: String, bindings: Bindings },
     Complete(Value),
     Fail { code: String, message: String },
