@@ -40,3 +40,21 @@ fn rejects_missing_bindings_and_corrupt_cursors() {
     let corrupt = FrameSnapshot { statement_index: 1, ..missing };
     assert!(matches!(next_command(&workflow, &corrupt), Err(TransitionError::Corrupt(_))));
 }
+
+#[test]
+fn emits_call_parallel_and_ask_commands_in_source_order() {
+    let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(2), [])
+        .expect("empty catalog");
+    let workflow = compile(
+        "workflow w(value: string) -> string { start t(value: value) } task t(value: string) -> string { prompt \"\"\"x\"\"\" tools [] on call_one() { child = call c(value: value) done child } on parallel_one() { parallel { left = call c(value: value) right = call c(value: value) } done value } on ask_one(question: string) { answer = ask string question done answer } } task c(value: string) -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done value } }",
+        &catalog,
+        &Limits::default(),
+    ).expect("compile");
+    let bindings = BTreeMap::from([("value".to_owned(), json!("v")), ("question".to_owned(), json!("q"))]);
+    let call = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "call_one".to_owned(), statement_index: 0, bindings: bindings.clone() }).expect("call");
+    assert!(matches!(call, FrameCommand::StartCall(child) if child.target == "c" && child.binding == "child"));
+    let parallel = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "parallel_one".to_owned(), statement_index: 0, bindings: bindings.clone() }).expect("parallel");
+    assert!(matches!(parallel, FrameCommand::StartParallel(children) if children.iter().map(|child| child.binding.as_str()).collect::<Vec<_>>() == ["left", "right"]));
+    let ask = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "ask_one".to_owned(), statement_index: 0, bindings }).expect("ask");
+    assert!(matches!(ask, FrameCommand::SuspendAsk(question) if question.text == "q"));
+}
