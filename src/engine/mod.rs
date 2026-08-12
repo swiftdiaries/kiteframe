@@ -7,6 +7,7 @@ pub use recovery::RecoveryReport;
 use std::sync::Arc;
 
 use thiserror::Error;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
@@ -24,7 +25,8 @@ pub struct Engine {
     pub config: EngineConfig,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PermissionChoice {
     AllowOnce,
     AllowToolForSession,
@@ -32,7 +34,7 @@ pub enum PermissionChoice {
     DenyToolForSession,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ResolvePermission {
     pub session_id: crate::SessionId,
     pub run_id: crate::RunId,
@@ -41,7 +43,7 @@ pub struct ResolvePermission {
     pub idempotency_key: crate::IdempotencyKey,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct AnswerQuestion {
     pub session_id: crate::SessionId,
     pub run_id: crate::RunId,
@@ -50,7 +52,7 @@ pub struct AnswerQuestion {
     pub idempotency_key: crate::IdempotencyKey,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct CancelRun {
     pub session_id: crate::SessionId,
     pub run_id: crate::RunId,

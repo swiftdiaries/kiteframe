@@ -1,3 +1,4 @@
+use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{AnswerQuestion, CancelRun, PrincipalId, ResolvePermission, RunEvent, RunId, RunView, SessionId, StartRun};
@@ -8,12 +9,12 @@ pub struct ApplicationContext {
     pub session_id: Option<SessionId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct GetRun {
     pub run_id: RunId,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct EventCursor {
     pub run_id: RunId,
     pub after: u64,
