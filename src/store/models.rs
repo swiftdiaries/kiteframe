@@ -92,6 +92,14 @@ pub struct NewPermissionRequest {
     pub policy_revision: PolicyRevision,
 }
 
+#[derive(Clone, Debug)]
+pub struct Question {
+    pub id: uuid::Uuid,
+    pub binding: String,
+    pub text: String,
+    pub schema: crate::ClosedSchema,
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("store database error: {0}")]
