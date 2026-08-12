@@ -68,7 +68,7 @@ async fn permitted_model_tool_call_replays_output_then_completes() {
     let source = format!("workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}");
     let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
     let definition = store.publish(session.id.clone(), &workflow, &source).await.unwrap();
-    let run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name, version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
+    let run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name.clone(), version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
     assert_eq!(store.runnable_frames_for_run(run.id.clone(), 16).await.unwrap().into_iter().find(|frame| frame.id == run.root_frame_id).unwrap().session_id, session.id);
     registry.bound_tool(session.id.clone(), "docs/search", descriptor.descriptor_digest()).unwrap();
     let model = Arc::new(ScriptedModel(Mutex::new(VecDeque::from([
@@ -131,23 +131,48 @@ async fn conflicting_session_permission_choices_commit_one_matching_policy_atomi
     let source = format!("workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}");
     let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
     let definition = store.publish(session.id.clone(), &workflow, &source).await.unwrap();
-    let run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name, version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
-    let engine = Engine { store: store.clone(), model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([vec![json!({"type":"function_call","call_id":"race-call","name":"docs/search","arguments":{}})]])))), tools: registry, authorizer: Arc::new(RequirePermission), config: EngineConfig::default() };
-    engine.tick_run(run.id.clone()).await.unwrap();
+    let workflow_name = definition.name.clone();
+    let run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name.clone(), version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
+    let second_run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name, version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
+    let engine = Engine { store: store.clone(), model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([
+        vec![json!({"type":"function_call","call_id":"race-call-a","name":"docs/search","arguments":{}})],
+        vec![json!({"type":"function_call","call_id":"race-call-b","name":"docs/search","arguments":{}})],
+        vec![json!({"type":"function_call","call_id":"close-race-call","name":"docs/search","arguments":{}})],
+    ])))), tools: registry, authorizer: Arc::new(RequirePermission), config: EngineConfig::default() };
+    let (first_tick, second_tick) = tokio::join!(engine.tick_run(run.id.clone()), engine.tick_run(second_run.id.clone()));
+    first_tick.unwrap();
+    second_tick.unwrap();
     let request_id: Uuid = sqlx::query_scalar("SELECT id FROM permission_requests WHERE run_id = $1").bind(*run.id.as_uuid()).fetch_one(store.pool()).await.unwrap();
+    let second_request_id: Uuid = sqlx::query_scalar("SELECT id FROM permission_requests WHERE run_id = $1").bind(*second_run.id.as_uuid()).fetch_one(store.pool()).await.unwrap();
     let key = IdempotencyKey::new(format!("permission-race-{}", Uuid::now_v7())).unwrap();
     let allow = ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::AllowToolForSession, idempotency_key: key.clone() };
-    let deny = ResolvePermission { session_id: session.id.clone(), run_id: run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(request_id), choice: PermissionChoice::DenyToolForSession, idempotency_key: key };
+    let deny = ResolvePermission { session_id: session.id.clone(), run_id: second_run.id.clone(), permission_request_id: kiteframe::PermissionRequestId::new(second_request_id), choice: PermissionChoice::DenyToolForSession, idempotency_key: key };
     let (allow_result, deny_result) = tokio::join!(engine.resolve_permission(allow), engine.resolve_permission(deny));
-    assert_eq!(allow_result.is_ok() as u8 + deny_result.is_ok() as u8, 1);
-    let loser = if allow_result.is_err() { allow_result } else { deny_result };
-    assert!(matches!(loser, Err(kiteframe::EngineError::Store(kiteframe::StoreError::IdempotencyConflict))), "unexpected losing decision result: {loser:?}");
-    let resolution: serde_json::Value = sqlx::query_scalar("SELECT resolution FROM permission_requests WHERE id = $1").bind(request_id).fetch_one(store.pool()).await.unwrap();
+    let committed = allow_result.is_ok() as usize + deny_result.is_ok() as usize;
+    assert!(committed >= 1, "at least one concurrent decision must commit");
+    for failure in [allow_result.as_ref().err(), deny_result.as_ref().err()].into_iter().flatten() {
+        assert!(matches!(failure, kiteframe::EngineError::Store(kiteframe::StoreError::PolicyRevisionConflict)), "unexpected losing decision result: {failure:?}");
+    }
     let policy = store.current_session_policy(session.id.clone()).await.unwrap();
-    assert_eq!(policy.rules.len(), 1);
-    let expected_effect = if resolution["choice"] == "allow_tool_for_session" { kiteframe::PolicyEffect::Permit } else { kiteframe::PolicyEffect::Forbid };
-    assert_eq!(policy.rules[0].effect, expected_effect);
-    assert_eq!(store.policy_revision(session.id).await.unwrap().get(), 1);
+    assert_eq!(policy.rules.len(), committed, "no committed policy rule may be overwritten");
+    for (result, permission_id, expected_effect) in [
+        (&allow_result, request_id, kiteframe::PolicyEffect::Permit),
+        (&deny_result, second_request_id, kiteframe::PolicyEffect::Forbid),
+    ] {
+        if result.is_ok() {
+            assert!(policy.rules.iter().any(|rule| rule.rule_id == format!("permission-{permission_id}") && rule.effect == expected_effect));
+        }
+    }
+    assert_eq!(store.policy_revision(session.id.clone()).await.unwrap().get(), committed as u64);
+
+    let close_race_run = store.start_run(StartRun { session_id: session.id.clone(), workflow_name, version: Some(definition.version), input: json!({}), idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap() }).await.unwrap();
+    engine.tick_run(close_race_run.id.clone()).await.unwrap();
+    let close_race_request: Uuid = sqlx::query_scalar("SELECT id FROM permission_requests WHERE run_id = $1").bind(*close_race_run.id.as_uuid()).fetch_one(store.pool()).await.unwrap();
+    let resolution = engine.resolve_permission(ResolvePermission { session_id: session.id.clone(), run_id: close_race_run.id, permission_request_id: kiteframe::PermissionRequestId::new(close_race_request), choice: PermissionChoice::AllowToolForSession, idempotency_key: IdempotencyKey::new(format!("close-race-{}", Uuid::now_v7())).unwrap() });
+    let closing = store.close_session_and_cancel_work(session.id.clone(), &session.principal);
+    let (resolution, closing) = tokio::time::timeout(std::time::Duration::from_secs(3), async { tokio::join!(resolution, closing) }).await.expect("session close and permission response must not deadlock");
+    closing.unwrap();
+    assert!(resolution.is_ok() || matches!(resolution, Err(kiteframe::EngineError::Store(kiteframe::StoreError::SessionClosed | kiteframe::StoreError::RevisionConflict))), "unexpected concurrent resolution result: {resolution:?}");
 }
 
 #[tokio::test]

@@ -218,24 +218,41 @@ impl PostgresStore {
         .await
     }
 
-    pub async fn current_session_policy(&self, session: SessionId) -> Result<crate::SessionPolicy, StoreError> {
-        let exists = sqlx::query("SELECT 1 FROM sessions WHERE id = $1")
+    pub async fn current_session_policy(
+        &self,
+        session: SessionId,
+    ) -> Result<crate::SessionPolicy, StoreError> {
+        Ok(self.current_session_policy_snapshot(session).await?.0)
+    }
+
+    pub async fn current_session_policy_snapshot(
+        &self,
+        session: SessionId,
+    ) -> Result<(crate::SessionPolicy, PolicyRevision), StoreError> {
+        let row = sqlx::query(
+            "SELECT s.current_policy_revision, p.typed_source \
+             FROM sessions s \
+             LEFT JOIN LATERAL ( \
+               SELECT typed_source FROM session_policy_rules \
+               WHERE session_id = s.id ORDER BY revision DESC LIMIT 1 \
+             ) p ON TRUE WHERE s.id = $1",
+        )
             .bind(*session.as_uuid())
             .fetch_optional(&self.pool)
             .await?
-            .is_some();
-        if !exists {
-            return Err(StoreError::SessionNotFound);
-        }
-        let source = sqlx::query("SELECT typed_source FROM session_policy_rules WHERE session_id = $1 ORDER BY revision DESC LIMIT 1")
-            .bind(*session.as_uuid())
-            .fetch_optional(&self.pool)
-            .await?
-            .map(|row| row.get::<Value, _>("typed_source"));
-        match source {
-            Some(source) => serde_json::from_value(source).map_err(|error| StoreError::InvalidData(error.to_string())),
-            None => Ok(crate::SessionPolicy { version: 1, rules: vec![] }),
-        }
+            .ok_or(StoreError::SessionNotFound)?;
+        let policy = match row.get::<Option<Value>, _>("typed_source") {
+            Some(source) => serde_json::from_value(source)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+            None => crate::SessionPolicy {
+                version: 1,
+                rules: vec![],
+            },
+        };
+        Ok((
+            policy,
+            PolicyRevision::new(row.get::<i64, _>("current_policy_revision") as u64),
+        ))
     }
 
     pub async fn start_run(&self, request: StartRun) -> Result<RunView, StoreError> {
@@ -908,10 +925,37 @@ impl PostgresStore {
         idempotency_key: String,
         policy_update: Option<PolicyUpdate>,
     ) -> Result<bool, StoreError> {
+        let aggregate = sqlx::query(
+            "SELECT r.id AS run_id, r.session_id FROM frames f \
+             JOIN runs r ON r.id = f.run_id WHERE f.id = $1",
+        )
+        .bind(*frame_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::FrameNotFound)?;
+        let run_id: uuid::Uuid = aggregate.get("run_id");
+        let session_id: uuid::Uuid = aggregate.get("session_id");
         let mut tx = self.pool.begin().await?;
-        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
-        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
-            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        let session = sqlx::query(
+            "SELECT current_policy_revision, state FROM sessions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::SessionNotFound)?;
+        if session.get::<String, _>("state") != "active" {
+            return Err(StoreError::SessionClosed);
+        }
+        lock_run(&mut tx, run_id).await?;
+        let frame =
+            sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+                .bind(*frame_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<uuid::Uuid, _>("run_id") != run_id {
+            return Err(StoreError::RevisionConflict);
+        }
         let request = sqlx::query("SELECT state, resolution_idempotency_key FROM permission_requests WHERE id = $1 AND frame_id = $2 FOR UPDATE")
             .bind(*request_id.as_uuid()).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
             .ok_or_else(|| StoreError::InvalidData("permission request was not found for frame".to_owned()))?;
@@ -928,11 +972,11 @@ impl PostgresStore {
             return Err(StoreError::RevisionConflict);
         }
         if let Some(update) = policy_update {
+            if *update.session.as_uuid() != session_id {
+                return Err(StoreError::CatalogScopeViolation);
+            }
             let digest = canonical_sha256(&update.typed_source)
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-            let session = sqlx::query("SELECT s.current_policy_revision FROM sessions s JOIN runs r ON r.session_id = s.id WHERE s.id = $1 AND r.id = $2 FOR UPDATE OF s")
-                .bind(*update.session.as_uuid()).bind(run_id).fetch_optional(&mut *tx).await?
-                .ok_or(StoreError::SessionNotFound)?;
             if let Some(existing) = sqlx::query("SELECT source_digest, revision FROM session_policy_rules WHERE session_id = $1 AND idempotency_key = $2")
                 .bind(*update.session.as_uuid()).bind(&update.idempotency_key).fetch_optional(&mut *tx).await?
             {

@@ -133,9 +133,9 @@ impl Engine {
             catalog
                 .resolve(&pending.qualified_name, &pending.descriptor_digest)
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-            let mut policy = self
+            let (mut policy, revision) = self
                 .store
-                .current_session_policy(request.session_id.clone())
+                .current_session_policy_snapshot(request.session_id.clone())
                 .await?;
             let rule_id = format!("permission-{}", request.permission_request_id.as_uuid());
             if policy.rules.iter().any(|rule| rule.rule_id == rule_id) {
@@ -164,10 +164,6 @@ impl Engine {
                 },
                 input: Default::default(),
             });
-            let revision = self
-                .store
-                .policy_revision(request.session_id.clone())
-                .await?;
             let compiled = crate::policy::compile(&policy, &catalog)
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?;
             Some(crate::PolicyUpdate {

@@ -918,14 +918,37 @@ async fn permission_discovery_progresses_past_the_oldest_256_pending_rows() {
     .await
     .expect("overflow permission rows");
 
-    let found = tokio::time::timeout(Duration::from_secs(4), async {
-        for _ in 0..257 {
-            let message = peer.next_message().await;
-            if message["params"]["toolCall"]["toolCallId"] == "overflow-256" {
-                return true;
+    let mut outstanding = Vec::new();
+    for _ in 0..32 {
+        outstanding.push(
+            tokio::time::timeout(Duration::from_secs(2), peer.next_message())
+                .await
+                .expect("permission window must fill"),
+        );
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), peer.next_message())
+            .await
+            .is_err(),
+        "an unanswered client must have a bounded outstanding permission window"
+    );
+
+    let found = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            for message in outstanding.drain(..) {
+                if message["params"]["toolCall"]["toolCallId"] == "overflow-256" {
+                    return true;
+                }
+                peer.respond(
+                    message["id"].clone(),
+                    json!({"outcome": {"outcome": "cancelled"}}),
+                )
+                .await;
+            }
+            for _ in 0..32 {
+                outstanding.push(peer.next_message().await);
             }
         }
-        false
     })
     .await
     .expect("permission pagination must continue");
@@ -1233,6 +1256,30 @@ async fn remote_admission_is_bounded_and_database_gated() {
     );
     remote.mark_ready();
     let server = TestServer::start(&remote).await;
+
+    for _ in 0..2 {
+        let mut rejected = format!("ws://{}/acp", server.address)
+            .into_client_request()
+            .expect("rejected WebSocket request");
+        rejected.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer bounded-secret"),
+        );
+        rejected.headers_mut().insert(
+            http::header::ORIGIN,
+            HeaderValue::from_static("https://untrusted.example"),
+        );
+        let error = connect_async(rejected)
+            .await
+            .expect_err("disabled CORS must reject WebSocket origins");
+        let response = match error {
+            async_tungstenite::tungstenite::Error::Http(response) => response,
+            other => panic!("expected HTTP origin rejection, got {other:?}"),
+        };
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        assert_eq!(remote.available_connection_capacity(), 1);
+    }
+
     let mut first = WebSocketPeer::connect(server.address, "bounded-secret").await;
     success(
         first
