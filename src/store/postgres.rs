@@ -560,6 +560,71 @@ impl PostgresStore {
         Ok(())
     }
 
+    pub async fn create_question(
+        &self,
+        frame_id: crate::FrameId,
+        expected_revision: u64,
+        question: super::Question,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "running" {
+            return Err(StoreError::RevisionConflict);
+        }
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
+        question.schema.validate_definition().map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let schema = serde_json::to_value(&question.schema).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        sqlx::query("INSERT INTO questions (id, run_id, frame_id, binding, text, schema, state) VALUES ($1, $2, $3, $4, $5, $6, 'pending')")
+            .bind(question.id).bind(run_id).bind(*frame_id.as_uuid()).bind(&question.binding).bind(&question.text).bind(schema).execute(&mut *tx).await?;
+        let revision = expected_revision + 1;
+        sqlx::query("UPDATE frames SET state = 'waiting_for_answer', suspension_id = $1, revision = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3")
+            .bind(question.id).bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE runs SET state = 'waiting_for_answer', updated_at = CURRENT_TIMESTAMP WHERE id = $1").bind(run_id).execute(&mut *tx).await?;
+        append_event(&mut tx, run_id, "question.requested", json!({"frame_id": frame_id.as_uuid(), "question_id": question.id, "binding": question.binding})).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn answer(
+        &self,
+        frame_id: crate::FrameId,
+        question_id: uuid::Uuid,
+        expected_revision: u64,
+        answer: Value,
+        idempotency_key: String,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let frame = sqlx::query("SELECT run_id, revision, state, bindings FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?.ok_or(StoreError::FrameNotFound)?;
+        let run_id = frame.get::<uuid::Uuid, _>("run_id");
+        sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE").bind(run_id).fetch_one(&mut *tx).await?;
+        let question = sqlx::query("SELECT binding, schema, state, answer_idempotency_key FROM questions WHERE id = $1 AND frame_id = $2 FOR UPDATE")
+            .bind(question_id).bind(*frame_id.as_uuid()).fetch_optional(&mut *tx).await?
+            .ok_or_else(|| StoreError::InvalidData("question was not found for frame".to_owned()))?;
+        if question.get::<String, _>("state") == "answered" {
+            if question.get::<Option<String>, _>("answer_idempotency_key") == Some(idempotency_key) { return Ok(()); }
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || frame.get::<String, _>("state") != "waiting_for_answer" || question.get::<String, _>("state") != "pending" {
+            return Err(StoreError::RevisionConflict);
+        }
+        let schema: crate::ClosedSchema = serde_json::from_value(question.get("schema")).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        schema.validate(&answer).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let mut bindings = frame.get::<Value, _>("bindings").as_object().cloned().ok_or_else(|| StoreError::InvalidData("frame bindings are malformed".to_owned()))?;
+        bindings.insert(question.get("binding"), answer.clone());
+        sqlx::query("UPDATE questions SET state = 'answered', answer = $1, answer_idempotency_key = $2, answered_at = CURRENT_TIMESTAMP WHERE id = $3")
+            .bind(answer).bind(idempotency_key).bind(question_id).execute(&mut *tx).await?;
+        let revision = expected_revision + 1;
+        sqlx::query("UPDATE frames SET state = 'runnable', suspension_id = NULL, bindings = $1, revision = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3")
+            .bind(Value::Object(bindings)).bind(revision as i64).bind(*frame_id.as_uuid()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE runs SET state = 'runnable', updated_at = CURRENT_TIMESTAMP WHERE id = $1").bind(run_id).execute(&mut *tx).await?;
+        append_event(&mut tx, run_id, "question.answered", json!({"frame_id": frame_id.as_uuid(), "question_id": question_id})).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn publish(
         &self,
         session: SessionId,

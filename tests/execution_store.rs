@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, IdempotencyKey, PostgresStore,
-    NewPermissionRequest, PermissionRequestId, PolicyRevision, PrincipalId, RecoverySupport,
+    NewPermissionRequest, PermissionRequestId, PolicyRevision, PrincipalId, Question, RecoverySupport,
     StartRun, StoreError, ToolCatalogSnapshot,
 };
 use serde_json::json;
@@ -122,6 +122,26 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         )
         .await
         .expect("persist tool result");
+    let question = Question {
+        id: Uuid::now_v7(),
+        binding: "confirmation".to_owned(),
+        text: "Continue?".to_owned(),
+        schema: ClosedSchema::boolean(),
+    };
+    store
+        .create_question(started.root_frame_id.clone(), 6, question.clone())
+        .await
+        .expect("persist question");
+    store
+        .answer(
+            started.root_frame_id.clone(),
+            question.id,
+            7,
+            json!(true),
+            "answer-1".to_owned(),
+        )
+        .await
+        .expect("persist answer");
     assert!(matches!(
         store
             .start_run(StartRun { input: json!({"query": "changed"}), ..StartRun {
