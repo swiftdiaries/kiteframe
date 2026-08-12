@@ -28,7 +28,7 @@ impl TrustedTool for ExternalTrustedTool {
     }
 
     async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
-        Ok(ToolStatus::Succeeded)
+        Ok(ToolStatus::Succeeded { result: json!({}) })
     }
 }
 

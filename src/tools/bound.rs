@@ -96,13 +96,13 @@ impl ToolCall {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
 pub enum ToolStatus {
     Pending,
     Running,
-    Succeeded,
-    Failed,
+    Succeeded { result: serde_json::Value },
+    Failed { error: serde_json::Value },
     WaitingForPermission,
 }
 

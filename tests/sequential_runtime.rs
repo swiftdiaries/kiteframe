@@ -48,7 +48,7 @@ struct SearchTool { descriptor: CatalogTool }
 impl TrustedTool for SearchTool {
     fn descriptor(&self) -> &CatalogTool { &self.descriptor }
     async fn invoke(&self, _call: ToolCall) -> Result<Value, ToolError> { Ok(json!({"result":"found"})) }
-    async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> { Ok(ToolStatus::Succeeded) }
+    async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> { Ok(ToolStatus::Succeeded { result: json!({}) }) }
 }
 
 #[tokio::test]
