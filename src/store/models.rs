@@ -67,6 +67,7 @@ pub struct RunnableFrame {
     pub statement_index: usize,
     pub bindings: Value,
     pub revision: u64,
+    pub workflow: crate::dsl::CompiledWorkflow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
