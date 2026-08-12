@@ -2,6 +2,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod domain;
 pub mod dsl;
+pub mod engine;
 pub mod hash;
 pub mod mcp;
 pub mod model;
