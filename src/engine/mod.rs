@@ -82,7 +82,12 @@ pub enum EngineError {
 
 impl Engine {
     pub async fn recover(&self) -> Result<RecoveryReport, EngineError> {
-        Ok(recovery::recover_model_attempts(&self.store).await?)
+        let mut report = recovery::recover_model_attempts(&self.store).await?;
+        let tools = recovery::recover_tool_statuses(&self.store, self.tools.as_ref()).await?;
+        report.tools_recovered = tools.tools_recovered;
+        report.tools_requeued = tools.tools_requeued;
+        report.outcomes_unknown = tools.outcomes_unknown;
+        Ok(report)
     }
 
     pub async fn cancel_run(&self, request: CancelRun) -> Result<(), EngineError> {

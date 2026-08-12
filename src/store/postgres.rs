@@ -495,6 +495,21 @@ impl PostgresStore {
         Ok(frames.len() as u64)
     }
 
+    pub async fn recoverable_tool_calls(&self, limit: i64) -> Result<Vec<super::RecoverableToolCall>, StoreError> {
+        let rows = sqlx::query("SELECT t.id, t.frame_id, r.id AS run_id, r.session_id, f.revision, t.qualified_name, t.descriptor_digest, t.idempotency_key FROM tool_calls t JOIN frames f ON f.id = t.frame_id JOIN runs r ON r.id = f.run_id WHERE t.state = 'intent' AND f.state = 'running' AND r.state = 'running' ORDER BY t.updated_at, t.id LIMIT $1")
+            .bind(limit.clamp(1, 256))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(|row| {
+            Ok(super::RecoverableToolCall {
+                id: row.get("id"), frame_id: crate::FrameId::new(row.get("frame_id")),
+                run_id: crate::RunId::new(row.get("run_id")), session_id: crate::SessionId::new(row.get("session_id")),
+                revision: row.get::<i64, _>("revision") as u64, qualified_name: row.get("qualified_name"),
+                descriptor_digest: row.get("descriptor_digest"), idempotency_key: crate::IdempotencyKey::new(row.get::<String, _>("idempotency_key")).map_err(|error| StoreError::InvalidData(error.to_string()))?,
+            })
+        }).collect()
+    }
+
     pub async fn begin_model_attempt(
         &self,
         frame_id: crate::FrameId,

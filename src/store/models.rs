@@ -133,6 +133,18 @@ pub struct ToolCallIntent {
 }
 
 #[derive(Clone, Debug)]
+pub struct RecoverableToolCall {
+    pub id: uuid::Uuid,
+    pub frame_id: FrameId,
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub revision: u64,
+    pub qualified_name: String,
+    pub descriptor_digest: String,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug)]
 pub struct NewPermissionRequest {
     pub id: crate::PermissionRequestId,
     pub provider_call_id: String,
