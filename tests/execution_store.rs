@@ -184,6 +184,20 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .await
         .expect("start cancellable run");
     store.cancel_run(cancellable.id, 0).await.expect("cancel run");
+    let completable = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name.clone(),
+            version: Some(definition.version),
+            input: json!({"query": "complete"}),
+            idempotency_key: IdempotencyKey::new(format!("complete-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .expect("start completable run");
+    let completion_attempt = store.begin_model_attempt(completable.root_frame_id.clone(), 0, json!({"prompt": "complete"})).await.expect("completion intent");
+    store.commit_model_attempt(completable.root_frame_id.clone(), completion_attempt.attempt, completion_attempt.revision, vec![json!({"type": "function_call"})]).await.expect("completion output");
+    store.record_completion(completable.root_frame_id.clone(), 2, "ok".to_owned(), json!({})).await.expect("record completion");
+    assert!(store.runnable_frames(256).await.expect("runnable frames").iter().any(|frame| frame.id == completable.root_frame_id && frame.outcome_name.as_deref() == Some("ok")));
     assert!(matches!(
         store
             .start_run(StartRun { input: json!({"query": "changed"}), ..StartRun {
