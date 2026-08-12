@@ -18,12 +18,17 @@ impl Application {
             return Ok(ApplicationResult::Sessions(self.store.list_sessions(&context.principal).await?));
         }
         let session_id = context.session_id.as_ref().ok_or(ProtocolError::MissingSession)?;
+        if matches!(command, ApplicationCommand::CloseSession) {
+            self.store.close_session(session_id.clone(), &context.principal).await?;
+            return Ok(ApplicationResult::Ack);
+        }
         self.store.resume_session(session_id.clone(), &context.principal).await?;
         if let Some(command_session) = command_session(&command) && command_session != session_id {
             return Err(ProtocolError::SessionMismatch);
         }
         match command {
             ApplicationCommand::ListSessions => unreachable!("handled before session requirement"),
+            ApplicationCommand::CloseSession => unreachable!("handled before session requirement"),
             ApplicationCommand::Start(request) => Ok(ApplicationResult::Run(self.store.start_run(request).await?)),
             ApplicationCommand::Get(request) => Ok(ApplicationResult::Run(self.store.get_run(session_id.clone(), request.run_id).await?)),
             ApplicationCommand::Answer(request) => {

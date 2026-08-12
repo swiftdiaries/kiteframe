@@ -10,6 +10,7 @@ impl V1Adapter {
     pub fn decode_extension(method: &str, payload: Value) -> Result<ApplicationCommand, ProtocolError> {
         match method {
             "session/list" => Ok(ApplicationCommand::ListSessions),
+            "session/close" => Ok(ApplicationCommand::CloseSession),
             "_kiteframe/run/start" => decode(payload, ApplicationCommand::Start),
             "_kiteframe/run/get" => decode(payload, ApplicationCommand::Get),
             "_kiteframe/run/answer" => decode(payload, ApplicationCommand::Answer),

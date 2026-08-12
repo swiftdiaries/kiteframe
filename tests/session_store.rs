@@ -108,6 +108,8 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         store.publish(other.id, &workflow, source).await,
         Err(StoreError::CatalogScopeViolation)
     ));
+    store.close_session(session.id.clone(), &principal).await.expect("close session");
+    assert!(matches!(store.resume_session(session.id, &principal).await, Err(StoreError::SessionClosed)));
 }
 
 fn tool(name: &str) -> CatalogTool {

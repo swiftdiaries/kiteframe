@@ -80,6 +80,15 @@ impl PostgresStore {
         }).collect())
     }
 
+    pub async fn close_session(&self, session_id: SessionId, principal: &PrincipalId) -> Result<(), StoreError> {
+        let result = sqlx::query("UPDATE sessions SET state = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = $1 AND principal = $2 AND state = 'active'")
+            .bind(*session_id.as_uuid()).bind(principal.as_str()).execute(&self.pool).await?;
+        if result.rows_affected() == 1 { return Ok(()); }
+        let row = sqlx::query("SELECT principal, state FROM sessions WHERE id = $1").bind(*session_id.as_uuid()).fetch_optional(&self.pool).await?.ok_or(StoreError::SessionNotFound)?;
+        if row.get::<String, _>("principal") != principal.as_str() { return Err(StoreError::PrincipalMismatch); }
+        Err(StoreError::SessionClosed)
+    }
+
     pub async fn append_catalog_epoch(
         &self,
         epoch: &ToolCatalogSnapshot,
