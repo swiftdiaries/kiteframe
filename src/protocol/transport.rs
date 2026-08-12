@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    error::Error as _,
     fmt,
     sync::{
         Arc, Mutex,
@@ -9,6 +10,7 @@ use std::{
 
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectTo, ConnectionTo, Dispatch, HandleDispatchFrom, Handled,
+    RawJsonRpcMessage, TransportBatchEntry, TransportFrame,
 };
 use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
 use axum::{
@@ -1293,9 +1295,14 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
         principal: principal.clone(),
         transport,
     };
-    let creates_connection = transport == TransportKind::WebSocket
-        || (request.method() == Method::POST
-            && !request.headers().contains_key("acp-connection-id"));
+    let creates_connection = if transport == TransportKind::WebSocket {
+        true
+    } else {
+        match streamable_http_creates_connection(&mut request).await {
+            Ok(creates_connection) => creates_connection,
+            Err(response) => return response,
+        }
+    };
     let mut admission_guard = if creates_connection {
         Some(state.admission_gate.clone().lock_owned().await)
     } else {
@@ -1347,6 +1354,202 @@ async fn handle_acp(State(state): State<Arc<RemoteState>>, mut request: Request<
         cleanup.reap_after(std::time::Duration::from_secs(1));
     }
     response
+}
+
+const ACP_HTTP_MAX_POST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+async fn streamable_http_creates_connection(request: &mut Request<Body>) -> Result<bool, Response> {
+    if request.method() != Method::POST
+        || !request
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|content_type| content_type.starts_with("application/json"))
+        || request
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .is_some_and(|length| length > ACP_HTTP_MAX_POST_BODY_BYTES)
+    {
+        return Ok(false);
+    }
+
+    let body = std::mem::replace(request.body_mut(), Body::empty());
+    let body = match axum::body::to_bytes(body, ACP_HTTP_MAX_POST_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(if body_limit_exceeded(&error) {
+                (StatusCode::PAYLOAD_TOO_LARGE, "POST body too large").into_response()
+            } else {
+                StatusCode::BAD_REQUEST.into_response()
+            });
+        }
+    };
+    *request.body_mut() = Body::from(body.clone());
+    let Ok(body) = std::str::from_utf8(&body) else {
+        return Ok(false);
+    };
+    let session_id = request
+        .headers()
+        .get("acp-session-id")
+        .and_then(|value| value.to_str().ok());
+    Ok(frame_starts_connection(
+        &TransportFrame::parse_json(body),
+        session_id,
+    ))
+}
+
+fn body_limit_exceeded(error: &axum::Error) -> bool {
+    let mut source = error.source();
+    while let Some(error) = source {
+        if error.to_string() == "length limit exceeded" {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn frame_starts_connection(frame: &TransportFrame, session_id: Option<&str>) -> bool {
+    fn is_initialize(message: &RawJsonRpcMessage) -> bool {
+        matches!(
+            message,
+            RawJsonRpcMessage::Request(request) if request.method.as_ref() == "initialize"
+        )
+    }
+
+    match frame {
+        TransportFrame::Single(message) => is_initialize(message),
+        TransportFrame::Malformed { .. } => false,
+        TransportFrame::Batch(batch) => {
+            let initialize_index =
+                batch
+                    .entries()
+                    .enumerate()
+                    .find_map(|(index, entry)| match entry {
+                        TransportBatchEntry::Message(RawJsonRpcMessage::Response(_)) => None,
+                        TransportBatchEntry::Message(message) if is_initialize(message) => {
+                            Some(index)
+                        }
+                        TransportBatchEntry::Message(_) => Some(usize::MAX),
+                        TransportBatchEntry::Malformed { raw, .. } if response_only_shape(raw) => {
+                            None
+                        }
+                        TransportBatchEntry::Malformed { .. } => Some(usize::MAX),
+                    });
+            let Some(initialize_index) = initialize_index.filter(|index| *index != usize::MAX)
+            else {
+                return false;
+            };
+            for (index, entry) in batch.entries().enumerate() {
+                if index == initialize_index {
+                    continue;
+                }
+                match entry {
+                    TransportBatchEntry::Message(message)
+                        if !message_route_is_valid(message, session_id) =>
+                    {
+                        return false;
+                    }
+                    TransportBatchEntry::Message(_) | TransportBatchEntry::Malformed { .. } => {}
+                }
+            }
+            true
+        }
+    }
+}
+
+fn response_only_shape(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        !object.contains_key("method")
+            && (object.contains_key("result") || object.contains_key("error"))
+    })
+}
+
+fn message_route_is_valid(message: &RawJsonRpcMessage, session_id: Option<&str>) -> bool {
+    let Some(method) = message_method(message) else {
+        return true;
+    };
+    let connection_scoped = connection_scoped_message(message, method);
+    if let Some(session_id) = session_id
+        && !connection_scoped
+    {
+        let params = match message {
+            RawJsonRpcMessage::Request(request) => request.params.as_ref(),
+            RawJsonRpcMessage::Notification(notification) => notification.params.as_ref(),
+            RawJsonRpcMessage::Response(_) => None,
+        };
+        return match params {
+            Some(agent_client_protocol::RawJsonRpcParams::Object(params)) => {
+                params.get("sessionId").is_none_or(|existing| {
+                    existing
+                        .as_str()
+                        .is_some_and(|existing| existing == session_id)
+                })
+            }
+            Some(agent_client_protocol::RawJsonRpcParams::Array(_)) => false,
+            None => true,
+        };
+    }
+
+    let routed_session = if connection_scoped {
+        None
+    } else {
+        match message {
+            RawJsonRpcMessage::Request(request) => request.params.as_ref(),
+            RawJsonRpcMessage::Notification(notification) => notification.params.as_ref(),
+            RawJsonRpcMessage::Response(_) => None,
+        }
+        .and_then(|params| match params {
+            agent_client_protocol::RawJsonRpcParams::Object(params) => params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            agent_client_protocol::RawJsonRpcParams::Array(_) => None,
+        })
+    };
+    !method_requires_session_header(method) || routed_session.is_some()
+}
+
+fn message_method(message: &RawJsonRpcMessage) -> Option<&str> {
+    match message {
+        RawJsonRpcMessage::Request(request) => Some(request.method.as_ref()),
+        RawJsonRpcMessage::Notification(notification) => Some(notification.method.as_ref()),
+        RawJsonRpcMessage::Response(_) => None,
+    }
+}
+
+fn connection_scoped_message(message: &RawJsonRpcMessage, method: &str) -> bool {
+    if method.starts_with("$/") {
+        return true;
+    }
+    let RawJsonRpcMessage::Notification(notification) = message else {
+        return false;
+    };
+    let params = notification.params.clone().map_or(
+        Value::Null,
+        agent_client_protocol::RawJsonRpcParams::into_value,
+    );
+    agent_client_protocol::UntypedMessage::new(notification.method.as_ref(), params).is_ok_and(
+        |notification| agent_client_protocol::is_cancel_request_notification(&notification),
+    )
+}
+
+fn method_requires_session_header(method: &str) -> bool {
+    matches!(
+        method,
+        "session/prompt"
+            | "session/cancel"
+            | "session/close"
+            | "session/delete"
+            | "session/fork"
+            | "session/load"
+            | "session/resume"
+            | "session/set_config_option"
+            | "session/set_mode"
+            | "session/set_model"
+    )
 }
 
 fn acp_connection_router(

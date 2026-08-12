@@ -442,6 +442,21 @@ fn success(response: Value) -> Value {
     response["result"].clone()
 }
 
+async fn wait_for_connection_capacity(remote: &RemoteService, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while remote.available_connection_capacity() != expected {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "connection capacity did not become {expected}; observed {}",
+            remote.available_connection_capacity()
+        )
+    });
+}
+
 struct PendingPermissionFixture {
     session: Value,
     session_id: SessionId,
@@ -1611,6 +1626,286 @@ async fn remote_admission_is_bounded_and_database_gated() {
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()[reqwest::header::RETRY_AFTER], "1");
 
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn streamable_http_initialize_with_client_id_is_rejected_at_capacity() {
+    let (application, store) = application().await;
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(
+            Secret::new("http-capacity-secret"),
+            principal("http-capacity"),
+        )])
+        .expect("bearer binding"),
+    );
+    let remote = RemoteService::with_v2_and_limit(
+        application,
+        authenticator,
+        store,
+        ready_model(),
+        false,
+        1,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+    let mut holder = WebSocketPeer::connect(server.address, "http-capacity-secret").await;
+    success(
+        holder
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "capacity-holder", "version": "1.0.0"}
+                }),
+            )
+            .await,
+    );
+    assert_eq!(remote.available_connection_capacity(), 0);
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{}/acp", server.address))
+        .bearer_auth("http-capacity-secret")
+        .header("Acp-Connection-Id", "client-supplied-id")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "capacity-contender", "version": "1.0.0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("overloaded Streamable HTTP initialize");
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[reqwest::header::RETRY_AFTER], "1");
+
+    let invalid_batch = client
+        .post(format!("http://{}/acp", server.address))
+        .bearer_auth("http-capacity-secret")
+        .header("Acp-Connection-Id", "client-supplied-batch-id")
+        .json(&json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "batch-contender", "version": "1.0.0"}
+                }
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/delete",
+                "params": {}
+            }
+        ]))
+        .send()
+        .await
+        .expect("invalid Streamable HTTP initialize batch");
+    assert_eq!(invalid_batch.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        invalid_batch
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .is_none()
+    );
+
+    let malformed = client
+        .post(format!("http://{}/acp", server.address))
+        .bearer_auth("http-capacity-secret")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{not-json")
+        .send()
+        .await
+        .expect("malformed Streamable HTTP request");
+    assert_eq!(malformed.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        malformed
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .is_none()
+    );
+    assert_eq!(remote.available_connection_capacity(), 0);
+
+    holder.close().await;
+    wait_for_connection_capacity(&remote, 1).await;
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn valid_streamable_http_connection_remains_usable_at_capacity() {
+    let (application, store) = application().await;
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(
+            Secret::new("http-existing-secret"),
+            principal("http-existing"),
+        )])
+        .expect("bearer binding"),
+    );
+    let remote = RemoteService::with_v2_and_limit(
+        application,
+        authenticator,
+        store,
+        ready_model(),
+        false,
+        1,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+    let client = reqwest::Client::new();
+
+    let initialized = client
+        .post(format!("http://{}/acp", server.address))
+        .bearer_auth("http-existing-secret")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "existing-client", "version": "1.0.0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("initialize Streamable HTTP connection");
+    assert_eq!(initialized.status(), reqwest::StatusCode::OK);
+    let connection_id = initialized.headers()["acp-connection-id"]
+        .to_str()
+        .expect("connection id header")
+        .to_owned();
+    assert_eq!(remote.available_connection_capacity(), 0);
+
+    let follow_up = client
+        .post(format!("http://{}/acp", server.address))
+        .bearer_auth("http-existing-secret")
+        .header("Acp-Connection-Id", &connection_id)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": {"cwd": "/tmp/http-existing", "mcpServers": []}
+        }))
+        .send()
+        .await
+        .expect("follow up on admitted Streamable HTTP connection");
+    assert_eq!(follow_up.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        follow_up
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .is_none()
+    );
+
+    let deleted = client
+        .delete(format!("http://{}/acp", server.address))
+        .bearer_auth("http-existing-secret")
+        .header("Acp-Connection-Id", connection_id)
+        .send()
+        .await
+        .expect("delete Streamable HTTP connection");
+    assert_eq!(deleted.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_connection_capacity(&remote, 1).await;
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn failed_streamable_http_initialization_leaves_no_admission_orphan() {
+    let (application, store) = application().await;
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(
+            Secret::new("http-failure-secret"),
+            principal("http-failure"),
+        )])
+        .expect("bearer binding"),
+    );
+    let remote = RemoteService::with_v2_and_limit(
+        application,
+        authenticator,
+        store,
+        ready_model(),
+        false,
+        1,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+    let client = reqwest::Client::new();
+
+    let rejected = client
+        .post(format!("http://{}/acp", server.address))
+        .bearer_auth("http-failure-secret")
+        .header("Acp-Connection-Id", "untrusted-failure-id")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "invalid",
+                "clientCapabilities": {},
+                "clientInfo": {"name": "rejected-client", "version": "1.0.0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("rejected Streamable HTTP initialize");
+    assert_eq!(rejected.status(), reqwest::StatusCode::OK);
+    assert!(rejected.headers().get("acp-connection-id").is_none());
+    assert!(
+        rejected
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .is_none()
+    );
+    let rejected: Value = rejected.json().await.expect("JSON-RPC rejection");
+    assert_eq!(rejected["error"]["code"], -32602);
+    wait_for_connection_capacity(&remote, 1).await;
+
+    let initialized = client
+        .post(format!("http://{}/acp", server.address))
+        .bearer_auth("http-failure-secret")
+        .header("Acp-Connection-Id", "untrusted-success-id")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "successful-client", "version": "1.0.0"}
+            }
+        }))
+        .send()
+        .await
+        .expect("successful Streamable HTTP initialize");
+    assert_eq!(initialized.status(), reqwest::StatusCode::OK);
+    let connection_id = initialized.headers()["acp-connection-id"]
+        .to_str()
+        .expect("server-owned connection id")
+        .to_owned();
+    assert_ne!(connection_id, "untrusted-success-id");
+    assert_eq!(remote.available_connection_capacity(), 0);
+
+    let deleted = client
+        .delete(format!("http://{}/acp", server.address))
+        .bearer_auth("http-failure-secret")
+        .header("Acp-Connection-Id", connection_id)
+        .send()
+        .await
+        .expect("delete successful Streamable HTTP connection");
+    assert_eq!(deleted.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_connection_capacity(&remote, 1).await;
     remote.begin_shutdown();
     server.stop().await;
 }
