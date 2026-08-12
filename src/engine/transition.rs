@@ -48,20 +48,24 @@ pub fn next_command(
             target: child.call.task.clone(), binding: child.binding.clone(), arguments: resolve_bindings(&child.call.arguments, &frame.bindings)?, branch_index: branch_index as i32,
         })).collect::<Result<Vec<_>, TransitionError>>()?)),
         CompiledStatement::Ask { binding, answer_type, question } => Ok(FrameCommand::SuspendAsk(Question {
-            id: uuid::Uuid::now_v7(), binding: binding.clone(), text: resolve(question, &frame.bindings)?.as_str().ok_or_else(|| TransitionError::Corrupt("question is not a string".to_owned()))?.to_owned(), schema: closed_schema(answer_type)?,
+            id: uuid::Uuid::now_v7(), binding: binding.clone(), text: resolve(question, &frame.bindings)?.as_str().ok_or_else(|| TransitionError::Corrupt("question is not a string".to_owned()))?.to_owned(), schema: closed_schema(workflow, answer_type)?,
         })),
     }
 }
 
-fn closed_schema(ty: &CompiledType) -> Result<ClosedSchema, TransitionError> {
+fn closed_schema(workflow: &CompiledWorkflow, ty: &CompiledType) -> Result<ClosedSchema, TransitionError> {
     match ty {
         CompiledType::String => Ok(ClosedSchema::string()),
         CompiledType::Integer => Ok(ClosedSchema::integer()),
         CompiledType::Number => Ok(ClosedSchema::number()),
         CompiledType::Boolean => Ok(ClosedSchema::boolean()),
-        CompiledType::Optional(inner) => Ok(ClosedSchema::nullable(closed_schema(inner)?)),
-        CompiledType::List(inner) => Ok(ClosedSchema::array(closed_schema(inner)?)),
-        CompiledType::Record(_) => Err(TransitionError::Corrupt("record answer schemas require workflow record expansion".to_owned())),
+        CompiledType::Optional(inner) => Ok(ClosedSchema::nullable(closed_schema(workflow, inner)?)),
+        CompiledType::List(inner) => Ok(ClosedSchema::array(closed_schema(workflow, inner)?)),
+        CompiledType::Record(name) => workflow.records.get(name).ok_or_else(|| TransitionError::Corrupt(format!("record type is absent: {name}")))?
+            .iter()
+            .map(|(name, ty)| Ok((name.clone(), closed_schema(workflow, ty)?)))
+            .collect::<Result<std::collections::BTreeMap<_, _>, TransitionError>>()
+            .map(|properties| ClosedSchema::object("answer", properties)),
     }
 }
 

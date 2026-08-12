@@ -71,3 +71,26 @@ fn preserves_large_numeric_literals() {
     let command = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "ok".to_owned(), statement_index: 0, bindings: BTreeMap::new() }).expect("number");
     assert!(matches!(command, FrameCommand::Complete(value) if value == json!(9_007_199_254_740_993_u64)));
 }
+
+#[test]
+fn emits_closed_record_schema_for_typed_questions() {
+    let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(4), [])
+        .expect("empty catalog");
+    let workflow = compile(
+        "type Choice { approved: boolean note: string? } workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ask() { answer = ask Choice \"Continue?\" done \"done\" } }",
+        &catalog,
+        &Limits::default(),
+    )
+    .expect("compile");
+    let command = next_command(
+        &workflow,
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "ask".to_owned(),
+            statement_index: 0,
+            bindings: BTreeMap::new(),
+        },
+    )
+    .expect("ask command");
+    assert!(matches!(command, FrameCommand::SuspendAsk(question) if question.schema.validate(&json!({"approved": true, "note": null})).is_ok() && question.schema.validate(&json!({"approved": true})).is_err()));
+}
