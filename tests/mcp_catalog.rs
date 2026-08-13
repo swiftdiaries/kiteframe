@@ -2,11 +2,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kiteframe::{
-    AuthenticatedMcpPeer, ClosedSchema, FrameId, IdempotencyKey, McpError, McpLimits, McpManager,
-    PolicyRevision, PrincipalId, RemoteTool, RunId, SessionId, ToolCall, ToolResolver,
-    closed_schema,
+    AuthenticatedMcpPeer, ClosedSchema, CreateSession, FrameId, IdempotencyKey, McpError,
+    McpLimits, McpManager, PolicyRevision, PostgresStore, PrincipalId, RemoteTool, RunId,
+    SessionId, ToolCall, ToolResolver, closed_schema,
 };
 use serde_json::json;
+use time::{Duration, OffsetDateTime};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -141,6 +142,42 @@ async fn discovered_mcp_tools_cross_the_engine_resolver_boundary() {
         .await
         .unwrap();
     assert_eq!(result, json!({}));
+}
+
+#[tokio::test]
+async fn persisted_mcp_catalog_requires_fresh_attachment_on_resume() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let principal = PrincipalId::new(format!("mcp-resume-{}", Uuid::now_v7())).unwrap();
+    let session = store
+        .create_session(CreateSession {
+            principal: principal.clone(),
+            working_directory: "/mcp-resume".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let manager = McpManager::with_store(McpLimits::default(), store.clone());
+    manager
+        .attach_peer(
+            session.id.clone(),
+            principal.clone(),
+            "docs".to_owned(),
+            Arc::new(FakePeer::new(vec![tool("search")])),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .resume_session(session.id, &principal)
+            .await
+            .unwrap()
+            .mcp_attached,
+        "only MCP-managed epochs require a fresh reconnect"
+    );
 }
 
 #[test]

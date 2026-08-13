@@ -1079,7 +1079,8 @@ fn protocol_sdk_error(error: crate::ProtocolError) -> agent_client_protocol::Err
         }
         crate::ProtocolError::InvalidPayload(_)
         | crate::ProtocolError::UnsupportedVersion(_)
-        | crate::ProtocolError::V2Disabled => agent_client_protocol::Error::invalid_params(),
+        | crate::ProtocolError::V2Disabled
+        | crate::ProtocolError::McpUnavailable => agent_client_protocol::Error::invalid_params(),
         crate::ProtocolError::UnexpectedResult(_) => agent_client_protocol::Error::internal_error(),
         crate::ProtocolError::PermissionCancelled => {
             agent_client_protocol::Error::request_cancelled()

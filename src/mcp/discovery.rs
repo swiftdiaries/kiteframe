@@ -405,7 +405,7 @@ impl McpManager {
         }
         let snapshot = self.build_snapshot(session.clone()).await?;
         if let Some(store) = &self.store {
-            store.append_catalog_epoch(&snapshot).await?;
+            store.append_mcp_catalog_epoch(&snapshot).await?;
         }
         self.catalogs
             .write()
@@ -427,7 +427,7 @@ impl McpManager {
             .ok_or(McpError::SessionNotAttached)?;
         let epoch = self.build_snapshot(session.clone()).await?;
         if let Some(store) = &self.store {
-            store.append_catalog_epoch(&epoch).await?;
+            store.append_mcp_catalog_epoch(&epoch).await?;
         }
         self.catalogs
             .write()

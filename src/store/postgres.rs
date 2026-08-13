@@ -52,7 +52,7 @@ impl PostgresStore {
             principal: request.principal,
             policy_revision: PolicyRevision::new(0),
             current_catalog_epoch: Some(catalog.epoch_id().clone()),
-            mcp_attached: true,
+            mcp_attached: false,
         })
     }
 
@@ -61,7 +61,7 @@ impl PostgresStore {
         id: SessionId,
         principal: &PrincipalId,
     ) -> Result<SessionView, StoreError> {
-        let row = sqlx::query("SELECT principal, state, current_policy_revision, current_catalog_epoch FROM sessions WHERE id = $1")
+        let row = sqlx::query("SELECT s.principal, s.state, s.current_policy_revision, s.current_catalog_epoch, e.connection_binding FROM sessions s LEFT JOIN mcp_catalog_epochs e ON e.epoch_id = s.current_catalog_epoch AND e.session_id = s.id WHERE s.id = $1")
             .bind(*id.as_uuid()).fetch_optional(&self.pool).await?.ok_or(StoreError::SessionNotFound)?;
         if row.get::<String, _>("principal") != principal.as_str() {
             return Err(StoreError::PrincipalMismatch);
@@ -78,7 +78,9 @@ impl PostgresStore {
             policy_revision: PolicyRevision::new(
                 row.get::<i64, _>("current_policy_revision") as u64
             ),
-            mcp_attached: epoch.is_some(),
+            mcp_attached: catalog_requires_mcp_attachment(
+                row.get::<Option<Value>, _>("connection_binding").as_ref(),
+            ),
             current_catalog_epoch: epoch,
         })
     }
@@ -87,7 +89,7 @@ impl PostgresStore {
         &self,
         principal: &PrincipalId,
     ) -> Result<Vec<SessionView>, StoreError> {
-        let rows = sqlx::query("SELECT id, principal, current_policy_revision, current_catalog_epoch FROM sessions WHERE principal = $1 AND state = 'active' ORDER BY updated_at DESC, id")
+        let rows = sqlx::query("SELECT s.id, s.principal, s.current_policy_revision, s.current_catalog_epoch, e.connection_binding FROM sessions s LEFT JOIN mcp_catalog_epochs e ON e.epoch_id = s.current_catalog_epoch AND e.session_id = s.id WHERE s.principal = $1 AND s.state = 'active' ORDER BY s.updated_at DESC, s.id")
             .bind(principal.as_str()).fetch_all(&self.pool).await?;
         Ok(rows
             .into_iter()
@@ -100,9 +102,9 @@ impl PostgresStore {
                 current_catalog_epoch: row
                     .get::<Option<uuid::Uuid>, _>("current_catalog_epoch")
                     .map(CatalogEpochId::new),
-                mcp_attached: row
-                    .get::<Option<uuid::Uuid>, _>("current_catalog_epoch")
-                    .is_some(),
+                mcp_attached: catalog_requires_mcp_attachment(
+                    row.get::<Option<Value>, _>("connection_binding").as_ref(),
+                ),
             })
             .collect())
     }
@@ -132,6 +134,23 @@ impl PostgresStore {
         &self,
         epoch: &ToolCatalogSnapshot,
     ) -> Result<(), StoreError> {
+        self.append_catalog_epoch_with_binding(epoch, "session_catalog")
+            .await
+    }
+
+    pub async fn append_mcp_catalog_epoch(
+        &self,
+        epoch: &ToolCatalogSnapshot,
+    ) -> Result<(), StoreError> {
+        self.append_catalog_epoch_with_binding(epoch, "mcp_catalog")
+            .await
+    }
+
+    async fn append_catalog_epoch_with_binding(
+        &self,
+        epoch: &ToolCatalogSnapshot,
+        binding_kind: &str,
+    ) -> Result<(), StoreError> {
         let snapshot = catalog_json(epoch);
         let mut tx = self.pool.begin().await?;
         let exists = sqlx::query("SELECT 1 FROM sessions WHERE id = $1 FOR UPDATE")
@@ -155,7 +174,7 @@ impl PostgresStore {
             }
         } else {
             sqlx::query("INSERT INTO mcp_catalog_epochs (epoch_id, session_id, server_alias, refresh_identity, canonical_digest, connection_binding, descriptor_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7)")
-            .bind(*epoch.epoch_id().as_uuid()).bind(*epoch.session_id().as_uuid()).bind("session_catalog").bind(epoch.epoch_id().as_uuid().to_string()).bind(epoch.digest()).bind(json!({"kind":"session_catalog"})).bind(snapshot)
+            .bind(*epoch.epoch_id().as_uuid()).bind(*epoch.session_id().as_uuid()).bind(binding_kind).bind(epoch.epoch_id().as_uuid().to_string()).bind(epoch.digest()).bind(json!({"kind":binding_kind})).bind(snapshot)
             .execute(&mut *tx).await?;
         }
         sqlx::query("UPDATE sessions SET current_catalog_epoch = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2").bind(*epoch.epoch_id().as_uuid()).bind(*epoch.session_id().as_uuid()).execute(&mut *tx).await?;
@@ -1819,6 +1838,13 @@ impl PostgresStore {
         }
         Ok(())
     }
+}
+
+fn catalog_requires_mcp_attachment(connection_binding: Option<&Value>) -> bool {
+    connection_binding
+        .and_then(|binding| binding.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "mcp_catalog")
 }
 
 fn catalog_json(epoch: &ToolCatalogSnapshot) -> Value {

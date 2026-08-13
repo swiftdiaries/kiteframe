@@ -32,6 +32,10 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         })
         .await
         .expect("create session");
+    assert!(
+        !session.mcp_attached,
+        "the initial empty catalog is not an external MCP attachment"
+    );
     assert!(matches!(
         store
             .resume_session(session.id.clone(), &PrincipalId::new("bob").unwrap())
@@ -62,11 +66,12 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         catalog.tools()["docs/search"].descriptor_digest()
     );
     assert!(
-        store
+        !store
             .resume_session(session.id.clone(), &principal)
             .await
             .expect("resume")
-            .mcp_attached
+            .mcp_attached,
+        "a durable local catalog does not require an MCP reconnect"
     );
 
     let key = format!("policy-{}", Uuid::now_v7());
