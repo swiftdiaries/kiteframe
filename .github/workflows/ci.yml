@@ -162,6 +162,10 @@ jobs:
           bun run package-platform -- "${{ matrix.package }}" "../../target/release/${{ matrix.binary }}"
           (cd "npm/${{ matrix.package }}" && bun pm pack)
           tar -tzf "npm/${{ matrix.package }}"/*.tgz | grep -F "package/${{ matrix.binary }}"
+          KITEFRAME_BUN_SMOKE_DIR="$(mktemp -d)"
+          bun init -y --cwd "$KITEFRAME_BUN_SMOKE_DIR"
+          bun add --cwd "$KITEFRAME_BUN_SMOKE_DIR" "$(pwd)/npm/${{ matrix.package }}"/*.tgz
+          "$KITEFRAME_BUN_SMOKE_DIR/node_modules/.bin/kiteframe-harness" --version
         working-directory: clients/typescript
 
       - name: Upload packed platform artifact
