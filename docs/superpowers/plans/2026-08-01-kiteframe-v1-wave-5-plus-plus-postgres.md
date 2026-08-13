@@ -1,5 +1,9 @@
 # Kiteframe V1 Wave 5++ Distributed PostgreSQL Store Implementation Plan
 
+> **Superseded (2026-08-11):** Historical plan retained for context. The active
+> replacement plan is the
+> [Minimal Workflow Engine Implementation Plan](2026-08-11-kiteframe-minimal-workflow-engine.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make PostgreSQL the shared transactional authority for admissions, idempotency, invocation status, suspension, and crash recovery in replicated Kiteframe provider deployments.

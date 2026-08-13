@@ -1,5 +1,9 @@
 # Kiteframe V1 Wave 5 Capability Enforcement Plane Implementation Plan
 
+> **Superseded (2026-08-11):** Historical plan retained for context. The active
+> replacement plan is the
+> [Minimal Workflow Engine Implementation Plan](2026-08-11-kiteframe-minimal-workflow-engine.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Deliver the standardized capability provider on the mandatory Wave 3R contract closure, with authenticated dual-principal admission, monotonic authority, current point-of-use authorization, a real OpenFGA reference backend, schema-validated invocation, durable idempotency/status, and write-ahead audit ordering.

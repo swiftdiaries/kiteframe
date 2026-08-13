@@ -1,5 +1,9 @@
 # Kiteframe Capability Control and MCP Design
 
+> **Superseded (2026-08-11):** Historical design retained for context. The
+> current normative architecture is the
+> [Minimal Workflow Engine Design](2026-08-11-kiteframe-minimal-workflow-engine-design.md).
+
 - **Status:** Approved design; not yet implemented
 - **Date:** 2026-08-05
 - **Scope:** Capability-provider control API, MCP capability projection, and
