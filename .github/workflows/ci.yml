@@ -42,6 +42,19 @@ jobs:
       - name: Test all targets
         run: cargo test --all-targets --all-features -- --test-threads=1
 
+      - name: Install uv for live Python client smoke
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      - name: Exercise Python client against the compiled harness
+        run: |
+          cargo build --bin kiteframe-harness
+          uv run --project clients/python pytest -q clients/python/tests
+        env:
+          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
+          KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
+
   python:
     runs-on: ubuntu-latest
     steps:
