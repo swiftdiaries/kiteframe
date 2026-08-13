@@ -9,6 +9,8 @@ use kiteframe::{
 };
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
+mod support;
+use support::ResponsesServer;
 use time::{Duration, OffsetDateTime};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -65,11 +67,11 @@ impl IsolatedDatabase {
 }
 
 impl HarnessChild {
-    async fn start(database_url: &str, principal: &str) -> Self {
+    async fn start(database_url: &str, principal: &str, responses_base_url: &str) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_kiteframe-harness"))
             .env("KITEFRAME_DATABASE_URL", database_url)
             .env("KITEFRAME_PRINCIPAL", principal)
-            .env("KITEFRAME_RESPONSES_BASE_URL", "http://127.0.0.1:9/v1")
+            .env("KITEFRAME_RESPONSES_BASE_URL", responses_base_url)
             .env("KITEFRAME_RESPONSES_API_KEY", "process-restart-test")
             .env("KITEFRAME_RESPONSES_MODEL", "test-model")
             .env("RUST_LOG", "warn")
@@ -131,7 +133,7 @@ async fn stdio_harness_child_restarts_and_reloads_an_authenticated_session() {
     let database = IsolatedDatabase::create(&database_url).await;
     let principal = format!("process-restart-{}", Uuid::now_v7());
     let cwd = "/tmp/kiteframe-process-restart";
-    let mut first = HarnessChild::start(&database.url, &principal).await;
+    let mut first = HarnessChild::start(&database.url, &principal, "http://127.0.0.1:9/v1").await;
     first
         .request(
             1,
@@ -148,7 +150,8 @@ async fn stdio_harness_child_restarts_and_reloads_an_authenticated_session() {
         .to_owned();
     first.close().await;
 
-    let mut restarted = HarnessChild::start(&database.url, &principal).await;
+    let mut restarted =
+        HarnessChild::start(&database.url, &principal, "http://127.0.0.1:9/v1").await;
     restarted
         .request(
             1,
@@ -167,6 +170,105 @@ async fn stdio_harness_child_restarts_and_reloads_an_authenticated_session() {
         json!({})
     );
     restarted.close().await;
+    database.drop().await;
+}
+
+#[tokio::test]
+async fn stdio_harness_child_completes_a_real_model_workflow_and_replays_events() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let database = IsolatedDatabase::create(&database_url).await;
+    let responses = ResponsesServer::start(json!({
+        "output": [{
+            "type":"function_call",
+            "call_id":"complete-1",
+            "name":"complete_task",
+            "arguments":{"outcome":"ok","fields":{}}
+        }]
+    }))
+    .await;
+    let principal = format!("process-model-{}", Uuid::now_v7());
+    let cwd = "/tmp/kiteframe-process-model";
+    let mut child = HarnessChild::start(&database.url, &principal, responses.base_url()).await;
+    child
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion":1, "clientCapabilities":{}, "clientInfo":{"name":"e2e","version":"1"}}),
+        )
+        .await;
+    let session = child
+        .request(2, "session/new", json!({"cwd":cwd, "mcpServers":[]}))
+        .await;
+    let session_id = session["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let workflow_name = format!("processmodel{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {workflow_name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [] on ok() {{ done \"done\" }} }}"
+    );
+    let published = child
+        .request(3, "_kiteframe/workflow/publish", json!({"source":source}))
+        .await;
+    let run = child
+        .request(
+            4,
+            "_kiteframe/run/start",
+            json!({
+                "sessionId":session_id,
+                "workflowName":workflow_name,
+                "version":published["version"],
+                "input":{},
+                "idempotencyKey":format!("process-model-run-{}", Uuid::now_v7())
+            }),
+        )
+        .await;
+    let run_id = run["id"].clone();
+    let mut completed = None;
+    for request_id in 5..=40 {
+        let state = child
+            .request(request_id, "_kiteframe/run/get", json!({"runId":run_id}))
+            .await;
+        if state["state"] == "completed" {
+            completed = Some(state);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        completed.expect("model workflow completed")["state"],
+        "completed"
+    );
+    let replay = child
+        .request(
+            41,
+            "_kiteframe/run/event",
+            json!({"runId":run_id, "after":0, "limit":32}),
+        )
+        .await;
+    let kinds = replay["events"]
+        .as_array()
+        .expect("replayed events")
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            "run.started",
+            "model.intent",
+            "model.output",
+            "model.completed_task",
+            "run.completed"
+        ]
+    );
+    let request = responses.one_request().await;
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/v1/responses");
+    assert_eq!(request.body["model"], "test-model");
+    child.close().await;
     database.drop().await;
 }
 
