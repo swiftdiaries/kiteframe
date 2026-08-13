@@ -153,6 +153,7 @@ async fn update_model_health(model: &dyn ModelClient, ready: &AtomicBool) {
 fn init_logging() {
     let _ = tracing_subscriber::fmt()
         .json()
+        .with_writer(std::io::stderr)
         .with_env_filter("info,agent_client_protocol=off,agent_client_protocol_http=off")
         .try_init();
 }
