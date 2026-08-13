@@ -60,12 +60,34 @@ jobs:
 
       - name: Exercise TypeScript client against the compiled harness
         run: |
-          bun install --frozen-lockfile
-          bun test
-        working-directory: clients/typescript
+          (cd clients/typescript && bun install --frozen-lockfile)
+          (cd clients/typescript && bun test)
         env:
           KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
           KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
+
+      - name: Exercise TypeScript client against the remote harness
+        shell: bash
+        run: |
+          KITEFRAME_BIND=127.0.0.1:38473 \
+          KITEFRAME_TLS_TERMINATED=true \
+          KITEFRAME_BEARER_BINDINGS='[{"secret":"remote-integration-token","principal":"typescript-remote"}]' \
+          KITEFRAME_DATABASE_URL="$DATABASE_URL" \
+          KITEFRAME_RESPONSES_BASE_URL=http://127.0.0.1:9/v1 \
+          KITEFRAME_RESPONSES_API_KEY=integration-test \
+          KITEFRAME_RESPONSES_MODEL=test-model \
+          ./target/debug/kiteframe-harness &
+          harness_pid=$!
+          trap 'kill "$harness_pid" 2>/dev/null || true; wait "$harness_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            if curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null; then break; fi
+            sleep 0.1
+          done
+          curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null
+          (cd clients/typescript && bun test)
+        env:
+          KITEFRAME_REMOTE_INTEGRATION_URL: ws://127.0.0.1:38473/acp
+          KITEFRAME_REMOTE_INTEGRATION_TOKEN: remote-integration-token
 
   python:
     runs-on: ubuntu-latest

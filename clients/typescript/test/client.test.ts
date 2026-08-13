@@ -184,3 +184,19 @@ if (integrationDatabaseUrl && integrationHarnessPath) {
     }
   });
 }
+
+const integrationRemoteUrl = process.env.KITEFRAME_REMOTE_INTEGRATION_URL;
+const integrationRemoteToken = process.env.KITEFRAME_REMOTE_INTEGRATION_TOKEN;
+if (integrationRemoteUrl && integrationRemoteToken) {
+  test("remote client initializes the real harness over WebSocket", async () => {
+    const client = await Kiteframe.connect(new URL(integrationRemoteUrl), {
+      token: integrationRemoteToken,
+      policy: emptyPolicy,
+    });
+    try {
+      expect(client.sessionId).toMatch(/[0-9a-f-]{36}/);
+    } finally {
+      await client.close();
+    }
+  });
+}
