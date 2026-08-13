@@ -1,11 +1,15 @@
 # Kiteframe
 
-Kiteframe is a durable Rust workflow harness under active implementation. The
-single `kiteframe-harness` process owns PostgreSQL workflow state, workflow
-compilation, typed Cedar policy evaluation, and local NDJSON stdio dispatch.
+Kiteframe is a durable Rust workflow harness. The single
+`kiteframe-harness` process compiles author-authored `.kite` workflows, stores
+workflow state in PostgreSQL, evaluates typed Cedar policy, discovers MCP
+tools, and serves the Agent Client Protocol (ACP).
 
-The Python and TypeScript packages are thin child-process clients. They do not
-contain a workflow compiler, scheduler, policy evaluator, or durable state.
+The engine persists runs, frames, questions, permission requests, model
+attempts, tool calls, and run events. It schedules model turns, durable tool
+calls, child tasks, parallel joins, questions, cancellation, and recovery. The
+Python and TypeScript packages are thin clients: they do not carry a workflow
+compiler, scheduler, policy evaluator, or durable state.
 
 ## Local stdio
 
@@ -21,10 +25,32 @@ export KITEFRAME_RESPONSES_MODEL=...
 cargo run --bin kiteframe-harness
 ```
 
-It accepts one NDJSON request per line. The envelope owns `session_id`; command
-payloads cannot replace the connection principal or session binding. Remote
-WebSocket and Streamable HTTP ACP serving, MCP restart attachment, and
-status-first tool recovery are not complete yet.
+It accepts one ACP message per line over NDJSON. The authenticated connection
+owns the principal, and the session binding cannot be replaced by a command
+payload.
+
+## Remote ACP
+
+Set `KITEFRAME_BIND` to serve ACP over WebSocket and Streamable HTTP. Remote
+mode requires TLS to be terminated upstream and one or more bearer-token to
+principal bindings:
+
+```console
+export KITEFRAME_BIND=127.0.0.1:8080
+export KITEFRAME_TLS_TERMINATED=true
+export KITEFRAME_BEARER_BINDINGS='[{"secret":"replace-me","principal":"service-user"}]'
+cargo run --bin kiteframe-harness
+```
+
+The optional ACP v2 adapter is compile-time gated and must also be enabled at
+runtime with `KITEFRAME_ENABLE_ACP_V2=true`.
+
+## Workflow authoring
+
+Workflows declare typed tasks, model outcomes, MCP tools, transitions,
+questions, child calls, parallel work, limits, and terminal results. See the
+[support workflow example](examples/support.kite) for a small end-to-end
+workflow.
 
 ## Design and plan
 
