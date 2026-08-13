@@ -240,6 +240,40 @@ async fn active_session_quota_is_principal_scoped_and_releases_on_close() {
         .expect("capacity released");
 }
 
+#[tokio::test]
+async fn concurrent_active_session_quota_admits_exactly_one_creation() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = std::sync::Arc::new(
+        PostgresStore::connect_with_limits(
+            &database_url,
+            StoreLimits {
+                max_active_sessions_per_principal: 1,
+                ..StoreLimits::default()
+            },
+        )
+        .await
+        .expect("quota store"),
+    );
+    let principal = PrincipalId::new(format!("quota-race-{}", Uuid::now_v7())).unwrap();
+    let request = CreateSession {
+        principal: principal.clone(),
+        working_directory: "/quota".to_owned(),
+        retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+    };
+    let (first, second) = tokio::join!(
+        store.create_session(request.clone()),
+        store.create_session(request)
+    );
+    let created = match (first, second) {
+        (Ok(created), Err(StoreError::QuotaExceeded("active_sessions_per_principal")))
+        | (Err(StoreError::QuotaExceeded("active_sessions_per_principal")), Ok(created)) => created,
+        results => panic!("expected one creation and one quota rejection, got {results:?}"),
+    };
+    store.close_session(created.id, &principal).await.unwrap();
+}
+
 fn tool(name: &str) -> CatalogTool {
     let alias = name.split_once('/').expect("qualified name").0;
     CatalogTool::new(
