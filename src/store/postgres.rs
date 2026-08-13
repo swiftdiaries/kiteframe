@@ -1498,6 +1498,17 @@ impl PostgresStore {
         expected_revision: u64,
         command: super::FrameCommand,
     ) -> Result<(), StoreError> {
+        self.apply_frame_command_with_step_limit(frame_id, expected_revision, command, u64::MAX)
+            .await
+    }
+
+    pub async fn apply_frame_command_with_step_limit(
+        &self,
+        frame_id: crate::FrameId,
+        expected_revision: u64,
+        command: super::FrameCommand,
+        step_limit: u64,
+    ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let metadata = sqlx::query("SELECT run_id, parent_frame_id FROM frames WHERE id = $1")
             .bind(*frame_id.as_uuid())
@@ -1533,6 +1544,43 @@ impl PostgresStore {
             )
         {
             return Err(StoreError::RevisionConflict);
+        }
+        let consumed = sqlx::query(
+            "UPDATE runs SET step_count = step_count + 1, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = $1 AND step_count < $2 RETURNING step_count",
+        )
+        .bind(run_id)
+        .bind(step_limit.min(i64::MAX as u64) as i64)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if consumed.is_none() {
+            let failure = json!({"code":"step_limit_exceeded"});
+            sqlx::query(
+                "UPDATE frames SET state = 'failed', failure = $1, revision = $2, \
+                 updated_at = CURRENT_TIMESTAMP WHERE id = $3",
+            )
+            .bind(&failure)
+            .bind((expected_revision + 1) as i64)
+            .bind(*frame_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE runs SET state = 'failed', failure = $1, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = $2",
+            )
+            .bind(&failure)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+            append_event(
+                &mut tx,
+                run_id,
+                "run.failed",
+                json!({"code":"step_limit_exceeded", "frame_id": frame_id.as_uuid()}),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(());
         }
         let revision = expected_revision + 1;
         match command {

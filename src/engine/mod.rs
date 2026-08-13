@@ -292,8 +292,14 @@ impl Engine {
                     bindings,
                 },
             )?;
+            let step_limit = frame
+                .workflow
+                .limits
+                .get("steps")
+                .copied()
+                .unwrap_or(u64::MAX);
             self.store
-                .apply_frame_command(frame.id, frame.revision, command)
+                .apply_frame_command_with_step_limit(frame.id, frame.revision, command, step_limit)
                 .await?;
             applied += 1;
         }

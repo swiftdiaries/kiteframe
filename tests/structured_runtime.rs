@@ -106,3 +106,66 @@ async fn parallel_children_complete_before_the_parent_resumes() {
         .get("output");
     assert_eq!(output, Some(json!("joined")));
 }
+
+#[tokio::test]
+async fn durable_step_ceiling_fails_a_goto_loop_across_model_turns() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("step-limit-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let catalog = ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), []).unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("steps{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ limits {{ steps: 1 }} start t() }} \
+         task t() -> string {{ prompt \"\"\"x\"\"\" tools [] \
+         on again() {{ goto t() }} on done(answer: string) {{ done answer }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .unwrap();
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let engine = Engine {
+        store: store.clone(),
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([
+            vec![
+                json!({"type":"function_call","call_id":"again","name":"complete_task","arguments":{"outcome":"again","fields":{}}}),
+            ],
+            vec![
+                json!({"type":"function_call","call_id":"done","name":"complete_task","arguments":{"outcome":"done","fields":{"answer":"never"}}}),
+            ],
+        ])))),
+        tools: Arc::new(InProcessToolRegistry::new()),
+        authorizer: Arc::new(AllowAll),
+        config: EngineConfig::default(),
+    };
+    for _ in 0..4 {
+        engine.tick_run(run.id.clone()).await.unwrap();
+    }
+    let failure: Value = sqlx::query("SELECT failure FROM runs WHERE id = $1")
+        .bind(*run.id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("failure");
+    assert_eq!(failure["code"], "step_limit_exceeded");
+}
