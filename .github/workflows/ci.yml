@@ -106,3 +106,23 @@ jobs:
         shell: bash
         run: python scripts/inspect_wheel.py "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
         working-directory: clients/python
+
+  typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install TypeScript dependencies
+        run: bun install --frozen-lockfile
+        working-directory: clients/typescript
+
+      - name: Test, type-check, and build TypeScript client
+        run: |
+          bun test
+          bun run typecheck
+          bun run build
+        working-directory: clients/typescript

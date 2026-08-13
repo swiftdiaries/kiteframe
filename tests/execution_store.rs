@@ -52,7 +52,10 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
     let events = store.events_after(session.id.clone(), started.id.clone(), 0, 8).await.expect("replay events");
     assert_eq!(events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![1]);
     assert_eq!(events[0].kind, "run.started");
-    let runnable = store.runnable_frames(256).await.expect("list runnable frames");
+    let runnable = store
+        .runnable_frames_for_run(started.id.clone(), 8)
+        .await
+        .expect("list this run's runnable frames");
     assert!(runnable.iter().any(|frame| frame.id == started.root_frame_id));
     assert_eq!(store.start_run(request.clone()).await.expect("replay"), started);
     let attempt = store
@@ -209,7 +212,12 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
     let completion_attempt = store.begin_model_attempt(completable.root_frame_id.clone(), 0, json!({"prompt": "complete"})).await.expect("completion intent");
     store.commit_model_attempt(completable.root_frame_id.clone(), completion_attempt.attempt, completion_attempt.revision, vec![json!({"type": "function_call"})]).await.expect("completion output");
     store.record_completion(completable.root_frame_id.clone(), 2, "ok".to_owned(), json!({})).await.expect("record completion");
-    assert!(store.runnable_frames(256).await.expect("runnable frames").iter().any(|frame| frame.id == completable.root_frame_id && frame.outcome_name.as_deref() == Some("ok")));
+    assert!(store
+        .runnable_frames_for_run(completable.id.clone(), 8)
+        .await
+        .expect("this run's runnable frames")
+        .iter()
+        .any(|frame| frame.id == completable.root_frame_id && frame.outcome_name.as_deref() == Some("ok")));
     assert!(matches!(
         store
             .start_run(StartRun { input: json!({"query": "changed"}), ..StartRun {

@@ -3,10 +3,24 @@
   "version": "0.1.0",
   "type": "module",
   "exports": {
-    "./client": "./src/client.ts",
-    ".": "./src/index.ts"
+    ".": {"types": "./dist/index.d.ts", "default": "./dist/index.js"},
+    "./client": {"types": "./dist/client.d.ts", "default": "./dist/client.js"}
   },
+  "files": ["dist"],
   "scripts": {
-    "test": "bun test"
+    "build": "bun build src/index.ts src/client.ts --outdir dist && tsc --project tsconfig.build.json",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.11",
+    "typescript": "^5.9.3"
+  },
+  "optionalDependencies": {
+    "@kiteframe/darwin-arm64": "0.1.0",
+    "@kiteframe/darwin-x64": "0.1.0",
+    "@kiteframe/linux-arm64": "0.1.0",
+    "@kiteframe/linux-x64": "0.1.0",
+    "@kiteframe/win32-x64": "0.1.0"
   }
 }

@@ -51,3 +51,5 @@ async-tungstenite = { version = "0.34", features = ["tokio-runtime"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[workspace]
