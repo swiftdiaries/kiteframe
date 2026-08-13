@@ -10,7 +10,8 @@
   "scripts": {
     "build": "bun build src/index.ts src/client.ts --outdir dist && tsc --project tsconfig.build.json",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "package-platform": "bun scripts/package-platform.ts"
   },
   "devDependencies": {
     "bun-types": "^1.3.11",

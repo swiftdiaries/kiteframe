@@ -120,6 +120,56 @@ jobs:
         run: bun install --frozen-lockfile
         working-directory: clients/typescript
 
+  typescript-platform-packages:
+    name: TypeScript platform package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-14
+            package: darwin-arm64
+            binary: kiteframe-harness
+          - name: macOS x86_64
+            runner: macos-15-intel
+            package: darwin-x64
+            binary: kiteframe-harness
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            package: linux-arm64
+            binary: kiteframe-harness
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            package: linux-x64
+            binary: kiteframe-harness
+          - name: Windows x86_64
+            runner: windows-latest
+            package: win32-x64
+            binary: kiteframe-harness.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build harness and stage platform package
+        shell: bash
+        run: |
+          cargo build --release --bin kiteframe-harness
+          bun install --frozen-lockfile
+          bun run package-platform -- "${{ matrix.package }}" "../../target/release/${{ matrix.binary }}"
+          (cd "npm/${{ matrix.package }}" && bun pm pack)
+          tar -tzf "npm/${{ matrix.package }}"/*.tgz | grep -F "package/${{ matrix.binary }}"
+        working-directory: clients/typescript
+
+      - name: Upload packed platform artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: kiteframe-${{ matrix.package }}
+          path: clients/typescript/npm/${{ matrix.package }}/*.tgz
+
       - name: Test, type-check, and build TypeScript client
         run: |
           bun test
