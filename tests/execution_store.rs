@@ -97,6 +97,30 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .expect("persist model intent");
     assert_eq!(attempt.attempt, 1);
     assert_eq!(attempt.revision, 1);
+    let event_count_before_stale = store
+        .events_after(session.id.clone(), started.id.clone(), 0, 8)
+        .await
+        .expect("events before stale completion")
+        .len();
+    assert!(matches!(
+        store
+            .commit_model_attempt(
+                started.root_frame_id.clone(),
+                attempt.attempt,
+                attempt.revision - 1,
+                vec![json!({"type": "stale"})],
+            )
+            .await,
+        Err(StoreError::RevisionConflict)
+    ));
+    assert_eq!(
+        store
+            .events_after(session.id.clone(), started.id.clone(), 0, 8)
+            .await
+            .expect("stale completion must not append an event")
+            .len(),
+        event_count_before_stale
+    );
     assert_eq!(
         store
             .model_attempt_count(started.root_frame_id.clone())
@@ -144,6 +168,35 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
             .await
             .expect("replay tool intent"),
         tool_call
+    );
+    let event_count_before_conflict = store
+        .events_after(session.id.clone(), started.id.clone(), 0, 16)
+        .await
+        .expect("events before conflicting tool replay")
+        .len();
+    assert!(matches!(
+        store
+            .begin_tool_call(
+                started.root_frame_id.clone(),
+                2,
+                "provider-call-1".to_owned(),
+                "docs/search".to_owned(),
+                catalog.tools()["docs/search"]
+                    .descriptor_digest()
+                    .to_owned(),
+                json!({"query": "changed"}),
+                "tool-attempt-1".to_owned(),
+            )
+            .await,
+        Err(StoreError::IdempotencyConflict)
+    ));
+    assert_eq!(
+        store
+            .events_after(session.id.clone(), started.id.clone(), 0, 16)
+            .await
+            .expect("conflicting tool replay must not append an event")
+            .len(),
+        event_count_before_conflict
     );
     let permission = NewPermissionRequest {
         id: PermissionRequestId::new(Uuid::now_v7()),
