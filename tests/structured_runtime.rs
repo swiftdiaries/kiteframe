@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
-    CreateSession, Engine, EngineConfig, IdempotencyKey, InProcessToolRegistry, ModelClient,
-    ModelError, ModelRequest, ModelResponse, PolicyDecision, PolicyRequest, PostgresStore,
-    PrincipalId, SessionAuthorizer, StartRun, ToolCatalogSnapshot,
+    AnswerQuestion, CreateSession, Engine, EngineConfig, IdempotencyKey, InProcessToolRegistry,
+    ModelClient, ModelError, ModelRequest, ModelResponse, PolicyDecision, PolicyRequest,
+    PostgresStore, PrincipalId, SessionAuthorizer, StartRun, ToolCatalogSnapshot,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -266,6 +266,114 @@ async fn parallel_children_complete_before_the_parent_resumes() {
             "child transcript must not inherit parent model history"
         );
     }
+}
+
+#[tokio::test]
+async fn parallel_questions_remain_independently_answerable_until_all_children_resume() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("parallel-questions-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let catalog = ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), []).unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("parallelquestions{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start root() }} \
+         task root() -> string {{ prompt \"\"\"x\"\"\" tools [] on split() {{ parallel {{ left = call leaf(value: \"left\") right = call leaf(value: \"right\") }} done \"joined\" }} }} \
+         task leaf(value: string) -> string {{ prompt \"\"\"x\"\"\" tools [] on ask_one(question: string) {{ answer = ask string question done answer }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .unwrap();
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let engine = Engine {
+        store: store.clone(),
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([
+            vec![
+                json!({"type":"function_call","call_id":"root","name":"complete_task","arguments":{"outcome":"split","fields":{}}}),
+            ],
+            vec![
+                json!({"type":"function_call","call_id":"left","name":"complete_task","arguments":{"outcome":"ask_one","fields":{"question":"left?"}}}),
+            ],
+            vec![
+                json!({"type":"function_call","call_id":"right","name":"complete_task","arguments":{"outcome":"ask_one","fields":{"question":"right?"}}}),
+            ],
+        ])))),
+        tools: Arc::new(InProcessToolRegistry::new()),
+        authorizer: Arc::new(AllowAll),
+        config: EngineConfig::default(),
+    };
+    for _ in 0..8 {
+        engine.tick_run(run.id.clone()).await.unwrap();
+    }
+    let questions = sqlx::query("SELECT questions.id, questions.frame_id, frames.revision, questions.text, questions.state FROM questions JOIN frames ON frames.id = questions.frame_id WHERE questions.run_id = $1 ORDER BY questions.text")
+        .bind(*run.id.as_uuid()).fetch_all(store.pool()).await.unwrap();
+    assert_eq!(questions.len(), 2);
+    let first_id: Uuid = questions[0].get("id");
+    let second_id: Uuid = questions[1].get("id");
+    engine
+        .answer_question(AnswerQuestion {
+            session_id: session.id.clone(),
+            run_id: run.id.clone(),
+            question_id: first_id,
+            answer: json!("first answer"),
+            idempotency_key: IdempotencyKey::new(format!("answer-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let second_state: String = sqlx::query_scalar("SELECT state FROM questions WHERE id = $1")
+        .bind(second_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(second_state, "pending");
+    assert_ne!(
+        store
+            .get_run(session.id.clone(), run.id.clone())
+            .await
+            .unwrap()
+            .state,
+        kiteframe::RunState::Completed
+    );
+    engine
+        .answer_question(AnswerQuestion {
+            session_id: session.id.clone(),
+            run_id: run.id.clone(),
+            question_id: second_id,
+            answer: json!("second answer"),
+            idempotency_key: IdempotencyKey::new(format!("answer-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    for _ in 0..6 {
+        engine.tick_run(run.id.clone()).await.unwrap();
+    }
+    let output: Option<Value> = sqlx::query("SELECT output FROM runs WHERE id = $1")
+        .bind(*run.id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("output");
+    assert_eq!(output, Some(json!("joined")));
 }
 
 #[tokio::test]
