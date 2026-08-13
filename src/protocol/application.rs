@@ -87,7 +87,7 @@ impl Application {
                 if request.mcp_servers.is_empty() && session.view.mcp_attached {
                     return Err(ProtocolError::McpConfigurationRequired);
                 }
-                self.attach_mcp(
+                self.reattach_mcp(
                     session.view.id.clone(),
                     context.connection_principal.clone(),
                     request.mcp_servers.clone(),
@@ -261,6 +261,24 @@ impl Application {
             .as_ref()
             .ok_or(ProtocolError::McpUnavailable)?
             .attach(session, principal, configs)
+            .await
+            .map_err(|error| ProtocolError::Application(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn reattach_mcp(
+        &self,
+        session: SessionId,
+        principal: crate::PrincipalId,
+        configs: Vec<McpServerConfig>,
+    ) -> Result<(), ProtocolError> {
+        if configs.is_empty() {
+            return Ok(());
+        }
+        self.mcp
+            .as_ref()
+            .ok_or(ProtocolError::McpUnavailable)?
+            .reattach(session, principal, configs)
             .await
             .map_err(|error| ProtocolError::Application(error.to_string()))?;
         Ok(())

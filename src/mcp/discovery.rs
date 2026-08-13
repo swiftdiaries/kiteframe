@@ -364,6 +364,22 @@ impl McpManager {
             McpError::Configuration("at least one MCP server is required".to_owned())
         })
     }
+    pub async fn reattach(
+        &self,
+        session: SessionId,
+        principal: PrincipalId,
+        configs: Vec<McpServerConfig>,
+    ) -> Result<ToolCatalogSnapshot, McpError> {
+        self.connections
+            .write()
+            .expect("MCP connections lock poisoned")
+            .remove(&session);
+        self.catalogs
+            .write()
+            .expect("MCP catalogs lock poisoned")
+            .remove(&session);
+        self.attach(session, principal, configs).await
+    }
     pub async fn attach_peer(
         &self,
         session: SessionId,
