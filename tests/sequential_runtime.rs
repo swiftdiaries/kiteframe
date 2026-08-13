@@ -59,6 +59,32 @@ struct SearchTool {
     descriptor: CatalogTool,
 }
 
+struct ChangedResolver;
+
+#[async_trait]
+impl ToolResolver for ChangedResolver {
+    fn bound_tool(
+        &self,
+        _session: kiteframe::SessionId,
+        qualified_name: &str,
+        _descriptor_digest: &str,
+    ) -> Result<Arc<dyn kiteframe::BoundTool>, ToolError> {
+        Err(ToolError::ToolContractChanged {
+            qualified_name: qualified_name.to_owned(),
+        })
+    }
+
+    async fn invoke(
+        &self,
+        _session: kiteframe::SessionId,
+        _qualified_name: &str,
+        _descriptor_digest: &str,
+        _call: ToolCall,
+    ) -> Result<Value, ToolError> {
+        unreachable!("scheduler resolves before invoking")
+    }
+}
+
 #[async_trait]
 impl TrustedTool for SearchTool {
     fn descriptor(&self) -> &CatalogTool {
@@ -177,6 +203,75 @@ async fn permitted_model_tool_call_replays_output_then_completes() {
         .unwrap()
         .get("state");
     assert_eq!(state, "completed");
+}
+
+#[tokio::test]
+async fn changed_descriptor_becomes_a_durable_tool_contract_failure() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("changed-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .expect("session");
+    let descriptor = CatalogTool::new(
+        "docs/search",
+        "docs",
+        "search",
+        ClosedSchema::object("input", BTreeMap::new()),
+        ClosedSchema::object("output", BTreeMap::new()),
+        BTreeSet::new(),
+        EffectKind::ReadOnly,
+        RecoverySupport::NotRequired,
+    )
+    .unwrap();
+    let catalog =
+        ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), [descriptor.clone()]).unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("changed{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .unwrap();
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let engine = Engine {
+        store: store.clone(),
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([vec![
+            json!({"type":"function_call","call_id":"changed-call","name":"docs/search","arguments":{}}),
+        ]])))),
+        tools: Arc::new(ChangedResolver),
+        authorizer: Arc::new(AllowAll),
+        config: EngineConfig::default(),
+    };
+    engine
+        .tick_run(run.id.clone())
+        .await
+        .expect("scheduler survives changed descriptor");
+    let error: Value = sqlx::query("SELECT error FROM tool_calls WHERE frame_id = $1")
+        .bind(*run.root_frame_id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("error");
+    assert_eq!(error["code"], "tool_contract_changed");
 }
 
 #[tokio::test]

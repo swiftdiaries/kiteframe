@@ -15,7 +15,7 @@ use crate::dsl::CompiledType;
 use crate::{
     IdempotencyKey, ModelClient, ModelRequest, NewPermissionRequest, PermissionRequestId,
     PolicyDecision, PolicyRequest, PostgresStore, SessionAuthorizer, StoreError, ToolCall,
-    ToolResolver, canonical_sha256,
+    ToolError, ToolResolver, canonical_sha256,
 };
 
 pub struct Engine {
@@ -206,7 +206,23 @@ impl Engine {
         match request.choice {
             PermissionChoice::AllowOnce | PermissionChoice::AllowToolForSession => {
                 let binding = self.store.run_tool_binding(request.run_id.clone(), &pending.qualified_name).await?;
-                let tool = self.tools.bound_tool(request.session_id.clone(), &binding.qualified_name, &binding.descriptor_digest).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let tool = match self.tools.bound_tool(
+                    request.session_id.clone(),
+                    &binding.qualified_name,
+                    &binding.descriptor_digest,
+                ) {
+                    Ok(tool) => tool,
+                    Err(ToolError::ToolContractChanged { .. } | ToolError::UnknownTool(_)) => {
+                        self.store.finish_tool_call(
+                            pending.frame_id,
+                            pending.tool_call_id,
+                            revision,
+                            Err(json!({"code":"tool_contract_changed"})),
+                        ).await?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(StoreError::InvalidData(error.to_string()).into()),
+                };
                 let policy_revision = self.store.policy_revision(request.session_id.clone()).await?;
                 let call = ToolCall::new(request.session_id, request.run_id, pending.frame_id.clone(), policy_revision, tool.descriptor(), pending.arguments, IdempotencyKey::new(format!("{}:{}", pending.frame_id.as_uuid(), pending.provider_call_id)).map_err(|error| StoreError::InvalidData(error.to_string()))?).map_err(|error| StoreError::InvalidData(error.to_string()))?;
                 let result = tool.invoke(call).await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
@@ -440,14 +456,30 @@ impl Engine {
             .map_err(|error| StoreError::InvalidData(error.to_string()))?
         {
             PolicyDecision::Allow => {
-                let tool = self
-                    .tools
-                    .bound_tool(
-                        frame.session_id.clone(),
-                        &binding.qualified_name,
-                        &binding.descriptor_digest,
-                    )
-                    .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                let tool = match self.tools.bound_tool(
+                    frame.session_id.clone(),
+                    &binding.qualified_name,
+                    &binding.descriptor_digest,
+                ) {
+                    Ok(tool) => tool,
+                    Err(ToolError::ToolContractChanged { .. } | ToolError::UnknownTool(_)) => {
+                        self.store
+                            .finish_tool_call(
+                                frame.id.clone(),
+                                intent.id,
+                                intent.revision,
+                                Err(json!({"code":"tool_contract_changed"})),
+                            )
+                            .await
+                            .map_err(|error| {
+                                StoreError::InvalidData(format!(
+                                    "persist changed tool contract result: {error}"
+                                ))
+                            })?;
+                        return Ok(());
+                    }
+                    Err(error) => return Err(StoreError::InvalidData(error.to_string()).into()),
+                };
                 let call = ToolCall::new(
                     frame.session_id.clone(),
                     frame.run_id.clone(),
