@@ -412,9 +412,10 @@ impl Engine {
             .copied()
             .unwrap_or(u64::MAX);
         if self.store.model_attempt_count(frame.id.clone()).await? >= limit {
-            return Err(
-                StoreError::InvalidData("model turn limit reached for task".to_owned()).into(),
-            );
+            self.store
+                .fail_frame_with_code(frame.id, frame.revision, "model_turn_limit_exceeded")
+                .await?;
+            return Ok(());
         }
         let attempt = self
             .store
@@ -452,10 +453,10 @@ impl Engine {
         if response.items.iter().any(|item| {
             serde_json::to_vec(item).map_or(true, |bytes| bytes.len() as u64 > item_limit)
         }) {
-            return Err(StoreError::InvalidData(
-                "model response item exceeds workflow byte limit".to_owned(),
-            )
-            .into());
+            self.store
+                .fail_frame_with_code(frame.id, attempt.revision, "response_item_limit_exceeded")
+                .await?;
+            return Ok(());
         }
         let tool_limit = frame
             .workflow
@@ -469,10 +470,10 @@ impl Engine {
             .filter(|item| tool_call_from_item(item).is_some())
             .count() as u64;
         if tool_calls > tool_limit {
-            return Err(StoreError::InvalidData(
-                "model response exceeds workflow tool-call limit".to_owned(),
-            )
-            .into());
+            self.store
+                .fail_frame_with_code(frame.id, attempt.revision, "tool_call_limit_exceeded")
+                .await?;
+            return Ok(());
         }
         self.store
             .commit_model_attempt(

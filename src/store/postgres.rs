@@ -1026,6 +1026,50 @@ impl PostgresStore {
         })
     }
 
+    pub async fn fail_frame_with_code(
+        &self,
+        frame_id: crate::FrameId,
+        expected_revision: u64,
+        code: &str,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
+        let frame = sqlx::query("SELECT revision, state FROM frames WHERE id = $1 FOR UPDATE")
+            .bind(*frame_id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::FrameNotFound)?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision
+            || !matches!(
+                frame.get::<String, _>("state").as_str(),
+                "runnable" | "running"
+            )
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        let failure = json!({"code":code});
+        sqlx::query("UPDATE frames SET state = 'failed', failure = $1, revision = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3")
+            .bind(&failure)
+            .bind((expected_revision + 1) as i64)
+            .bind(*frame_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE runs SET state = 'failed', failure = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(&failure)
+            .bind(run_id)
+            .execute(&mut *tx)
+            .await?;
+        append_event(
+            &mut tx,
+            run_id,
+            "run.failed",
+            json!({"code":code, "frame_id":frame_id.as_uuid()}),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn commit_model_attempt(
         &self,
         frame_id: crate::FrameId,
