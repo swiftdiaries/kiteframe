@@ -183,7 +183,7 @@ impl PostgresStore {
         if exists.is_none() {
             return Err(StoreError::SessionNotFound);
         }
-        if let Some(row) = sqlx::query(
+        let epoch_id = if let Some(row) = sqlx::query(
             "SELECT session_id, canonical_digest FROM mcp_catalog_epochs WHERE epoch_id = $1",
         )
         .bind(*epoch.epoch_id().as_uuid())
@@ -195,12 +195,24 @@ impl PostgresStore {
             {
                 return Err(StoreError::CatalogScopeViolation);
             }
+            *epoch.epoch_id().as_uuid()
+        } else if let Some(existing) = sqlx::query(
+            "SELECT epoch_id FROM mcp_catalog_epochs WHERE session_id = $1 AND server_alias = $2 AND canonical_digest = $3",
+        )
+        .bind(*epoch.session_id().as_uuid())
+        .bind(binding_kind)
+        .bind(epoch.digest())
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            existing.get("epoch_id")
         } else {
             sqlx::query("INSERT INTO mcp_catalog_epochs (epoch_id, session_id, server_alias, refresh_identity, canonical_digest, connection_binding, descriptor_snapshot) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(*epoch.epoch_id().as_uuid()).bind(*epoch.session_id().as_uuid()).bind(binding_kind).bind(epoch.epoch_id().as_uuid().to_string()).bind(epoch.digest()).bind(json!({"kind":binding_kind})).bind(snapshot)
             .execute(&mut *tx).await?;
-        }
-        sqlx::query("UPDATE sessions SET current_catalog_epoch = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2").bind(*epoch.epoch_id().as_uuid()).bind(*epoch.session_id().as_uuid()).execute(&mut *tx).await?;
+            *epoch.epoch_id().as_uuid()
+        };
+        sqlx::query("UPDATE sessions SET current_catalog_epoch = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2").bind(epoch_id).bind(*epoch.session_id().as_uuid()).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }

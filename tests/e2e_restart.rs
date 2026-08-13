@@ -370,6 +370,35 @@ async fn stdio_harness_child_discovers_and_invokes_a_real_mcp_tool() {
     let invocations = std::fs::read_to_string(&log_path).expect("MCP invocation log");
     assert_eq!(invocations.lines().collect::<Vec<_>>(), ["tools/call"]);
     child.close().await;
+    let mut restarted = HarnessChild::start(&database.url, &principal, responses.base_url()).await;
+    restarted
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion":1, "clientCapabilities":{}, "clientInfo":{"name":"e2e","version":"1"}}),
+        )
+        .await;
+    assert_eq!(
+        restarted
+            .request(
+                2,
+                "session/load",
+                json!({
+                    "sessionId":session_id,
+                    "cwd":"/tmp/kiteframe-process-mcp",
+                    "mcpServers":[{
+                        "type":"stdio",
+                        "name":"docs",
+                        "command":"python3",
+                        "args":[fixture],
+                        "env":[{"name":"KITEFRAME_E2E_MCP_LOG", "value":log_path}]
+                    }]
+                }),
+            )
+            .await,
+        json!({})
+    );
+    restarted.close().await;
     std::fs::remove_file(&log_path).expect("remove MCP log");
     database.drop().await;
 }
