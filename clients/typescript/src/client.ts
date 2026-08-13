@@ -39,6 +39,7 @@ type Json = Record<string, unknown>;
 interface JsonRpcTransport {
   request(method: string, params: Json): Promise<Json>;
   close(): Promise<void>;
+  openSession?(sessionId: string): Promise<void>;
 }
 
 type Pending = { resolve: (value: Json) => void; reject: (reason: Error) => void };
@@ -190,6 +191,7 @@ class HttpTransport extends AsyncJsonRpcTransport {
   readonly #token: string;
   #connectionId: string | undefined;
   #closed = false;
+  #streams = new Set<AbortController>();
 
   constructor(url: URL, token: string, permissionHandler?: PermissionHandler) {
     super(permissionHandler);
@@ -219,9 +221,36 @@ class HttpTransport extends AsyncJsonRpcTransport {
     await this.dispatch(JSON.stringify(await response.json()));
   }
 
+  async openSession(sessionId: string): Promise<void> {
+    await this.#openStream();
+    await this.#openStream(sessionId);
+  }
+
+  async #openStream(sessionId?: string): Promise<void> {
+    if (!this.#connectionId) throw new HarnessError("Streamable HTTP is not initialized");
+    const controller = new AbortController();
+    this.#streams.add(controller);
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${this.#token}`,
+      Accept: "text/event-stream",
+      "Acp-Connection-Id": this.#connectionId,
+    };
+    if (sessionId) headers["Acp-Session-Id"] = sessionId;
+    const response = await fetch(this.#url, { headers, signal: controller.signal });
+    if (!response.ok) throw new HarnessError(`Streamable HTTP event stream failed with HTTP ${response.status}`);
+    void response.text().then(async text => {
+      for (const event of text.split("\n\n")) {
+        const data = event.split("\n").filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+        if (data) await this.dispatch(data);
+      }
+    }).finally(() => this.#streams.delete(controller));
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    for (const stream of this.#streams) stream.abort();
+    this.#streams.clear();
     if (this.#connectionId) await fetch(this.#url, { method: "DELETE", headers: { Authorization: `Bearer ${this.#token}`, "Acp-Connection-Id": this.#connectionId } });
     this.finish();
   }
@@ -318,6 +347,7 @@ export class Kiteframe {
     }
     const session = await transport.request("session/new", protocolVersion === 1 ? { cwd, mcpServers: [] } : { cwd });
     if (typeof session.sessionId !== "string") throw new HarnessError("harness returned an invalid session ID");
+    await transport.openSession?.(session.sessionId);
     await transport.request("_kiteframe/session/policy/update", { expectedRevision: 0, idempotencyKey: crypto.randomUUID(), policy });
     return new Kiteframe(transport, session.sessionId);
   }

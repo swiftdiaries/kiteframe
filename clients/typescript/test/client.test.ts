@@ -76,9 +76,14 @@ test("remote connects over WebSocket before considering HTTP fallback", async ()
 });
 
 test("remote falls back to Streamable HTTP only after a WebSocket upgrade rejection", async () => {
+  let streams = 0;
   const server = Bun.serve({
     port: 0,
     async fetch(request) {
+      if (request.method === "GET" && request.headers.get("accept") === "text/event-stream") {
+        streams += 1;
+        return new Response("", { headers: { "Content-Type": "text/event-stream" } });
+      }
       if (request.method !== "POST" || new URL(request.url).pathname !== "/acp") return new Response("not found", { status: 404 });
       const message = await request.json() as { id: number; method: string; params: Record<string, unknown> };
       let result: object;
@@ -92,6 +97,7 @@ test("remote falls back to Streamable HTTP only after a WebSocket upgrade reject
   try {
     const client = await Kiteframe.connect(new URL(server.url.toString() + "acp"), { token: "test-token", policy: emptyPolicy });
     expect((await client.publish("source")).name).toBe("support");
+    expect(streams).toBe(2);
     await client.close();
   } finally {
     server.stop(true);
