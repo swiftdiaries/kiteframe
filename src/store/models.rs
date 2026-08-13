@@ -1,9 +1,11 @@
-use serde_json::Value;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-use crate::{CatalogEpochId, FrameId, IdempotencyKey, PolicyRevision, PrincipalId, RunId, SessionId};
+use crate::{
+    CatalogEpochId, FrameId, IdempotencyKey, PolicyRevision, PrincipalId, RunId, SessionId,
+};
 
 #[derive(Clone, Debug)]
 pub struct CreateSession {
@@ -180,9 +182,15 @@ pub enum FrameCommand {
     StartCall(NewChild),
     StartParallel(Vec<NewChild>),
     SuspendAsk(Question),
-    Goto { task_name: String, bindings: Bindings },
+    Goto {
+        task_name: String,
+        bindings: Bindings,
+    },
     Complete(Value),
-    Fail { code: String, message: String },
+    Fail {
+        code: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Error)]

@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use super::{CompiledPolicy, PolicyEffect, PolicyError, PolicyTarget, SessionPolicy};
 use crate::{Capability, SessionId};
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 #[derive(Clone, Debug)]
 pub struct PolicyRequest {
     pub session: SessionId,
@@ -79,12 +79,20 @@ impl PersistedAuthorizer {
 #[async_trait]
 impl SessionAuthorizer for PersistedAuthorizer {
     async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision, PolicyError> {
-        let policy = self.store.current_session_policy(request.session.clone()).await
+        let policy = self
+            .store
+            .current_session_policy(request.session.clone())
+            .await
             .map_err(|error| PolicyError::Cedar(error.to_string()))?;
-        let catalog = self.store.current_catalog(request.session.clone()).await
+        let catalog = self
+            .store
+            .current_catalog(request.session.clone())
+            .await
             .map_err(|error| PolicyError::Cedar(error.to_string()))?;
         let compiled = crate::policy::compile(&policy, &catalog)?;
-        CedarAuthorizer::new(&compiled, policy)?.authorize(request).await
+        CedarAuthorizer::new(&compiled, policy)?
+            .authorize(request)
+            .await
     }
 }
 impl CedarAuthorizer {

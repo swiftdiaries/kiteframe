@@ -3,7 +3,8 @@ mod compile;
 mod types;
 
 pub use authorize::{
-    CedarAuthorizer, PersistedAuthorizer, PolicyDecision, PolicyRequest, SessionAuthorizer, TypedAuthorizer,
+    CedarAuthorizer, PersistedAuthorizer, PolicyDecision, PolicyRequest, SessionAuthorizer,
+    TypedAuthorizer,
 };
 pub use compile::{CompiledPolicy, compile};
 pub use types::{

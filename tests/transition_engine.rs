@@ -22,23 +22,51 @@ fn resolves_terminal_outcomes_without_io() {
     let workflow = workflow();
     let done = next_command(
         &workflow,
-        &FrameSnapshot { task_name: "t".to_owned(), outcome: "ok".to_owned(), statement_index: 0, bindings: BTreeMap::from([("answer".to_owned(), json!("done"))]) },
-    ).expect("done command");
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "ok".to_owned(),
+            statement_index: 0,
+            bindings: BTreeMap::from([("answer".to_owned(), json!("done"))]),
+        },
+    )
+    .expect("done command");
     assert!(matches!(done, FrameCommand::Complete(value) if value == json!("done")));
     let failed = next_command(
         &workflow,
-        &FrameSnapshot { task_name: "t".to_owned(), outcome: "bad".to_owned(), statement_index: 0, bindings: BTreeMap::from([("reason".to_owned(), json!("nope"))]) },
-    ).expect("failure command");
-    assert!(matches!(failed, FrameCommand::Fail { code, message } if code == "bad" && message == "nope"));
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "bad".to_owned(),
+            statement_index: 0,
+            bindings: BTreeMap::from([("reason".to_owned(), json!("nope"))]),
+        },
+    )
+    .expect("failure command");
+    assert!(
+        matches!(failed, FrameCommand::Fail { code, message } if code == "bad" && message == "nope")
+    );
 }
 
 #[test]
 fn rejects_missing_bindings_and_corrupt_cursors() {
     let workflow = workflow();
-    let missing = FrameSnapshot { task_name: "t".to_owned(), outcome: "ok".to_owned(), statement_index: 0, bindings: BTreeMap::new() };
-    assert!(matches!(next_command(&workflow, &missing), Err(TransitionError::MissingBinding(_))));
-    let corrupt = FrameSnapshot { statement_index: 1, ..missing };
-    assert!(matches!(next_command(&workflow, &corrupt), Err(TransitionError::Corrupt(_))));
+    let missing = FrameSnapshot {
+        task_name: "t".to_owned(),
+        outcome: "ok".to_owned(),
+        statement_index: 0,
+        bindings: BTreeMap::new(),
+    };
+    assert!(matches!(
+        next_command(&workflow, &missing),
+        Err(TransitionError::MissingBinding(_))
+    ));
+    let corrupt = FrameSnapshot {
+        statement_index: 1,
+        ..missing
+    };
+    assert!(matches!(
+        next_command(&workflow, &corrupt),
+        Err(TransitionError::Corrupt(_))
+    ));
 }
 
 #[test]
@@ -50,12 +78,46 @@ fn emits_call_parallel_and_ask_commands_in_source_order() {
         &catalog,
         &Limits::default(),
     ).expect("compile");
-    let bindings = BTreeMap::from([("value".to_owned(), json!("v")), ("question".to_owned(), json!("q"))]);
-    let call = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "call_one".to_owned(), statement_index: 0, bindings: bindings.clone() }).expect("call");
-    assert!(matches!(call, FrameCommand::StartCall(child) if child.target == "c" && child.binding == "child"));
-    let parallel = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "parallel_one".to_owned(), statement_index: 0, bindings: bindings.clone() }).expect("parallel");
-    assert!(matches!(parallel, FrameCommand::StartParallel(children) if children.iter().map(|child| child.binding.as_str()).collect::<Vec<_>>() == ["left", "right"]));
-    let ask = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "ask_one".to_owned(), statement_index: 0, bindings }).expect("ask");
+    let bindings = BTreeMap::from([
+        ("value".to_owned(), json!("v")),
+        ("question".to_owned(), json!("q")),
+    ]);
+    let call = next_command(
+        &workflow,
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "call_one".to_owned(),
+            statement_index: 0,
+            bindings: bindings.clone(),
+        },
+    )
+    .expect("call");
+    assert!(
+        matches!(call, FrameCommand::StartCall(child) if child.target == "c" && child.binding == "child")
+    );
+    let parallel = next_command(
+        &workflow,
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "parallel_one".to_owned(),
+            statement_index: 0,
+            bindings: bindings.clone(),
+        },
+    )
+    .expect("parallel");
+    assert!(
+        matches!(parallel, FrameCommand::StartParallel(children) if children.iter().map(|child| child.binding.as_str()).collect::<Vec<_>>() == ["left", "right"])
+    );
+    let ask = next_command(
+        &workflow,
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "ask_one".to_owned(),
+            statement_index: 0,
+            bindings,
+        },
+    )
+    .expect("ask");
     assert!(matches!(ask, FrameCommand::SuspendAsk(question) if question.text == "q"));
 }
 
@@ -68,8 +130,19 @@ fn preserves_large_numeric_literals() {
         &catalog,
         &Limits::default(),
     ).expect("compile");
-    let command = next_command(&workflow, &FrameSnapshot { task_name: "t".to_owned(), outcome: "ok".to_owned(), statement_index: 0, bindings: BTreeMap::new() }).expect("number");
-    assert!(matches!(command, FrameCommand::Complete(value) if value == json!(9_007_199_254_740_993_u64)));
+    let command = next_command(
+        &workflow,
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "ok".to_owned(),
+            statement_index: 0,
+            bindings: BTreeMap::new(),
+        },
+    )
+    .expect("number");
+    assert!(
+        matches!(command, FrameCommand::Complete(value) if value == json!(9_007_199_254_740_993_u64))
+    );
 }
 
 #[test]
@@ -92,5 +165,7 @@ fn emits_closed_record_schema_for_typed_questions() {
         },
     )
     .expect("ask command");
-    assert!(matches!(command, FrameCommand::SuspendAsk(question) if question.schema.validate(&json!({"approved": true, "note": null})).is_ok() && question.schema.validate(&json!({"approved": true})).is_err()));
+    assert!(
+        matches!(command, FrameCommand::SuspendAsk(question) if question.schema.validate(&json!({"approved": true, "note": null})).is_ok() && question.schema.validate(&json!({"approved": true})).is_err())
+    );
 }

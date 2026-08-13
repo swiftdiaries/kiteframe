@@ -18,9 +18,11 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         eprintln!("skipping session store test: DATABASE_URL is not configured");
         return;
     };
-    let store = Arc::new(PostgresStore::connect(&database_url)
-        .await
-        .expect("connect store"));
+    let store = Arc::new(
+        PostgresStore::connect(&database_url)
+            .await
+            .expect("connect store"),
+    );
     let principal = PrincipalId::new(format!("alice-{}", Uuid::now_v7())).expect("principal");
     let session = store
         .create_session(CreateSession {
@@ -51,7 +53,10 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
     assert_eq!(restored.digest(), catalog.digest());
     assert_eq!(
         restored
-            .resolve("docs/search", catalog.tools()["docs/search"].descriptor_digest())
+            .resolve(
+                "docs/search",
+                catalog.tools()["docs/search"].descriptor_digest()
+            )
             .expect("restored descriptor")
             .descriptor_digest(),
         catalog.tools()["docs/search"].descriptor_digest()
@@ -103,25 +108,60 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         rules: vec![PolicyRule {
             rule_id: "permit-search".to_owned(),
             effect: PolicyEffect::Permit,
-            target: PolicyTarget::Tool { names: BTreeSet::from(["docs/search".to_owned()]) },
+            target: PolicyTarget::Tool {
+                names: BTreeSet::from(["docs/search".to_owned()]),
+            },
             input: Default::default(),
         }],
     };
-    store.append_session_policy(session.id.clone(), PolicyRevision::new(1), "permit-search".to_owned(), &permit, &catalog).await.expect("append permit");
+    store
+        .append_session_policy(
+            session.id.clone(),
+            PolicyRevision::new(1),
+            "permit-search".to_owned(),
+            &permit,
+            &catalog,
+        )
+        .await
+        .expect("append permit");
     let authorizer = PersistedAuthorizer::new(store.clone());
-    let request = PolicyRequest { session: session.id.clone(), qualified_name: "docs/search".to_owned(), descriptor_digest: catalog.tools()["docs/search"].descriptor_digest().to_owned(), capabilities: vec![] };
-    assert!(matches!(authorizer.authorize(&request).await, Ok(PolicyDecision::Allow)));
+    let request = PolicyRequest {
+        session: session.id.clone(),
+        qualified_name: "docs/search".to_owned(),
+        descriptor_digest: catalog.tools()["docs/search"]
+            .descriptor_digest()
+            .to_owned(),
+        capabilities: vec![],
+    };
+    assert!(matches!(
+        authorizer.authorize(&request).await,
+        Ok(PolicyDecision::Allow)
+    ));
     let forbid = SessionPolicy {
         version: 1,
         rules: vec![PolicyRule {
             rule_id: "forbid-search".to_owned(),
             effect: PolicyEffect::Forbid,
-            target: PolicyTarget::Tool { names: BTreeSet::from(["docs/search".to_owned()]) },
+            target: PolicyTarget::Tool {
+                names: BTreeSet::from(["docs/search".to_owned()]),
+            },
             input: Default::default(),
         }],
     };
-    store.append_session_policy(session.id.clone(), PolicyRevision::new(2), "forbid-search".to_owned(), &forbid, &catalog).await.expect("append forbid");
-    assert!(matches!(authorizer.authorize(&request).await, Ok(PolicyDecision::Forbid { .. })));
+    store
+        .append_session_policy(
+            session.id.clone(),
+            PolicyRevision::new(2),
+            "forbid-search".to_owned(),
+            &forbid,
+            &catalog,
+        )
+        .await
+        .expect("append forbid");
+    assert!(matches!(
+        authorizer.authorize(&request).await,
+        Ok(PolicyDecision::Forbid { .. })
+    ));
 
     let source = "workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [search] on ok() { done \"x\" } }";
     let workflow = compile(source, &catalog, &Limits::default()).expect("compile workflow");
@@ -147,8 +187,14 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         store.publish(other.id, &workflow, source).await,
         Err(StoreError::CatalogScopeViolation)
     ));
-    store.close_session(session.id.clone(), &principal).await.expect("close session");
-    assert!(matches!(store.resume_session(session.id, &principal).await, Err(StoreError::SessionClosed)));
+    store
+        .close_session(session.id.clone(), &principal)
+        .await
+        .expect("close session");
+    assert!(matches!(
+        store.resume_session(session.id, &principal).await,
+        Err(StoreError::SessionClosed)
+    ));
 }
 
 fn tool(name: &str) -> CatalogTool {

@@ -137,29 +137,57 @@ impl ClosedSchema {
     }
 
     pub fn from_normalized(value: &Value) -> Result<Self, String> {
-        let kind = value.get("type").and_then(Value::as_str).ok_or("schema type is missing")?;
+        let kind = value
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or("schema type is missing")?;
         match kind {
             "boolean" => Ok(Self::Boolean),
             "integer" => Ok(Self::Integer),
             "number" => Ok(Self::Number),
             "string" => Ok(Self::String),
-            "array" => Ok(Self::array(Self::from_normalized(value.get("items").ok_or("array items are missing")?)?)),
-            "nullable" => Ok(Self::nullable(Self::from_normalized(value.get("inner").ok_or("nullable inner schema is missing")?)?)),
+            "array" => Ok(Self::array(Self::from_normalized(
+                value.get("items").ok_or("array items are missing")?,
+            )?)),
+            "nullable" => Ok(Self::nullable(Self::from_normalized(
+                value
+                    .get("inner")
+                    .ok_or("nullable inner schema is missing")?,
+            )?)),
             "object" => {
-                let name = value.get("name").and_then(Value::as_str).ok_or("object name is missing")?;
-                let properties = value.get("properties").and_then(Value::as_object).ok_or("object properties are missing")?
-                    .iter().map(|(name, schema)| Self::from_normalized(schema).map(|schema| (name.clone(), schema)))
+                let name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or("object name is missing")?;
+                let properties = value
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .ok_or("object properties are missing")?
+                    .iter()
+                    .map(|(name, schema)| {
+                        Self::from_normalized(schema).map(|schema| (name.clone(), schema))
+                    })
                     .collect::<Result<BTreeMap<_, _>, _>>()?;
                 Ok(Self::object(name, properties))
             }
             "enum" => {
-                let values = value.get("values").and_then(Value::as_array).ok_or("enum values are missing")?
-                    .iter().map(|value| {
-                        if let Some(value) = value.get("boolean").and_then(Value::as_bool) { Ok(PrimitiveValue::Boolean(value)) }
-                        else if let Some(value) = value.get("integer").and_then(Value::as_i64) { Ok(PrimitiveValue::Integer(value)) }
-                        else if let Some(value) = value.get("string").and_then(Value::as_str) { Ok(PrimitiveValue::String(value.to_owned())) }
-                        else { Err("enum value is malformed") }
-                    }).collect::<Result<BTreeSet<_>, _>>()?;
+                let values = value
+                    .get("values")
+                    .and_then(Value::as_array)
+                    .ok_or("enum values are missing")?
+                    .iter()
+                    .map(|value| {
+                        if let Some(value) = value.get("boolean").and_then(Value::as_bool) {
+                            Ok(PrimitiveValue::Boolean(value))
+                        } else if let Some(value) = value.get("integer").and_then(Value::as_i64) {
+                            Ok(PrimitiveValue::Integer(value))
+                        } else if let Some(value) = value.get("string").and_then(Value::as_str) {
+                            Ok(PrimitiveValue::String(value.to_owned()))
+                        } else {
+                            Err("enum value is malformed")
+                        }
+                    })
+                    .collect::<Result<BTreeSet<_>, _>>()?;
                 Ok(Self::enumeration(values))
             }
             _ => Err("unsupported schema type".to_owned()),

@@ -2,9 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
-    CatalogTool, ClosedSchema, CreateSession, EffectKind, IdempotencyKey, PostgresStore,
-    FrameCommand, NewChild, NewPermissionRequest, PermissionRequestId, PolicyRevision, PrincipalId, Question, RecoverySupport,
-    StartRun, StoreError, ToolCatalogSnapshot,
+    CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand, IdempotencyKey, NewChild,
+    NewPermissionRequest, PermissionRequestId, PolicyRevision, PostgresStore, PrincipalId,
+    Question, RecoverySupport, StartRun, StoreError, ToolCatalogSnapshot,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -17,7 +17,9 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         eprintln!("skipping execution store test: DATABASE_URL is not configured");
         return;
     };
-    let store = PostgresStore::connect(&database_url).await.expect("connect store");
+    let store = PostgresStore::connect(&database_url)
+        .await
+        .expect("connect store");
     let session = store
         .create_session(CreateSession {
             principal: PrincipalId::new(format!("alice-{}", Uuid::now_v7())).unwrap(),
@@ -26,14 +28,23 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         })
         .await
         .expect("create session");
-    let catalog = ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), [tool("docs/search")])
-        .expect("catalog");
-    store.append_catalog_epoch(&catalog).await.expect("append catalog");
+    let catalog =
+        ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), [tool("docs/search")])
+            .expect("catalog");
+    store
+        .append_catalog_epoch(&catalog)
+        .await
+        .expect("append catalog");
 
     let workflow_name = format!("w{}", Uuid::now_v7().simple());
-    let source = format!("workflow {workflow_name}(query: string) -> string {{ start t(query: query) }} task t(query: string) -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok() {{ done query }} }}");
+    let source = format!(
+        "workflow {workflow_name}(query: string) -> string {{ start t(query: query) }} task t(query: string) -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok() {{ done query }} }}"
+    );
     let workflow = compile(&source, &catalog, &Limits::default()).expect("compile workflow");
-    let definition = store.publish(session.id.clone(), &workflow, &source).await.expect("publish");
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .expect("publish");
     let key = IdempotencyKey::new(format!("start-{}", Uuid::now_v7())).unwrap();
     let request = StartRun {
         session_id: session.id.clone(),
@@ -48,23 +59,51 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
     assert_eq!(started.session_id, session.id);
     assert_eq!(started.state, kiteframe::RunState::Runnable);
     assert_eq!(started.revision, 0);
-    assert_eq!(store.get_run(session.id.clone(), started.id.clone()).await.expect("get run"), started);
-    let events = store.events_after(session.id.clone(), started.id.clone(), 0, 8).await.expect("replay events");
-    assert_eq!(events.iter().map(|event| event.sequence).collect::<Vec<_>>(), vec![1]);
+    assert_eq!(
+        store
+            .get_run(session.id.clone(), started.id.clone())
+            .await
+            .expect("get run"),
+        started
+    );
+    let events = store
+        .events_after(session.id.clone(), started.id.clone(), 0, 8)
+        .await
+        .expect("replay events");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
     assert_eq!(events[0].kind, "run.started");
     let runnable = store
         .runnable_frames_for_run(started.id.clone(), 8)
         .await
         .expect("list this run's runnable frames");
-    assert!(runnable.iter().any(|frame| frame.id == started.root_frame_id));
-    assert_eq!(store.start_run(request.clone()).await.expect("replay"), started);
+    assert!(
+        runnable
+            .iter()
+            .any(|frame| frame.id == started.root_frame_id)
+    );
+    assert_eq!(
+        store.start_run(request.clone()).await.expect("replay"),
+        started
+    );
     let attempt = store
         .begin_model_attempt(started.root_frame_id.clone(), 0, json!({"prompt": "x"}))
         .await
         .expect("persist model intent");
     assert_eq!(attempt.attempt, 1);
     assert_eq!(attempt.revision, 1);
-    assert_eq!(store.model_attempt_count(started.root_frame_id.clone()).await.expect("count attempts"), 1);
+    assert_eq!(
+        store
+            .model_attempt_count(started.root_frame_id.clone())
+            .await
+            .expect("count attempts"),
+        1
+    );
     store
         .commit_model_attempt(
             started.root_frame_id.clone(),
@@ -80,7 +119,9 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
             2,
             "provider-call-1".to_owned(),
             "docs/search".to_owned(),
-            catalog.tools()["docs/search"].descriptor_digest().to_owned(),
+            catalog.tools()["docs/search"]
+                .descriptor_digest()
+                .to_owned(),
             json!({"query": "durable"}),
             "tool-attempt-1".to_owned(),
         )
@@ -94,7 +135,9 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
                 2,
                 "provider-call-1".to_owned(),
                 "docs/search".to_owned(),
-                catalog.tools()["docs/search"].descriptor_digest().to_owned(),
+                catalog.tools()["docs/search"]
+                    .descriptor_digest()
+                    .to_owned(),
                 json!({"query": "durable"}),
                 "tool-attempt-1".to_owned(),
             )
@@ -106,12 +149,18 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         id: PermissionRequestId::new(Uuid::now_v7()),
         provider_call_id: tool_call.provider_call_id.clone(),
         qualified_tool: "docs/search".to_owned(),
-        descriptor_digest: catalog.tools()["docs/search"].descriptor_digest().to_owned(),
+        descriptor_digest: catalog.tools()["docs/search"]
+            .descriptor_digest()
+            .to_owned(),
         input_digest: kiteframe::canonical_sha256(&json!({"query": "durable"})).unwrap(),
         policy_revision: PolicyRevision::new(0),
     };
     store
-        .create_permission_request(started.root_frame_id.clone(), tool_call.revision, permission.clone())
+        .create_permission_request(
+            started.root_frame_id.clone(),
+            tool_call.revision,
+            permission.clone(),
+        )
         .await
         .expect("persist permission request");
     store
@@ -154,7 +203,11 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .await
         .expect("persist answer");
     let resumed = store
-        .begin_model_attempt(started.root_frame_id.clone(), 8, json!({"prompt": "resume"}))
+        .begin_model_attempt(
+            started.root_frame_id.clone(),
+            8,
+            json!({"prompt": "resume"}),
+        )
         .await
         .expect("resume frame");
     store
@@ -177,10 +230,34 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .expect("find child")
         .get("id");
     let child = kiteframe::FrameId::new(child_id);
-    let child_attempt = store.begin_model_attempt(child.clone(), 0, json!({"prompt": "child"})).await.expect("start child");
-    store.apply_frame_command(child, child_attempt.revision, FrameCommand::Complete(json!("child done"))).await.expect("complete child");
-    let final_attempt = store.begin_model_attempt(started.root_frame_id.clone(), 11, json!({"prompt": "finish"})).await.expect("resume parent");
-    store.apply_frame_command(started.root_frame_id.clone(), final_attempt.revision, FrameCommand::Complete(json!("done"))).await.expect("complete root frame");
+    let child_attempt = store
+        .begin_model_attempt(child.clone(), 0, json!({"prompt": "child"}))
+        .await
+        .expect("start child");
+    store
+        .apply_frame_command(
+            child,
+            child_attempt.revision,
+            FrameCommand::Complete(json!("child done")),
+        )
+        .await
+        .expect("complete child");
+    let final_attempt = store
+        .begin_model_attempt(
+            started.root_frame_id.clone(),
+            11,
+            json!({"prompt": "finish"}),
+        )
+        .await
+        .expect("resume parent");
+    store
+        .apply_frame_command(
+            started.root_frame_id.clone(),
+            final_attempt.revision,
+            FrameCommand::Complete(json!("done")),
+        )
+        .await
+        .expect("complete root frame");
     let cancellable = store
         .start_run(StartRun {
             session_id: session.id.clone(),
@@ -191,14 +268,57 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         })
         .await
         .expect("start cancellable run");
-    store.cancel_run(cancellable.id.clone(), 0, Some("operator request".to_owned()), "cancel-1".to_owned()).await.expect("cancel run");
-    store.cancel_run(cancellable.id, 0, Some("operator request".to_owned()), "cancel-1".to_owned()).await.expect("replay cancel");
+    store
+        .cancel_run(
+            cancellable.id.clone(),
+            0,
+            Some("operator request".to_owned()),
+            "cancel-1".to_owned(),
+        )
+        .await
+        .expect("cancel run");
+    store
+        .cancel_run(
+            cancellable.id,
+            0,
+            Some("operator request".to_owned()),
+            "cancel-1".to_owned(),
+        )
+        .await
+        .expect("replay cancel");
     let recoverable = store
-        .start_run(StartRun { session_id: session.id.clone(), workflow_name: definition.name.clone(), version: Some(definition.version), input: json!({"query": "recover"}), idempotency_key: IdempotencyKey::new(format!("recover-{}", Uuid::now_v7())).unwrap() })
-        .await.expect("start recoverable run");
-    store.begin_model_attempt(recoverable.root_frame_id.clone(), 0, json!({"prompt":"recover"})).await.expect("interrupted model intent");
-    assert!(store.requeue_uncommitted_model_attempts(256).await.expect("recover model intent") >= 1);
-    assert!(store.runnable_frames_for_run(recoverable.id.clone(), 8).await.expect("requeued frame").iter().any(|frame| frame.id == recoverable.root_frame_id));
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name.clone(),
+            version: Some(definition.version),
+            input: json!({"query": "recover"}),
+            idempotency_key: IdempotencyKey::new(format!("recover-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .expect("start recoverable run");
+    store
+        .begin_model_attempt(
+            recoverable.root_frame_id.clone(),
+            0,
+            json!({"prompt":"recover"}),
+        )
+        .await
+        .expect("interrupted model intent");
+    assert!(
+        store
+            .requeue_uncommitted_model_attempts(256)
+            .await
+            .expect("recover model intent")
+            >= 1
+    );
+    assert!(
+        store
+            .runnable_frames_for_run(recoverable.id.clone(), 8)
+            .await
+            .expect("requeued frame")
+            .iter()
+            .any(|frame| frame.id == recoverable.root_frame_id)
+    );
     let completable = store
         .start_run(StartRun {
             session_id: session.id.clone(),
@@ -209,24 +329,53 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         })
         .await
         .expect("start completable run");
-    let completion_attempt = store.begin_model_attempt(completable.root_frame_id.clone(), 0, json!({"prompt": "complete"})).await.expect("completion intent");
-    store.commit_model_attempt(completable.root_frame_id.clone(), completion_attempt.attempt, completion_attempt.revision, vec![json!({"type": "function_call"})]).await.expect("completion output");
-    store.record_completion(completable.root_frame_id.clone(), 2, "ok".to_owned(), json!({})).await.expect("record completion");
-    assert!(store
-        .runnable_frames_for_run(completable.id.clone(), 8)
+    let completion_attempt = store
+        .begin_model_attempt(
+            completable.root_frame_id.clone(),
+            0,
+            json!({"prompt": "complete"}),
+        )
         .await
-        .expect("this run's runnable frames")
-        .iter()
-        .any(|frame| frame.id == completable.root_frame_id && frame.outcome_name.as_deref() == Some("ok")));
+        .expect("completion intent");
+    store
+        .commit_model_attempt(
+            completable.root_frame_id.clone(),
+            completion_attempt.attempt,
+            completion_attempt.revision,
+            vec![json!({"type": "function_call"})],
+        )
+        .await
+        .expect("completion output");
+    store
+        .record_completion(
+            completable.root_frame_id.clone(),
+            2,
+            "ok".to_owned(),
+            json!({}),
+        )
+        .await
+        .expect("record completion");
+    assert!(
+        store
+            .runnable_frames_for_run(completable.id.clone(), 8)
+            .await
+            .expect("this run's runnable frames")
+            .iter()
+            .any(|frame| frame.id == completable.root_frame_id
+                && frame.outcome_name.as_deref() == Some("ok"))
+    );
     assert!(matches!(
         store
-            .start_run(StartRun { input: json!({"query": "changed"}), ..StartRun {
-                session_id: session.id,
-                workflow_name: definition.name,
-                version: Some(definition.version),
-                input: json!({"query": "ignored"}),
-                idempotency_key: key,
-            } })
+            .start_run(StartRun {
+                input: json!({"query": "changed"}),
+                ..StartRun {
+                    session_id: session.id,
+                    workflow_name: definition.name,
+                    version: Some(definition.version),
+                    input: json!({"query": "ignored"}),
+                    idempotency_key: key,
+                }
+            })
             .await,
         Err(StoreError::IdempotencyConflict)
     ));
