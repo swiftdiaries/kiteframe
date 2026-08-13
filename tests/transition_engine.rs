@@ -169,3 +169,42 @@ fn emits_closed_record_schema_for_typed_questions() {
         matches!(command, FrameCommand::SuspendAsk(question) if question.schema.validate(&json!({"approved": true, "note": null})).is_ok() && question.schema.validate(&json!({"approved": true})).is_err())
     );
 }
+
+#[test]
+fn accepts_required_nullable_scalar_answers_and_rejects_corrupt_record_ir() {
+    let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(5), [])
+        .expect("empty catalog");
+    let mut workflow = compile(
+        "type Choice { value: string? } workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ask_optional() { answer = ask string? \"Optional\" done \"done\" } on ask_record() { answer = ask Choice \"Record\" done \"done\" } }",
+        &catalog,
+        &Limits::default(),
+    )
+    .expect("compile");
+    let optional = next_command(
+        &workflow,
+        &FrameSnapshot {
+            task_name: "t".to_owned(),
+            outcome: "ask_optional".to_owned(),
+            statement_index: 0,
+            bindings: BTreeMap::new(),
+        },
+    )
+    .expect("nullable question");
+    assert!(
+        matches!(optional, FrameCommand::SuspendAsk(question) if question.schema.validate(&json!(null)).is_ok() && question.schema.validate(&json!("value")).is_ok())
+    );
+
+    workflow.records.remove("Choice");
+    assert!(matches!(
+        next_command(
+            &workflow,
+            &FrameSnapshot {
+                task_name: "t".to_owned(),
+                outcome: "ask_record".to_owned(),
+                statement_index: 0,
+                bindings: BTreeMap::new(),
+            },
+        ),
+        Err(TransitionError::Corrupt(message)) if message.contains("record type is absent")
+    ));
+}
