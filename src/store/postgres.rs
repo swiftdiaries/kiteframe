@@ -14,16 +14,24 @@ use super::{
 
 pub struct PostgresStore {
     pool: PgPool,
+    limits: super::StoreLimits,
 }
 
 impl PostgresStore {
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
+        Self::connect_with_limits(database_url, super::StoreLimits::default()).await
+    }
+
+    pub async fn connect_with_limits(
+        database_url: &str,
+        limits: super::StoreLimits,
+    ) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(database_url)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, limits })
     }
 
     #[must_use]
@@ -38,6 +46,21 @@ impl PostgresStore {
             .map_err(|error| StoreError::InvalidData(error.to_string()))?;
         let snapshot = catalog_json(&catalog);
         let mut tx = self.pool.begin().await?;
+        lock_principal(&mut tx, request.principal.as_str()).await?;
+        let active_sessions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE principal = $1 AND state = 'active'",
+        )
+        .bind(request.principal.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if active_sessions
+            >= self
+                .limits
+                .max_active_sessions_per_principal
+                .min(i64::MAX as usize) as i64
+        {
+            return Err(StoreError::QuotaExceeded("active_sessions_per_principal"));
+        }
         sqlx::query("INSERT INTO sessions (id, principal, working_directory, retention_until) VALUES ($1, $2, $3, $4)")
             .bind(id).bind(request.principal.as_str()).bind(request.working_directory).bind(request.retention_until)
             .execute(&mut *tx).await?;
@@ -325,7 +348,7 @@ impl PostgresStore {
         })?;
         let mut tx = self.pool.begin().await?;
         let session = sqlx::query(
-            "SELECT state, current_catalog_epoch FROM sessions WHERE id = $1 FOR UPDATE",
+            "SELECT principal, state, current_catalog_epoch FROM sessions WHERE id = $1 FOR UPDATE",
         )
         .bind(*request.session_id.as_uuid())
         .fetch_optional(&mut *tx)
@@ -334,6 +357,12 @@ impl PostgresStore {
         if session.get::<String, _>("state") != "active" {
             return Err(StoreError::SessionClosed);
         }
+        let active_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE session_id = $1 AND state IN ('runnable', 'running', 'waiting_for_answer', 'waiting_for_permission', 'outcome_unknown')",
+        )
+        .bind(*request.session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
         let catalog_epoch = session
             .get::<Option<uuid::Uuid>, _>("current_catalog_epoch")
             .ok_or(StoreError::CatalogScopeViolation)?;
@@ -378,6 +407,14 @@ impl PostgresStore {
                 state: run_state(&existing.get::<String, _>("state"))?,
                 revision: existing.get::<i64, _>("revision") as u64,
             });
+        }
+        if active_runs
+            >= self
+                .limits
+                .max_active_runs_per_session
+                .min(i64::MAX as usize) as i64
+        {
+            return Err(StoreError::QuotaExceeded("active_runs_per_session"));
         }
         let catalog = sqlx::query(
             "SELECT descriptor_snapshot FROM mcp_catalog_epochs WHERE epoch_id = $1 AND session_id = $2",
@@ -1415,6 +1452,22 @@ impl PostgresStore {
                 .bind(session_id)
                 .fetch_one(&mut *tx)
                 .await?;
+        let pending_permissions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM permission_requests p JOIN runs r ON r.id = p.run_id WHERE r.session_id = $1 AND p.state = 'pending'",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pending_permissions
+            >= self
+                .limits
+                .max_open_permission_requests_per_session
+                .min(i64::MAX as usize) as i64
+        {
+            return Err(StoreError::QuotaExceeded(
+                "open_permission_requests_per_session",
+            ));
+        }
         lock_run(&mut tx, run_id).await?;
         let frame =
             sqlx::query("SELECT run_id, revision, state FROM frames WHERE id = $1 FOR UPDATE")
@@ -2093,6 +2146,17 @@ async fn lock_run(
     sqlx::query("SELECT id FROM runs WHERE id = $1 FOR UPDATE")
         .bind(run_id)
         .fetch_one(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn lock_principal(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    principal: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(principal)
+        .execute(&mut **tx)
         .await?;
     Ok(())
 }

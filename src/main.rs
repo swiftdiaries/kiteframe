@@ -30,7 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     init_logging();
     let config = HarnessConfig::from_env()?;
-    let store = Arc::new(PostgresStore::connect(&config.database_url).await?);
+    let store = Arc::new(
+        PostgresStore::connect_with_limits(&config.database_url, config.store_limits).await?,
+    );
     let mut process_lock = ProcessLock::acquire(store.pool()).await?;
     let running = async move {
         let model = Arc::new(ResponsesClient::new(config.model.clone())?);

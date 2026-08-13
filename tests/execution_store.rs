@@ -4,7 +4,7 @@ use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand, IdempotencyKey, NewChild,
     NewPermissionRequest, PermissionRequestId, PolicyRevision, PostgresStore, PrincipalId,
-    Question, RecoverySupport, StartRun, StoreError, ToolCatalogSnapshot,
+    Question, RecoverySupport, StartRun, StoreError, StoreLimits, ToolCatalogSnapshot,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -472,6 +472,70 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
             })
             .await,
         Err(StoreError::IdempotencyConflict)
+    ));
+}
+
+#[tokio::test]
+async fn active_run_quota_rejects_new_work_but_replays_the_original_request() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = PostgresStore::connect_with_limits(
+        &database_url,
+        StoreLimits {
+            max_active_runs_per_session: 1,
+            ..StoreLimits::default()
+        },
+    )
+    .await
+    .expect("quota store");
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("run-quota-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/quota".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .expect("session");
+    let catalog =
+        ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), []).expect("catalog");
+    store
+        .append_catalog_epoch(&catalog)
+        .await
+        .expect("catalog epoch");
+    let name = format!("quota{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [] on ok() {{ done \"ok\" }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).expect("workflow");
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .expect("publish");
+    let request = StartRun {
+        session_id: session.id.clone(),
+        workflow_name: definition.name.clone(),
+        version: Some(definition.version),
+        input: json!({}),
+        idempotency_key: IdempotencyKey::new(format!("quota-start-{}", Uuid::now_v7())).unwrap(),
+    };
+    let first = store.start_run(request.clone()).await.expect("first run");
+    assert_eq!(
+        store.start_run(request).await.expect("idempotent replay"),
+        first
+    );
+    assert!(matches!(
+        store
+            .start_run(StartRun {
+                session_id: session.id,
+                workflow_name: definition.name,
+                version: Some(definition.version),
+                input: json!({}),
+                idempotency_key: IdempotencyKey::new(format!("quota-start-{}", Uuid::now_v7()))
+                    .unwrap(),
+            })
+            .await,
+        Err(StoreError::QuotaExceeded("active_runs_per_session"))
     ));
 }
 

@@ -184,7 +184,7 @@ async fn stdio_harness_child_completes_a_real_model_workflow_and_replays_events(
             "type":"function_call",
             "call_id":"complete-1",
             "name":"complete_task",
-            "arguments":{"outcome":"ok","fields":{}}
+            "arguments":"{\"outcome\":\"ok\",\"fields\":{}}"
         }]
     }))
     .await;
@@ -259,9 +259,9 @@ async fn stdio_harness_child_completes_a_real_model_workflow_and_replays_events(
         [
             "run.started",
             "model.intent",
-            "model.output",
+            "model.committed",
             "model.completed_task",
-            "run.completed"
+            "frame.completed"
         ]
     );
     let request = responses.one_request().await;

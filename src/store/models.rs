@@ -14,6 +14,24 @@ pub struct CreateSession {
     pub retention_until: time::OffsetDateTime,
 }
 
+/// Deployment-owned ceilings enforced transactionally by `PostgresStore`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreLimits {
+    pub max_active_sessions_per_principal: usize,
+    pub max_active_runs_per_session: usize,
+    pub max_open_permission_requests_per_session: usize,
+}
+
+impl Default for StoreLimits {
+    fn default() -> Self {
+        Self {
+            max_active_sessions_per_principal: usize::MAX,
+            max_active_runs_per_session: usize::MAX,
+            max_open_permission_requests_per_session: usize::MAX,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionView {
     pub id: SessionId,
@@ -217,6 +235,8 @@ pub enum StoreError {
     FrameNotFound,
     #[error("execution revision conflict")]
     RevisionConflict,
+    #[error("deployment quota exceeded: {0}")]
+    QuotaExceeded(&'static str),
     #[error("stored data is invalid: {0}")]
     InvalidData(String),
 }

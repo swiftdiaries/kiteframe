@@ -50,7 +50,7 @@ pub use store::{
     Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest,
     PendingPermission, PolicyUpdate, PostgresStore, PublishedDefinition, Question,
     RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame, SessionView,
-    StartRun, StoreError, SuspensionFrame, ToolCallIntent,
+    StartRun, StoreError, StoreLimits, SuspensionFrame, ToolCallIntent,
 };
 pub use tools::{
     BoundTool, CatalogTool, EffectKind, InProcessToolRegistry, RecoverySupport, ToolCall,

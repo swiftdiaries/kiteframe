@@ -6,7 +6,7 @@ use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, PersistedAuthorizer, PolicyDecision,
     PolicyEffect, PolicyRequest, PolicyRevision, PolicyRule, PolicyTarget, PolicyUpdate,
     PostgresStore, PrincipalId, RecoverySupport, SessionAuthorizer, SessionPolicy, StoreError,
-    ToolCatalogSnapshot,
+    StoreLimits, ToolCatalogSnapshot,
 };
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
@@ -200,6 +200,44 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         store.resume_session(session.id, &principal).await,
         Err(StoreError::SessionClosed)
     ));
+}
+
+#[tokio::test]
+async fn active_session_quota_is_principal_scoped_and_releases_on_close() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = PostgresStore::connect_with_limits(
+        &database_url,
+        StoreLimits {
+            max_active_sessions_per_principal: 1,
+            ..StoreLimits::default()
+        },
+    )
+    .await
+    .expect("quota store");
+    let principal = PrincipalId::new(format!("quota-{}", Uuid::now_v7())).unwrap();
+    let request = CreateSession {
+        principal: principal.clone(),
+        working_directory: "/quota".to_owned(),
+        retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+    };
+    let first = store
+        .create_session(request.clone())
+        .await
+        .expect("first session");
+    assert!(matches!(
+        store.create_session(request.clone()).await,
+        Err(StoreError::QuotaExceeded("active_sessions_per_principal"))
+    ));
+    store
+        .close_session(first.id, &principal)
+        .await
+        .expect("close first");
+    store
+        .create_session(request)
+        .await
+        .expect("capacity released");
 }
 
 fn tool(name: &str) -> CatalogTool {

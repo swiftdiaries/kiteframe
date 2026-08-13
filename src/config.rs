@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fmt, time::Duration};
 
-use crate::{PrincipalId, ResponsesConfig, Secret};
+use crate::{PrincipalId, ResponsesConfig, Secret, StoreLimits};
 
 #[derive(Clone, Debug)]
 pub enum HarnessMode {
@@ -40,6 +40,7 @@ pub struct HarnessConfig {
     pub model: ResponsesConfig,
     pub acp_v2_enabled: bool,
     pub max_remote_connections: usize,
+    pub store_limits: StoreLimits,
 }
 
 impl fmt::Debug for HarnessConfig {
@@ -53,6 +54,7 @@ impl fmt::Debug for HarnessConfig {
             .field("model", &self.model)
             .field("acp_v2_enabled", &self.acp_v2_enabled)
             .field("max_remote_connections", &self.max_remote_connections)
+            .field("store_limits", &self.store_limits)
             .finish()
     }
 }
@@ -135,6 +137,20 @@ impl HarnessConfig {
         if !(1..=4096).contains(&max_remote_connections) {
             return Err(ConfigError::InvalidRemoteConnectionLimit);
         }
+        let store_limits = StoreLimits {
+            max_active_sessions_per_principal: parse_quota(
+                value("KITEFRAME_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL"),
+                64,
+            )?,
+            max_active_runs_per_session: parse_quota(
+                value("KITEFRAME_MAX_ACTIVE_RUNS_PER_SESSION"),
+                32,
+            )?,
+            max_open_permission_requests_per_session: parse_quota(
+                value("KITEFRAME_MAX_OPEN_PERMISSION_REQUESTS_PER_SESSION"),
+                32,
+            )?,
+        };
 
         Ok(Self {
             database_url,
@@ -144,8 +160,19 @@ impl HarnessConfig {
             model,
             acp_v2_enabled,
             max_remote_connections,
+            store_limits,
         })
     }
+}
+
+fn parse_quota(value: Option<String>, default: usize) -> Result<usize, ConfigError> {
+    let value = value
+        .map_or(Ok(default), |value| value.parse::<usize>())
+        .map_err(|_| ConfigError::InvalidDeploymentQuota)?;
+    if !(1..=4096).contains(&value) {
+        return Err(ConfigError::InvalidDeploymentQuota);
+    }
+    Ok(value)
 }
 
 #[derive(serde::Deserialize)]
@@ -224,6 +251,8 @@ pub enum ConfigError {
     AcpV2Unavailable,
     #[error("KITEFRAME_MAX_REMOTE_CONNECTIONS must be between 1 and 4096")]
     InvalidRemoteConnectionLimit,
+    #[error("deployment quota values must be between 1 and 4096")]
+    InvalidDeploymentQuota,
 }
 
 #[cfg(test)]
@@ -325,5 +354,27 @@ mod tests {
                 Err(ConfigError::InvalidRemoteConnectionLimit)
             ));
         }
+    }
+
+    #[test]
+    fn deployment_quotas_are_bounded_and_configurable() {
+        let mut values = vec![
+            ("DATABASE_URL", "postgres://localhost/kiteframe"),
+            ("KITEFRAME_PRINCIPAL", "local-user"),
+            ("KITEFRAME_MAX_ACTIVE_SESSIONS_PER_PRINCIPAL", "7"),
+            ("KITEFRAME_MAX_ACTIVE_RUNS_PER_SESSION", "8"),
+            ("KITEFRAME_MAX_OPEN_PERMISSION_REQUESTS_PER_SESSION", "9"),
+        ];
+        values.extend(model_values());
+        let limits = config(&values).expect("config").store_limits;
+        assert_eq!(limits.max_active_sessions_per_principal, 7);
+        assert_eq!(limits.max_active_runs_per_session, 8);
+        assert_eq!(limits.max_open_permission_requests_per_session, 9);
+        values.retain(|(key, _)| *key != "KITEFRAME_MAX_ACTIVE_RUNS_PER_SESSION");
+        values.push(("KITEFRAME_MAX_ACTIVE_RUNS_PER_SESSION", "0"));
+        assert!(matches!(
+            config(&values),
+            Err(ConfigError::InvalidDeploymentQuota)
+        ));
     }
 }
