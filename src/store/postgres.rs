@@ -1026,6 +1026,82 @@ impl PostgresStore {
         })
     }
 
+    /// Starts a durable run-wide active-I/O interval and returns its remaining budget in ms.
+    pub async fn begin_active_execution(
+        &self,
+        run_id: crate::RunId,
+        limit_millis: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_run(&mut tx, *run_id.as_uuid()).await?;
+        let run = sqlx::query("SELECT state, active_execution_millis, active_execution_count FROM runs WHERE id = $1 FOR UPDATE")
+            .bind(*run_id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+        if !matches!(
+            run.get::<String, _>("state").as_str(),
+            "runnable" | "running" | "waiting_for_answer" | "waiting_for_permission"
+        ) {
+            return Err(StoreError::RevisionConflict);
+        }
+        let consumed = run.get::<i64, _>("active_execution_millis") as u64;
+        if consumed >= limit_millis {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        sqlx::query("UPDATE runs SET active_execution_count = active_execution_count + 1, active_execution_started_at = COALESCE(active_execution_started_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+            .bind(*run_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(limit_millis - consumed))
+    }
+
+    /// Ends one active-I/O interval and returns whether the durable budget is exhausted.
+    pub async fn finish_active_execution(
+        &self,
+        run_id: crate::RunId,
+        limit_millis: u64,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        lock_run(&mut tx, *run_id.as_uuid()).await?;
+        let run = sqlx::query("SELECT active_execution_millis, active_execution_started_at, active_execution_count FROM runs WHERE id = $1 FOR UPDATE")
+            .bind(*run_id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+        let count = run.get::<i32, _>("active_execution_count");
+        if count <= 0 {
+            return Err(StoreError::InvalidData(
+                "active execution lease was not held".to_owned(),
+            ));
+        }
+        if count > 1 {
+            sqlx::query("UPDATE runs SET active_execution_count = active_execution_count - 1, updated_at = CURRENT_TIMESTAMP WHERE id = $1")
+                .bind(*run_id.as_uuid())
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let started = run
+            .get::<Option<time::OffsetDateTime>, _>("active_execution_started_at")
+            .ok_or_else(|| {
+                StoreError::InvalidData("active execution start is absent".to_owned())
+            })?;
+        let elapsed = (time::OffsetDateTime::now_utc() - started)
+            .whole_milliseconds()
+            .max(0) as u64;
+        let consumed = run.get::<i64, _>("active_execution_millis") as u64;
+        let total = consumed.saturating_add(elapsed);
+        sqlx::query("UPDATE runs SET active_execution_millis = $1, active_execution_count = 0, active_execution_started_at = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+            .bind(total.min(i64::MAX as u64) as i64)
+            .bind(*run_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(total >= limit_millis)
+    }
+
     pub async fn fail_frame_with_code(
         &self,
         frame_id: crate::FrameId,

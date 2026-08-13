@@ -427,23 +427,72 @@ impl Engine {
             .await?;
         let mut input = self.store.frame_history(frame.id.clone()).await?;
         input.insert(0, json!({"bindings": frame.bindings}));
-        let response = self
-            .model
-            .respond(ModelRequest {
-                instructions: task.prompt.clone(),
-                input,
-                tools: std::iter::once(completion_tool(task))
-                    .chain(
-                        self.store
-                            .run_tool_bindings(frame.run_id.clone())
-                            .await?
-                            .into_iter()
-                            .map(model_tool),
-                    )
-                    .collect(),
-            })
-            .await
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let active_limit = active_execution_limit_millis(&frame.workflow);
+        let remaining = if active_limit == u64::MAX {
+            None
+        } else {
+            match self
+                .store
+                .begin_active_execution(frame.run_id.clone(), active_limit)
+                .await?
+            {
+                Some(remaining) => Some(remaining),
+                None => {
+                    self.store
+                        .fail_frame_with_code(
+                            frame.id,
+                            attempt.revision,
+                            "active_execution_limit_exceeded",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        };
+        let request = ModelRequest {
+            instructions: task.prompt.clone(),
+            input,
+            tools: std::iter::once(completion_tool(task))
+                .chain(
+                    self.store
+                        .run_tool_bindings(frame.run_id.clone())
+                        .await?
+                        .into_iter()
+                        .map(model_tool),
+                )
+                .collect(),
+        };
+        let response = match remaining {
+            Some(remaining) => {
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_millis(remaining.max(1)),
+                    self.model.respond(request),
+                )
+                .await;
+                let exhausted = self
+                    .store
+                    .finish_active_execution(frame.run_id.clone(), active_limit)
+                    .await?;
+                if exhausted || result.is_err() {
+                    self.store
+                        .fail_frame_with_code(
+                            frame.id,
+                            attempt.revision,
+                            "active_execution_limit_exceeded",
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                result
+                    .expect("timeout checked")
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))?
+            }
+            None => self
+                .model
+                .respond(request)
+                .await
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+        };
         let item_limit = frame
             .workflow
             .limits
@@ -593,10 +642,85 @@ impl Engine {
                         .map_err(|error| StoreError::InvalidData(error.to_string()))?,
                 )
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-                let outcome = tool
-                    .invoke(call)
-                    .await
-                    .map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
+                let active_limit = active_execution_limit_millis(&frame.workflow);
+                let remaining = if active_limit == u64::MAX {
+                    None
+                } else {
+                    match self
+                        .store
+                        .begin_active_execution(frame.run_id.clone(), active_limit)
+                        .await?
+                    {
+                        Some(remaining) => Some(remaining),
+                        None => {
+                            self.store
+                                .finish_tool_call(
+                                    frame.id.clone(),
+                                    intent.id,
+                                    intent.revision,
+                                    Err(json!({"code":"active_execution_limit_exceeded"})),
+                                )
+                                .await?;
+                            self.store
+                                .fail_frame_with_code(
+                                    frame.id.clone(),
+                                    intent.revision + 1,
+                                    "active_execution_limit_exceeded",
+                                )
+                                .await?;
+                            return Ok(());
+                        }
+                    }
+                };
+                let outcome = match remaining {
+                    Some(remaining) => {
+                        let result = tokio::time::timeout(
+                            std::time::Duration::from_millis(remaining.max(1)),
+                            tool.invoke(call),
+                        )
+                        .await;
+                        let exhausted = self
+                            .store
+                            .finish_active_execution(frame.run_id.clone(), active_limit)
+                            .await?;
+                        if result.is_err() {
+                            self.store
+                                .mark_tool_call_outcome_unknown(
+                                    frame.id.clone(),
+                                    intent.id,
+                                    intent.revision,
+                                )
+                                .await?;
+                            return Ok(());
+                        }
+                        let outcome = result.expect("timeout checked").map_err(
+                            |error| json!({"code":"tool_failed","message":error.to_string()}),
+                        );
+                        if exhausted {
+                            self.store
+                                .finish_tool_call(
+                                    frame.id.clone(),
+                                    intent.id,
+                                    intent.revision,
+                                    outcome,
+                                )
+                                .await?;
+                            self.store
+                                .fail_frame_with_code(
+                                    frame.id.clone(),
+                                    intent.revision + 1,
+                                    "active_execution_limit_exceeded",
+                                )
+                                .await?;
+                            return Ok(());
+                        }
+                        outcome
+                    }
+                    None => tool
+                        .invoke(call)
+                        .await
+                        .map_err(|error| json!({"code":"tool_failed","message":error.to_string()})),
+                };
                 self.store
                     .finish_tool_call(frame.id.clone(), intent.id, intent.revision, outcome)
                     .await
@@ -627,6 +751,15 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+fn active_execution_limit_millis(workflow: &crate::dsl::CompiledWorkflow) -> u64 {
+    workflow
+        .limits
+        .get("active_execution_seconds")
+        .copied()
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000)
 }
 
 fn permission_resolution_key(

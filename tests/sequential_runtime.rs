@@ -75,6 +75,10 @@ struct FailingTool {
     descriptor: CatalogTool,
 }
 
+struct SlowTool {
+    descriptor: CatalogTool,
+}
+
 struct ChangedResolver;
 
 #[async_trait]
@@ -129,6 +133,109 @@ impl TrustedTool for FailingTool {
             error: json!({"code":"tool_failed"}),
         })
     }
+}
+
+#[async_trait]
+impl TrustedTool for SlowTool {
+    fn descriptor(&self) -> &CatalogTool {
+        &self.descriptor
+    }
+
+    async fn invoke(&self, _call: ToolCall) -> Result<Value, ToolError> {
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        Ok(json!({}))
+    }
+
+    async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
+        Ok(ToolStatus::Unknown)
+    }
+}
+
+#[tokio::test]
+async fn active_execution_tool_timeout_is_durably_outcome_unknown() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("tool-active-limit-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let descriptor = CatalogTool::new(
+        "docs/search",
+        "docs",
+        "search",
+        ClosedSchema::object("input", BTreeMap::new()),
+        ClosedSchema::object("output", BTreeMap::new()),
+        BTreeSet::new(),
+        EffectKind::ReadOnly,
+        RecoverySupport::NotRequired,
+    )
+    .unwrap();
+    let tools = Arc::new(InProcessToolRegistry::new());
+    tools
+        .register(bind_tool(Arc::new(SlowTool {
+            descriptor: descriptor.clone(),
+        })))
+        .unwrap();
+    let catalog = tools
+        .snapshot(
+            session.id.clone(),
+            Uuid::now_v7(),
+            &BTreeSet::from(["docs/search".to_owned()]),
+            &BTreeMap::from([(
+                "docs/search".to_owned(),
+                descriptor.descriptor_digest().to_owned(),
+            )]),
+        )
+        .unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("toolactivelimit{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ limits {{ active_execution_seconds: 1 }} start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok() {{ done \"ok\" }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .unwrap();
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let engine = Engine {
+        store: store.clone(),
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([vec![json!(
+            {
+                "type":"function_call",
+                "call_id":"slow-call",
+                "name":"docs/search",
+                "arguments":{}
+            }
+        )]])))),
+        tools,
+        authorizer: Arc::new(AllowAll),
+        config: EngineConfig::default(),
+    };
+
+    assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
+    let state: String = sqlx::query("SELECT state FROM runs WHERE id = $1")
+        .bind(*run.id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("state");
+    assert_eq!(state, "outcome_unknown");
 }
 
 #[tokio::test]
