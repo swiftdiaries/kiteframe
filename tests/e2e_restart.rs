@@ -99,13 +99,33 @@ impl HarnessChild {
             .await
             .expect("write child request");
         self.stdin.flush().await.expect("flush child request");
-        let line = tokio::time::timeout(std::time::Duration::from_secs(5), self.stdout.next_line())
-            .await
-            .expect("child response timeout")
-            .expect("read child response")
-            .expect("child response EOF");
-        let response: serde_json::Value =
-            serde_json::from_str(&line).expect("child JSON-RPC response");
+        let response = loop {
+            let line =
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.stdout.next_line())
+                    .await
+                    .expect("child response timeout")
+                    .expect("read child response")
+                    .expect("child response EOF");
+            let response: serde_json::Value =
+                serde_json::from_str(&line).expect("child JSON-RPC response");
+            if response["method"] == "session/request_permission" {
+                let approval = json!({
+                    "jsonrpc":"2.0",
+                    "id":response["id"],
+                    "result":{"outcome":{"outcome":"selected", "optionId":"allow-once"}}
+                });
+                self.stdin
+                    .write_all(format!("{approval}\n").as_bytes())
+                    .await
+                    .expect("approve child permission");
+                self.stdin
+                    .flush()
+                    .await
+                    .expect("flush child permission approval");
+                continue;
+            }
+            break response;
+        };
         assert_eq!(response["id"], id, "unexpected child response: {response}");
         assert!(response.get("error").is_none(), "child error: {response}");
         response["result"].clone()
@@ -269,6 +289,88 @@ async fn stdio_harness_child_completes_a_real_model_workflow_and_replays_events(
     assert_eq!(request.path, "/v1/responses");
     assert_eq!(request.body["model"], "test-model");
     child.close().await;
+    database.drop().await;
+}
+
+#[tokio::test]
+async fn stdio_harness_child_discovers_and_invokes_a_real_mcp_tool() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let database = IsolatedDatabase::create(&database_url).await;
+    let responses = ResponsesServer::start_sequence(vec![
+        json!({"output":[{"type":"function_call","call_id":"tool-1","name":"docs/search","arguments":"{}"}]}),
+        json!({"output":[{"type":"function_call","call_id":"complete-1","name":"complete_task","arguments":"{\"outcome\":\"ok\",\"fields\":{}}"}]}),
+    ])
+    .await;
+    let log_path = std::env::temp_dir().join(format!("kiteframe-e2e-mcp-{}.log", Uuid::now_v7()));
+    let fixture = format!("{}/tests/fixtures/mcp_stdio.py", env!("CARGO_MANIFEST_DIR"));
+    let principal = format!("process-mcp-{}", Uuid::now_v7());
+    let mut child = HarnessChild::start(&database.url, &principal, responses.base_url()).await;
+    child
+        .request(
+            1,
+            "initialize",
+            json!({"protocolVersion":1, "clientCapabilities":{}, "clientInfo":{"name":"e2e","version":"1"}}),
+        )
+        .await;
+    let session = child
+        .request(
+            2,
+            "session/new",
+            json!({
+                "cwd":"/tmp/kiteframe-process-mcp",
+                "mcpServers":[{
+                    "type":"stdio",
+                    "name":"docs",
+                    "command":"python3",
+                    "args":[fixture],
+                    "env":[{"name":"KITEFRAME_E2E_MCP_LOG", "value":log_path}]
+                }]
+            }),
+        )
+        .await;
+    let session_id = session["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let workflow_name = format!("processmcp{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {workflow_name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok() {{ done \"done\" }} }}"
+    );
+    let published = child
+        .request(3, "_kiteframe/workflow/publish", json!({"source":source}))
+        .await;
+    let run = child
+        .request(
+            4,
+            "_kiteframe/run/start",
+            json!({
+                "sessionId":session_id,
+                "workflowName":workflow_name,
+                "version":published["version"],
+                "input":{},
+                "idempotencyKey":format!("process-mcp-run-{}", Uuid::now_v7())
+            }),
+        )
+        .await;
+    let run_id = run["id"].clone();
+    let mut completed = false;
+    for request_id in 5..=40 {
+        let state = child
+            .request(request_id, "_kiteframe/run/get", json!({"runId":run_id}))
+            .await;
+        if state["state"] == "completed" {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(completed, "MCP workflow completed");
+    let invocations = std::fs::read_to_string(&log_path).expect("MCP invocation log");
+    assert_eq!(invocations.lines().collect::<Vec<_>>(), ["tools/call"]);
+    child.close().await;
+    std::fs::remove_file(&log_path).expect("remove MCP log");
     database.drop().await;
 }
 
