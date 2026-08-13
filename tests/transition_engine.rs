@@ -122,6 +122,31 @@ fn emits_call_parallel_and_ask_commands_in_source_order() {
 }
 
 #[test]
+fn emits_tail_goto_with_freshly_resolved_bindings() {
+    let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(6), [])
+        .expect("empty catalog");
+    let workflow = compile(
+        "workflow w(value: string) -> string { start first(value: value) } task first(value: string) -> string { prompt \"\"\"x\"\"\" tools [] on redirect() { goto second(value: value) } } task second(value: string) -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done value } }",
+        &catalog,
+        &Limits::default(),
+    )
+    .expect("compile");
+    let command = next_command(
+        &workflow,
+        &FrameSnapshot {
+            task_name: "first".to_owned(),
+            outcome: "redirect".to_owned(),
+            statement_index: 0,
+            bindings: BTreeMap::from([("value".to_owned(), json!("carried"))]),
+        },
+    )
+    .expect("goto command");
+    assert!(
+        matches!(command, FrameCommand::Goto { task_name, bindings } if task_name == "second" && bindings == BTreeMap::from([("value".to_owned(), json!("carried"))]))
+    );
+}
+
+#[test]
 fn preserves_large_numeric_literals() {
     let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(3), [])
         .expect("empty catalog");
