@@ -55,6 +55,18 @@ jobs:
           KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
           KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
 
+      - name: Install Bun for live TypeScript client smoke
+        uses: oven-sh/setup-bun@v2
+
+      - name: Exercise TypeScript client against the compiled harness
+        run: |
+          bun install --frozen-lockfile
+          bun test
+        working-directory: clients/typescript
+        env:
+          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
+          KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
+
   python:
     runs-on: ubuntu-latest
     steps:

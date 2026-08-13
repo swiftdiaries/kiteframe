@@ -90,9 +90,9 @@ abstract class AsyncJsonRpcTransport implements JsonRpcTransport {
   protected abstract send(message: Json): Promise<void>;
   abstract close(): Promise<void>;
 
-  protected finish(): void {
+  protected finish(error = new HarnessError("Kiteframe transport closed")): void {
     this.#closed = true;
-    for (const pending of this.#pending.values()) pending.reject(new HarnessError("Kiteframe transport closed"));
+    for (const pending of this.#pending.values()) pending.reject(error);
     this.#pending.clear();
   }
 }
@@ -144,7 +144,9 @@ class StdioTransport extends AsyncJsonRpcTransport {
         await this.dispatch(line);
       }
     }
-    } catch { this.finish(); }
+    } catch (error) {
+      this.finish(error instanceof Error ? error : new HarnessError("Kiteframe transport failed"));
+    }
   }
 }
 

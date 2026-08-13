@@ -161,3 +161,26 @@ test("local maps an unsolicited permission request through its typed handler", a
   expect((await client.publish("source")).name).toBe("support");
   await client.close();
 });
+
+const integrationDatabaseUrl = process.env.KITEFRAME_INTEGRATION_DATABASE_URL;
+const integrationHarnessPath = process.env.KITEFRAME_HARNESS_PATH;
+if (integrationDatabaseUrl && integrationHarnessPath) {
+  test("local client initializes the real compiled harness", async () => {
+    const client = await Kiteframe.local({
+      config: {
+        databaseUrl: integrationDatabaseUrl,
+        principal: `typescript-live-${crypto.randomUUID()}`,
+        responsesBaseUrl: "http://127.0.0.1:9/v1",
+        responsesApiKey: "integration-test",
+        responsesModel: "test-model",
+        command: [integrationHarnessPath],
+      },
+      policy: emptyPolicy,
+    });
+    try {
+      expect(client.sessionId).toMatch(/[0-9a-f-]{36}/);
+    } finally {
+      await client.close();
+    }
+  });
+}
