@@ -449,17 +449,21 @@ impl Engine {
                 }
             }
         };
+        let run_tools = match self.store.run_tool_bindings(frame.run_id.clone()).await {
+            Ok(bindings) => bindings,
+            Err(StoreError::InvalidData(message)) if message == "run tool descriptor is absent" => {
+                self.store
+                    .fail_frame_with_code(frame.id, attempt.revision, "run_tool_descriptor_missing")
+                    .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let request = ModelRequest {
             instructions: task.prompt.clone(),
             input,
             tools: std::iter::once(completion_tool(task))
-                .chain(
-                    self.store
-                        .run_tool_bindings(frame.run_id.clone())
-                        .await?
-                        .into_iter()
-                        .map(model_tool),
-                )
+                .chain(run_tools.into_iter().map(model_tool))
                 .collect(),
         };
         let response = match remaining {
