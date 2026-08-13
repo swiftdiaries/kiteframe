@@ -12,7 +12,7 @@ use agent_client_protocol::{ConnectTo, Stdio};
 use kiteframe::protocol::transport::{AcpService, BearerAuthenticator, RemoteService};
 use kiteframe::{
     Application, AuthenticatedConnection, Engine, EngineConfig, HarnessConfig, HarnessMode,
-    InProcessToolRegistry, ModelClient, ModelRequest, PersistedAuthorizer, PostgresStore,
+    McpLimits, McpManager, ModelClient, ModelRequest, PersistedAuthorizer, PostgresStore,
     ResponsesClient, TransportKind,
 };
 use tokio::sync::watch;
@@ -34,10 +34,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut process_lock = ProcessLock::acquire(store.pool()).await?;
     let running = async move {
         let model = Arc::new(ResponsesClient::new(config.model.clone())?);
+        let mcp = Arc::new(McpManager::with_store(McpLimits::default(), store.clone()));
         let engine = Arc::new(Engine {
             store: store.clone(),
             model: model.clone(),
-            tools: Arc::new(InProcessToolRegistry::new()),
+            tools: mcp.clone(),
             authorizer: Arc::new(PersistedAuthorizer::new(store.clone())),
             config: EngineConfig::default(),
         });
@@ -50,7 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             outcomes_unknown = recovery.outcomes_unknown,
             "startup recovery complete"
         );
-        let application = Arc::new(Application::new(store.clone(), engine.clone()));
+        let application =
+            Arc::new(Application::new(store.clone(), engine.clone()).with_mcp_manager(mcp));
 
         match config.mode {
             HarnessMode::Stdio => {

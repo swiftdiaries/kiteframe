@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use sqlx::Row;
 
-use crate::{CreateSession, Engine, PostgresStore};
+use crate::{CreateSession, Engine, McpManager, McpServerConfig, PostgresStore, SessionId};
 
 use super::{
     ApplicationCommand, ApplicationContext, ApplicationResult, ApplicationSession, ProtocolError,
@@ -12,6 +12,7 @@ use super::{
 pub struct Application {
     store: Arc<PostgresStore>,
     engine: Arc<Engine>,
+    mcp: Option<Arc<McpManager>>,
     session_retention: time::Duration,
 }
 
@@ -21,6 +22,7 @@ impl Application {
         Self {
             store,
             engine,
+            mcp: None,
             session_retention: time::Duration::days(30),
         }
     }
@@ -28,6 +30,12 @@ impl Application {
     #[must_use]
     pub fn with_session_retention(mut self, retention: time::Duration) -> Self {
         self.session_retention = retention;
+        self
+    }
+
+    #[must_use]
+    pub fn with_mcp_manager(mut self, mcp: Arc<McpManager>) -> Self {
+        self.mcp = Some(mcp);
         self
     }
 
@@ -46,8 +54,25 @@ impl Application {
                         retention_until: time::OffsetDateTime::now_utc() + self.session_retention,
                     })
                     .await?;
+                if let Err(error) = self
+                    .attach_mcp(
+                        session.id.clone(),
+                        context.connection_principal.clone(),
+                        request.mcp_servers.clone(),
+                    )
+                    .await
+                {
+                    self.store
+                        .close_session_and_cancel_work(session.id, &context.connection_principal)
+                        .await?;
+                    return Err(error);
+                }
+                let view = self
+                    .store
+                    .resume_session(session.id, &context.connection_principal)
+                    .await?;
                 return Ok(ApplicationResult::Session(ApplicationSession {
-                    view: session,
+                    view,
                     working_directory: request.working_directory.clone(),
                 }));
             }
@@ -59,7 +84,23 @@ impl Application {
                         Some(&request.working_directory),
                     )
                     .await?;
-                return Ok(ApplicationResult::Session(session));
+                if request.mcp_servers.is_empty() && session.view.mcp_attached {
+                    return Err(ProtocolError::McpConfigurationRequired);
+                }
+                self.attach_mcp(
+                    session.view.id.clone(),
+                    context.connection_principal.clone(),
+                    request.mcp_servers.clone(),
+                )
+                .await?;
+                let view = self
+                    .store
+                    .resume_session(session.view.id, &context.connection_principal)
+                    .await?;
+                return Ok(ApplicationResult::Session(ApplicationSession {
+                    view,
+                    working_directory: session.working_directory,
+                }));
             }
             ApplicationCommand::ListSessions => {
                 let mut sessions = Vec::new();
@@ -205,6 +246,24 @@ impl Application {
             view,
             working_directory: metadata.working_directory,
         })
+    }
+
+    async fn attach_mcp(
+        &self,
+        session: SessionId,
+        principal: crate::PrincipalId,
+        configs: Vec<McpServerConfig>,
+    ) -> Result<(), ProtocolError> {
+        if configs.is_empty() {
+            return Ok(());
+        }
+        self.mcp
+            .as_ref()
+            .ok_or(ProtocolError::McpUnavailable)?
+            .attach(session, principal, configs)
+            .await
+            .map_err(|error| ProtocolError::Application(error.to_string()))?;
+        Ok(())
     }
 
     async fn session_metadata(

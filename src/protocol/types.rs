@@ -4,9 +4,9 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::{
-    AnswerQuestion, CancelRun, IdempotencyKey, PermissionChoice, PermissionRequestId,
-    PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission, RunEvent, RunId, RunView,
-    SessionId, SessionPolicy, SessionView, StartRun,
+    AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PermissionChoice,
+    PermissionRequestId, PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission,
+    RunEvent, RunId, RunView, SessionId, SessionPolicy, SessionView, StartRun,
 };
 
 #[derive(Clone, Debug)]
@@ -18,12 +18,14 @@ pub struct ApplicationContext {
 #[derive(Clone, Debug)]
 pub struct NewSession {
     pub working_directory: String,
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ResumeSession {
     pub session_id: SessionId,
     pub working_directory: String,
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +234,10 @@ pub enum ProtocolError {
     SessionExpired,
     #[error("session working directory does not match the durable session")]
     WorkingDirectoryMismatch,
+    #[error("fresh MCP connection configuration is required to resume this session")]
+    McpConfigurationRequired,
+    #[error("MCP attachment is not enabled for this harness")]
+    McpUnavailable,
     #[error("application result is not valid for protocol method {0}")]
     UnexpectedResult(String),
 }

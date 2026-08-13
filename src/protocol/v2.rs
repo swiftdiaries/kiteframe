@@ -3,8 +3,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    AnswerQuestion, CancelRun, IdempotencyKey, PolicyRevision, RunId, SessionId, SessionPolicy,
-    StartRun,
+    AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PolicyRevision, RunId, Secret,
+    SessionId, SessionPolicy, StartRun,
 };
 
 use super::{
@@ -59,12 +59,10 @@ impl V2Adapter {
         match method {
             "session/new" => {
                 let request: acp::NewSessionRequest = decode(params)?;
-                ensure_empty_session_attachments(
-                    &request.additional_directories,
-                    &request.mcp_servers,
-                )?;
+                ensure_empty_directories(&request.additional_directories)?;
                 Ok(ApplicationCommand::NewSession(NewSession {
                     working_directory: path_string(request.cwd.as_ref())?,
+                    mcp_servers: mcp_servers(request.mcp_servers)?,
                 }))
             }
             "session/list" => {
@@ -78,10 +76,7 @@ impl V2Adapter {
             }
             "session/resume" => {
                 let request: acp::ResumeSessionRequest = decode(params)?;
-                ensure_empty_session_attachments(
-                    &request.additional_directories,
-                    &request.mcp_servers,
-                )?;
+                ensure_empty_directories(&request.additional_directories)?;
                 if request.replay_from.is_some() {
                     return Err(ProtocolError::InvalidPayload(
                         "ACP conversation replay is not a workflow event cursor".to_owned(),
@@ -90,6 +85,7 @@ impl V2Adapter {
                 Ok(ApplicationCommand::ResumeSession(ResumeSession {
                     session_id: session_id(request.session_id)?,
                     working_directory: path_string(request.cwd.as_ref())?,
+                    mcp_servers: mcp_servers(request.mcp_servers)?,
                 }))
             }
             "session/close" => {
@@ -222,16 +218,55 @@ fn path_string(path: &std::path::Path) -> Result<String, ProtocolError> {
         .ok_or_else(|| ProtocolError::InvalidPayload("working directory is not UTF-8".to_owned()))
 }
 
-fn ensure_empty_session_attachments<A, M>(
-    additional_directories: &[A],
-    mcp_servers: &[M],
-) -> Result<(), ProtocolError> {
-    if !additional_directories.is_empty() || !mcp_servers.is_empty() {
+fn ensure_empty_directories<A>(additional_directories: &[A]) -> Result<(), ProtocolError> {
+    if !additional_directories.is_empty() {
         return Err(ProtocolError::InvalidPayload(
-            "session attachments are configured by the authenticated connection".to_owned(),
+            "additional directories are not supported".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn mcp_servers(servers: Vec<acp::McpServer>) -> Result<Vec<McpServerConfig>, ProtocolError> {
+    servers
+        .into_iter()
+        .map(|server| match server {
+            acp::McpServer::Stdio(server) => Ok(McpServerConfig::Stdio {
+                alias: server.name,
+                program: server
+                    .command
+                    .0
+                    .to_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        ProtocolError::InvalidPayload("MCP command is not UTF-8".to_owned())
+                    })?,
+                args: server.args,
+                env: server
+                    .env
+                    .into_iter()
+                    .map(|entry| (entry.name, Secret::new(entry.value)))
+                    .collect(),
+            }),
+            acp::McpServer::Http(server) => Ok(McpServerConfig::StreamableHttp {
+                alias: server.name,
+                url: server.url.parse().map_err(|error| {
+                    ProtocolError::InvalidPayload(format!("invalid MCP URL: {error}"))
+                })?,
+                headers: server
+                    .headers
+                    .into_iter()
+                    .map(|header| (header.name, Secret::new(header.value)))
+                    .collect(),
+            }),
+            acp::McpServer::Other(_) => Err(ProtocolError::InvalidPayload(
+                "unsupported MCP server configuration".to_owned(),
+            )),
+            _ => Err(ProtocolError::InvalidPayload(
+                "unsupported MCP server configuration".to_owned(),
+            )),
+        })
+        .collect()
 }
 
 type Meta = Option<serde_json::Map<String, Value>>;

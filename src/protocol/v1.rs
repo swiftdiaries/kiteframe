@@ -5,8 +5,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    AnswerQuestion, CancelRun, IdempotencyKey, PolicyRevision, RunId, SessionId, SessionPolicy,
-    StartRun,
+    AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PolicyRevision, RunId, Secret,
+    SessionId, SessionPolicy, StartRun,
 };
 
 use super::{
@@ -45,23 +45,19 @@ impl V1Adapter {
         match method {
             "session/new" => {
                 let request: acp::NewSessionRequest = decode(params)?;
-                ensure_empty_session_attachments(
-                    &request.additional_directories,
-                    &request.mcp_servers,
-                )?;
+                ensure_empty_directories(&request.additional_directories)?;
                 Ok(ApplicationCommand::NewSession(NewSession {
                     working_directory: path_string(&request.cwd)?,
+                    mcp_servers: mcp_servers(request.mcp_servers)?,
                 }))
             }
             "session/load" => {
                 let request: acp::LoadSessionRequest = decode(params)?;
-                ensure_empty_session_attachments(
-                    &request.additional_directories,
-                    &request.mcp_servers,
-                )?;
+                ensure_empty_directories(&request.additional_directories)?;
                 Ok(ApplicationCommand::ResumeSession(ResumeSession {
                     session_id: session_id(request.session_id)?,
                     working_directory: path_string(&request.cwd)?,
+                    mcp_servers: mcp_servers(request.mcp_servers)?,
                 }))
             }
             _ => Err(ProtocolError::UnsupportedMethod(method.to_owned())),
@@ -163,16 +159,56 @@ fn path_string(path: &Path) -> Result<String, ProtocolError> {
         .ok_or_else(|| ProtocolError::InvalidPayload("working directory is not UTF-8".to_owned()))
 }
 
-fn ensure_empty_session_attachments<T>(
+fn ensure_empty_directories(
     additional_directories: &[std::path::PathBuf],
-    mcp_servers: &[T],
 ) -> Result<(), ProtocolError> {
-    if !additional_directories.is_empty() || !mcp_servers.is_empty() {
+    if !additional_directories.is_empty() {
         return Err(ProtocolError::InvalidPayload(
-            "session attachments are configured by the authenticated connection".to_owned(),
+            "additional directories are not supported".to_owned(),
         ));
     }
     Ok(())
+}
+
+fn mcp_servers(servers: Vec<acp::McpServer>) -> Result<Vec<McpServerConfig>, ProtocolError> {
+    servers
+        .into_iter()
+        .map(|server| match server {
+            acp::McpServer::Stdio(server) => Ok(McpServerConfig::Stdio {
+                alias: server.name,
+                program: server
+                    .command
+                    .to_str()
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        ProtocolError::InvalidPayload("MCP command is not UTF-8".to_owned())
+                    })?,
+                args: server.args,
+                env: server
+                    .env
+                    .into_iter()
+                    .map(|entry| (entry.name, Secret::new(entry.value)))
+                    .collect(),
+            }),
+            acp::McpServer::Http(server) => Ok(McpServerConfig::StreamableHttp {
+                alias: server.name,
+                url: server.url.parse().map_err(|error| {
+                    ProtocolError::InvalidPayload(format!("invalid MCP URL: {error}"))
+                })?,
+                headers: server
+                    .headers
+                    .into_iter()
+                    .map(|header| (header.name, Secret::new(header.value)))
+                    .collect(),
+            }),
+            acp::McpServer::Sse(_) => Err(ProtocolError::InvalidPayload(
+                "SSE MCP servers are not supported; use streamable HTTP".to_owned(),
+            )),
+            _ => Err(ProtocolError::InvalidPayload(
+                "unsupported MCP server configuration".to_owned(),
+            )),
+        })
+        .collect()
 }
 
 type Meta = Option<serde_json::Map<String, Value>>;

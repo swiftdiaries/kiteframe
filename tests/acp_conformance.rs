@@ -90,6 +90,33 @@ fn v1_golden_messages_use_sdk_types_and_only_v1_lifecycle() {
     assert_eq!(permission["_meta"]["future.permission"][1], 1);
 }
 
+#[test]
+fn v1_session_mcp_configuration_stays_connection_local() {
+    let command = V1Adapter
+        .decode_session(
+            "session/new",
+            json!({
+                "cwd": "/tmp/kiteframe-mcp",
+                "mcpServers": [{
+                    "type": "http",
+                    "name": "docs",
+                    "url": "http://127.0.0.1:3010/mcp",
+                    "headers": [{"name": "Authorization", "value": "Bearer ephemeral"}]
+                }]
+            }),
+        )
+        .expect("standard ACP MCP declaration is accepted");
+    let ApplicationCommand::NewSession(session) = command else {
+        panic!("expected session command");
+    };
+    assert_eq!(session.mcp_servers.len(), 1);
+    assert!(matches!(
+        &session.mcp_servers[0],
+        kiteframe::McpServerConfig::StreamableHttp { alias, headers, .. }
+            if alias == "docs" && headers.len() == 1
+    ));
+}
+
 fn fixture_application_session(cwd: &str) -> ApplicationSession {
     ApplicationSession {
         view: SessionView {
@@ -445,6 +472,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
             &alice_context,
             ApplicationCommand::NewSession(NewSession {
                 working_directory: "/tmp/kiteframe-acp".to_owned(),
+                mcp_servers: vec![],
             }),
         )
         .await
@@ -462,6 +490,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
                 ApplicationCommand::ResumeSession(ResumeSession {
                     session_id: created.view.id.clone(),
                     working_directory: "/tmp/not-the-session-cwd".to_owned(),
+                    mcp_servers: vec![],
                 }),
             )
             .await,
@@ -480,6 +509,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
                 ApplicationCommand::ResumeSession(ResumeSession {
                     session_id: created.view.id.clone(),
                     working_directory: "/tmp/kiteframe-acp".to_owned(),
+                    mcp_servers: vec![],
                 }),
             )
             .await,
@@ -679,6 +709,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
                 ApplicationCommand::ResumeSession(ResumeSession {
                     session_id: created.view.id,
                     working_directory: "/tmp/kiteframe-acp".to_owned(),
+                    mcp_servers: vec![],
                 }),
             )
             .await
@@ -692,6 +723,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
             &alice_context,
             ApplicationCommand::NewSession(NewSession {
                 working_directory: "/tmp/kiteframe-expired".to_owned(),
+                mcp_servers: vec![],
             }),
         )
         .await
@@ -706,6 +738,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
                 ApplicationCommand::ResumeSession(ResumeSession {
                     session_id: expired.view.id,
                     working_directory: expired.working_directory,
+                    mcp_servers: vec![],
                 }),
             )
             .await,

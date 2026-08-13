@@ -21,6 +21,18 @@ pub struct McpLimits {
     pub max_catalog_bytes: usize,
 }
 
+impl Default for McpLimits {
+    fn default() -> Self {
+        Self {
+            max_servers: 8,
+            max_pages_per_server: 32,
+            max_tools: 256,
+            max_descriptor_bytes: 64 * 1024,
+            max_catalog_bytes: 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum McpServerConfig {
     Stdio {
