@@ -55,6 +55,18 @@ impl SessionAuthorizer for RequirePermission {
     }
 }
 
+struct DenyAll;
+
+#[async_trait]
+impl SessionAuthorizer for DenyAll {
+    async fn authorize(
+        &self,
+        _request: &PolicyRequest,
+    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
+        Ok(PolicyDecision::Forbid { rule_ids: vec![] })
+    }
+}
+
 struct SearchTool {
     descriptor: CatalogTool,
 }
@@ -388,6 +400,94 @@ async fn failed_tool_invocation_becomes_a_durable_tool_failed_output() {
         .unwrap()
         .get("state");
     assert_eq!(state, "completed");
+}
+
+#[tokio::test]
+async fn policy_denial_is_durable_without_invoking_or_prompting() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("denied-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let descriptor = CatalogTool::new(
+        "docs/search",
+        "docs",
+        "search",
+        ClosedSchema::object("input", BTreeMap::new()),
+        ClosedSchema::object("output", BTreeMap::new()),
+        BTreeSet::new(),
+        EffectKind::ReadOnly,
+        RecoverySupport::NotRequired,
+    )
+    .unwrap();
+    let registry = Arc::new(InProcessToolRegistry::new());
+    registry
+        .register(bind_tool(Arc::new(FailingTool {
+            descriptor: descriptor.clone(),
+        })))
+        .unwrap();
+    let catalog = registry
+        .snapshot(
+            session.id.clone(),
+            Uuid::now_v7(),
+            &BTreeSet::from(["docs/search".to_owned()]),
+            &BTreeMap::from([(
+                "docs/search".to_owned(),
+                descriptor.descriptor_digest().to_owned(),
+            )]),
+        )
+        .unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("denied{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .unwrap();
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let engine = Engine {
+        store: store.clone(),
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([vec![
+            json!({"type":"function_call","call_id":"denied-call","name":"docs/search","arguments":{}}),
+        ]])))),
+        tools: registry,
+        authorizer: Arc::new(DenyAll),
+        config: EngineConfig::default(),
+    };
+    engine.tick_run(run.id.clone()).await.unwrap();
+    let error: Value = sqlx::query("SELECT error FROM tool_calls WHERE frame_id = $1")
+        .bind(*run.root_frame_id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("error");
+    assert_eq!(error["code"], "policy_denied");
+    let prompts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM permission_requests WHERE run_id = $1")
+            .bind(*run.id.as_uuid())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(prompts, 0);
 }
 
 #[tokio::test]
