@@ -1,16 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use thiserror::Error;
-use tokio::sync::RwLock;
 
 use crate::PostgresStore;
 use crate::{
     BoundTool, Capability, CatalogTool, ClosedSchema, EffectKind, IdempotencyKey, PrincipalId,
-    RecoverySupport, Secret, SessionId, ToolCall, ToolCatalogSnapshot, ToolError, ToolStatus,
-    TrustedTool, bind_tool,
+    RecoverySupport, Secret, SessionId, ToolCall, ToolCatalogSnapshot, ToolError, ToolResolver,
+    ToolStatus, TrustedTool, bind_tool,
 };
 
 #[derive(Clone, Debug)]
@@ -365,20 +364,24 @@ impl McpManager {
                 "server alias must not be empty".to_owned(),
             ));
         }
-        let mut connections = self.connections.write().await;
-        let servers = connections.entry(session.clone()).or_default();
-        if !servers.contains_key(&alias) && servers.len() >= self.limits.max_servers {
-            return Err(McpError::LimitExceeded("server count".to_owned()));
+        {
+            let mut connections = self
+                .connections
+                .write()
+                .expect("MCP connections lock poisoned");
+            let servers = connections.entry(session.clone()).or_default();
+            if !servers.contains_key(&alias) && servers.len() >= self.limits.max_servers {
+                return Err(McpError::LimitExceeded("server count".to_owned()));
+            }
+            servers.insert(alias, peer);
         }
-        servers.insert(alias, peer);
-        drop(connections);
         let snapshot = self.build_snapshot(session.clone()).await?;
         if let Some(store) = &self.store {
             store.append_catalog_epoch(&snapshot).await?;
         }
         self.catalogs
             .write()
-            .await
+            .expect("MCP catalogs lock poisoned")
             .insert(session, snapshot.clone());
         Ok(snapshot)
     }
@@ -390,7 +393,7 @@ impl McpManager {
         let before = self
             .catalogs
             .read()
-            .await
+            .expect("MCP catalogs lock poisoned")
             .get(&session)
             .cloned()
             .ok_or(McpError::SessionNotAttached)?;
@@ -398,7 +401,10 @@ impl McpManager {
         if let Some(store) = &self.store {
             store.append_catalog_epoch(&epoch).await?;
         }
-        self.catalogs.write().await.insert(session, epoch.clone());
+        self.catalogs
+            .write()
+            .expect("MCP catalogs lock poisoned")
+            .insert(session, epoch.clone());
         let before_tools = before.tools();
         let after_tools = epoch.tools();
         let added = after_tools
@@ -436,7 +442,7 @@ impl McpManager {
         let catalog = self
             .catalogs
             .read()
-            .await
+            .expect("MCP catalogs lock poisoned")
             .get(&session)
             .cloned()
             .ok_or(McpError::SessionNotAttached)?;
@@ -445,7 +451,7 @@ impl McpManager {
         let peer = self
             .connections
             .read()
-            .await
+            .expect("MCP connections lock poisoned")
             .get(&session)
             .and_then(|servers| servers.get(&alias))
             .cloned()
@@ -457,15 +463,19 @@ impl McpManager {
         })))
     }
     async fn build_snapshot(&self, session: SessionId) -> Result<ToolCatalogSnapshot, McpError> {
-        let connections = self.connections.read().await;
-        let servers = connections
-            .get(&session)
-            .ok_or(McpError::SessionNotAttached)?;
-        let peers = servers
-            .iter()
-            .map(|(alias, peer)| (alias.clone(), Arc::clone(peer)))
-            .collect::<Vec<_>>();
-        drop(connections);
+        let peers = {
+            let connections = self
+                .connections
+                .read()
+                .expect("MCP connections lock poisoned");
+            let servers = connections
+                .get(&session)
+                .ok_or(McpError::SessionNotAttached)?;
+            servers
+                .iter()
+                .map(|(alias, peer)| (alias.clone(), Arc::clone(peer)))
+                .collect::<Vec<_>>()
+        };
         let mut tools = Vec::new();
         let mut total_bytes = 0;
         for (alias, peer) in peers {
@@ -509,6 +519,50 @@ impl McpManager {
             }
         }
         ToolCatalogSnapshot::new(session, uuid::Uuid::now_v7(), tools).map_err(McpError::Catalog)
+    }
+}
+
+#[async_trait]
+impl ToolResolver for McpManager {
+    fn bound_tool(
+        &self,
+        session: SessionId,
+        qualified_name: &str,
+        descriptor_digest: &str,
+    ) -> Result<Arc<dyn BoundTool>, ToolError> {
+        let catalog = self
+            .catalogs
+            .read()
+            .expect("MCP catalogs lock poisoned")
+            .get(&session)
+            .cloned()
+            .ok_or_else(|| ToolError::UnknownSession(session.clone()))?;
+        let descriptor = catalog.resolve(qualified_name, descriptor_digest)?.clone();
+        let peer = self
+            .connections
+            .read()
+            .expect("MCP connections lock poisoned")
+            .get(&session)
+            .and_then(|servers| servers.get(descriptor.server_alias()))
+            .cloned()
+            .ok_or_else(|| ToolError::UnknownSession(session.clone()))?;
+        Ok(bind_tool(Arc::new(McpTrustedTool {
+            session,
+            descriptor,
+            peer,
+        })))
+    }
+
+    async fn invoke(
+        &self,
+        session: SessionId,
+        qualified_name: &str,
+        descriptor_digest: &str,
+        call: ToolCall,
+    ) -> Result<Value, ToolError> {
+        ToolResolver::bound_tool(self, session, qualified_name, descriptor_digest)?
+            .invoke(call)
+            .await
     }
 }
 

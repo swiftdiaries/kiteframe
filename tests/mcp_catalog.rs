@@ -3,7 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use kiteframe::{
     AuthenticatedMcpPeer, ClosedSchema, FrameId, IdempotencyKey, McpError, McpLimits, McpManager,
-    PolicyRevision, PrincipalId, RemoteTool, RunId, SessionId, ToolCall, closed_schema,
+    PolicyRevision, PrincipalId, RemoteTool, RunId, SessionId, ToolCall, ToolResolver,
+    closed_schema,
 };
 use serde_json::json;
 use tokio::sync::RwLock;
@@ -75,6 +76,52 @@ async fn discovery_is_principal_scoped_and_refreshes_only_its_own_catalog() {
             .await,
         Err(McpError::SessionNotAttached)
     ));
+}
+
+#[tokio::test]
+async fn discovered_mcp_tools_cross_the_engine_resolver_boundary() {
+    let manager = McpManager::new(McpLimits {
+        max_servers: 1,
+        max_pages_per_server: 1,
+        max_tools: 4,
+        max_descriptor_bytes: 1024,
+        max_catalog_bytes: 4096,
+    });
+    let session = SessionId::new(Uuid::now_v7());
+    let peer = Arc::new(FakePeer::new(vec![tool("search")]));
+    let catalog = manager
+        .attach_peer(
+            session.clone(),
+            PrincipalId::new("resolver-principal").unwrap(),
+            "docs".to_owned(),
+            peer,
+        )
+        .await
+        .unwrap();
+    let descriptor = catalog.tools().get("docs/search").unwrap();
+    let bound = ToolResolver::bound_tool(
+        &manager,
+        session.clone(),
+        "docs/search",
+        descriptor.descriptor_digest(),
+    )
+    .expect("MCP catalog binding resolves through the engine boundary");
+    let result = bound
+        .invoke(
+            ToolCall::new(
+                session,
+                RunId::new(Uuid::now_v7()),
+                FrameId::new(Uuid::now_v7()),
+                PolicyRevision::new(0),
+                descriptor,
+                json!({}),
+                IdempotencyKey::new("mcp-resolver-call").unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result, json!({}));
 }
 
 #[test]
