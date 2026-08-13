@@ -394,7 +394,13 @@ async fn run_scheduler(
                 }
                 continue;
             }
-            result = engine.tick_until_idle() => result?,
+            result = engine.tick_until_idle() => match result {
+                Ok(applied) => applied,
+                Err(error) => {
+                    tracing::warn!(error = %error, "scheduler tick failed; retaining service availability");
+                    0
+                }
+            },
         };
         if applied == 0 {
             tokio::select! {
