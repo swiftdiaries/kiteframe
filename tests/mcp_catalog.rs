@@ -32,6 +32,9 @@ async fn discovery_is_principal_scoped_and_refreshes_only_its_own_catalog() {
         )
         .await
         .unwrap();
+    let alice_search_digest = alice_catalog.tools()["docs/search"]
+        .descriptor_digest()
+        .to_owned();
     let bob_catalog = manager
         .attach_peer(
             bob_session.clone(),
@@ -47,10 +50,26 @@ async fn discovery_is_principal_scoped_and_refreshes_only_its_own_catalog() {
     assert!(!bob_catalog.tools().contains_key("docs/search"));
 
     alice.set(vec![tool("shared"), tool("new")]).await;
-    let refresh = manager.refresh(alice_session, "docs").await.unwrap();
+    let refresh = manager
+        .refresh(alice_session.clone(), "docs")
+        .await
+        .unwrap();
     assert_eq!(refresh.added, ["docs/new"]);
     assert_eq!(refresh.removed, ["docs/search"]);
     assert!(refresh.changed.is_empty());
+    assert!(matches!(
+        ToolResolver::bound_tool(&manager, alice_session.clone(), "docs/search", &alice_search_digest),
+        Err(kiteframe::ToolError::UnknownTool(name)) if name == "docs/search"
+    ));
+    assert!(
+        ToolResolver::bound_tool(
+            &manager,
+            bob_session.clone(),
+            "ops/admin",
+            bob_catalog.tools()["ops/admin"].descriptor_digest(),
+        )
+        .is_ok()
+    );
     let bound = manager
         .bound_tool(
             refresh.epoch.session_id().clone(),
