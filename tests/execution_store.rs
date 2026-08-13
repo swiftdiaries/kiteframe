@@ -571,6 +571,63 @@ async fn active_run_quota_rejects_new_work_but_replays_the_original_request() {
     ));
 }
 
+#[tokio::test]
+async fn concurrent_active_run_quota_admits_exactly_one_distinct_request() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = std::sync::Arc::new(
+        PostgresStore::connect_with_limits(
+            &database_url,
+            StoreLimits {
+                max_active_runs_per_session: 1,
+                ..StoreLimits::default()
+            },
+        )
+        .await
+        .expect("quota store"),
+    );
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("run-quota-race-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/quota".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .expect("session");
+    let catalog =
+        ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), []).expect("catalog");
+    store
+        .append_catalog_epoch(&catalog)
+        .await
+        .expect("catalog epoch");
+    let name = format!("quotarace{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [] on ok() {{ done \"ok\" }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).expect("workflow");
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .expect("publish");
+    let make_request = || StartRun {
+        session_id: session.id.clone(),
+        workflow_name: definition.name.clone(),
+        version: Some(definition.version),
+        input: json!({}),
+        idempotency_key: IdempotencyKey::new(format!("quota-race-{}", Uuid::now_v7())).unwrap(),
+    };
+    let (first, second) = tokio::join!(
+        store.start_run(make_request()),
+        store.start_run(make_request())
+    );
+    match (first, second) {
+        (Ok(_), Err(StoreError::QuotaExceeded("active_runs_per_session")))
+        | (Err(StoreError::QuotaExceeded("active_runs_per_session")), Ok(_)) => {}
+        results => panic!("expected one creation and one quota rejection, got {results:?}"),
+    }
+}
+
 fn tool(name: &str) -> CatalogTool {
     let alias = name.split_once('/').expect("qualified name").0;
     CatalogTool::new(
