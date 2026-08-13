@@ -980,11 +980,6 @@ impl PostgresStore {
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(StoreError::FrameNotFound)?;
-        if frame.get::<i64, _>("revision") as u64 != expected_revision
-            || frame.get::<String, _>("state") != "running"
-        {
-            return Err(StoreError::RevisionConflict);
-        }
         let call =
             sqlx::query("SELECT state FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
                 .bind(tool_call_id)
@@ -994,6 +989,11 @@ impl PostgresStore {
                 .ok_or_else(|| {
                     StoreError::InvalidData("tool call was not found for frame".to_owned())
                 })?;
+        if frame.get::<i64, _>("revision") as u64 != expected_revision
+            || frame.get::<String, _>("state") != "running"
+        {
+            return Err(StoreError::RevisionConflict);
+        }
         if call.get::<String, _>("state") != "intent" {
             return Err(StoreError::RevisionConflict);
         }
@@ -1386,11 +1386,6 @@ impl PostgresStore {
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(StoreError::FrameNotFound)?;
-        if frame.get::<i64, _>("revision") as u64 != expected_revision
-            || frame.get::<String, _>("state") != "running"
-        {
-            return Err(StoreError::RevisionConflict);
-        }
         let call =
             sqlx::query("SELECT state FROM tool_calls WHERE id = $1 AND frame_id = $2 FOR UPDATE")
                 .bind(tool_call_id)
@@ -1400,6 +1395,34 @@ impl PostgresStore {
                 .ok_or_else(|| {
                     StoreError::InvalidData("tool call was not found for frame".to_owned())
                 })?;
+        if frame.get::<String, _>("state") == "cancelled" {
+            if call.get::<String, _>("state") == "intent" {
+                match outcome {
+                    Ok(result) => {
+                        sqlx::query("UPDATE tool_calls SET state = 'completed', result = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                            .bind(result).bind(tool_call_id).execute(&mut *tx).await?;
+                    }
+                    Err(error) => {
+                        sqlx::query("UPDATE tool_calls SET state = 'failed', error = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2")
+                            .bind(error).bind(tool_call_id).execute(&mut *tx).await?;
+                    }
+                }
+                append_event(
+                    &mut tx,
+                    run_id,
+                    "tool.late_result",
+                    json!({"frame_id": frame_id.as_uuid(), "tool_call_id": tool_call_id}),
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
+        if frame.get::<i64, _>("revision") as u64 != expected_revision
+            || frame.get::<String, _>("state") != "running"
+        {
+            return Err(StoreError::RevisionConflict);
+        }
         if call.get::<String, _>("state") != "intent" {
             return Err(StoreError::RevisionConflict);
         }

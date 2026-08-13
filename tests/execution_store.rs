@@ -329,6 +329,20 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         )
         .await
         .expect("persist model intent before cancellation");
+    let late_tool = store
+        .begin_tool_call(
+            cancellable.root_frame_id.clone(),
+            late_attempt.revision,
+            "cancelled-tool".to_owned(),
+            "docs/search".to_owned(),
+            catalog.tools()["docs/search"]
+                .descriptor_digest()
+                .to_owned(),
+            json!({"query": "late"}),
+            "cancelled-tool-key".to_owned(),
+        )
+        .await
+        .expect("persist tool intent before cancellation");
     store
         .cancel_run(
             cancellable.id.clone(),
@@ -372,13 +386,31 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
     .await
     .expect("count late model items");
     assert_eq!(late_items, 1);
+    store
+        .finish_tool_call(
+            cancellable.root_frame_id.clone(),
+            late_tool.id,
+            late_tool.revision,
+            Ok(json!({"result": "late external effect"})),
+        )
+        .await
+        .expect("late tool result is recorded without reviving the cancelled run");
+    let late_tool_state: String = sqlx::query_scalar("SELECT state FROM tool_calls WHERE id = $1")
+        .bind(late_tool.id)
+        .fetch_one(store.pool())
+        .await
+        .expect("late tool state");
+    assert_eq!(late_tool_state, "completed");
     assert!(
         store
             .events_after(session.id.clone(), cancellable.id, 0, 16)
             .await
             .expect("cancelled run events")
             .iter()
-            .any(|event| event.kind == "model.late_result")
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|kinds| kinds == ["model.late_result", "tool.late_result"])
     );
     let recoverable = store
         .start_run(StartRun {
