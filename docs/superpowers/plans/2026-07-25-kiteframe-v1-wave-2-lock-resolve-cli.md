@@ -1,5 +1,9 @@
 # Kiteframe V1 Wave 2 Lock Resolve and CLI Implementation Plan
 
+> **Superseded (2026-08-11):** Historical plan retained for context. The active
+> replacement plan is the
+> [Minimal Workflow Engine Implementation Plan](2026-08-11-kiteframe-minimal-workflow-engine.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Resolve semantic capabilities into an immutable lock, verify every locked byte and safety field, negotiate runtime features, produce canonical `ResolvedAgent` IR, and expose the shared Rust pipeline through the four V1 CLI commands.

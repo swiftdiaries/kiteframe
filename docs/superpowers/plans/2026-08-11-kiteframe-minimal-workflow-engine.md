@@ -21,7 +21,7 @@ commit.
 PostgreSQL 16, Reqwest 0.12 with rustls, Serde/serde_json 1, UUID 1, `time` 0.3,
 RFC 8785/SHA-256, `agent-client-protocol = "=2.0.0"`,
 `agent-client-protocol-http = "=2.0.0"`, `rmcp = "=3.1.2"`,
-`cedar-policy = "=4.12.0"`,
+`cedar-policy = "=4.11.0"`,
 `cedar-policy-mcp-schema-generator = "=0.6.0"`, Python 3.11+ with Maturin bin
 wheels, and TypeScript on Bun with platform-specific optional packages.
 
@@ -667,7 +667,7 @@ pub trait SessionAuthorizer: Send + Sync {
 - [ ] **Step 1: Pin published Cedar crates**
 
 ```toml
-cedar-policy = "=4.12.0"
+cedar-policy = "=4.11.0"
 cedar-policy-mcp-schema-generator = { version = "=0.6.0", features = ["serde", "serde_json"] }
 ```
 

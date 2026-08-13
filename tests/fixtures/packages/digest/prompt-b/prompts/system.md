@@ -1,1 +1,0 @@
-Prompt variant B.

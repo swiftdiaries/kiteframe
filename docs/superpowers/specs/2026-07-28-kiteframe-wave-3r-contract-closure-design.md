@@ -1,5 +1,9 @@
 # Kiteframe Wave 3R Contract Closure Design Addendum
 
+> **Superseded (2026-08-11):** Historical design retained for context. The
+> current normative architecture is the
+> [Minimal Workflow Engine Design](2026-08-11-kiteframe-minimal-workflow-engine-design.md).
+
 - **Status:** Approved
 - **Date:** 2026-07-28
 - **Repository:** `swiftdiaries/kiteframe`

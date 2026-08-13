@@ -382,7 +382,7 @@ unsupported input paths, duplicate IDs, and values outside the referenced tool
 schema are validation errors.
 
 The Rust harness deterministically compiles this structure into Cedar policies,
-entities, and a schema. It pins `cedar-policy = 4.12.0` and
+entities, and a schema. It pins `cedar-policy = 4.11.0` and
 `cedar-policy-mcp-schema-generator = 0.6.0`. It adopts the schema-generation,
 session-context, consent, and input-restriction patterns from
 `cedar-policy/cedar-for-agents`, but does not depend on the unpublished

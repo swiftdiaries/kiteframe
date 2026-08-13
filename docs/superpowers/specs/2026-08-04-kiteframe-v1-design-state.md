@@ -1,5 +1,9 @@
 # Kiteframe V1 Design State
 
+> **Superseded (2026-08-11):** Historical state audit retained for context. The
+> current normative architecture is the
+> [Minimal Workflow Engine Design](2026-08-11-kiteframe-minimal-workflow-engine-design.md).
+
 - **Status:** State audit; not a replacement normative specification
 - **Date:** 2026-08-04
 - **Repository:** `swiftdiaries/kiteframe`

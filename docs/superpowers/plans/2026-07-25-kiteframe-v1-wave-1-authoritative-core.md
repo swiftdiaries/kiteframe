@@ -1,5 +1,9 @@
 # Kiteframe V1 Wave 1 Authoritative Core Implementation Plan
 
+> **Superseded (2026-08-11):** Historical plan retained for context. The active
+> replacement plan is the
+> [Minimal Workflow Engine Implementation Plan](2026-08-11-kiteframe-minimal-workflow-engine.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Establish the Rust workspace, normative V1 schemas and diagnostics, hostile-input package loader, containment rules, and deterministic portable package digest.

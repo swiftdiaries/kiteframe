@@ -1,3 +1,0 @@
-A
-first: &value ok
-second: *value

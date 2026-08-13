@@ -1,0 +1,1 @@
+{"name":"@kiteframe/darwin-arm64","version":"0.1.0","os":["darwin"],"cpu":["arm64"],"files":["kiteframe-harness"],"bin":{"kiteframe-harness":"kiteframe-harness"}}

@@ -8,22 +8,27 @@ permissions:
   contents: read
 
 jobs:
-  wave-2:
-    name: Wave 2 and 3R gates
+  rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: kiteframe_ci
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d kiteframe_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
-      PYO3_PYTHON: python
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/kiteframe_ci
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8
 
       - name: Show Rust toolchain
         run: rustup show active-toolchain
@@ -31,165 +36,201 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Check fuzz workspace formatting
-        run: cargo fmt --manifest-path fuzz/Cargo.toml --all --check
-
       - name: Lint all targets
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Test workspace
-        run: cargo test --workspace --all-features
+      - name: Test all targets
+        run: cargo test --all-targets --all-features -- --test-threads=1
 
-      - name: Test authenticated provider HTTP profile
-        run: cargo test -p kiteframe-provider-http --test http_profile
+      - name: Install uv for live Python client smoke
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
 
-      - name: Check server authority boundary
+      - name: Exercise Python client against the compiled harness
+        run: |
+          cargo build --bin kiteframe-harness
+          uv run --project clients/python pytest -q clients/python/tests
+        env:
+          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
+          KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
+
+      - name: Install Bun for live TypeScript client smoke
+        uses: oven-sh/setup-bun@v2
+
+      - name: Exercise TypeScript client against the compiled harness
+        run: |
+          (cd clients/typescript && bun install --frozen-lockfile)
+          (cd clients/typescript && bun test)
+        env:
+          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
+          KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
+
+      - name: Exercise TypeScript client against the remote harness
         shell: bash
         run: |
-          set -euo pipefail
-          if grep -R -E 'ProviderAuthenticator|CatalogFetchResult' \
-            crates/kiteframe-provider-http/src; then
-            echo "client authentication or catalog-fetch authority leaked into the server" >&2
-            exit 1
-          fi
-
-      - name: Check generated schemas
-        run: cargo run -p kiteframe-schema -- --check schemas/v1alpha1
-
-      - name: Check generated Python stubs
-        run: >-
-          cargo run -p kiteframe-schema --
-          --check-python-stubs python/kiteframe/src/kiteframe/_native.pyi
-
-      - name: Check portable dependency boundary
-        shell: bash
-        run: |
-          set -euo pipefail
-          dependencies="$(cargo tree \
-            -p kiteframe-contract \
-            -p kiteframe-core \
-            --edges normal \
-            --prefix none)"
-          forbidden='^(deepagents|langchain|langgraph|openfga|opentelemetry|opentelemetry_sdk|tracing-opentelemetry)( |$)'
-          if grep -E "${forbidden}" <<<"${dependencies}"; then
-            echo "portable crate depends on a runtime, authorization, or telemetry SDK" >&2
-            exit 1
-          fi
+          python3 tests/fixtures/responses_ready.py &
+          responses_pid=$!
+          for _ in $(seq 1 50); do
+            if curl --fail --silent http://127.0.0.1:38474/ready >/dev/null; then break; fi
+            sleep 0.1
+          done
+          curl --fail --silent http://127.0.0.1:38474/ready >/dev/null
+          KITEFRAME_BIND=127.0.0.1:38473 \
+          KITEFRAME_TLS_TERMINATED=true \
+          KITEFRAME_BEARER_BINDINGS='[{"secret":"remote-integration-token","principal":"typescript-remote"}]' \
+          KITEFRAME_DATABASE_URL="$DATABASE_URL" \
+          KITEFRAME_RESPONSES_BASE_URL=http://127.0.0.1:38474/v1 \
+          KITEFRAME_RESPONSES_API_KEY=integration-test \
+          KITEFRAME_RESPONSES_MODEL=test-model \
+          ./target/debug/kiteframe-harness &
+          harness_pid=$!
+          trap 'kill "$harness_pid" "$responses_pid" 2>/dev/null || true; wait "$harness_pid" "$responses_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 50); do
+            if curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null; then break; fi
+            sleep 0.1
+          done
+          curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null
+          (cd clients/typescript && bun test)
+        env:
+          KITEFRAME_REMOTE_INTEGRATION_URL: ws://127.0.0.1:38473/acp
+          KITEFRAME_REMOTE_INTEGRATION_TOKEN: remote-integration-token
 
   python:
-    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.11"
+
+      - name: Test Python client
+        run: uv run --project clients/python pytest -q clients/python/tests
+
+      - name: Lint Python client
+        run: uv run ruff check src tests scripts
+        working-directory: clients/python
+
+      - name: Type-check Python client
+        run: uv run --project clients/python pyright
+
+  python-wheels:
+    name: Python wheel (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - name: macOS arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - name: macOS x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: Linux glibc arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: Linux glibc x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: Windows x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+      - name: Build platform wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          manylinux: auto
+          working-directory: clients/python
 
-      - name: Build Python native extension
-        working-directory: python/kiteframe
-        run: uv run --project . maturin develop
+      - name: Inspect, install, import, and launch wheel
+        shell: bash
+        run: python scripts/inspect_wheel.py "$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+        working-directory: clients/python
 
-      - name: Test Python package
-        working-directory: python/kiteframe
-        run: uv run --project . pytest -q
-
-      - name: Lint Python package
-        working-directory: python/kiteframe
-        run: uv run --project . ruff check src tests
-
-      - name: Type-check Python package
-        working-directory: python/kiteframe
-        run: uv run --project . pyright
-
-      - name: Run Wave 3R no-loss and consumer gates
-        working-directory: python/kiteframe
-        run: >-
-          uv run --project . pytest -q
-          tests/test_native_golden.py
-          tests/test_service_round_trip.py
-          tests/test_wave4_consumer_gate.py
-          tests/test_wave5_consumer_gate.py
-          tests/conformance/test_crankshaft_profile.py
-
-  wave-4:
-    name: Wave 4 Deep Agents adapter gate
+  typescript:
     runs-on: ubuntu-latest
-    env:
-      PYO3_PYTHON: python
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
 
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v8
+      - name: Install TypeScript dependencies
+        run: bun install --frozen-lockfile
+        working-directory: clients/typescript
 
-      - name: Build Python native extension
-        working-directory: python/kiteframe
-        run: uv run --project . maturin develop
-
-      - name: Verify Wave 3R native contracts
-        run: >-
-          uv run --project python/kiteframe
-          python scripts/verify_wave3r.py
-
-      - name: Test Deep Agents adapter
-        working-directory: python/kiteframe-deepagents
-        run: uv run --project . pytest -q
-
-      - name: Lint Deep Agents adapter
-        working-directory: python/kiteframe-deepagents
-        run: uv run --project . ruff check src tests
-
-      - name: Type-check Deep Agents adapter
-        working-directory: python/kiteframe-deepagents
-        run: uv run --project . pyright
-
-      - name: Check Deep Agents target metadata drift
-        working-directory: python/kiteframe-deepagents
-        run: >-
-          uv run --project . python -m kiteframe_deepagents.target
-          --check ../../runtime-targets/deepagents-0.6.12.json
-
-  fuzz:
-    name: Strict YAML invariant and fuzz gates
-    runs-on: ubuntu-latest
-    env:
-      RUSTUP_TOOLCHAIN: nightly-2026-07-25
+  typescript-platform-packages:
+    name: TypeScript platform package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runner: macos-14
+            package: darwin-arm64
+            binary: kiteframe-harness
+          - name: macOS x86_64
+            runner: macos-15-intel
+            package: darwin-x64
+            binary: kiteframe-harness
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            package: linux-arm64
+            binary: kiteframe-harness
+          - name: Linux x86_64
+            runner: ubuntu-24.04
+            package: linux-x64
+            binary: kiteframe-harness
+          - name: Windows x86_64
+            runner: windows-latest
+            package: win32-x64
+            binary: kiteframe-harness.exe
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Install nightly Rust
-        run: rustup toolchain install nightly-2026-07-25 --profile minimal
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Build harness and stage platform package
+        shell: bash
+        run: |
+          cargo build --release --bin kiteframe-harness
+          bun install --frozen-lockfile
+          bun run package-platform -- "${{ matrix.package }}" "../../target/release/${{ matrix.binary }}"
+          (cd "npm/${{ matrix.package }}" && bun pm pack)
+          tar -tzf "npm/${{ matrix.package }}"/*.tgz | grep -F "package/${{ matrix.binary }}"
+          KITEFRAME_BUN_SMOKE_DIR="$(mktemp -d)"
+          bun init -y --cwd "$KITEFRAME_BUN_SMOKE_DIR"
+          bun add --cwd "$KITEFRAME_BUN_SMOKE_DIR" "$(pwd)/npm/${{ matrix.package }}"/*.tgz
+          "$KITEFRAME_BUN_SMOKE_DIR/node_modules/.bin/kiteframe-harness" --version
+        working-directory: clients/typescript
 
-      - name: Check deterministic strict YAML invariants
-        run: bash fuzz/check-invariants.sh
-
-      - name: Run stochastic strict YAML fuzz smoke
-        run: cargo fuzz run strict_yaml -- -max_total_time=10
-
-      - name: Upload fuzz crash artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
+      - name: Upload packed platform artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: strict-yaml-fuzz-artifacts
-          path: fuzz/artifacts/strict_yaml
-          if-no-files-found: ignore
+          name: kiteframe-${{ matrix.package }}
+          path: clients/typescript/npm/${{ matrix.package }}/*.tgz
+
+      - name: Test, type-check, and build TypeScript client
+        run: |
+          bun test
+          bun run typecheck
+          bun run build
+        working-directory: clients/typescript

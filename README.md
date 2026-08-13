@@ -1,54 +1,47 @@
 # Kiteframe
 
-Kiteframe is a Rust-first, runtime-neutral declarative agent layer.
+Kiteframe is a durable Rust workflow harness under active implementation. The
+single `kiteframe-harness` process owns PostgreSQL workflow state, workflow
+compilation, typed Cedar policy evaluation, and local NDJSON stdio dispatch.
 
-## Wave 2: lock, resolve, and compile
+The Python and TypeScript packages are thin child-process clients. They do not
+contain a workflow compiler, scheduler, policy evaluator, or durable state.
 
-Kiteframe strictly validates portable packages, selects exact capability
-versions into a self-contained lock, and deterministically resolves a package,
-runtime binding, and target component catalog into canonical `ResolvedAgent`
-IR. The checked-in JSON schemas, resolved support-agent IR and digest record,
-and redacted diagnostic corpus are frozen by exact-byte tests and checked for
-drift in CI.
+## Local stdio
 
-### Trust boundary
+The local harness requires PostgreSQL, an authenticated local principal, and a
+Responses-compatible model configuration:
 
-- `kiteframe lock` is the only command that mutates package state. It validates
-  the complete selection before atomically replacing `capability.lock`. The
-  default path remains package-local; an explicit `--output` must be outside
-  the canonical package root and cannot alias the consumed catalog.
-- `kiteframe check` and `kiteframe explain` are read-only. `kiteframe compile`
-  emits canonical IR to stdout or an explicit output artifact; it does not
-  rewrite the package, lock, or binding and does not construct runtime objects.
-- Deterministic resolution narrows declared package requirements against an
-  exact lock and explicit runtime metadata. Actor grants are not an input to
-  resolution, and point-of-use authorization remains a runtime enforcement
-  responsibility outside this compiler boundary.
+```console
+export KITEFRAME_DATABASE_URL=postgres://postgres:postgres@localhost/kiteframe
+export KITEFRAME_PRINCIPAL=local-user
+export KITEFRAME_RESPONSES_BASE_URL=https://api.example.com/v1
+export KITEFRAME_RESPONSES_API_KEY=...
+export KITEFRAME_RESPONSES_MODEL=...
+cargo run --bin kiteframe-harness
+```
 
-Feature handling has two distinct deterministic phases. For schema
-compatibility, `CapabilityLock.resolvedFeatures` stores the canonical
-package-requested set (`required ∪ optional`), not a target-negotiated result;
-lock verification exact-matches that set against the verified package.
-Resolution then negotiates the verified request against the explicit target,
-and only `ResolvedAgent` records the enabled and omitted target result.
+It accepts one NDJSON request per line. The envelope owns `session_id`; command
+payloads cannot replace the connection principal or session binding. Remote
+WebSocket and Streamable HTTP ACP serving, MCP restart attachment, and
+status-first tool recovery are not complete yet.
 
-## Design
+## Design and plan
 
-- [Kiteframe declarative agent harness design](docs/superpowers/specs/2026-07-25-kiteframe-declarative-agent-harness-design.md)
+- [Minimal workflow engine design](docs/superpowers/specs/2026-08-11-kiteframe-minimal-workflow-engine-design.md)
+- [Implementation plan](docs/superpowers/plans/2026-08-11-kiteframe-minimal-workflow-engine.md)
 
 ## Development verification
 
-Run the complete Wave 3R Rust, PyO3, schema, and stub matrix from the
-repository root:
+Run the baseline Rust checks from the repository root:
 
 ```console
-uv run --project python/kiteframe python scripts/verify_wave3r.py
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+python3 -W error::ResourceWarning -m unittest discover -s clients/python/tests -v
+bun test clients/typescript/test
 ```
-
-The checked-in command runs through the Python project managed by `uv`, rejects
-Python versions below the package's 3.11 floor, and supplies that exact
-interpreter and its base installation to PyO3. This avoids macOS system Python
-selection for embedded-Python tests and stub generation.
 
 ## License
 
