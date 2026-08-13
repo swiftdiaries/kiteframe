@@ -29,6 +29,26 @@ impl ModelClient for ScriptedModel {
     }
 }
 
+struct RecordingModel {
+    responses: Mutex<VecDeque<Vec<Value>>>,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait]
+impl ModelClient for RecordingModel {
+    async fn respond(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.requests.lock().unwrap().push(request);
+        Ok(ModelResponse {
+            items: self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted response"),
+        })
+    }
+}
+
 struct AllowAll;
 
 #[async_trait]
@@ -78,9 +98,8 @@ async fn parallel_children_complete_before_the_parent_resumes() {
         })
         .await
         .unwrap();
-    let engine = Engine {
-        store: store.clone(),
-        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([
+    let model = Arc::new(RecordingModel {
+        responses: Mutex::new(VecDeque::from([
             vec![
                 json!({"type":"function_call","call_id":"root","name":"complete_task","arguments":{"outcome":"split","fields":{}}}),
             ],
@@ -90,7 +109,12 @@ async fn parallel_children_complete_before_the_parent_resumes() {
             vec![
                 json!({"type":"function_call","call_id":"right","name":"complete_task","arguments":{"outcome":"ok","fields":{}}}),
             ],
-        ])))),
+        ])),
+        requests: Mutex::new(Vec::new()),
+    });
+    let engine = Engine {
+        store: store.clone(),
+        model: model.clone(),
         tools: Arc::new(InProcessToolRegistry::new()),
         authorizer: Arc::new(AllowAll),
         config: EngineConfig::default(),
@@ -105,6 +129,14 @@ async fn parallel_children_complete_before_the_parent_resumes() {
         .unwrap()
         .get("output");
     assert_eq!(output, Some(json!("joined")));
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for child in &requests[1..] {
+        assert!(
+            !child.input.iter().any(|item| item["call_id"] == "root"),
+            "child transcript must not inherit parent model history"
+        );
+    }
 }
 
 #[tokio::test]
