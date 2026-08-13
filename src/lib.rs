@@ -20,7 +20,7 @@ pub use domain::{
 };
 pub use engine::{
     AnswerQuestion, CancelRun, Engine, EngineConfig, EngineError, PermissionChoice, RecoveryReport,
-    ResolvePermission,
+    ResolvePermission, RetryRecovery,
 };
 pub use hash::{HashError, canonical_json, canonical_sha256};
 pub use mcp::{

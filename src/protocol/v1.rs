@@ -5,8 +5,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PolicyRevision, RunId, Secret,
-    SessionId, SessionPolicy, StartRun,
+    AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PolicyRevision, RetryRecovery,
+    RunId, Secret, SessionId, SessionPolicy, StartRun,
 };
 
 use super::{
@@ -91,6 +91,7 @@ impl ProtocolAdapter for V1Adapter {
             "_kiteframe/run/get" => decode(params).map(GetDto::into_command),
             "_kiteframe/run/answer" => decode(params).map(AnswerDto::into_command),
             "_kiteframe/run/cancel" => decode(params).map(CancelDto::into_command),
+            "_kiteframe/run/recovery/retry" => decode(params).map(RetryRecoveryDto::into_command),
             "_kiteframe/session/policy/update" => decode(params).map(UpdatePolicyDto::into_command),
             "_kiteframe/run/event" => decode(params).map(EventCursorDto::into_command),
             _ => Err(ProtocolError::UnsupportedMethod(method.to_owned())),
@@ -302,6 +303,26 @@ struct CancelDto {
     idempotency_key: IdempotencyKey,
     #[serde(default, rename = "_meta")]
     _meta: Meta,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryRecoveryDto {
+    session_id: SessionId,
+    run_id: RunId,
+    tool_call_id: uuid::Uuid,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl RetryRecoveryDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::RetryRecovery(RetryRecovery {
+            session_id: self.session_id,
+            run_id: self.run_id,
+            tool_call_id: self.tool_call_id,
+        })
+    }
 }
 
 impl CancelDto {

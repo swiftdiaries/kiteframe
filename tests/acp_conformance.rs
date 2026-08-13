@@ -252,6 +252,7 @@ fn command_kind(command: &ApplicationCommand) -> &'static str {
         ApplicationCommand::Answer(_) => "answer",
         ApplicationCommand::ResolvePermission(_) => "permission",
         ApplicationCommand::Cancel(_) => "cancel",
+        ApplicationCommand::RetryRecovery(_) => "recovery_retry",
         ApplicationCommand::UpdatePolicy(_) => "policy",
         ApplicationCommand::ReplayEvents(_) => "events",
         other => panic!("unexpected lifecycle command: {other:?}"),
@@ -282,6 +283,11 @@ fn command_snapshot(command: &ApplicationCommand) -> Value {
             "reason": request.reason,
             "idempotencyKey": request.idempotency_key.as_str(),
         }),
+        ApplicationCommand::RetryRecovery(request) => json!({
+            "sessionId": request.session_id.as_uuid(),
+            "runId": request.run_id.as_uuid(),
+            "toolCallId": request.tool_call_id,
+        }),
         ApplicationCommand::UpdatePolicy(request) => json!({
             "expectedRevision": request.expected_revision.get(),
             "idempotencyKey": request.idempotency_key.as_str(),
@@ -294,6 +300,28 @@ fn command_snapshot(command: &ApplicationCommand) -> Value {
         }),
         other => panic!("unexpected command snapshot: {other:?}"),
     }
+}
+
+#[test]
+fn recovery_retry_is_an_explicit_authenticated_extension_command() {
+    let session_id = uuid::Uuid::now_v7();
+    let run_id = uuid::Uuid::now_v7();
+    let tool_call_id = uuid::Uuid::now_v7();
+    let command = V1Adapter
+        .decode_extension(
+            "_kiteframe/run/recovery/retry",
+            json!({
+                "sessionId": session_id,
+                "runId": run_id,
+                "toolCallId": tool_call_id,
+            }),
+        )
+        .expect("retry command");
+    assert_eq!(command_kind(&command), "recovery_retry");
+    assert_eq!(
+        command_snapshot(&command),
+        json!({"sessionId": session_id, "runId": run_id, "toolCallId": tool_call_id})
+    );
 }
 
 #[test]

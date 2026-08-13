@@ -206,6 +206,13 @@ impl Application {
                     self.store.get_run(session_id.clone(), run_id).await?,
                 ))
             }
+            ApplicationCommand::RetryRecovery(request) => {
+                let run_id = request.run_id.clone();
+                self.engine.retry_recovery(request).await?;
+                Ok(ApplicationResult::Run(
+                    self.store.get_run(session_id.clone(), run_id).await?,
+                ))
+            }
             ApplicationCommand::ReplayEvents(cursor) => {
                 let after = u64::try_from(cursor.after).map_err(|_| {
                     ProtocolError::InvalidPayload("event cursor must not be negative".to_owned())

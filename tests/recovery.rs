@@ -9,9 +9,9 @@ use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, Engine, EngineConfig, IdempotencyKey,
     InProcessToolRegistry, ModelClient, ModelError, ModelRequest, ModelResponse, PolicyDecision,
-    PolicyRequest, PostgresStore, PrincipalId, RecoverySupport, SessionAuthorizer, SessionId,
-    StartRun, ToolCall, ToolCatalogSnapshot, ToolError, ToolResolver, ToolStatus, TrustedTool,
-    bind_tool,
+    PolicyRequest, PostgresStore, PrincipalId, RecoverySupport, RetryRecovery, SessionAuthorizer,
+    SessionId, StartRun, ToolCall, ToolCatalogSnapshot, ToolError, ToolResolver, ToolStatus,
+    TrustedTool, bind_tool,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -55,6 +55,11 @@ struct PendingStatusTool {
     descriptor: CatalogTool,
     invocations: Arc<AtomicUsize>,
     status_polls: Arc<AtomicUsize>,
+}
+
+struct NotStartedRetryTool {
+    descriptor: CatalogTool,
+    invocations: Arc<AtomicUsize>,
 }
 
 #[tokio::test]
@@ -159,6 +164,141 @@ impl TrustedTool for UnavailableStatusTool {
     async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
         Err(ToolError::InvocationFailed)
     }
+}
+
+#[async_trait]
+impl TrustedTool for NotStartedRetryTool {
+    fn descriptor(&self) -> &CatalogTool {
+        &self.descriptor
+    }
+
+    async fn invoke(&self, _call: ToolCall) -> Result<Value, ToolError> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({}))
+    }
+
+    async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
+        Ok(ToolStatus::NotStarted)
+    }
+}
+
+#[tokio::test]
+async fn direct_recovery_retry_replays_only_a_status_proven_read_only_call() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("retry-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let descriptor = CatalogTool::new(
+        "docs/search",
+        "docs",
+        "search",
+        ClosedSchema::object("input", BTreeMap::new()),
+        ClosedSchema::object("output", BTreeMap::new()),
+        BTreeSet::new(),
+        EffectKind::ReadOnly,
+        RecoverySupport::NotRequired,
+    )
+    .unwrap();
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(InProcessToolRegistry::new());
+    tools
+        .register(bind_tool(Arc::new(NotStartedRetryTool {
+            descriptor: descriptor.clone(),
+            invocations: invocations.clone(),
+        })))
+        .unwrap();
+    let catalog = tools
+        .snapshot(
+            session.id.clone(),
+            Uuid::now_v7(),
+            &BTreeSet::from(["docs/search".to_owned()]),
+            &BTreeMap::from([(
+                "docs/search".to_owned(),
+                descriptor.descriptor_digest().to_owned(),
+            )]),
+        )
+        .unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("retry{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .unwrap();
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let attempt = store
+        .begin_model_attempt(run.root_frame_id.clone(), 0, json!({}))
+        .await
+        .unwrap();
+    store
+        .commit_model_attempt(
+            run.root_frame_id.clone(),
+            attempt.attempt,
+            attempt.revision,
+            vec![],
+        )
+        .await
+        .unwrap();
+    let intent = store
+        .begin_tool_call(
+            run.root_frame_id.clone(),
+            2,
+            "call-1".to_owned(),
+            "docs/search".to_owned(),
+            descriptor.descriptor_digest().to_owned(),
+            json!({}),
+            "original-effect-key".to_owned(),
+        )
+        .await
+        .unwrap();
+    let engine = Engine {
+        store: store.clone(),
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::new()))),
+        tools,
+        authorizer: Arc::new(AllowAll),
+        config: EngineConfig::default(),
+    };
+
+    engine
+        .retry_recovery(RetryRecovery {
+            session_id: session.id.clone(),
+            run_id: run.id.clone(),
+            tool_call_id: intent.id,
+        })
+        .await
+        .expect("direct user retry");
+
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    let call = sqlx::query("SELECT state, idempotency_key FROM tool_calls WHERE id = $1")
+        .bind(intent.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(call.get::<String, _>("state"), "completed");
+    assert_eq!(
+        call.get::<String, _>("idempotency_key"),
+        "original-effect-key"
+    );
 }
 
 #[tokio::test]

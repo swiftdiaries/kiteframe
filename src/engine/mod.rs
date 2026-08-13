@@ -14,8 +14,8 @@ use thiserror::Error;
 use crate::dsl::CompiledType;
 use crate::{
     IdempotencyKey, ModelClient, ModelRequest, NewPermissionRequest, PermissionRequestId,
-    PolicyDecision, PolicyRequest, PostgresStore, SessionAuthorizer, StoreError, ToolCall,
-    ToolError, ToolResolver, canonical_sha256,
+    PolicyDecision, PolicyRequest, PostgresStore, RecoverySupport, SessionAuthorizer, StoreError,
+    ToolCall, ToolError, ToolResolver, ToolStatus, canonical_sha256,
 };
 
 pub struct Engine {
@@ -59,6 +59,14 @@ pub struct CancelRun {
     pub run_id: crate::RunId,
     pub reason: Option<String>,
     pub idempotency_key: crate::IdempotencyKey,
+}
+
+/// A direct user authorization to repeat a status-proven unstarted tool call.
+#[derive(Clone, Debug, Deserialize)]
+pub struct RetryRecovery {
+    pub session_id: crate::SessionId,
+    pub run_id: crate::RunId,
+    pub tool_call_id: uuid::Uuid,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +120,93 @@ impl Engine {
                 request.reason,
                 request.idempotency_key.as_str().to_owned(),
             )
+            .await?;
+        Ok(())
+    }
+
+    /// Retries only a provider-confirmed `not_started` intent using its original key.
+    pub async fn retry_recovery(&self, request: RetryRecovery) -> Result<(), EngineError> {
+        let call = self
+            .store
+            .recoverable_tool_call(
+                request.session_id.clone(),
+                request.run_id,
+                request.tool_call_id,
+            )
+            .await?;
+        let tool = self
+            .tools
+            .bound_tool(
+                call.session_id.clone(),
+                &call.qualified_name,
+                &call.descriptor_digest,
+            )
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        if !matches!(
+            tool.status(&call.idempotency_key).await,
+            Ok(ToolStatus::NotStarted)
+        ) {
+            return Err(StoreError::InvalidData(
+                "recovery retry requires provider status not_started".to_owned(),
+            )
+            .into());
+        }
+        if !matches!(tool.descriptor().effect(), crate::EffectKind::ReadOnly)
+            && !matches!(tool.descriptor().recovery(), RecoverySupport::Idempotent)
+        {
+            return Err(StoreError::InvalidData(
+                "recovery retry requires a read-only or idempotent tool".to_owned(),
+            )
+            .into());
+        }
+        let policy_revision = self.store.policy_revision(call.session_id.clone()).await?;
+        if !matches!(
+            self.authorizer
+                .authorize(&PolicyRequest {
+                    session: call.session_id.clone(),
+                    qualified_name: call.qualified_name.clone(),
+                    descriptor_digest: call.descriptor_digest.clone(),
+                    capabilities: tool.descriptor().capabilities().iter().cloned().collect(),
+                })
+                .await
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+            PolicyDecision::Allow
+        ) {
+            return Err(StoreError::InvalidData(
+                "recovery retry is not currently authorized by session policy".to_owned(),
+            )
+            .into());
+        }
+        let Some(revision) = self
+            .store
+            .claim_tool_recovery_retry(
+                call.frame_id.clone(),
+                call.id,
+                call.revision,
+                self.config.status_poll_retry_budget,
+            )
+            .await?
+        else {
+            return Err(
+                StoreError::InvalidData("recovery retry budget is exhausted".to_owned()).into(),
+            );
+        };
+        let invocation = ToolCall::new(
+            call.session_id,
+            call.run_id,
+            call.frame_id.clone(),
+            policy_revision,
+            tool.descriptor(),
+            call.arguments,
+            call.idempotency_key,
+        )
+        .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let outcome = tool
+            .invoke(invocation)
+            .await
+            .map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
+        self.store
+            .finish_tool_call(call.frame_id, call.id, revision, outcome)
             .await?;
         Ok(())
     }

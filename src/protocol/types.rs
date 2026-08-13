@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::{
     AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PermissionChoice,
     PermissionRequestId, PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission,
-    RunEvent, RunId, RunView, SessionId, SessionPolicy, SessionView, StartRun,
+    RetryRecovery, RunEvent, RunId, RunView, SessionId, SessionPolicy, SessionView, StartRun,
 };
 
 #[derive(Clone, Debug)]
@@ -123,6 +123,7 @@ pub enum ApplicationCommand {
     Answer(AnswerQuestion),
     ResolvePermission(ResolvePermission),
     Cancel(CancelRun),
+    RetryRecovery(RetryRecovery),
     UpdatePolicy(UpdateSessionPolicy),
     ReplayEvents(EventCursor),
 }
@@ -262,6 +263,7 @@ pub(crate) fn command_session(command: &ApplicationCommand) -> Option<&SessionId
         ApplicationCommand::Answer(request) => Some(&request.session_id),
         ApplicationCommand::ResolvePermission(request) => Some(&request.session_id),
         ApplicationCommand::Cancel(request) => Some(&request.session_id),
+        ApplicationCommand::RetryRecovery(request) => Some(&request.session_id),
         ApplicationCommand::NewSession(_)
         | ApplicationCommand::ListSessions
         | ApplicationCommand::Publish(_)
