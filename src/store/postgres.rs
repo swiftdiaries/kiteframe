@@ -1152,7 +1152,7 @@ impl PostgresStore {
         attempt: u32,
         expected_revision: u64,
         items: Vec<Value>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<bool, StoreError> {
         let mut tx = self.pool.begin().await?;
         let run_id = lock_run_for_frame(&mut tx, *frame_id.as_uuid()).await?;
         let frame =
@@ -1161,17 +1161,40 @@ impl PostgresStore {
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or(StoreError::FrameNotFound)?;
-        if frame.get::<i64, _>("revision") as u64 != expected_revision
-            || frame.get::<String, _>("state") != "running"
-        {
-            return Err(StoreError::RevisionConflict);
-        }
         let intent = sqlx::query("SELECT 1 FROM model_items WHERE frame_id = $1 AND attempt = $2 AND position = 0 AND direction = 'input'")
             .bind(*frame_id.as_uuid()).bind(attempt as i32).fetch_optional(&mut *tx).await?;
         if intent.is_none() {
             return Err(StoreError::InvalidData(
                 "model result has no matching intent".to_owned(),
             ));
+        }
+        let state = frame.get::<String, _>("state");
+        if frame.get::<i64, _>("revision") as u64 != expected_revision || state != "running" {
+            if state == "cancelled" {
+                let already_recorded = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM model_items WHERE frame_id = $1 AND attempt = $2 AND direction = 'output')",
+                )
+                .bind(*frame_id.as_uuid())
+                .bind(attempt as i32)
+                .fetch_one(&mut *tx)
+                .await?;
+                if !already_recorded {
+                    for (position, item) in items.into_iter().enumerate() {
+                        sqlx::query("INSERT INTO model_items (frame_id, attempt, position, direction, item) VALUES ($1, $2, $3, 'output', $4)")
+                            .bind(*frame_id.as_uuid()).bind(attempt as i32).bind(position as i32).bind(item).execute(&mut *tx).await?;
+                    }
+                    append_event(
+                        &mut tx,
+                        run_id,
+                        "model.late_result",
+                        json!({"frame_id": frame_id.as_uuid(), "attempt": attempt}),
+                    )
+                    .await?;
+                }
+                tx.commit().await?;
+                return Ok(false);
+            }
+            return Err(StoreError::RevisionConflict);
         }
         for (position, item) in items.into_iter().enumerate() {
             sqlx::query("INSERT INTO model_items (frame_id, attempt, position, direction, item) VALUES ($1, $2, $3, 'output', $4)")
@@ -1193,7 +1216,7 @@ impl PostgresStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn record_completion(

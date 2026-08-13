@@ -321,6 +321,14 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         })
         .await
         .expect("start cancellable run");
+    let late_attempt = store
+        .begin_model_attempt(
+            cancellable.root_frame_id.clone(),
+            0,
+            json!({"prompt": "cancelled while waiting"}),
+        )
+        .await
+        .expect("persist model intent before cancellation");
     store
         .cancel_run(
             cancellable.id.clone(),
@@ -332,13 +340,46 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .expect("cancel run");
     store
         .cancel_run(
-            cancellable.id,
+            cancellable.id.clone(),
             0,
             Some("operator request".to_owned()),
             "cancel-1".to_owned(),
         )
         .await
         .expect("replay cancel");
+    assert!(
+        !store
+            .commit_model_attempt(
+                cancellable.root_frame_id.clone(),
+                late_attempt.attempt,
+                late_attempt.revision,
+                vec![json!({"type": "late_model_result"})],
+            )
+            .await
+            .expect("late model result is recorded without reviving the cancelled run")
+    );
+    let cancelled = store
+        .get_run(session.id.clone(), cancellable.id.clone())
+        .await
+        .expect("cancelled run");
+    assert_eq!(cancelled.state, kiteframe::RunState::Cancelled);
+    let late_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_items WHERE frame_id = $1 AND attempt = $2 AND direction = 'output'",
+    )
+    .bind(*cancellable.root_frame_id.as_uuid())
+    .bind(late_attempt.attempt as i32)
+    .fetch_one(store.pool())
+    .await
+    .expect("count late model items");
+    assert_eq!(late_items, 1);
+    assert!(
+        store
+            .events_after(session.id.clone(), cancellable.id, 0, 16)
+            .await
+            .expect("cancelled run events")
+            .iter()
+            .any(|event| event.kind == "model.late_result")
+    );
     let recoverable = store
         .start_run(StartRun {
             session_id: session.id.clone(),

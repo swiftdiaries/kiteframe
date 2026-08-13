@@ -524,7 +524,8 @@ impl Engine {
                 .await?;
             return Ok(());
         }
-        self.store
+        let applied = self
+            .store
             .commit_model_attempt(
                 frame.id.clone(),
                 attempt.attempt,
@@ -532,6 +533,9 @@ impl Engine {
                 response.items.clone(),
             )
             .await?;
+        if !applied {
+            return Ok(());
+        }
         let calls = response
             .items
             .iter()
