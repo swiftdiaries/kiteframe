@@ -13,12 +13,23 @@ pub struct ParseLimits {
     pub max_diagnostics: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParseReport {
+    pub source: SourceFile,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 pub fn parse(source: &str, limits: ParseLimits) -> Result<SourceFile, Vec<Diagnostic>> {
+    parse_report(source, limits).map(|report| report.source)
+}
+
+pub fn parse_report(source: &str, limits: ParseLimits) -> Result<ParseReport, Vec<Diagnostic>> {
     if source.len() > limits.max_source_bytes {
         return Err(if limits.max_diagnostics == 0 {
             Vec::new()
         } else {
-            vec![Diagnostic::new(
+            vec![Diagnostic::error(
+                "source_byte_limit",
                 "source exceeds configured byte limit",
                 Span {
                     start: limits.max_source_bytes,
@@ -44,7 +55,12 @@ pub fn parse(source: &str, limits: ParseLimits) -> Result<SourceFile, Vec<Diagno
     if parser.had_error {
         Err(parser.diagnostics)
     } else {
-        value.ok_or_else(Vec::new)
+        value
+            .map(|source| ParseReport {
+                source,
+                diagnostics: parser.diagnostics,
+            })
+            .ok_or_else(Vec::new)
     }
 }
 
@@ -69,9 +85,15 @@ impl Parser {
                 }
             } else if self.keyword("workflow") {
                 let declaration_span = self.previous_span();
+                self.warning(
+                    "deprecated_workflow",
+                    "workflow definitions are deprecated",
+                    declaration_span,
+                );
                 let item = self.workflow();
                 if saw_workflow {
                     self.error(
+                        "workflow_definition_count",
                         "a source file contains exactly one workflow",
                         declaration_span,
                     );
@@ -85,15 +107,17 @@ impl Parser {
                 }
             } else {
                 self.error(
+                    "expected_top_level_declaration",
                     "expected type, workflow, or task declaration",
                     self.current_span(),
                 );
                 self.advance();
             }
         }
-        let Some(workflow) = workflow else {
+        let Some(mut workflow) = workflow else {
             if !saw_workflow {
                 self.error(
+                    "workflow_definition_count",
                     "a source file contains exactly one workflow",
                     Span {
                         start: 0,
@@ -104,16 +128,20 @@ impl Parser {
             return None;
         };
         if tasks.is_empty() {
-            self.error("a source file requires at least one task", workflow.span);
+            self.error(
+                "workflow_task_required",
+                "a source file requires at least one task",
+                workflow.span,
+            );
         }
+        workflow.tasks = tasks;
         Some(SourceFile {
             span: Span {
                 start: 0,
                 end: source_len,
             },
             records,
-            workflow,
-            tasks,
+            definition: DefinitionAst::Workflow(workflow),
         })
     }
 
@@ -161,6 +189,7 @@ impl Parser {
             if self.keyword("start") {
                 if entry.is_some() {
                     self.error(
+                        "duplicate_workflow_start",
                         "workflow has duplicate start declaration",
                         self.previous_span(),
                     );
@@ -181,19 +210,32 @@ impl Parser {
                             | "response_item_bytes"
                             | "active_execution_seconds"
                     ) {
-                        self.error("unsupported workflow limit", span);
+                        self.error(
+                            "unsupported_workflow_limit",
+                            "unsupported workflow limit",
+                            span,
+                        );
                     }
                     if value == 0 {
-                        self.error("workflow limit must be positive", span);
+                        self.error(
+                            "non_positive_workflow_limit",
+                            "workflow limit must be positive",
+                            span,
+                        );
                     }
                     if limits.insert(key, value).is_some() {
-                        self.error("workflow limit is duplicated", span);
+                        self.error(
+                            "duplicate_workflow_limit",
+                            "workflow limit is duplicated",
+                            span,
+                        );
                     }
                     self.optional_comma();
                 }
                 self.expect_rbrace();
             } else {
                 self.error(
+                    "invalid_workflow_body",
                     "workflow body accepts only start and limits",
                     self.current_span(),
                 );
@@ -203,6 +245,7 @@ impl Parser {
         self.expect_rbrace();
         let Some(entry) = entry else {
             self.error(
+                "missing_workflow_start",
                 "workflow requires a start declaration",
                 Span {
                     start,
@@ -217,6 +260,7 @@ impl Parser {
             result,
             entry,
             limits,
+            tasks: Vec::new(),
             span: Span {
                 start,
                 end: self.previous_span().end,
@@ -244,12 +288,20 @@ impl Parser {
                     })
                     .is_some()
                 {
-                    self.error("task has duplicate prompt", token.1);
+                    self.error(
+                        "duplicate_task_prompt",
+                        "task has duplicate prompt",
+                        token.1,
+                    );
                 }
             } else if self.keyword("tools") {
                 let list = self.tool_list()?;
                 if tools.replace(list).is_some() {
-                    self.error("task has duplicate tools declaration", self.previous_span());
+                    self.error(
+                        "duplicate_task_tools",
+                        "task has duplicate tools declaration",
+                        self.previous_span(),
+                    );
                 }
             } else if self.keyword("on") {
                 if let Some(outcome) = self.outcome() {
@@ -257,6 +309,7 @@ impl Parser {
                 }
             } else {
                 self.error(
+                    "invalid_task_body",
                     "task body accepts only prompt, tools, and outcomes",
                     self.current_span(),
                 );
@@ -271,7 +324,7 @@ impl Parser {
         let prompt = match prompt {
             Some(value) => value,
             None => {
-                self.error("task requires a prompt", span);
+                self.error("missing_task_prompt", "task requires a prompt", span);
                 PromptAst {
                     text: String::new(),
                     span,
@@ -281,12 +334,20 @@ impl Parser {
         let tools = match tools {
             Some(value) => value,
             None => {
-                self.error("task requires a tools declaration", span);
+                self.error(
+                    "missing_task_tools",
+                    "task requires a tools declaration",
+                    span,
+                );
                 Vec::new()
             }
         };
         if outcomes.is_empty() {
-            self.error("task requires at least one outcome", span);
+            self.error(
+                "task_outcome_required",
+                "task requires at least one outcome",
+                span,
+            );
         }
         Some(TaskAst {
             name,
@@ -309,6 +370,7 @@ impl Parser {
         while !self.at_rbrace() && !self.at_eof() {
             if terminal {
                 self.error(
+                    "statement_after_terminal",
                     "statements are not allowed after a terminal control operation",
                     self.current_span(),
                 );
@@ -328,10 +390,14 @@ impl Parser {
             end: self.previous_span().end,
         };
         if statements.is_empty() {
-            self.error("outcome must not be empty", span);
+            self.error("empty_outcome", "outcome must not be empty", span);
         }
         if !terminal {
-            self.error("outcome must end in goto, done, or fail", span);
+            self.error(
+                "missing_terminal_statement",
+                "outcome must end in goto, done, or fail",
+                span,
+            );
         }
         Some(OutcomeAst {
             name,
@@ -377,7 +443,11 @@ impl Parser {
                 false,
             ))
         } else {
-            self.error("binding accepts only call or ask", self.current_span());
+            self.error(
+                "invalid_binding_statement",
+                "binding accepts only call or ask",
+                self.current_span(),
+            );
             None
         }
     }
@@ -390,6 +460,7 @@ impl Parser {
             self.expect_equals();
             if !self.keyword("call") {
                 self.error(
+                    "invalid_parallel_statement",
                     "parallel contains only call statements",
                     self.current_span(),
                 );
@@ -399,7 +470,11 @@ impl Parser {
         }
         self.expect_rbrace();
         if calls.is_empty() {
-            self.error("parallel block must not be empty", self.previous_span());
+            self.error(
+                "empty_parallel_block",
+                "parallel block must not be empty",
+                self.previous_span(),
+            );
         }
         Some(calls)
     }
@@ -423,7 +498,11 @@ impl Parser {
                 },
             });
             if !self.optional_comma() && !self.at_rparen() {
-                self.error("expected comma or closing parenthesis", self.current_span());
+                self.error(
+                    "expected_argument_separator",
+                    "expected comma or closing parenthesis",
+                    self.current_span(),
+                );
                 return None;
             }
         }
@@ -445,7 +524,11 @@ impl Parser {
         while !self.at_rbracket() && !self.at_eof() {
             tools.push(self.identifier()?);
             if !self.optional_comma() && !self.at_rbracket() {
-                self.error("expected comma or closing bracket", self.current_span());
+                self.error(
+                    "expected_tool_separator",
+                    "expected comma or closing bracket",
+                    self.current_span(),
+                );
                 return None;
             }
         }
@@ -470,7 +553,11 @@ impl Parser {
                 },
             });
             if !self.optional_comma() && !self.at_rparen() {
-                self.error("expected comma or closing parenthesis", self.current_span());
+                self.error(
+                    "expected_field_separator",
+                    "expected comma or closing parenthesis",
+                    self.current_span(),
+                );
                 return None;
             }
         }
@@ -480,7 +567,11 @@ impl Parser {
 
     fn ty(&mut self, depth: usize) -> Option<TypeAst> {
         if depth >= self.limits.max_nesting {
-            self.error("type nesting exceeds configured limit", self.current_span());
+            self.error(
+                "type_nesting_limit",
+                "type nesting exceeds configured limit",
+                self.current_span(),
+            );
             return None;
         }
         let mut ty = if self.at_lbracket() {
@@ -524,7 +615,11 @@ impl Parser {
                 }
             }
             _ => {
-                self.error("expected a binding or literal value", self.current_span());
+                self.error(
+                    "expected_value",
+                    "expected a binding or literal value",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -537,7 +632,11 @@ impl Parser {
                 Some(value)
             }
             _ => {
-                self.error("expected identifier", self.current_span());
+                self.error(
+                    "expected_identifier",
+                    "expected identifier",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -550,7 +649,11 @@ impl Parser {
                 Some((value, span))
             }
             _ => {
-                self.error("expected triple-quoted prompt", self.current_span());
+                self.error(
+                    "expected_triple_quoted_prompt",
+                    "expected triple-quoted prompt",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -560,14 +663,22 @@ impl Parser {
             TokenKind::Number(ref value) => {
                 let span = self.current_span();
                 let Ok(value) = value.parse() else {
-                    self.error("expected positive integer", span);
+                    self.error(
+                        "expected_positive_integer",
+                        "expected positive integer",
+                        span,
+                    );
                     return None;
                 };
                 self.advance();
                 Some((value, span))
             }
             _ => {
-                self.error("expected positive integer", self.current_span());
+                self.error(
+                    "expected_positive_integer",
+                    "expected positive integer",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -611,7 +722,11 @@ impl Parser {
         if matches(&self.current().kind) {
             self.advance();
         } else {
-            self.error(&format!("expected {expected}"), self.current_span());
+            self.error(
+                "expected_token",
+                &format!("expected {expected}"),
+                self.current_span(),
+            );
         }
     }
     fn optional_comma(&mut self) -> bool {
@@ -654,10 +769,17 @@ impl Parser {
             self.position += 1;
         }
     }
-    fn error(&mut self, message: &str, span: Span) {
+    fn error(&mut self, code: &'static str, message: &str, span: Span) {
         self.had_error = true;
         if self.diagnostics.len() < self.limits.max_diagnostics {
-            self.diagnostics.push(Diagnostic::new(message, span));
+            self.diagnostics
+                .push(Diagnostic::error(code, message, span));
+        }
+    }
+    fn warning(&mut self, code: &'static str, message: &str, span: Span) {
+        if self.diagnostics.len() < self.limits.max_diagnostics {
+            self.diagnostics
+                .push(Diagnostic::warning(code, message, span));
         }
     }
 }

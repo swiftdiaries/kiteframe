@@ -7,8 +7,8 @@ use crate::{ToolCatalogSnapshot, canonical_sha256};
 use super::{
     ArgumentAst, CallAst, CompiledCall, CompiledCallBinding, CompiledOutcome, CompiledStatement,
     CompiledTask, CompiledToolBinding, CompiledType, CompiledValue, CompiledWorkflow,
-    CompletionContract, Diagnostic, FieldAst, Limits, SourceFile, Span, StatementAst, TypeAst,
-    ValueRefAst, parse,
+    CompletionContract, DefinitionAst, Diagnostic, FieldAst, Limits, SourceFile, Span,
+    StatementAst, TypeAst, ValueRefAst, WorkflowAst, parse,
 };
 
 const DSL_VERSION: u8 = 1;
@@ -30,12 +30,20 @@ pub fn compile(
             max_diagnostics: 64,
         },
     )?;
-    Compiler::new(source, &parsed, catalog, ceilings).compile()
+    let DefinitionAst::Workflow(workflow) = &parsed.definition else {
+        return Err(vec![Diagnostic::error(
+            "agent_compiler_unavailable",
+            "agent compilation is unavailable",
+            parsed.span,
+        )]);
+    };
+    Compiler::new(source, &parsed, workflow, catalog, ceilings).compile()
 }
 
 struct Compiler<'a> {
     source: &'a str,
     ast: &'a SourceFile,
+    workflow: &'a WorkflowAst,
     catalog: &'a ToolCatalogSnapshot,
     ceilings: &'a Limits,
     diagnostics: Vec<Diagnostic>,
@@ -52,12 +60,14 @@ impl<'a> Compiler<'a> {
     fn new(
         source: &'a str,
         ast: &'a SourceFile,
+        workflow: &'a WorkflowAst,
         catalog: &'a ToolCatalogSnapshot,
         ceilings: &'a Limits,
     ) -> Self {
         Self {
             source,
             ast,
+            workflow,
             catalog,
             ceilings,
             diagnostics: Vec::new(),
@@ -74,22 +84,17 @@ impl<'a> Compiler<'a> {
     fn compile(mut self) -> Result<CompiledWorkflow, Vec<Diagnostic>> {
         self.collect_records();
         self.collect_tasks();
-        let inputs = self.compile_fields(&self.ast.workflow.inputs, "workflow input");
-        let result = self.compile_type(&self.ast.workflow.result, self.ast.workflow.span);
+        let inputs = self.compile_fields(&self.workflow.inputs, "workflow input");
+        let result = self.compile_type(&self.workflow.result, self.workflow.span);
         self.check_limits();
 
-        let entry = self.compile_call(
-            &self.ast.workflow.entry,
-            &inputs,
-            None,
-            self.ast.workflow.span,
-        );
-        if let Some(entry_task) = self.task_results.get(&self.ast.workflow.entry.task)
+        let entry = self.compile_call(&self.workflow.entry, &inputs, None, self.workflow.span);
+        if let Some(entry_task) = self.task_results.get(&self.workflow.entry.task)
             && *entry_task != result
         {
             self.error(
                 "workflow entry task result must match workflow result",
-                self.ast.workflow.entry.span,
+                self.workflow.entry.span,
             );
         }
 
@@ -102,7 +107,7 @@ impl<'a> Compiler<'a> {
         }
 
         self.reject_recursive_calls();
-        self.reject_unreachable_tasks(&self.ast.workflow.entry.task);
+        self.reject_unreachable_tasks(&self.workflow.entry.task);
 
         if !self.diagnostics.is_empty() {
             return Err(self.diagnostics);
@@ -113,13 +118,13 @@ impl<'a> Compiler<'a> {
             .map_err(|error| vec![Diagnostic::new(error, self.ast.span)])?;
         Ok(CompiledWorkflow {
             dsl_version: DSL_VERSION,
-            name: self.ast.workflow.name.clone(),
+            name: self.workflow.name.clone(),
             source: self.source.to_owned(),
             definition_hash,
             inputs,
             result,
             entry,
-            limits: self.ast.workflow.limits.clone(),
+            limits: self.workflow.limits.clone(),
             records: self.records,
             tasks,
             tool_bindings,
@@ -145,7 +150,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn collect_tasks(&mut self) {
-        for task in &self.ast.tasks {
+        for task in &self.workflow.tasks {
             self.reject_reserved(&task.name, task.span);
             if self.task_asts.insert(task.name.clone(), task).is_some() {
                 self.error("task declaration is duplicated", task.span);
@@ -539,11 +544,11 @@ impl<'a> Compiler<'a> {
     }
 
     fn check_limits(&mut self) {
-        for (name, value) in &self.ast.workflow.limits {
+        for (name, value) in &self.workflow.limits {
             if *value > self.ceiling(name) {
                 self.error(
                     "workflow limit exceeds deployment ceiling",
-                    self.ast.workflow.span,
+                    self.workflow.span,
                 );
             }
         }
@@ -562,8 +567,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn effective_limit(&self, name: &str) -> u64 {
-        self.ast
-            .workflow
+        self.workflow
             .limits
             .get(name)
             .copied()

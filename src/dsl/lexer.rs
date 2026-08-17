@@ -131,6 +131,7 @@ impl Lexer<'_> {
                     _ => {
                         self.offset += ch.len_utf8();
                         self.error(
+                            "unexpected_character",
                             "unexpected character",
                             Span {
                                 start,
@@ -185,6 +186,7 @@ impl Lexer<'_> {
         let value = &self.source[start..self.offset];
         if value.len() > self.max_identifier_bytes {
             self.error(
+                "identifier_byte_limit",
                 "identifier exceeds configured byte limit",
                 Span {
                     start,
@@ -223,6 +225,7 @@ impl Lexer<'_> {
             }
             if self.offset == fractional_start {
                 self.error(
+                    "missing_decimal_digits",
                     "decimal literal requires digits after the decimal point",
                     Span {
                         start,
@@ -246,6 +249,7 @@ impl Lexer<'_> {
         }
         if self.offset == self.source.len() {
             self.error(
+                "unterminated_triple_quoted_prompt",
                 "unterminated triple-quoted prompt",
                 Span {
                     start,
@@ -273,6 +277,7 @@ impl Lexer<'_> {
                 '\\' => {
                     let Some(escaped) = self.source[self.offset..].chars().next() else {
                         self.error(
+                            "unterminated_string_escape",
                             "unterminated string escape",
                             Span {
                                 start,
@@ -290,6 +295,7 @@ impl Lexer<'_> {
                         't' => value.push('\t'),
                         _ => {
                             self.error(
+                                "invalid_string_escape",
                                 "invalid string escape",
                                 Span {
                                     start,
@@ -302,6 +308,7 @@ impl Lexer<'_> {
                 }
                 '\n' | '\r' => {
                     self.error(
+                        "unterminated_string",
                         "unterminated string",
                         Span {
                             start,
@@ -314,6 +321,7 @@ impl Lexer<'_> {
             }
         }
         self.error(
+            "unterminated_string",
             "unterminated string",
             Span {
                 start,
@@ -325,15 +333,20 @@ impl Lexer<'_> {
 
     fn push(&mut self, kind: TokenKind, span: Span) {
         if self.tokens.len() >= self.max_tokens {
-            self.error("token count exceeds configured limit", span);
+            self.error(
+                "token_count_limit",
+                "token count exceeds configured limit",
+                span,
+            );
         } else {
             self.tokens.push(Token { kind, span });
         }
     }
-    fn error(&mut self, message: &str, span: Span) {
+    fn error(&mut self, code: &'static str, message: &str, span: Span) {
         self.had_error = true;
         if self.diagnostics.len() < self.max_diagnostics {
-            self.diagnostics.push(Diagnostic::new(message, span));
+            self.diagnostics
+                .push(Diagnostic::error(code, message, span));
         }
     }
 }
