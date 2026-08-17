@@ -514,9 +514,9 @@ Existing runs remain pinned to their definition and plugin-protocol versions.
 New starts select the latest permitted published version unless the caller
 requests an exact version.
 
-V1 continues to accept existing `workflow` sources with their current feature
-set and emits a deprecation diagnostic. `workflow` is not a literal alias for
-`agent`: it cannot declare durable goals, semantic events, or plugin roles.
+V1 continues to accept existing `workflow` syntax with its current feature set
+and emits a deprecation diagnostic. `workflow` and `agent` are distinct syntax:
+`workflow` cannot declare durable goals, semantic events, or plugin roles.
 Removal is outside V1 and requires a separate breaking-change design. New
 durable-goal and event behavior is authored through `agent`.
 
@@ -629,10 +629,10 @@ The official Python host exposes three narrower contracts:
 | Context | Resolve immutable, provenance-bearing evidence artifacts. |
 | Action | Perform one declared, policy-authorized provider mutation. |
 
-Provider actions include creating an SLO monitor or opening a pull request.
-They pass through the same kernel authorization, approval, idempotency, budget,
-and recovery boundaries as other effects. The Python service cannot execute
-undeclared mutations autonomously.
+Every provider action is declared and bounded. Actions pass through the same
+kernel authorization, approval, idempotency, budget, and recovery boundaries
+as other effects. The Python service cannot execute undeclared mutations
+autonomously.
 
 The Python host also handles provider OAuth, webhook endpoints, connection
 registration, secret-manager integration, and bounded context construction. It
@@ -722,60 +722,24 @@ Channel names remain outside `.kite` source:
 
 ```yaml
 bindings:
-  - event: service.slo.burn_rate_exceeded.v1
-    agent: diagnose_service
+  - event: github.review.submitted.v1
+    agent: babysit_pr
     correlate_by:
-      - subject.service_id
-      - subject.environment
-      - correlation.incident_fingerprint
+      - subject.repository
+      - subject.pull_request
 ```
 
-Repeated alerts with the same correlation identity resume the existing
-incident task. Resolution events can wake the same task.
+Repeated review events for the same pull request resume the existing task.
 
-### Future service-monitor setup
+### Synthetic service-event conformance seam
 
-A later `setup_service_monitoring` agent will create an approved
-`ServiceProfile`:
-
-```yaml
-service_id: checkout-api
-owners:
-  - payments-platform
-repositories:
-  application: acme/checkout
-  deployment: acme/service-deployments
-environments:
-  - production
-slos:
-  - id: checkout-availability
-    indicator: successful_request_ratio
-    objective: 99.9
-    window_days: 30
-    alert_policy: multi_window_burn_rate
-```
-
-That future setup workflow will discover candidate SLIs, propose SLOs and burn
-thresholds, obtain service-owner approval, create provider-specific monitors,
-store opaque monitor bindings, and verify a test event. Portable profiles hold
-semantic intent; provider queries and credentials stay in connector
-configuration.
-
-The later incident flow is:
-
-```text
-provider alert
-  -> semantic channel event
-  -> durable diagnose_service goal
-  -> logs, metrics, traces, deployments, and recent-change context
-  -> approved repair in application or deployment repository
-  -> repair pull request
-  -> successor babysit_pr goal
-```
-
-V1 implements none of this product flow. It includes a synthetic
-`service.slo.burn_rate_exceeded.v1` fixture only to prove schema registration,
-authentication, deduplication, correlation, and generic dispatch.
+V1 includes no service-monitor setup, provider connector, diagnosis agent, or
+incident flow. Its only service-monitoring artifact is a synthetic
+`service.slo.burn_rate_exceeded.v1` fixture that proves schema registration,
+authentication, deduplication, correlation, and generic dispatch through the
+same ingress boundary as GitHub events. Provider queries, credentials, monitor
+configuration, repair orchestration, and successor-agent execution remain
+outside V1.
 
 ## `babysit_pr` data flow
 
@@ -826,10 +790,6 @@ Installation is a separate workflow from normal agent execution:
 7. verify repository visibility and workspace trust; and
 8. persist only non-secret connection metadata and opaque credential
    references.
-
-Later service-monitor setup MAY use a provider skill through a bounded harness
-invocation to inspect and instrument a repository. Such a skill is setup input;
-it is not embedded into the long-running monitoring or PR-babysitting agent.
 
 ## Durable work items and IDE workers
 
@@ -1215,31 +1175,21 @@ replace them.
 
 ## Cumulative V1 feature slices
 
-V1 is delivered as small, independently reviewable slices:
+V1 is delivered as eight cumulative, independently reviewable vertical slices:
 
-1. Add NXL-shaped `agent` syntax with nested tasks and a deprecated `workflow`
-   alias.
-2. Add canonical `UserTask` and immutable `GoalContract`.
-3. Add durable goal lifecycle and evidence-backed completion commands.
-4. Extract the agent-runtime transition contract around the existing `.kite`
-   engine.
-5. Wrap the existing direct model loop as the built-in harness plugin.
-6. Add versioned out-of-process plugin registration and messaging.
-7. Add immutable context artifacts and provenance.
-8. Add the semantic event envelope, channel bindings, deduplication, and
-   correlation.
-9. Add durable harness work items, IDE worker leases, approvals, and fencing.
-10. Add authentication profiles and hierarchical budget reservation.
-11. Build the Python connector/control-plane host.
-12. Implement GitHub pull-request, review, and Actions connectors.
-13. Build the generic ACP harness adapter and verify Codex.
-14. Build one VS Code extension artifact with a thin Cursor adapter.
-15. Implement `babysit_pr` through merged-pull-request completion.
-16. Add recovery, security, conformance, and end-to-end release evidence.
+| Slice | Outcome | Review gate |
+|---|---|---|
+| 1. Authoring and durable intent foundation | NXL-shaped `agent` syntax, immutable publication, canonical `UserTask`, and one digest-bound `GoalContract` land together. Existing `workflow` syntax remains compatible; agent execution stays unavailable until lifecycle authority exists. | An authenticated submission atomically freezes an exact published agent version and immutable goal without creating execution state. |
+| 2. Authoritative agent lifecycle | The existing `.kite` engine runs behind the agent-runtime transition contract with durable goal phases and evidence-backed `CompleteGoal` and `BlockGoal`. | The kernel alone validates and commits revisioned transitions; harness results cannot complete a goal. |
+| 3. Replaceable harness and plugin boundary | The direct model loop becomes the built-in harness implementation and versioned out-of-process plugin registration and messaging are added. | Built-in and protocol harness fixtures pass the same command, failure, idempotency, and recovery conformance suite. |
+| 4. Context and event ingress | Immutable provenance-bearing context artifacts, semantic events, deployment bindings, deduplication, correlation, and durable waits work end to end. | GitHub and synthetic SLO fixtures traverse the same authenticated, persisted ingress and resume only the expected task revision. |
+| 5. Guarded local work delivery | Durable harness work items, approvals, IDE worker offers, leases, heartbeats, fencing, and uncertain-outcome reconciliation are operational. | Offline workers queue safely; mutating work is never reassigned after uncertainty without reconciliation. |
+| 6. Governed connector control plane | Harness authentication profiles, data classification, secret references, structural and consumption limits, exact-spend accounting where supported, and the Python connector/control-plane host enforce deployment policy. | Dispatch fails closed across identity, residency, capability, and every applicable hierarchical budget; secrets never enter durable task or protocol state. |
+| 7. GitHub, Codex, and editor path | GitHub PR/review/check connectors, the generic ACP adapter verified with Codex, and one VS Code extension artifact with a thin Cursor adapter form the interactive path. | The extension derives PR context, obtains mutation approval, and returns structured Codex evidence without Cursor-only execution dependencies. |
+| 8. `babysit_pr` release | The complete agent repeats review and repair cycles until GitHub reports the pull request merged, with recovery, security, and end-to-end evidence. | The release scenario and all normative V1 acceptance criteria pass, including channel-neutral synthetic SLO conformance. |
 
-Each slice preserves prior behavior and ends with a demonstrable contract or
-user outcome. Detailed implementation plans are written incrementally as each
-slice becomes active rather than speculating all task-level detail now.
+Each slice preserves prior behavior and ends with the stated observable gate.
+Task-level plans are written only for the active slice.
 
 ## V1 acceptance criteria
 
