@@ -1,0 +1,55 @@
+agent babysit_pr(repository: string, pull_request: integer) -> string {
+  entry inspect_pr(repository = repository, pull_request = pull_request)
+
+  events [
+    "github.pull_request.changed.v1",
+    "github.review.submitted.v1",
+    "github.required_checks.changed.v1"
+  ]
+
+  limits {
+    steps: 200
+    model_turns_per_task: 12
+    parallel_branches: 4
+    active_execution_seconds: 300
+    elapsed_seconds: 604800
+  }
+
+  task inspect_pr(repository: string, pull_request: integer) -> string {
+    model reasoning
+    prompt """Inspect the pull request and select its next safe action."""
+    tools [github_context]
+
+    on repair(review_ids: [string]) {
+      result = call repair_reviews(review_ids = review_ids) context kept
+      done result
+    }
+
+    on refresh() {
+      return inspect_pr(repository = repository, pull_request = pull_request)
+        context isolated
+    }
+
+    on compare(left: string, right: string) {
+      fork {
+        first = call inspect_branch(name = left) context isolated
+        second = call inspect_branch(name = right) context isolated
+      } join
+      done first
+    }
+  }
+
+  task repair_reviews(review_ids: [string]) -> string {
+    model coding
+    prompt """Address only the supplied actionable review threads."""
+    tools []
+    on repaired(commit: string) { done commit }
+  }
+
+  task inspect_branch(name: string) -> string {
+    model reasoning
+    prompt """Inspect one branch."""
+    tools []
+    on inspected(summary: string) { done summary }
+  }
+}
