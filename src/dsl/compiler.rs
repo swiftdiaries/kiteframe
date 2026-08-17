@@ -5,22 +5,36 @@ use serde::Serialize;
 use crate::{ToolCatalogSnapshot, canonical_sha256};
 
 use super::{
-    ArgumentAst, CallAst, CompiledCall, CompiledCallBinding, CompiledOutcome, CompiledStatement,
-    CompiledTask, CompiledToolBinding, CompiledType, CompiledValue, CompiledWorkflow,
-    CompletionContract, DefinitionAst, Diagnostic, FieldAst, Limits, SourceFile, Span,
-    StatementAst, TypeAst, ValueRefAst, WorkflowAst, parse,
+    ArgumentAst, CallAst, CompiledCall, CompiledCallBinding, CompiledDefinition, CompiledOutcome,
+    CompiledStatement, CompiledTask, CompiledToolBinding, CompiledType, CompiledValue,
+    CompletionContract, ContextMode, ContextModeAst, DefinitionAst, DefinitionKind, Diagnostic,
+    FieldAst, Limits, ModelRole, ModelRoleAst, SourceFile, Span, StatementAst, TaskAst, TypeAst,
+    ValueRefAst, parse_report,
 };
 
-const DSL_VERSION: u8 = 1;
 const RESERVED_NAMES: &[&str] = &["complete_task", "outcome"];
 
-/// Parses and compiles one author-authored workflow against a principal-visible catalog.
+#[derive(Clone, Debug)]
+pub struct Compilation {
+    pub definition: CompiledDefinition,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Parses and compiles one author-authored definition against a principal-visible catalog.
 pub fn compile(
     source: &str,
     catalog: &ToolCatalogSnapshot,
     ceilings: &Limits,
-) -> Result<CompiledWorkflow, Vec<Diagnostic>> {
-    let parsed = parse(
+) -> Result<CompiledDefinition, Vec<Diagnostic>> {
+    compile_report(source, catalog, ceilings).map(|value| value.definition)
+}
+
+pub fn compile_report(
+    source: &str,
+    catalog: &ToolCatalogSnapshot,
+    ceilings: &Limits,
+) -> Result<Compilation, Vec<Diagnostic>> {
+    let parsed = parse_report(
         source,
         super::ParseLimits {
             max_source_bytes: 256 * 1024,
@@ -30,20 +44,30 @@ pub fn compile(
             max_diagnostics: 64,
         },
     )?;
-    let DefinitionAst::Workflow(workflow) = &parsed.definition else {
-        return Err(vec![Diagnostic::error(
-            "agent_compiler_unavailable",
-            "agent compilation is unavailable",
-            parsed.span,
-        )]);
-    };
-    Compiler::new(source, &parsed, workflow, catalog, ceilings).compile()
+    let definition = Compiler::new(source, &parsed.source, catalog, ceilings).compile()?;
+    Ok(Compilation {
+        definition,
+        diagnostics: parsed.diagnostics,
+    })
+}
+
+struct DefinitionView<'a> {
+    kind: DefinitionKind,
+    dsl_version: u8,
+    name: &'a str,
+    inputs: &'a [FieldAst],
+    result: &'a TypeAst,
+    entry: &'a CallAst,
+    limits: &'a BTreeMap<String, u64>,
+    events: Vec<&'a str>,
+    tasks: &'a [TaskAst],
+    span: Span,
 }
 
 struct Compiler<'a> {
     source: &'a str,
     ast: &'a SourceFile,
-    workflow: &'a WorkflowAst,
+    view: DefinitionView<'a>,
     catalog: &'a ToolCatalogSnapshot,
     ceilings: &'a Limits,
     diagnostics: Vec<Diagnostic>,
@@ -60,14 +84,43 @@ impl<'a> Compiler<'a> {
     fn new(
         source: &'a str,
         ast: &'a SourceFile,
-        workflow: &'a WorkflowAst,
         catalog: &'a ToolCatalogSnapshot,
         ceilings: &'a Limits,
     ) -> Self {
+        let view = match &ast.definition {
+            DefinitionAst::Workflow(workflow) => DefinitionView {
+                kind: DefinitionKind::Workflow,
+                dsl_version: 1,
+                name: &workflow.name,
+                inputs: &workflow.inputs,
+                result: &workflow.result,
+                entry: &workflow.entry,
+                limits: &workflow.limits,
+                events: Vec::new(),
+                tasks: &workflow.tasks,
+                span: workflow.span,
+            },
+            DefinitionAst::Agent(agent) => DefinitionView {
+                kind: DefinitionKind::Agent,
+                dsl_version: 2,
+                name: &agent.name,
+                inputs: &agent.inputs,
+                result: &agent.result,
+                entry: &agent.entry,
+                limits: &agent.limits,
+                events: agent
+                    .events
+                    .iter()
+                    .map(|event| event.event_type.as_str())
+                    .collect(),
+                tasks: &agent.tasks,
+                span: agent.span,
+            },
+        };
         Self {
             source,
             ast,
-            workflow,
+            view,
             catalog,
             ceilings,
             diagnostics: Vec::new(),
@@ -81,20 +134,20 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn compile(mut self) -> Result<CompiledWorkflow, Vec<Diagnostic>> {
+    fn compile(mut self) -> Result<CompiledDefinition, Vec<Diagnostic>> {
         self.collect_records();
         self.collect_tasks();
-        let inputs = self.compile_fields(&self.workflow.inputs, "workflow input");
-        let result = self.compile_type(&self.workflow.result, self.workflow.span);
+        let inputs = self.compile_fields(self.view.inputs, "definition input");
+        let result = self.compile_type(self.view.result, self.view.span);
         self.check_limits();
 
-        let entry = self.compile_call(&self.workflow.entry, &inputs, None, self.workflow.span);
-        if let Some(entry_task) = self.task_results.get(&self.workflow.entry.task)
+        let entry = self.compile_call(self.view.entry, &inputs, None, self.view.span);
+        if let Some(entry_task) = self.task_results.get(&self.view.entry.task)
             && *entry_task != result
         {
             self.error(
-                "workflow entry task result must match workflow result",
-                self.workflow.entry.span,
+                "definition entry task result must match definition result",
+                self.view.entry.span,
             );
         }
 
@@ -107,24 +160,31 @@ impl<'a> Compiler<'a> {
         }
 
         self.reject_recursive_calls();
-        self.reject_unreachable_tasks(&self.workflow.entry.task);
+        self.reject_unreachable_tasks(&self.view.entry.task);
 
         if !self.diagnostics.is_empty() {
             return Err(self.diagnostics);
         }
 
         let tool_bindings = self.all_tool_bindings.into_values().collect::<Vec<_>>();
-        let definition_hash = definition_hash(self.source, &tool_bindings)
+        let definition_hash = definition_hash(self.source, self.view.dsl_version, &tool_bindings)
             .map_err(|error| vec![Diagnostic::new(error, self.ast.span)])?;
-        Ok(CompiledWorkflow {
-            dsl_version: DSL_VERSION,
-            name: self.workflow.name.clone(),
+        Ok(CompiledDefinition {
+            dsl_version: self.view.dsl_version,
+            definition_kind: self.view.kind,
+            name: self.view.name.to_owned(),
             source: self.source.to_owned(),
             definition_hash,
             inputs,
             result,
             entry,
-            limits: self.workflow.limits.clone(),
+            limits: self.view.limits.clone(),
+            events: self
+                .view
+                .events
+                .iter()
+                .map(|event| (*event).to_owned())
+                .collect(),
             records: self.records,
             tasks,
             tool_bindings,
@@ -150,7 +210,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn collect_tasks(&mut self) {
-        for task in &self.workflow.tasks {
+        for task in self.view.tasks {
             self.reject_reserved(&task.name, task.span);
             if self.task_asts.insert(task.name.clone(), task).is_some() {
                 self.error("task declaration is duplicated", task.span);
@@ -210,6 +270,10 @@ impl<'a> Compiler<'a> {
         Some(CompiledTask {
             inputs,
             result,
+            model_role: task.model_role.map(|role| match role {
+                ModelRoleAst::Reasoning => ModelRole::Reasoning,
+                ModelRoleAst::Coding => ModelRole::Coding,
+            }),
             prompt: task.prompt.text.clone(),
             tools,
             outcomes,
@@ -235,6 +299,7 @@ impl<'a> Compiler<'a> {
                 .iter()
                 .filter(|(qualified, _)| {
                     *qualified == declared
+                        || qualified.replace('/', "_") == *declared
                         || qualified
                             .rsplit_once('/')
                             .is_some_and(|(_, short)| short == declared)
@@ -307,7 +372,7 @@ impl<'a> Compiler<'a> {
                     }
                     if calls.len() as u64 > self.effective_limit("parallel_branches") {
                         self.error(
-                            "parallel branch count exceeds workflow limit",
+                            "parallel branch count exceeds definition limit",
                             self.ast.span,
                         );
                     }
@@ -403,6 +468,7 @@ impl<'a> Compiler<'a> {
             return CompiledCall {
                 task: call.task.clone(),
                 arguments: BTreeMap::new(),
+                context: compile_context(call.context),
             };
         };
         let mut supplied = BTreeMap::new();
@@ -439,6 +505,7 @@ impl<'a> Compiler<'a> {
         CompiledCall {
             task: call.task.clone(),
             arguments,
+            context: compile_context(call.context),
         }
     }
 
@@ -544,13 +611,23 @@ impl<'a> Compiler<'a> {
     }
 
     fn check_limits(&mut self) {
-        for (name, value) in &self.workflow.limits {
+        for (name, value) in self.view.limits {
             if *value > self.ceiling(name) {
                 self.error(
-                    "workflow limit exceeds deployment ceiling",
-                    self.workflow.span,
+                    "definition limit exceeds deployment ceiling",
+                    self.view.span,
                 );
             }
+        }
+        let compiled_limits = self.compiled_limits();
+        if self.view.kind == DefinitionKind::Agent
+            && compiled_limits.elapsed_seconds <= compiled_limits.active_execution_seconds
+        {
+            self.diagnostics.push(Diagnostic::error(
+                "invalid_elapsed_limit",
+                "elapsed_seconds must exceed active_execution_seconds",
+                self.view.span,
+            ));
         }
     }
 
@@ -562,16 +639,29 @@ impl<'a> Compiler<'a> {
             "parallel_branches" => self.ceilings.parallel_branches,
             "response_item_bytes" => self.ceilings.response_item_bytes,
             "active_execution_seconds" => self.ceilings.active_execution_seconds,
+            "elapsed_seconds" => self.ceilings.elapsed_seconds,
             _ => 0,
         }
     }
 
     fn effective_limit(&self, name: &str) -> u64 {
-        self.workflow
+        self.view
             .limits
             .get(name)
             .copied()
             .unwrap_or_else(|| self.ceiling(name))
+    }
+
+    fn compiled_limits(&self) -> Limits {
+        Limits {
+            steps: self.effective_limit("steps"),
+            model_turns_per_task: self.effective_limit("model_turns_per_task"),
+            tool_calls_per_response: self.effective_limit("tool_calls_per_response"),
+            parallel_branches: self.effective_limit("parallel_branches"),
+            response_item_bytes: self.effective_limit("response_item_bytes"),
+            active_execution_seconds: self.effective_limit("active_execution_seconds"),
+            elapsed_seconds: self.effective_limit("elapsed_seconds"),
+        }
     }
 
     fn reject_recursive_calls(&mut self) {
@@ -618,14 +708,14 @@ impl<'a> Compiler<'a> {
         let all_tasks = self.task_asts.keys().cloned().collect::<Vec<_>>();
         for task in all_tasks {
             if !reachable.contains(&task) {
-                self.error("task is unreachable from workflow start", self.ast.span);
+                self.error("task is unreachable from definition entry", self.ast.span);
             }
         }
     }
 
     fn reject_reserved(&mut self, name: &str, span: Span) {
         if RESERVED_NAMES.contains(&name) {
-            self.error("reserved name is not allowed in workflow source", span);
+            self.error("reserved name is not allowed in definition source", span);
         }
     }
 
@@ -641,7 +731,19 @@ fn nullable(ty: CompiledType) -> CompiledType {
     }
 }
 
-fn definition_hash(source: &str, tool_bindings: &[CompiledToolBinding]) -> Result<String, String> {
+fn compile_context(context: ContextModeAst) -> ContextMode {
+    match context {
+        ContextModeAst::Legacy => ContextMode::Legacy,
+        ContextModeAst::Isolated => ContextMode::Isolated,
+        ContextModeAst::Kept => ContextMode::Kept,
+    }
+}
+
+fn definition_hash(
+    source: &str,
+    dsl_version: u8,
+    tool_bindings: &[CompiledToolBinding],
+) -> Result<String, String> {
     #[derive(Serialize)]
     struct Identity<'a> {
         dsl_version: u8,
@@ -659,7 +761,7 @@ fn definition_hash(source: &str, tool_bindings: &[CompiledToolBinding]) -> Resul
         })
         .collect();
     canonical_sha256(&Identity {
-        dsl_version: DSL_VERSION,
+        dsl_version,
         source,
         descriptors,
     })

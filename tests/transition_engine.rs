@@ -6,7 +6,7 @@ use kiteframe::{FrameCommand, SessionId, ToolCatalogSnapshot};
 use serde_json::json;
 use uuid::Uuid;
 
-fn workflow() -> kiteframe::dsl::CompiledWorkflow {
+fn workflow() -> kiteframe::dsl::CompiledDefinition {
     let catalog = ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(1), [])
         .expect("empty catalog");
     compile(

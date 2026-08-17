@@ -10,6 +10,7 @@ pub mod model;
 pub mod policy;
 pub mod protocol;
 pub mod schema;
+#[allow(deprecated)]
 pub mod store;
 pub mod tools;
 

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::{CatalogEpochId, CatalogTool};
 
-/// Deployment ceilings for author-supplied workflow budgets.
+/// Deployment ceilings for author-supplied definition budgets.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     pub steps: u64,
@@ -14,6 +14,7 @@ pub struct Limits {
     pub parallel_branches: u64,
     pub response_item_bytes: u64,
     pub active_execution_seconds: u64,
+    pub elapsed_seconds: u64,
 }
 
 impl Default for Limits {
@@ -25,8 +26,45 @@ impl Default for Limits {
             parallel_branches: u64::MAX,
             response_item_bytes: u64::MAX,
             active_execution_seconds: u64::MAX,
+            elapsed_seconds: u64::MAX,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionKind {
+    #[default]
+    Workflow,
+    Agent,
+}
+
+impl DefinitionKind {
+    pub const fn is_workflow(&self) -> bool {
+        matches!(self, Self::Workflow)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextMode {
+    #[default]
+    Legacy,
+    Isolated,
+    Kept,
+}
+
+impl ContextMode {
+    pub const fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRole {
+    Reasoning,
+    Coding,
 }
 
 /// A descriptor binding captured from a principal-scoped catalog at publication time.
@@ -78,6 +116,8 @@ pub enum CompiledValue {
 pub struct CompiledCall {
     pub task: String,
     pub arguments: BTreeMap<String, CompiledValue>,
+    #[serde(default, skip_serializing_if = "ContextMode::is_legacy")]
+    pub context: ContextMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -130,6 +170,8 @@ pub struct CompletionContract {
 pub struct CompiledTask {
     pub inputs: BTreeMap<String, CompiledType>,
     pub result: CompiledType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_role: Option<ModelRole>,
     pub prompt: String,
     #[serde(default, skip_deserializing)]
     pub tools: Vec<CompiledToolBinding>,
@@ -138,8 +180,10 @@ pub struct CompiledTask {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct CompiledWorkflow {
+pub struct CompiledDefinition {
     pub dsl_version: u8,
+    #[serde(default, skip_serializing_if = "DefinitionKind::is_workflow")]
+    pub definition_kind: DefinitionKind,
     pub name: String,
     pub source: String,
     pub definition_hash: String,
@@ -147,8 +191,13 @@ pub struct CompiledWorkflow {
     pub result: CompiledType,
     pub entry: CompiledCall,
     pub limits: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<String>,
     pub records: BTreeMap<String, BTreeMap<String, CompiledType>>,
     pub tasks: BTreeMap<String, CompiledTask>,
     #[serde(default, skip_deserializing)]
     pub tool_bindings: Vec<CompiledToolBinding>,
 }
+
+#[deprecated(note = "use CompiledDefinition")]
+pub type CompiledWorkflow = CompiledDefinition;

@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use kiteframe::dsl::{Limits, compile};
+use kiteframe::dsl::{
+    CompiledStatement, ContextMode, DefinitionKind, DiagnosticSeverity, Limits, compile,
+    compile_report,
+};
 use kiteframe::{
     CatalogTool, ClosedSchema, EffectKind, RecoverySupport, SessionId, ToolCatalogSnapshot,
 };
@@ -17,6 +20,7 @@ fn ceilings() -> Limits {
         parallel_branches: 4,
         response_item_bytes: 16 * 1024,
         active_execution_seconds: 300,
+        elapsed_seconds: u64::MAX,
     }
 }
 
@@ -51,10 +55,23 @@ fn compiles_the_support_workflow_with_strict_completion_and_immutable_bindings()
         tool("metrics/search_metrics"),
     ]);
 
-    let compiled = compile(SUPPORT, &catalog, &ceilings()).expect("support compiles");
+    let report = compile_report(SUPPORT, &catalog, &ceilings()).expect("support compiles");
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].severity, DiagnosticSeverity::Warning);
+    assert_eq!(report.diagnostics[0].code, "deprecated_workflow");
+    let compiled = report.definition;
 
     assert_eq!(compiled.dsl_version, 1);
+    assert_eq!(compiled.definition_kind, DefinitionKind::Workflow);
     assert_eq!(compiled.name, "support");
+    assert_eq!(compiled.entry.context, ContextMode::Legacy);
+    assert!(compiled.events.is_empty());
+    assert!(
+        compiled
+            .tasks
+            .values()
+            .all(|task| task.model_role.is_none())
+    );
     assert_eq!(compiled.tool_bindings.len(), 3);
     assert_eq!(
         compiled
@@ -82,6 +99,15 @@ fn compiles_the_support_workflow_with_strict_completion_and_immutable_bindings()
     assert!(completion.required_nullable_fields.contains_key("answer"));
     assert!(completion.required_nullable_fields.contains_key("query"));
     assert_eq!(triage.tools[0].qualified_name, "docs/search_docs");
+    let CompiledStatement::Parallel { calls } = &triage.outcomes["investigate"].statements[0]
+    else {
+        panic!("investigation starts with parallel calls");
+    };
+    assert!(
+        calls
+            .iter()
+            .all(|binding| binding.call.context == ContextMode::Legacy)
+    );
 }
 
 #[test]
