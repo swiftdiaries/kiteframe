@@ -63,10 +63,17 @@ pub struct TaskAst {
     pub name: String,
     pub inputs: Vec<FieldAst>,
     pub result: TypeAst,
+    pub model_role: Option<ModelRoleAst>,
     pub prompt: PromptAst,
     pub tools: Vec<String>,
     pub outcomes: Vec<OutcomeAst>,
     pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelRoleAst {
+    Reasoning,
+    Coding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,7 +95,15 @@ pub struct CallAst {
     pub binding: Option<String>,
     pub task: String,
     pub arguments: Vec<ArgumentAst>,
+    pub context: ContextModeAst,
     pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextModeAst {
+    Legacy,
+    Isolated,
+    Kept,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
