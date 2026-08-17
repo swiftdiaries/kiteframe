@@ -39,16 +39,23 @@ invocation        = identifier, "(", [ argument, { [ "," ], argument } ], ")" ;
 argument          = identifier, "=", value ;
 prompt            = "prompt", triple-string ;
 tools             = "tools", "[", { [ "," ], identifier }, "]" ;
-outcome           = "on", identifier, fields, "{", statement, { statement }, "}" ;
-statement         = call-statement | return-statement | fork-statement |
+agent-outcome     = "on", identifier, fields, "{", agent-statement,
+                    { agent-statement }, "}" ;
+agent-statement   = call-statement | return-statement | fork-statement |
                     "done", value | "fail", value, value |
                     identifier, "=", "ask", type, value ;
+workflow-outcome  = (* existing workflow outcome grammar *) ;
 ```
+
+In an `agent-definition`, the `outcome` reference in `task-definition` means
+`agent-outcome`; legacy workflow tasks use `workflow-outcome`.
 
 `workflow-definition` retains the pre-Slice 1 top-level-task form. It is
 deprecated for new authoring but remains supported for publication and
 execution. In a workflow, `start`, `goto`, and `parallel` retain their current
-spellings and semantics; `return` and `fork ... join` are agent-only.
+spellings and semantics. `return`, `fork ... join`, call context modes, event
+declarations, and model roles are agent-only and are excluded from workflow
+definitions and workflow tasks.
 
 ## Names, words, and punctuation
 
@@ -82,22 +89,25 @@ unique within an agent. Agent limits additionally admit `elapsed_seconds`;
 workflow limits do not.
 
 `context kept` retains a call's context, while `context isolated` starts the
-target call with isolated context. A `fork` contains one or more bound call
-statements and ends with `join`. `done`, `fail`, and `ask` retain their
-existing outcome semantics in both definition kinds.
+target call with isolated context. When an agent call or return omits the
+optional context mode, it defaults to `context isolated`. A `fork` contains one
+or more bound call statements and ends with `join`. `done`, `fail`, and `ask`
+retain their existing outcome semantics in both definition kinds.
 
 ## Diagnostics and publication boundary
 
 Diagnostics use stable snake-case codes and include a source span. A valid
 legacy workflow produces the bounded warning code `deprecated_workflow`.
-Until agent compilation is implemented, an agent compile request reports
-`agent_compiler_unavailable`. Once compilation is available in Slice 1, agent
-publication remains fail-closed with `agent_runtime_unavailable` because
-durable agent goals and runtime authority are not yet available.
+Both definition kinds compile in Slice 1: a workflow has `dsl_version = 1` and
+an agent has `dsl_version = 2`. Agent publication remains fail-closed with
+`agent_runtime_unavailable` because durable agent goals and runtime authority
+are not yet available.
 
 Warnings and errors consume the same configured diagnostic budget. Existing
 source-size, token, identifier, and type-nesting limits remain in force.
 
-Compiled agents are available only to authoring and compile-time tooling in
-this slice. Publication must reject them before persistence; legacy workflows
-remain publishable and executable.
+Compiled definition identity includes definition kind, normalized agent
+metadata, exact source, and immutable tool descriptors. Compiled agents are
+available only to authoring and compile-time tooling in this slice. Publication
+must reject them before persistence; legacy workflows remain publishable and
+executable.
