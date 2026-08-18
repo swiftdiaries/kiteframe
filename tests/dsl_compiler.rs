@@ -47,6 +47,14 @@ fn catalog(tools: impl IntoIterator<Item = CatalogTool>) -> ToolCatalogSnapshot 
         .expect("test catalog is valid")
 }
 
+fn support_catalog() -> ToolCatalogSnapshot {
+    catalog([
+        tool("docs/search_docs"),
+        tool("logs/search_logs"),
+        tool("metrics/search_metrics"),
+    ])
+}
+
 #[test]
 fn compiles_the_support_workflow_with_strict_completion_and_immutable_bindings() {
     let catalog = catalog([
@@ -248,11 +256,7 @@ task t() -> string { prompt """x""" tools [search] on ok() { done "x" } }
 
 #[test]
 fn freezes_the_support_compilation_output() {
-    let catalog = catalog([
-        tool("docs/search_docs"),
-        tool("logs/search_logs"),
-        tool("metrics/search_metrics"),
-    ]);
+    let catalog = support_catalog();
     let compiled = compile(SUPPORT, &catalog, &ceilings()).expect("support compiles");
 
     let actual = json!({
@@ -269,4 +273,35 @@ fn freezes_the_support_compilation_output() {
             .expect("golden fixture is valid JSON");
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn legacy_workflow_identity_and_json_remain_version_one() {
+    let compiled = compile(SUPPORT, &support_catalog(), &ceilings()).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dsl/support.compiled.json")).unwrap();
+
+    assert_eq!(compiled.dsl_version, 1);
+    assert_eq!(compiled.definition_kind, DefinitionKind::Workflow);
+    assert_eq!(compiled.definition_hash, expected["definition_hash"]);
+    let legacy_projection = json!({
+        "definition_hash": compiled.definition_hash,
+        "entry": compiled.entry,
+        "tool_bindings": compiled.tool_bindings.iter().map(|binding| json!({
+            "qualified_name": binding.qualified_name,
+            "catalog_epoch_id": binding.catalog_epoch_id,
+            "descriptor_digest": binding.descriptor_digest,
+        })).collect::<Vec<_>>(),
+    });
+    assert_eq!(legacy_projection, expected);
+    let json = serde_json::to_value(compiled).unwrap();
+    assert!(json.get("definition_kind").is_none());
+    assert!(json.get("events").is_none());
+    assert!(
+        json["tasks"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|task| task.get("model_role").is_none())
+    );
 }

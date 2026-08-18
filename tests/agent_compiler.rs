@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use kiteframe::dsl::{
-    CompiledDefinition, CompiledStatement, ContextMode, DefinitionKind, Limits, ModelRole,
+    CompiledDefinition, CompiledStatement, ContextMode, DefinitionKind, Limits, ModelRole, compile,
     compile_report,
 };
 use kiteframe::{
@@ -46,6 +46,10 @@ fn tool(qualified_name: &str) -> CatalogTool {
 fn catalog(tools: impl IntoIterator<Item = CatalogTool>) -> ToolCatalogSnapshot {
     ToolCatalogSnapshot::new(SessionId::new(Uuid::nil()), Uuid::from_u128(7), tools)
         .expect("test catalog is valid")
+}
+
+fn github_catalog() -> ToolCatalogSnapshot {
+    catalog([tool("github/context")])
 }
 
 #[test]
@@ -223,4 +227,11 @@ fn agents_reuse_recursion_and_parallel_limit_checks() {
             .iter()
             .any(|diagnostic| diagnostic.message.contains("parallel branch count"))
     );
+}
+
+#[test]
+fn published_authoring_example_compiles_as_an_agent() {
+    let source = std::fs::read_to_string("examples/babysit_pr.kite").unwrap();
+    let compiled = compile(&source, &github_catalog(), &ceilings()).unwrap();
+    assert_eq!(compiled.definition_kind, DefinitionKind::Agent);
 }

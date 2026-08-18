@@ -35,3 +35,22 @@ unknown fields.
 The kernel allocates the UUID v7 task id. An explicit agent version freezes
 that version. An omitted version selects the latest visible version inside the
 acceptance transaction. An idempotent replay returns the original selection.
+
+## Persistence and current API boundary
+
+Acceptance atomically inserts one immutable task and one immutable goal
+contract. Rejected validation, missing or wrong-kind definitions, principal or
+session mismatches, closed sessions, and conflicting replays do not leave
+partial rows. Retrieval is session-scoped, survives a store restart, and
+recomputes the goal digest before returning the accepted intent. Acceptance
+does not create runs, frames, events, model items, tool calls, or permission
+requests.
+
+The authenticated application exposes `_kiteframe/task/submit` and
+`_kiteframe/task/get` as private Kiteframe ACP extension methods. Along with
+`_kiteframe/definition/publish`, these are not a stable plugin protocol and do
+not grant runtime authority.
+
+Accepted tasks remain inert in Slice 1. There are no complete, block, pause,
+or resume goal commands, and no agent execution, plugin lifecycle, semantic
+channels, workers, budgets, connectors, Codex, Cursor, or VS Code integration.

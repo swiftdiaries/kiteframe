@@ -17,3 +17,21 @@ fn repository_contains_one_runtime() {
     }
     assert!(root.join("src/main.rs").is_file());
 }
+
+#[test]
+fn published_agent_example_matches_the_reviewed_fixture_byte_for_byte() {
+    let fixture = std::fs::read("tests/fixtures/dsl/agent_babysit_pr.kite").unwrap();
+    let example = std::fs::read("examples/babysit_pr.kite").unwrap();
+    assert_eq!(example, fixture);
+}
+
+#[test]
+fn foundation_exposes_no_goal_lifecycle_commands() {
+    let source = std::fs::read_to_string("src/protocol/types.rs").unwrap();
+    for forbidden in ["CompleteGoal", "BlockGoal", "PauseTask", "ResumeTask"] {
+        assert!(
+            !source.contains(forbidden),
+            "unexpected command: {forbidden}"
+        );
+    }
+}

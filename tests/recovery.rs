@@ -15,6 +15,7 @@ use kiteframe::{
 };
 use serde_json::{Value, json};
 use sqlx::Row;
+use sqlx::postgres::PgPoolOptions;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -62,12 +63,57 @@ struct NotStartedRetryTool {
     invocations: Arc<AtomicUsize>,
 }
 
+struct IsolatedDatabase {
+    name: String,
+    admin_url: String,
+    url: String,
+}
+
+impl IsolatedDatabase {
+    async fn create(base_url: &str) -> Self {
+        let mut admin = url::Url::parse(base_url).expect("database URL");
+        admin.set_path("/postgres");
+        let name = format!("kiteframe_recovery_{}", Uuid::now_v7().simple());
+        let admin_url = admin.to_string();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect database administrator");
+        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+            .execute(&pool)
+            .await
+            .expect("create isolated recovery database");
+        drop(pool);
+        let mut database = admin;
+        database.set_path(&format!("/{name}"));
+        Self {
+            name,
+            admin_url,
+            url: database.to_string(),
+        }
+    }
+
+    async fn drop(self) {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&self.admin_url)
+            .await
+            .expect("connect database administrator for cleanup");
+        sqlx::query(&format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name))
+            .execute(&pool)
+            .await
+            .expect("drop isolated recovery database");
+    }
+}
+
 #[tokio::test]
 async fn one_recovery_call_pages_through_more_than_256_model_attempts() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+    let Ok(base_url) = std::env::var("DATABASE_URL") else {
         return;
     };
-    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let database = IsolatedDatabase::create(&base_url).await;
+    let store = Arc::new(PostgresStore::connect(&database.url).await.expect("store"));
     let session = store
         .create_session(CreateSession {
             principal: PrincipalId::new(format!("recovery-page-{}", Uuid::now_v7())).unwrap(),
@@ -131,6 +177,7 @@ async fn one_recovery_call_pages_through_more_than_256_model_attempts() {
 
     let report = engine.recover().await.expect("paged recovery");
     assert_eq!(report.model_attempts_requeued, 257);
+    database.drop().await;
 }
 
 #[async_trait]
