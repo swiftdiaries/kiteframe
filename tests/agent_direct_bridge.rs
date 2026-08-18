@@ -7,14 +7,14 @@ use std::sync::{Arc, Mutex};
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     AgentCommandDispatcher, AgentCommandId, AgentCommandView, AgentExecutionView, AgentKernel,
-    AgentSelector, CancelUserTask, CatalogTool, ClaimAgentCommand, ClosedSchema, CreateSession,
-    DirectLoopHarnessExecutor, EffectKind, EvidenceId, EvidenceRecord, EvidenceSourceIdentity,
-    GoalContract, GoalPhase, HarnessCommandExecutor, HarnessExecutionError, IdempotencyKey,
-    InvokeHarness, KernelCommandPayload, ModelClient, ModelError, ModelRequest, ModelResponse,
-    OperationalStatus, PauseUserTask, PostgresStore, PrincipalId, RecoverySupport, RequestContext,
-    RuntimeCeilings, StartAgent, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle,
-    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
-    WaitForEvent, canonical_sha256,
+    AgentSelector, CancelUserTask, CatalogTool, ClaimAgentCommand, ClosedSchema,
+    CompleteAgentCommand, CreateSession, DirectLoopHarnessExecutor, EffectKind, EvidenceId,
+    EvidenceRecord, EvidenceSourceIdentity, GoalContract, GoalPhase, HarnessCommandExecutor,
+    HarnessExecutionError, IdempotencyKey, InvokeHarness, KernelCommandPayload, ModelClient,
+    ModelError, ModelRequest, ModelResponse, OperationalStatus, PauseUserTask, PostgresStore,
+    PrincipalId, RecoverySupport, RequestContext, RuntimeCeilings, RuntimeEvent, StartAgent,
+    StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
+    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId, WaitForEvent, canonical_sha256,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -24,6 +24,34 @@ use uuid::Uuid;
 type ModelFuture = Pin<Box<dyn Future<Output = Result<ModelResponse, ModelError>> + Send>>;
 type ModelHandler = dyn Fn(ModelRequest) -> ModelFuture + Send + Sync;
 static BRIDGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn non_command_fingerprint(pool: &PgPool, task_id: &UserTaskId) -> Value {
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object( \
+             'task', (SELECT to_jsonb(t) FROM user_tasks t WHERE t.id = $1), \
+             'goalContract', (SELECT to_jsonb(g) FROM goal_contracts g WHERE g.task_id = $1), \
+             'goalState', (SELECT to_jsonb(g) FROM goal_states g WHERE g.task_id = $1), \
+             'snapshot', (SELECT to_jsonb(s) FROM agent_runtime_snapshots s WHERE s.task_id = $1), \
+             'transitions', (SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.id), '[]'::jsonb) \
+                 FROM agent_transitions t WHERE t.task_id = $1), \
+             'policies', (SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY p.id), '[]'::jsonb) \
+                 FROM agent_policy_decisions p WHERE p.task_id = $1), \
+             'evidence', (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.id), '[]'::jsonb) \
+                 FROM goal_evidence e WHERE e.task_id = $1), \
+             'assertions', (SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.criterion_id), '[]'::jsonb) \
+                 FROM goal_criterion_assertions a WHERE a.task_id = $1), \
+             'blockers', (SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY b.id), '[]'::jsonb) \
+                 FROM goal_blockers b WHERE b.task_id = $1), \
+             'actions', (SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.id), '[]'::jsonb) \
+                 FROM agent_task_actions a WHERE a.task_id = $1), \
+             'events', (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.sequence), '[]'::jsonb) \
+                 FROM agent_task_events e WHERE e.task_id = $1))",
+    )
+    .bind(task_id.as_uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
 
 struct ScriptedModel {
     handler: Mutex<Arc<ModelHandler>>,
@@ -155,6 +183,16 @@ impl BridgeFixture {
         unlock: ["Restore the required access."]
       }
     }"#,
+            false,
+        )
+        .await
+    }
+
+    async fn started_with_multiple_outcomes() -> Option<Self> {
+        Self::started_with_task(
+            "tools []",
+            r#"on ok(answer: string) { done answer }
+    on unavailable(reason: string) { done reason }"#,
             false,
         )
         .await
@@ -449,6 +487,24 @@ async fn invocation_is_persisted_and_claimed_before_model_call() {
 }
 
 #[tokio::test]
+async fn non_positive_tick_limits_do_not_list_or_dispatch_work() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    fixture
+        .model
+        .complete("ok", json!({"answer": "must not run"}));
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(0).await.unwrap(), 0);
+    assert_eq!(fixture.dispatcher.tick_agent_commands(-1).await.unwrap(), 0);
+    assert_eq!(fixture.model.calls(), 0);
+    assert_eq!(fixture.command_state(&command.id).await, "pending");
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
 async fn harness_success_mints_evidence_but_does_not_complete_goal() {
     let _guard = BRIDGE_TEST_LOCK.lock().await;
     let Some(fixture) = BridgeFixture::started().await else {
@@ -665,6 +721,55 @@ async fn bounded_executor_rejects_missing_multiple_invalid_and_oversized_actions
         ))
     );
     fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn multi_outcome_executor_rejects_missing_extra_and_cross_outcome_fields() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started_with_multiple_outcomes().await else {
+        return;
+    };
+    let invocation = fixture.pending_invocation().await;
+    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+
+    for (outcome, fields) in [
+        ("ok", json!({})),
+        ("ok", json!({"reason": "belongs to unavailable"})),
+        ("ok", json!({"answer": "done", "reason": "extra"})),
+        ("unavailable", json!({"answer": "belongs to ok"})),
+    ] {
+        fixture.model.complete(outcome, fields);
+        assert!(matches!(
+            executor.execute(&invocation).await,
+            Err(HarnessExecutionError::InvalidResult(_))
+        ));
+    }
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn multi_outcome_dispatcher_converts_cross_outcome_fields_to_harness_failure() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started_with_multiple_outcomes().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    fixture
+        .model
+        .complete("ok", json!({"reason": "belongs to unavailable"}));
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let failed = fixture.current().await;
+    assert_eq!(failed.lifecycle, TaskLifecycle::Failed);
+    assert_eq!(failed.operational_status, OperationalStatus::Finished);
+    assert_eq!(failed.goal_phase, GoalPhase::Active);
+    assert_eq!(fixture.command_state(&command.id).await, "completed");
+    let failure: Value = sqlx::query_scalar("SELECT failure FROM user_tasks WHERE id = $1")
+        .bind(fixture.task_id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(failure["code"], "harness_failed");
 }
 
 #[tokio::test]
@@ -951,7 +1056,7 @@ async fn blocked_goal_is_not_redispatched_to_the_model() {
 }
 
 #[tokio::test]
-async fn cancellation_during_model_execution_discards_the_late_result() {
+async fn cancellation_during_model_execution_audits_the_late_result_only_on_the_command() {
     let _guard = BRIDGE_TEST_LOCK.lock().await;
     let Some(fixture) = BridgeFixture::started().await else {
         return;
@@ -959,23 +1064,28 @@ async fn cancellation_during_model_execution_discards_the_late_result() {
     let command = fixture.pending_command().await;
     let before_snapshot = fixture.snapshot_fingerprint().await;
     let before = fixture.current().await;
+    let after_cancel_fingerprint = Arc::new(Mutex::new(None));
     fixture.model.on_request({
         let kernel = fixture.kernel.clone();
+        let pool = fixture.pool.clone();
         let principal = fixture.principal.clone();
         let session_id = fixture.session_id.clone();
         let task_id = fixture.task_id.clone();
+        let after_cancel_fingerprint = Arc::clone(&after_cancel_fingerprint);
         move |_| {
             let kernel = kernel.clone();
+            let pool = pool.clone();
             let principal = principal.clone();
             let session_id = session_id.clone();
             let task_id = task_id.clone();
+            let after_cancel_fingerprint = Arc::clone(&after_cancel_fingerprint);
             async move {
                 kernel
                     .cancel_task(
                         &principal,
                         CancelUserTask {
                             session_id,
-                            task_id,
+                            task_id: task_id.clone(),
                             expected_task_revision: before.task_revision,
                             expected_goal_revision: before.goal_revision,
                             reason: Some("Cancelled during model execution.".to_owned()),
@@ -984,6 +1094,8 @@ async fn cancellation_during_model_execution_discards_the_late_result() {
                     )
                     .await
                     .unwrap();
+                let fingerprint = non_command_fingerprint(&pool, &task_id).await;
+                *after_cancel_fingerprint.lock().unwrap() = Some(fingerprint);
                 Ok(ModelResponse {
                     items: vec![json!({
                         "type":"function_call", "call_id":"done-late", "name":"complete_task",
@@ -1001,6 +1113,190 @@ async fn cancellation_during_model_execution_discards_the_late_result() {
     assert_eq!(fixture.command_state(&command.id).await, "cancelled");
     assert_eq!(fixture.evidence().await.len(), 0);
     assert_eq!(fixture.snapshot_fingerprint().await, before_snapshot);
+    let after_cancel = after_cancel_fingerprint.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        non_command_fingerprint(&fixture.pool, &fixture.task_id).await,
+        after_cancel
+    );
+
+    let audited = sqlx::query(
+        "SELECT revision, completion_idempotency_key, completion_request_digest, result, failure \
+         FROM agent_commands WHERE id = $1",
+    )
+    .bind(command.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(audited.get::<i64, _>("revision"), 3);
+    let completion_key = audited
+        .get::<Option<String>, _>("completion_idempotency_key")
+        .unwrap();
+    assert_eq!(
+        completion_key,
+        format!("builtin-result:{}:1", command.id.as_uuid())
+    );
+    assert!(
+        audited
+            .get::<Option<String>, _>("completion_request_digest")
+            .is_some()
+    );
+    assert!(audited.get::<Option<Value>, _>("failure").is_none());
+    let result = audited.get::<Option<Value>, _>("result").unwrap();
+    let event: RuntimeEvent = serde_json::from_value(result).unwrap();
+    let RuntimeEvent::HarnessResult {
+        event_id,
+        command_key,
+        outcome,
+        fields,
+        evidence_id,
+        history,
+    } = event
+    else {
+        panic!("late audit must retain the harness result")
+    };
+    assert_eq!(outcome, "ok");
+    assert_eq!(fields, json!({"answer": "too late"}));
+    let replay = CompleteAgentCommand {
+        session_id: fixture.session_id.clone(),
+        task_id: fixture.task_id.clone(),
+        command_id: command.id.clone(),
+        expected_command_revision: 1,
+        idempotency_key: IdempotencyKey::new(completion_key).unwrap(),
+        event: RuntimeEvent::HarnessResult {
+            event_id: event_id.clone(),
+            command_key: command_key.clone(),
+            outcome: outcome.clone(),
+            fields: fields.clone(),
+            evidence_id: evidence_id.clone(),
+            history: history.clone(),
+        },
+    };
+    fixture
+        .store
+        .audit_late_agent_command_completion(&fixture.principal, &replay)
+        .await
+        .unwrap();
+    let command_after_replay: Value =
+        sqlx::query_scalar("SELECT to_jsonb(c) FROM agent_commands c WHERE c.id = $1")
+            .bind(command.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+
+    let mut conflicting = replay;
+    conflicting.event = RuntimeEvent::HarnessResult {
+        event_id,
+        command_key,
+        outcome,
+        fields: json!({"answer": "conflicting late result"}),
+        evidence_id,
+        history,
+    };
+    assert!(matches!(
+        fixture
+            .store
+            .audit_late_agent_command_completion(&fixture.principal, &conflicting)
+            .await,
+        Err(StoreError::IdempotencyConflict)
+    ));
+    let command_after_conflict: Value =
+        sqlx::query_scalar("SELECT to_jsonb(c) FROM agent_commands c WHERE c.id = $1")
+            .bind(command.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(command_after_conflict, command_after_replay);
+    assert_eq!(
+        non_command_fingerprint(&fixture.pool, &fixture.task_id).await,
+        after_cancel
+    );
+}
+
+#[tokio::test]
+async fn cancellation_during_model_or_tool_failure_audits_only_command_failure_metadata() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    for (mode, expected_code) in [
+        ("model", "harness_failed"),
+        ("tool", "runtime_command_unavailable"),
+    ] {
+        let Some(fixture) = BridgeFixture::started_with_declared_tool().await else {
+            return;
+        };
+        let command = fixture.pending_command().await;
+        let before = fixture.current().await;
+        let after_cancel_fingerprint = Arc::new(Mutex::new(None));
+        fixture.model.on_request({
+            let kernel = fixture.kernel.clone();
+            let pool = fixture.pool.clone();
+            let principal = fixture.principal.clone();
+            let session_id = fixture.session_id.clone();
+            let task_id = fixture.task_id.clone();
+            let after_cancel_fingerprint = Arc::clone(&after_cancel_fingerprint);
+            move |_| {
+                let kernel = kernel.clone();
+                let pool = pool.clone();
+                let principal = principal.clone();
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                let after_cancel_fingerprint = Arc::clone(&after_cancel_fingerprint);
+                async move {
+                    kernel
+                        .cancel_task(
+                            &principal,
+                            CancelUserTask {
+                                session_id,
+                                task_id: task_id.clone(),
+                                expected_task_revision: before.task_revision,
+                                expected_goal_revision: before.goal_revision,
+                                reason: Some("Cancelled during failed model work.".to_owned()),
+                                idempotency_key: IdempotencyKey::new(format!(
+                                    "cancel-during-{mode}"
+                                ))
+                                .unwrap(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    let fingerprint = non_command_fingerprint(&pool, &task_id).await;
+                    *after_cancel_fingerprint.lock().unwrap() = Some(fingerprint);
+                    if mode == "model" {
+                        Err(ModelError::Unavailable("offline after cancel".to_owned()))
+                    } else {
+                        Ok(ModelResponse {
+                            items: vec![json!({
+                                "type": "function_call",
+                                "call_id": "late-tool",
+                                "name": "docs/search",
+                                "arguments": {}
+                            })],
+                        })
+                    }
+                }
+            }
+        });
+
+        assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+        assert_eq!(fixture.current().await.lifecycle, TaskLifecycle::Cancelled);
+        let audited = sqlx::query(
+            "SELECT state, revision, result, failure FROM agent_commands WHERE id = $1",
+        )
+        .bind(command.id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(audited.get::<String, _>("state"), "cancelled");
+        assert_eq!(audited.get::<i64, _>("revision"), 3);
+        assert!(audited.get::<Option<Value>, _>("result").is_none());
+        assert_eq!(
+            audited.get::<Option<Value>, _>("failure").unwrap(),
+            json!({"code": expected_code})
+        );
+        assert_eq!(fixture.evidence().await.len(), 0);
+        assert_eq!(
+            non_command_fingerprint(&fixture.pool, &fixture.task_id).await,
+            after_cancel_fingerprint.lock().unwrap().clone().unwrap()
+        );
+    }
 }
 
 #[tokio::test]

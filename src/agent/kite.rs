@@ -1185,23 +1185,42 @@ fn completion_result_schema(
     completion: &CompletionContract,
     definition: &CompiledDefinition,
 ) -> Result<ClosedSchema, AgentRuntimeError> {
-    let mut fields = completion
-        .required_nullable_fields
+    let outcome_fields = completion
+        .outcomes
         .iter()
-        .map(|(name, value)| Ok((name.clone(), type_schema(value, definition)?)))
+        .map(|(outcome, fields)| {
+            Ok((
+                outcome.clone(),
+                ClosedSchema::object(
+                    format!("{outcome}_fields"),
+                    fields
+                        .iter()
+                        .map(|(name, value)| Ok((name.clone(), type_schema(value, definition)?)))
+                        .collect::<Result<_, AgentRuntimeError>>()?,
+                ),
+            ))
+        })
         .collect::<Result<BTreeMap<_, _>, AgentRuntimeError>>()?;
-    fields.insert(
-        "outcome".into(),
-        ClosedSchema::enumeration(
-            completion
-                .outcomes
-                .keys()
-                .cloned()
-                .map(PrimitiveValue::String)
-                .collect(),
-        ),
-    );
-    Ok(ClosedSchema::object("complete_task_result", fields))
+    Ok(ClosedSchema::object(
+        "complete_task_result",
+        BTreeMap::from([
+            (
+                "fields".into(),
+                ClosedSchema::object("completion_outcome_fields", outcome_fields),
+            ),
+            (
+                "outcome".into(),
+                ClosedSchema::enumeration(
+                    completion
+                        .outcomes
+                        .keys()
+                        .cloned()
+                        .map(PrimitiveValue::String)
+                        .collect(),
+                ),
+            ),
+        ]),
+    ))
 }
 
 fn validate_completion_contract(task: &CompiledTask) -> Result<(), AgentRuntimeError> {

@@ -9,8 +9,8 @@ use crate::{
     AgentCommandState, AgentKernel, ClaimAgentCommand, ClosedSchema, CompleteAgentCommand,
     EvidenceId, FailAgentCommand, GoalPhase, HarnessStructuralLimits, HarnessTool, IdempotencyKey,
     InvokeHarness, KernelCommandPayload, ModelClient, ModelRequest, OperationalStatus,
-    PrimitiveValue, RuntimeEvent, RuntimeHistoryItem, RuntimeHistoryKind, SessionId, StoreError,
-    TaskLifecycle,
+    PrimitiveValue, PrincipalId, RuntimeEvent, RuntimeHistoryItem, RuntimeHistoryKind, SessionId,
+    StoreError, TaskLifecycle,
 };
 
 const BUILTIN_CLAIMANT: &str = "builtin-direct-v1";
@@ -167,6 +167,29 @@ fn validate_schema_completion(
     outcome: &str,
     fields: &Value,
 ) -> Result<(), HarnessExecutionError> {
+    let (outcome_schema, outcome_fields) = completion_contract(result_schema)?;
+    outcome_schema
+        .validate(&Value::String(outcome.to_owned()))
+        .map_err(|error| HarnessExecutionError::InvalidResult(error.to_string()))?;
+    let fields_schema = outcome_fields.get(outcome).ok_or_else(|| {
+        HarnessExecutionError::InvalidResult("completion outcome schema is absent".to_owned())
+    })?;
+    fields_schema.validate(fields).map_err(|error| {
+        HarnessExecutionError::InvalidResult(format!(
+            "completion fields do not match selected outcome: {error}"
+        ))
+    })
+}
+
+fn completion_contract(
+    result_schema: &ClosedSchema,
+) -> Result<
+    (
+        &ClosedSchema,
+        &std::collections::BTreeMap<String, ClosedSchema>,
+    ),
+    HarnessExecutionError,
+> {
     let ClosedSchema::Object { properties, .. } = result_schema else {
         return Err(HarnessExecutionError::InvalidResult(
             "completion result schema must be an object".to_owned(),
@@ -175,38 +198,19 @@ fn validate_schema_completion(
     let outcome_schema = properties.get("outcome").ok_or_else(|| {
         HarnessExecutionError::InvalidResult("completion outcome schema is absent".to_owned())
     })?;
-    outcome_schema
-        .validate(&Value::String(outcome.to_owned()))
-        .map_err(|error| HarnessExecutionError::InvalidResult(error.to_string()))?;
-    let actual = fields.as_object().ok_or_else(|| {
-        HarnessExecutionError::InvalidResult("completion fields must be an object".to_owned())
+    let outcome_fields = properties.get("fields").ok_or_else(|| {
+        HarnessExecutionError::InvalidResult("completion fields schema is absent".to_owned())
     })?;
-    if actual.keys().any(|field| !properties.contains_key(field)) {
+    let ClosedSchema::Object {
+        properties: outcome_fields,
+        ..
+    } = outcome_fields
+    else {
         return Err(HarnessExecutionError::InvalidResult(
-            "completion fields contain an undeclared field".to_owned(),
+            "completion fields schema must map outcomes".to_owned(),
         ));
-    }
-    if matches!(outcome_schema, ClosedSchema::Enum(values) if values.len() == 1)
-        && actual.len() != properties.len().saturating_sub(1)
-    {
-        return Err(HarnessExecutionError::InvalidResult(
-            "completion fields do not match the selected outcome".to_owned(),
-        ));
-    }
-    let mut normalized = Map::from_iter([("outcome".to_owned(), Value::String(outcome.into()))]);
-    for (name, schema) in properties {
-        if name == "outcome" {
-            continue;
-        }
-        let value = actual.get(name).cloned().unwrap_or(Value::Null);
-        schema
-            .validate(&value)
-            .map_err(|error| HarnessExecutionError::InvalidResult(error.to_string()))?;
-        normalized.insert(name.clone(), value);
-    }
-    result_schema
-        .validate(&Value::Object(normalized))
-        .map_err(|error| HarnessExecutionError::InvalidResult(error.to_string()))
+    };
+    Ok((outcome_schema, outcome_fields))
 }
 
 pub struct AgentCommandDispatcher {
@@ -229,6 +233,9 @@ impl AgentKernel {
 
 impl AgentCommandDispatcher {
     pub async fn tick_agent_commands(&self, limit: i64) -> Result<usize, StoreError> {
+        if limit <= 0 {
+            return Ok(0);
+        }
         let listed = self
             .kernel
             .store()
@@ -328,11 +335,12 @@ impl AgentCommandDispatcher {
                                 history: result.history,
                             },
                         };
-                        ignore_late_terminal(
-                            self.kernel
-                                .complete_command(&execution.task.principal, completion)
-                                .await,
-                        )?;
+                        complete_or_audit_late(
+                            &self.kernel,
+                            &execution.task.principal,
+                            &completion,
+                        )
+                        .await?;
                     }
                     Err(HarnessExecutionError::Unavailable(_)) => {
                         let failure = failure_request(
@@ -341,12 +349,12 @@ impl AgentCommandDispatcher {
                             "builtin-unavailable",
                             "runtime_command_unavailable",
                         )?;
-                        ignore_late_terminal(
-                            self.kernel
-                                .store()
-                                .fail_unavailable_agent_command(&execution.task.principal, &failure)
-                                .await,
-                        )?;
+                        unavailable_or_audit_late(
+                            &self.kernel,
+                            &execution.task.principal,
+                            &failure,
+                        )
+                        .await?;
                     }
                     Err(
                         HarnessExecutionError::InvalidResult(_) | HarnessExecutionError::Failed(_),
@@ -357,11 +365,8 @@ impl AgentCommandDispatcher {
                             "builtin-failure",
                             "harness_failed",
                         )?;
-                        ignore_late_terminal(
-                            self.kernel
-                                .fail_command(&execution.task.principal, failure)
-                                .await,
-                        )?;
+                        failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                            .await?;
                     }
                 }
             }
@@ -372,12 +377,8 @@ impl AgentCommandDispatcher {
                     "builtin-unavailable",
                     "runtime_command_unavailable",
                 )?;
-                ignore_late_terminal(
-                    self.kernel
-                        .store()
-                        .fail_unavailable_agent_command(&execution.task.principal, &failure)
-                        .await,
-                )?;
+                unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                    .await?;
             }
             DispatchRoute::InternalAuthority => {
                 return Err(StoreError::AgentTransitionInvalid(
@@ -434,12 +435,63 @@ fn idempotency_key(value: String) -> Result<IdempotencyKey, StoreError> {
     IdempotencyKey::new(value).map_err(|error| StoreError::InvalidData(error.to_string()))
 }
 
-fn ignore_late_terminal(
-    result: Result<crate::AgentExecutionView, StoreError>,
+fn is_late_terminal(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::AgentTaskAlreadyTerminal | StoreError::GoalAlreadyTerminal
+    )
+}
+
+async fn complete_or_audit_late(
+    kernel: &AgentKernel,
+    principal: &PrincipalId,
+    completion: &CompleteAgentCommand,
 ) -> Result<(), StoreError> {
-    match result {
-        Ok(_) | Err(StoreError::AgentTaskAlreadyTerminal | StoreError::GoalAlreadyTerminal) => {
-            Ok(())
+    match kernel.complete_command(principal, completion.clone()).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_late_terminal(&error) => {
+            kernel
+                .store()
+                .audit_late_agent_command_completion(principal, completion)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn unavailable_or_audit_late(
+    kernel: &AgentKernel,
+    principal: &PrincipalId,
+    failure: &FailAgentCommand,
+) -> Result<(), StoreError> {
+    match kernel
+        .store()
+        .fail_unavailable_agent_command(principal, failure)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if is_late_terminal(&error) => {
+            kernel
+                .store()
+                .audit_late_agent_command_failure(principal, failure)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn failure_or_audit_late(
+    kernel: &AgentKernel,
+    principal: &PrincipalId,
+    failure: &FailAgentCommand,
+) -> Result<(), StoreError> {
+    match kernel.fail_command(principal, failure.clone()).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_late_terminal(&error) => {
+            kernel
+                .store()
+                .audit_late_agent_command_failure(principal, failure)
+                .await
         }
         Err(error) => Err(error),
     }
@@ -450,25 +502,24 @@ pub(crate) fn completion_tool(task: &CompiledTask) -> Value {
 }
 
 pub(crate) fn completion_tool_from_schema(result_schema: &ClosedSchema) -> Value {
-    let (outcome, fields) = match result_schema {
-        ClosedSchema::Object { properties, .. } => {
-            let outcome = properties
-                .get("outcome")
-                .map(model_schema_json)
-                .unwrap_or_else(|| json!({"type": "string", "enum": []}));
-            let field_properties = properties
-                .iter()
-                .filter(|(name, _)| name.as_str() != "outcome")
+    let (outcome, fields) = match completion_contract(result_schema) {
+        Ok((outcome, outcomes)) => {
+            let field_properties = outcomes
+                .values()
+                .filter_map(|schema| match schema {
+                    ClosedSchema::Object { properties, .. } => Some(properties),
+                    _ => None,
+                })
+                .flat_map(|properties| properties.iter())
                 .map(|(name, schema)| (name.clone(), model_schema_json(schema)))
                 .collect::<Map<_, _>>();
-            let required = match properties.get("outcome") {
-                Some(ClosedSchema::Enum(values)) if values.len() == 1 => {
-                    field_properties.keys().cloned().collect::<Vec<_>>()
-                }
-                _ => Vec::new(),
+            let required = if outcomes.len() == 1 {
+                field_properties.keys().cloned().collect::<Vec<_>>()
+            } else {
+                Vec::new()
             };
             (
-                outcome,
+                model_schema_json(outcome),
                 json!({
                     "type": "object",
                     "additionalProperties": false,
@@ -477,7 +528,7 @@ pub(crate) fn completion_tool_from_schema(result_schema: &ClosedSchema) -> Value
                 }),
             )
         }
-        _ => (
+        Err(_) => (
             json!({"type": "string", "enum": []}),
             json!({
                 "type": "object",

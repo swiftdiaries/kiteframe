@@ -358,11 +358,65 @@ fn start_is_deterministic_and_emits_one_complete_harness_payload() {
     );
     assert!(invocation.result_schema.validate_definition().is_ok());
     assert_eq!(
-        invocation.result_schema.normalized_json()["properties"]["answer"],
-        json!({"type":"nullable", "inner":{"type":"string"}})
+        invocation.result_schema.normalized_json()["properties"]["fields"]["properties"]["ok"]["properties"]
+            ["answer"],
+        json!({"type":"string"})
     );
     assert_eq!(invocation.tools.len(), 0);
     assert!(invocation.projected_history.is_empty());
+}
+
+#[test]
+fn harness_result_schema_preserves_each_outcomes_exact_field_contract() {
+    let fixture = RuntimeFixture::simple(
+        r#"on ok(answer: string) { done answer }
+        on unavailable(reason: string) { done reason }"#,
+    );
+    let start = fixture.runtime.start(fixture.start_input()).unwrap();
+    let KernelCommandPayload::InvokeHarness(invocation) = &start.commands[0].payload else {
+        panic!("one harness invocation")
+    };
+
+    assert_eq!(
+        invocation.result_schema.normalized_json(),
+        json!({
+            "type": "object",
+            "name": "complete_task_result",
+            "additionalProperties": false,
+            "required": ["fields", "outcome"],
+            "properties": {
+                "fields": {
+                    "type": "object",
+                    "name": "completion_outcome_fields",
+                    "additionalProperties": false,
+                    "required": ["ok", "unavailable"],
+                    "properties": {
+                        "ok": {
+                            "type": "object",
+                            "name": "ok_fields",
+                            "additionalProperties": false,
+                            "required": ["answer"],
+                            "properties": {"answer": {"type": "string"}}
+                        },
+                        "unavailable": {
+                            "type": "object",
+                            "name": "unavailable_fields",
+                            "additionalProperties": false,
+                            "required": ["reason"],
+                            "properties": {"reason": {"type": "string"}}
+                        }
+                    }
+                },
+                "outcome": {
+                    "type": "enum",
+                    "values": [
+                        {"string": "ok"},
+                        {"string": "unavailable"}
+                    ]
+                }
+            }
+        })
+    );
 }
 
 #[test]

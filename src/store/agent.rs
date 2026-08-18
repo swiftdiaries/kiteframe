@@ -8,11 +8,11 @@ use crate::{
     AgentCommandId, AgentExecutionView, AgentStartCommit, BlockGoal, CancelUserTask,
     CatalogEpochId, CatalogTool, ClaimAgentCommand, CompleteAgentCommand, CompleteGoal, EvidenceId,
     EvidenceRecord, EvidenceSourceIdentity, FailAgentCommand, GoalBlocker, GoalContract, GoalPhase,
-    KernelCommand, KernelCommandPayload, KiteAgentRuntime, KiteFrameState, KiteRuntimeState,
-    OperationalStatus, PauseUserTask, PolicyRevision, PrincipalId, ResumeUserTask, RuntimeCeilings,
-    RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeStateSnapshot, RuntimeTransition,
-    SessionId, StartAgent, TaskLifecycle, UserTaskId, canonical_sha256, goal_edge_allowed,
-    validate_transition,
+    IdempotencyKey, KernelCommand, KernelCommandPayload, KiteAgentRuntime, KiteFrameState,
+    KiteRuntimeState, OperationalStatus, PauseUserTask, PolicyRevision, PrincipalId,
+    ResumeUserTask, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent,
+    RuntimeStateSnapshot, RuntimeTransition, SessionId, StartAgent, TaskLifecycle, UserTaskId,
+    canonical_sha256, goal_edge_allowed, validate_transition,
 };
 
 use super::{
@@ -57,6 +57,18 @@ struct AuthorizedEvidence {
     evidence_type: String,
     source_authorized: bool,
     digest_current: bool,
+}
+
+struct LateAgentCommandAudit<'a> {
+    session_id: &'a SessionId,
+    task_id: &'a UserTaskId,
+    command_id: &'a AgentCommandId,
+    expected_command_revision: u64,
+    idempotency_key: &'a IdempotencyKey,
+    request_digest: String,
+    result: Option<Value>,
+    failure: Option<Value>,
+    command_key: Option<&'a RuntimeCommandKey>,
 }
 
 impl AgentActionReplay {
@@ -574,6 +586,155 @@ impl PostgresStore {
         self.get_agent_execution(completion.session_id.clone(), completion.task_id.clone())
             .await
             .map(Some)
+    }
+
+    pub async fn audit_late_agent_command_completion(
+        &self,
+        principal: &PrincipalId,
+        completion: &CompleteAgentCommand,
+    ) -> Result<(), StoreError> {
+        let result = serde_json::to_value(&completion.event).map_err(invalid_data)?;
+        crate::canonical_json(&result)
+            .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        self.audit_late_agent_command(
+            principal,
+            LateAgentCommandAudit {
+                session_id: &completion.session_id,
+                task_id: &completion.task_id,
+                command_id: &completion.command_id,
+                expected_command_revision: completion.expected_command_revision,
+                idempotency_key: &completion.idempotency_key,
+                request_digest: completion_request_digest(completion)?,
+                result: Some(result),
+                failure: None,
+                command_key: completion.event.command_key(),
+            },
+        )
+        .await
+    }
+
+    pub async fn audit_late_agent_command_failure(
+        &self,
+        principal: &PrincipalId,
+        request: &FailAgentCommand,
+    ) -> Result<(), StoreError> {
+        if request.code.is_empty() || request.code.len() > 128 {
+            return Err(StoreError::AgentTransitionInvalid(
+                "command failure code is invalid".to_owned(),
+            ));
+        }
+        self.audit_late_agent_command(
+            principal,
+            LateAgentCommandAudit {
+                session_id: &request.session_id,
+                task_id: &request.task_id,
+                command_id: &request.command_id,
+                expected_command_revision: request.expected_command_revision,
+                idempotency_key: &request.idempotency_key,
+                request_digest: unavailable_request_digest(request)?,
+                result: None,
+                failure: Some(json!({"code": request.code})),
+                command_key: None,
+            },
+        )
+        .await
+    }
+
+    async fn audit_late_agent_command(
+        &self,
+        principal: &PrincipalId,
+        audit: LateAgentCommandAudit<'_>,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool().begin().await?;
+        let aggregate = lock_agent_aggregate(&mut tx, audit.session_id, audit.task_id).await?;
+        if aggregate.task_principal != principal.as_str() {
+            return Err(StoreError::PrincipalMismatch);
+        }
+        let row = sqlx::query(
+            "SELECT id, task_id, runtime_key, ordinal, schema_version, command_kind, payload, \
+                    payload_digest, state, revision, claimant, claim_idempotency_key, \
+                    claim_request_digest, completion_idempotency_key, completion_request_digest, \
+                    result, failure FROM agent_commands \
+             WHERE task_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(audit.task_id.as_uuid())
+        .bind(audit.command_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::RevisionConflict)?;
+        let command = locked_agent_command_from_row(&row)?;
+        let stored_key = row.get::<Option<String>, _>("completion_idempotency_key");
+        let stored_digest = row.get::<Option<String>, _>("completion_request_digest");
+        let stored_result = row.get::<Option<Value>, _>("result");
+        let stored_failure = row.get::<Option<Value>, _>("failure");
+        if let Some(stored_key) = stored_key.as_deref() {
+            if stored_key != audit.idempotency_key.as_str()
+                || stored_digest.as_deref() != Some(audit.request_digest.as_str())
+                || stored_result.as_ref() != audit.result.as_ref()
+                || stored_failure.as_ref() != audit.failure.as_ref()
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            tx.commit().await?;
+            return Ok(());
+        }
+        if stored_digest.is_some() || stored_result.is_some() || stored_failure.is_some() {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if matches!(
+            aggregate.task_lifecycle,
+            TaskLifecycle::Accepted | TaskLifecycle::Running
+        ) && aggregate.goal_phase != GoalPhase::Complete
+            && aggregate.operational_status != OperationalStatus::Finished
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "late command audit requires a terminal aggregate".to_owned(),
+            ));
+        }
+        if command.view.state != AgentCommandState::Cancelled
+            || command.view.revision
+                != audit
+                    .expected_command_revision
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        StoreError::InvalidData("command revision is malformed".to_owned())
+                    })?
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        if audit
+            .command_key
+            .is_some_and(|command_key| command_key != &command.view.key)
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "late result command key does not match persisted command".to_owned(),
+            ));
+        }
+        let updated = sqlx::query(
+            "UPDATE agent_commands SET completion_idempotency_key = $1, \
+                    completion_request_digest = $2, result = $3, failure = $4, \
+                    revision = revision + 1, updated_at = CURRENT_TIMESTAMP \
+             WHERE task_id = $5 AND id = $6 AND state = 'cancelled' AND revision = $7 \
+               AND completion_idempotency_key IS NULL \
+               AND completion_request_digest IS NULL AND result IS NULL AND failure IS NULL",
+        )
+        .bind(audit.idempotency_key.as_str())
+        .bind(&audit.request_digest)
+        .bind(&audit.result)
+        .bind(&audit.failure)
+        .bind(audit.task_id.as_uuid())
+        .bind(audit.command_id.as_uuid())
+        .bind(to_i64(
+            command.view.revision,
+            "command revision is malformed",
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::RevisionConflict);
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn commit_agent_command_transition(
