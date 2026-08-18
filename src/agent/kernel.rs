@@ -3,10 +3,12 @@ use std::sync::Arc;
 use crate::{
     AcceptedUserTask, AgentCommandState, AgentExecutionView, AgentRecoveryReport, AgentRuntime,
     CancelUserTask, CompleteAgentCommand, FailAgentCommand, GoalPhase, KernelCommand,
-    KernelCommandPayload, PauseUserTask, PolicyRevision, PostgresStore, PrincipalId,
-    ResumeUserTask, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart, StartAgent,
-    StoreError, validate_transition,
+    KernelCommandPayload, OperationalStatus, PauseUserTask, PolicyRevision, PostgresStore,
+    PrincipalId, ResumeUserTask, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart,
+    StartAgent, StoreError, TaskLifecycle, validate_transition,
 };
+
+use super::principal_resumed_event_id;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentLifecycleAction {
@@ -202,6 +204,14 @@ impl AgentKernel {
                 request.command_id.clone(),
             )
             .await?;
+        if context.execution.goal_phase == GoalPhase::Complete {
+            return Err(StoreError::GoalAlreadyTerminal);
+        }
+        if context.execution.lifecycle != TaskLifecycle::Running
+            || context.execution.operational_status == OperationalStatus::Finished
+        {
+            return Err(StoreError::AgentTaskAlreadyTerminal);
+        }
         if context.command.state != AgentCommandState::Claimed {
             return Err(StoreError::RevisionConflict);
         }
@@ -297,6 +307,9 @@ impl AgentKernel {
         principal: &PrincipalId,
         request: ResumeUserTask,
     ) -> Result<AgentExecutionView, StoreError> {
+        self.store
+            .authenticate_agent_task_owner(principal, &request.session_id, &request.task_id)
+            .await?;
         let execution = self
             .store
             .get_agent_execution(request.session_id.clone(), request.task_id.clone())
@@ -307,11 +320,7 @@ impl AgentKernel {
                 .load_agent_start_seed(request.session_id.clone(), request.task_id.clone())
                 .await?;
             let event = RuntimeEvent::PrincipalResumed {
-                event_id: format!(
-                    "principal-resumed:{}:{}",
-                    request.task_id.as_uuid(),
-                    request.idempotency_key.as_str(),
-                ),
+                event_id: principal_resumed_event_id(&request.task_id, &request.idempotency_key),
             };
             let transition = self
                 .runtime

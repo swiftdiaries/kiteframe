@@ -7,13 +7,13 @@ use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     AgentKernel, AgentRuntime, AgentRuntimeError, AgentSelector, CancelUserTask, CatalogTool,
     ClaimAgentCommand, ClosedSchema, CompleteAgentCommand, CreateSession, EffectKind, EvidenceId,
-    FrameCommand, FrameId, GoalContract, IdempotencyKey, KernelCommand, KernelCommandPayload,
-    KiteAgentRuntime, NewChild, NewPermissionRequest, PauseUserTask, PermissionRequestId,
-    PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId, RecoverySupport, RequestContext,
-    ResumeUserTask, RunId, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent,
-    RuntimeStart, RuntimeStateSnapshot, RuntimeTransition, SessionId, StartAgent, StartRun,
-    StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
-    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+    FrameCommand, FrameId, GoalContract, GoalPhase, IdempotencyKey, KernelCommand,
+    KernelCommandPayload, KiteAgentRuntime, NewChild, NewPermissionRequest, OperationalStatus,
+    PauseUserTask, PermissionRequestId, PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId,
+    RecoverySupport, RequestContext, ResumeUserTask, RunId, RuntimeCeilings, RuntimeCommandKey,
+    RuntimeDisposition, RuntimeEvent, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition,
+    SessionId, StartAgent, StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle,
+    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -867,6 +867,109 @@ async fn concurrent_agent_starts_do_not_invert_the_session_task_goal_prefix() {
     let first_result = first_result.expect("first task").expect("first start");
     let second_result = second_result.expect("second task").expect("second start");
     assert_eq!(first_result.task.id, second_result.task.id);
+}
+
+#[tokio::test]
+async fn pause_winning_the_aggregate_lock_prevents_a_stale_pending_claim() {
+    let application_name = format!("kf-pause-claim-lock-{}", Uuid::now_v7());
+    let child = child_run(&application_name).await;
+    let task_id = accepted_fork_agent_task(&child).await;
+    let kernel = kite_agent_kernel(&child);
+    let started = kernel
+        .start_agent(
+            &child.principal,
+            start_agent_request(&child, task_id.clone(), "start-pause-claim"),
+        )
+        .await
+        .expect("start agent");
+    let pending = child
+        .store
+        .dispatchable_agent_commands(256)
+        .await
+        .expect("list pending command")
+        .into_iter()
+        .find(|command| command.task_id == task_id)
+        .expect("pending command");
+
+    let mut snapshot_gate = child.store.pool().begin().await.expect("snapshot gate");
+    sqlx::query("SELECT task_id FROM agent_runtime_snapshots WHERE task_id = $1 FOR UPDATE")
+        .bind(task_id.as_uuid())
+        .execute(&mut *snapshot_gate)
+        .await
+        .expect("lock runtime snapshot");
+
+    let pause_kernel = Arc::clone(&kernel);
+    let pause_principal = child.principal.clone();
+    let pause_session = child.session_id.clone();
+    let pause_task = task_id.clone();
+    let mut pause = tokio::spawn(async move {
+        pause_kernel
+            .pause_task(
+                &pause_principal,
+                PauseUserTask {
+                    session_id: pause_session,
+                    task_id: pause_task,
+                    expected_task_revision: started.task_revision,
+                    expected_goal_revision: started.goal_revision,
+                    reason: "Pause before dispatch.".to_owned(),
+                    idempotency_key: IdempotencyKey::new("pause-before-claim").expect("pause key"),
+                },
+            )
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+    let claim_store = Arc::clone(&child.store);
+    let claim_session = child.session_id.clone();
+    let claim_task = task_id.clone();
+    let mut claim = tokio::spawn(async move {
+        claim_store
+            .claim_agent_command(ClaimAgentCommand {
+                session_id: claim_session,
+                task_id: claim_task,
+                command_id: pending.id,
+                expected_command_revision: pending.revision,
+                claimant: "builtin-direct-v1".to_owned(),
+                idempotency_key: IdempotencyKey::new("claim-after-pause-list").expect("claim key"),
+            })
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 2).await;
+    snapshot_gate.commit().await.expect("release snapshot gate");
+
+    let (pause_result, claim_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut pause, &mut claim)
+    })
+    .await
+    .expect("pause and claim must terminate without deadlock");
+    let pause_result = pause_result.expect("pause task");
+    let claim_result = claim_result.expect("claim task");
+    assert_eq!(
+        usize::from(pause_result.is_ok()) + usize::from(claim_result.is_ok()),
+        1,
+        "exactly one aggregate mutation may commit",
+    );
+    let paused = pause_result.expect("pause wins the gated aggregate lock");
+    assert!(matches!(claim_result, Err(StoreError::RevisionConflict)));
+    assert_eq!(paused.goal_phase, GoalPhase::Paused);
+    assert_eq!(paused.operational_status, OperationalStatus::Paused);
+    let (state, revision): (String, i64) =
+        sqlx::query_as("SELECT state, revision FROM agent_commands WHERE task_id = $1")
+            .bind(task_id.as_uuid())
+            .fetch_one(child.store.pool())
+            .await
+            .expect("command state");
+    assert_eq!(state, "pending");
+    assert_eq!(revision, 0);
+    assert!(
+        child
+            .store
+            .dispatchable_agent_commands(256)
+            .await
+            .expect("dispatch after pause")
+            .into_iter()
+            .all(|command| command.task_id != task_id),
+    );
 }
 
 #[tokio::test]

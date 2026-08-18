@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+use crate::agent::principal_resumed_event_id;
 use crate::dsl::{CompiledDefinition, CompiledToolBinding, DefinitionKind};
 use crate::{
     AgentCommandId, AgentExecutionView, AgentStartCommit, BlockGoal, CancelUserTask,
@@ -87,6 +88,15 @@ impl PostgresStore {
     ) -> Result<AgentExecutionView, StoreError> {
         let row = self.agent_row(&session_id, &task_id).await?;
         agent_execution_from_row(&row, self.agent_runtime_ceilings())
+    }
+
+    pub(crate) async fn authenticate_agent_task_owner(
+        &self,
+        principal: &PrincipalId,
+        session_id: &SessionId,
+        task_id: &UserTaskId,
+    ) -> Result<(), StoreError> {
+        authenticate_agent_owner(self, principal, session_id, task_id).await
     }
 
     pub async fn load_agent_start_seed(
@@ -434,7 +444,8 @@ impl PostgresStore {
         }
         let request_digest = claim_request_digest(&request)?;
         let mut tx = self.pool().begin().await?;
-        lock_agent_aggregate(&mut tx, &request.session_id, &request.task_id).await?;
+        let aggregate =
+            lock_agent_aggregate(&mut tx, &request.session_id, &request.task_id).await?;
         let row =
             select_agent_command_for_update(&mut tx, &request.task_id, &request.command_id).await?;
         let command = locked_agent_command_from_row(&row)?;
@@ -444,6 +455,17 @@ impl PostgresStore {
             }
             tx.commit().await?;
             return Ok(command.view);
+        }
+        if aggregate.task_lifecycle != TaskLifecycle::Running
+            || aggregate.goal_phase != GoalPhase::Active
+            || matches!(
+                aggregate.operational_status,
+                OperationalStatus::Paused
+                    | OperationalStatus::Blocked
+                    | OperationalStatus::Finished
+            )
+        {
+            return Err(StoreError::RevisionConflict);
         }
         if command.view.state != AgentCommandState::Pending
             || command.view.revision != request.expected_command_revision
@@ -1196,7 +1218,10 @@ impl PostgresStore {
                         .as_ref()
                         .expect("transition digest exists"),
                 )
-                .bind(principal_resumed_event_id(&request))
+                .bind(principal_resumed_event_id(
+                    &request.task_id,
+                    &request.idempotency_key,
+                ))
                 .bind(to_i64(
                     aggregate.task_revision,
                     "user task revision is malformed",
@@ -2843,14 +2868,6 @@ async fn insert_agent_action(
     Ok(())
 }
 
-fn principal_resumed_event_id(request: &ResumeUserTask) -> String {
-    format!(
-        "principal-resumed:{}:{}",
-        request.task_id.as_uuid(),
-        request.idempotency_key.as_str(),
-    )
-}
-
 fn outstanding_operational_status(
     commands: &[LockedAgentCommand],
 ) -> Result<OperationalStatus, StoreError> {
@@ -2902,7 +2919,11 @@ fn validate_blocked_resume_transition(
     if transition.expected_goal_revision != aggregate.goal_revision {
         return Err(StoreError::GoalRevisionConflict);
     }
-    if transition.idempotency_key != format!("event:{}", principal_resumed_event_id(request))
+    if transition.idempotency_key
+        != format!(
+            "event:{}",
+            principal_resumed_event_id(&request.task_id, &request.idempotency_key)
+        )
         || transition.snapshot.disposition != RuntimeDisposition::Running
         || transition.commands.is_empty()
         || transition.commands.len() > ceilings.max_commands_per_transition

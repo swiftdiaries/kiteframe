@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::dsl::ModelRole;
 use crate::{
@@ -53,6 +54,14 @@ pub struct FailAgentCommand {
     pub expected_command_revision: u64,
     pub idempotency_key: IdempotencyKey,
     pub code: String,
+}
+
+pub(crate) fn principal_resumed_event_id(
+    task_id: &UserTaskId,
+    idempotency_key: &IdempotencyKey,
+) -> String {
+    let digest = Sha256::digest(idempotency_key.as_str().as_bytes());
+    format!("principal-resumed:{}:{digest:x}", task_id.as_uuid())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

@@ -1,15 +1,19 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     AgentCommandView, AgentExecutionView, AgentKernel, AgentLifecycleAction,
-    AgentLifecycleAuthorizer, AgentPolicyDecision, AgentRuntime, AgentSelector, CancelUserTask,
-    ClaimAgentCommand, CompleteAgentCommand, CreateSession, CriterionAssertion, EvidenceId,
-    GoalContract, GoalPhase, IdempotencyKey, KernelCommandPayload, KiteAgentRuntime,
-    OperationalStatus, PauseUserTask, PolicyRevision, PostgresStore, PrincipalId, ResumeUserTask,
-    RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeTransition, SessionView, StartAgent,
-    StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
-    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId, goal_edge_allowed,
+    AgentLifecycleAuthorizer, AgentPolicyDecision, AgentRuntime, AgentRuntimeError, AgentSelector,
+    CancelUserTask, ClaimAgentCommand, CompleteAgentCommand, CreateSession, CriterionAssertion,
+    EvidenceId, FailAgentCommand, GoalContract, GoalPhase, IdempotencyKey, KernelCommandPayload,
+    KiteAgentRuntime, OperationalStatus, PauseUserTask, PolicyRevision, PostgresStore, PrincipalId,
+    ResumeUserTask, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart, RuntimeTransition,
+    SessionView, StartAgent, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle,
+    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+    goal_edge_allowed,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -29,6 +33,42 @@ struct PreparedGoalCompletion {
     completion: CompleteAgentCommand,
     transition: RuntimeTransition,
     policy: AgentPolicyDecision,
+}
+
+struct RecordingRuntime {
+    inner: KiteAgentRuntime,
+    handle_calls: AtomicUsize,
+}
+
+impl RecordingRuntime {
+    fn new() -> Self {
+        Self {
+            inner: KiteAgentRuntime::new(RuntimeCeilings::default()),
+            handle_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn handle_calls(&self) -> usize {
+        self.handle_calls.load(Ordering::SeqCst)
+    }
+}
+
+impl AgentRuntime for RecordingRuntime {
+    fn validate_agent(
+        &self,
+        definition: &kiteframe::dsl::CompiledDefinition,
+    ) -> Result<(), AgentRuntimeError> {
+        self.inner.validate_agent(definition)
+    }
+
+    fn start(&self, input: RuntimeStart<'_>) -> Result<RuntimeTransition, AgentRuntimeError> {
+        self.inner.start(input)
+    }
+
+    fn handle(&self, input: RuntimeHandle<'_>) -> Result<RuntimeTransition, AgentRuntimeError> {
+        self.handle_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.handle(input)
+    }
 }
 
 impl GoalFixture {
@@ -1675,6 +1715,255 @@ async fn blocked_resume_retains_history_and_proposes_fresh_work() {
             .count(),
         1,
     );
+}
+
+#[tokio::test]
+async fn blocked_resume_authenticates_before_invoking_the_runtime() {
+    let Some(fixture) = GoalFixture::blocked_conditions().await else {
+        return;
+    };
+    let command = fixture.claim_next().await;
+    let blocked = fixture
+        .complete(
+            &command,
+            "no_path",
+            json!({}),
+            EvidenceId::new(Uuid::now_v7()),
+        )
+        .await
+        .unwrap();
+    let runtime = Arc::new(RecordingRuntime::new());
+    let kernel = AgentKernel::new(
+        Arc::clone(&fixture.store),
+        runtime.clone(),
+        Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&fixture.store))),
+    );
+    let request = ResumeUserTask {
+        session_id: fixture.session.id.clone(),
+        task_id: fixture.task_id.clone(),
+        expected_task_revision: blocked.task_revision,
+        expected_goal_revision: blocked.goal_revision,
+        idempotency_key: IdempotencyKey::new(format!("resume-{}", Uuid::now_v7())).unwrap(),
+    };
+    let before_foreign = fixture.database_fingerprint().await;
+    let foreign = PrincipalId::new(format!("foreign-{}", Uuid::now_v7())).unwrap();
+    assert!(matches!(
+        kernel.resume_task(&foreign, request.clone()).await,
+        Err(StoreError::PrincipalMismatch),
+    ));
+    assert_eq!(runtime.handle_calls(), 0);
+    assert_eq!(fixture.database_fingerprint().await, before_foreign);
+
+    fixture
+        .store
+        .close_session_and_cancel_work(fixture.session.id.clone(), &fixture.principal)
+        .await
+        .unwrap();
+    let before_closed = fixture.database_fingerprint().await;
+    assert!(matches!(
+        kernel.resume_task(&fixture.principal, request).await,
+        Err(StoreError::SessionClosed),
+    ));
+    assert_eq!(runtime.handle_calls(), 0);
+    assert_eq!(fixture.database_fingerprint().await, before_closed);
+}
+
+#[tokio::test]
+async fn public_kernel_reports_terminal_authority_before_claim_revision_conflicts() {
+    let Some(completed_fixture) = GoalFixture::complete_or_block().await else {
+        return;
+    };
+    let source = completed_fixture.claim_next().await;
+    let prepared = completed_fixture
+        .prepare_claimed_authority(&source, "finished")
+        .await;
+    let completed = completed_fixture
+        .kernel
+        .complete_command(&completed_fixture.principal, prepared.completion.clone())
+        .await
+        .unwrap();
+    assert_eq!(completed.goal_phase, GoalPhase::Complete);
+    assert_eq!(
+        completed_fixture
+            .kernel
+            .complete_command(&completed_fixture.principal, prepared.completion.clone(),)
+            .await
+            .unwrap(),
+        completed,
+    );
+    let completed_fingerprint = completed_fixture.database_fingerprint().await;
+
+    let mut new_complete = prepared.completion.clone();
+    new_complete.idempotency_key =
+        IdempotencyKey::new(format!("complete-{}", Uuid::now_v7())).unwrap();
+    assert!(matches!(
+        completed_fixture
+            .kernel
+            .complete_command(&completed_fixture.principal, new_complete)
+            .await,
+        Err(StoreError::GoalAlreadyTerminal),
+    ));
+
+    let mut new_block = prepared.completion;
+    new_block.idempotency_key = IdempotencyKey::new(format!("block-{}", Uuid::now_v7())).unwrap();
+    let RuntimeEvent::HarnessResult {
+        event_id,
+        outcome,
+        evidence_id,
+        ..
+    } = &mut new_block.event
+    else {
+        unreachable!()
+    };
+    *event_id = format!("event-{}", Uuid::now_v7());
+    *outcome = "no_path".to_owned();
+    *evidence_id = EvidenceId::new(Uuid::now_v7());
+    assert!(matches!(
+        completed_fixture
+            .kernel
+            .complete_command(&completed_fixture.principal, new_block)
+            .await,
+        Err(StoreError::GoalAlreadyTerminal),
+    ));
+    assert_eq!(
+        completed_fixture.database_fingerprint().await,
+        completed_fingerprint,
+    );
+
+    let Some(failed_fixture) = GoalFixture::complete_or_block().await else {
+        return;
+    };
+    let source = failed_fixture.claim_next().await;
+    let failure = FailAgentCommand {
+        session_id: failed_fixture.session.id.clone(),
+        task_id: failed_fixture.task_id.clone(),
+        command_id: source.id,
+        expected_command_revision: source.revision,
+        idempotency_key: IdempotencyKey::new(format!("fail-{}", Uuid::now_v7())).unwrap(),
+        code: "harness_failed".to_owned(),
+    };
+    let failed = failed_fixture
+        .kernel
+        .fail_command(&failed_fixture.principal, failure.clone())
+        .await
+        .unwrap();
+    assert_eq!(failed.lifecycle, TaskLifecycle::Failed);
+    assert_eq!(
+        failed_fixture
+            .kernel
+            .fail_command(&failed_fixture.principal, failure.clone())
+            .await
+            .unwrap(),
+        failed,
+    );
+    let failed_fingerprint = failed_fixture.database_fingerprint().await;
+    let mut new_failure = failure;
+    new_failure.idempotency_key = IdempotencyKey::new(format!("fail-{}", Uuid::now_v7())).unwrap();
+    assert!(matches!(
+        failed_fixture
+            .kernel
+            .fail_command(&failed_fixture.principal, new_failure)
+            .await,
+        Err(StoreError::AgentTaskAlreadyTerminal),
+    ));
+    assert_eq!(
+        failed_fixture.database_fingerprint().await,
+        failed_fingerprint
+    );
+}
+
+#[tokio::test]
+async fn blocked_resume_hashes_unbounded_external_keys_into_stable_internal_event_ids() {
+    for (key, expected_digest) in [
+        (
+            "a".repeat(67),
+            "6116c09f89718e829f69b7afb1d9d60c6973935d96b33213e4d28689fe108ee7",
+        ),
+        (
+            "b".repeat(68),
+            "97fdd2ff4b4a2448a99045bdb1986d021275a13b91cc6cd09614f5a40fbeca42",
+        ),
+        (
+            "long".repeat(1_000),
+            "59f1d666fce5d94e6a3225cb92ad724a95e43d13b9621de98f443e730a346105",
+        ),
+        (
+            "界".repeat(100),
+            "57c42d71b2a0f0d14086964cf358b71a2f29b17ff54f0d4801a6d344c215544d",
+        ),
+    ] {
+        let Some(fixture) = GoalFixture::blocked_conditions().await else {
+            return;
+        };
+        let command = fixture.claim_next().await;
+        let blocked = fixture
+            .complete(
+                &command,
+                "no_path",
+                json!({}),
+                EvidenceId::new(Uuid::now_v7()),
+            )
+            .await
+            .unwrap();
+        let request = ResumeUserTask {
+            session_id: fixture.session.id.clone(),
+            task_id: fixture.task_id.clone(),
+            expected_task_revision: blocked.task_revision,
+            expected_goal_revision: blocked.goal_revision,
+            idempotency_key: IdempotencyKey::new(key.clone()).unwrap(),
+        };
+        let resumed = fixture
+            .kernel
+            .resume_task(&fixture.principal, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(resumed.goal_phase, GoalPhase::Active);
+        assert_eq!(
+            fixture
+                .kernel
+                .resume_task(&fixture.principal, request.clone())
+                .await
+                .unwrap(),
+            resumed,
+        );
+
+        let stored_external_key: String = sqlx::query_scalar(
+            "SELECT idempotency_key FROM agent_task_actions \
+             WHERE task_id = $1 AND action_kind = 'resume'",
+        )
+        .bind(fixture.task_id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_external_key, key);
+        let (source_event_id, transition_key): (String, String) = sqlx::query_as(
+            "SELECT source_event_id, idempotency_key FROM agent_transitions \
+             WHERE task_id = $1 AND source_event_id LIKE 'principal-resumed:%'",
+        )
+        .bind(fixture.task_id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        let expected_event_id = format!(
+            "principal-resumed:{}:{expected_digest}",
+            fixture.task_id.as_uuid(),
+        );
+        assert_eq!(source_event_id, expected_event_id);
+        assert_eq!(transition_key, format!("event:{expected_event_id}"));
+        assert!(transition_key.len() <= 128);
+
+        let before_conflict = fixture.database_fingerprint().await;
+        let mut conflicting = request;
+        conflicting.expected_task_revision += 1;
+        assert!(matches!(
+            fixture
+                .kernel
+                .resume_task(&fixture.principal, conflicting)
+                .await,
+            Err(StoreError::IdempotencyConflict),
+        ));
+        assert_eq!(fixture.database_fingerprint().await, before_conflict);
+    }
 }
 
 #[test]
