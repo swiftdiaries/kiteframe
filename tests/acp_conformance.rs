@@ -183,6 +183,7 @@ fn v1_standard_responses_use_sdk_dtos_and_permission_reaches_core() {
             .encode_result(ApplicationResult::Published(
                 kiteframe::PublishedDefinition {
                     id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+                    kind: kiteframe::dsl::DefinitionKind::Workflow,
                     name: "support".to_owned(),
                     version: 7,
                     definition_hash: "sha256:fixture".to_owned(),
@@ -973,6 +974,7 @@ mod v2 {
                 .encode_result(ApplicationResult::Published(
                     kiteframe::PublishedDefinition {
                         id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+                        kind: kiteframe::dsl::DefinitionKind::Workflow,
                         name: "support".to_owned(),
                         version: 7,
                         definition_hash: "sha256:fixture".to_owned(),

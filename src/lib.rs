@@ -51,10 +51,10 @@ pub use protocol::{
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
-    Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest,
-    PendingPermission, PolicyUpdate, PostgresStore, PublishedDefinition, Question,
-    RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame, SessionView,
-    StartRun, StoreError, StoreLimits, SuspensionFrame, ToolCallIntent,
+    AcceptedUserTask, Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild,
+    NewPermissionRequest, PendingPermission, PolicyUpdate, PostgresStore, PublishedDefinition,
+    Question, RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame,
+    SessionView, StartRun, StoreError, StoreLimits, SuspensionFrame, ToolCallIntent,
 };
 pub use task::{
     AgentSelector, HarnessRole, SubmitUserTask, TaskPreferences, TaskTarget, UserTaskError,

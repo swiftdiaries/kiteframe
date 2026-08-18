@@ -3,8 +3,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+use crate::dsl::DefinitionKind;
 use crate::{
-    CatalogEpochId, FrameId, IdempotencyKey, PolicyRevision, PrincipalId, RunId, SessionId,
+    CatalogEpochId, FrameId, GoalContract, IdempotencyKey, PolicyRevision, PrincipalId, RunId,
+    SessionId, TaskPreferences, TaskTarget, UserTaskId,
 };
 
 #[derive(Clone, Debug)]
@@ -54,9 +56,24 @@ pub struct PolicyUpdate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PublishedDefinition {
     pub id: uuid::Uuid,
+    pub kind: DefinitionKind,
     pub name: String,
     pub version: u32,
     pub definition_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedUserTask {
+    pub id: UserTaskId,
+    pub session_id: SessionId,
+    pub principal: PrincipalId,
+    pub definition: PublishedDefinition,
+    pub target: TaskTarget,
+    pub preferences: TaskPreferences,
+    pub goal: GoalContract,
+    pub goal_digest: String,
+    pub revision: u64,
+    pub created_at: time::OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -231,6 +248,14 @@ pub enum StoreError {
     CatalogScopeViolation,
     #[error("workflow definition was not found")]
     DefinitionNotFound,
+    #[error("user task was not found")]
+    UserTaskNotFound,
+    #[error("user task requires a published agent definition")]
+    AgentDefinitionRequired,
+    #[error("user task request is invalid: {0}")]
+    InvalidUserTask(String),
+    #[error("agent definitions cannot start through the workflow runner")]
+    AgentRuntimeUnavailable,
     #[error("frame was not found")]
     FrameNotFound,
     #[error("execution revision conflict")]
