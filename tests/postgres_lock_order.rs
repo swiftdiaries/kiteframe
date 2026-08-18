@@ -32,6 +32,27 @@ struct ChildRun {
     descriptor_digest: String,
 }
 
+#[test]
+fn frozen_runtime_reference_pins_global_postgres_lock_order() {
+    let reference = include_str!("../docs/reference/agent-runtime-and-goal-lifecycle.md");
+    let normalized = reference.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        normalized.contains(
+            "session -> user task -> goal state -> frozen definition -> runtime snapshot -> all command rows"
+        ),
+        "runtime reference must preserve the global agent lock order",
+    );
+    assert!(
+        normalized.contains("`AgentCommandId` UUID (`id`) order"),
+        "runtime reference must order command-row locks by their stable UUID ids",
+    );
+    assert!(
+        !normalized.contains("Command rows are acquired or inserted in `RuntimeCommandKey` order"),
+        "runtime command keys are not the PostgreSQL row-lock order",
+    );
+}
+
 async fn child_run(application_name: &str) -> ChildRun {
     let database_url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL is required for PostgreSQL lock-order tests");

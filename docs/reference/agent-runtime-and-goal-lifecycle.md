@@ -232,13 +232,15 @@ Every event exposes `event_id()`. All except `PrincipalResumed` expose a
 
 ## Transaction and lock order
 
-Lifecycle mutation is one kernel transaction. Implementations acquire the
-session row first, then the user-task row, then the goal-state row, then the
-runtime-state row. Command rows are acquired or inserted in
-`RuntimeCommandKey` order; evidence rows are acquired or inserted in
-`EvidenceId` order. Revisions and idempotency are checked while those locks are
-held. No runtime or harness callback occurs while database locks are held.
-Every later persistence slice must preserve this order to avoid deadlocks.
+Lifecycle mutation is one kernel transaction. When a mutation needs these
+rows, implementations preserve the global relative order: session -> user task
+-> goal state -> frozen definition -> runtime snapshot -> all command rows.
+Command rows are acquired or inserted in stable `AgentCommandId` UUID (`id`)
+order; `RuntimeCommandKey` is not a database row-lock key. Evidence rows are
+acquired or inserted in `EvidenceId` order. Revisions and idempotency are
+checked while those locks are held. No runtime or harness callback occurs while
+database locks are held. Every later persistence slice must preserve this order
+to avoid deadlocks.
 
 ## Evidence and explicit goal authority
 
