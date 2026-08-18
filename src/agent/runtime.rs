@@ -180,11 +180,6 @@ pub fn validate_transition(
     }
 
     match transition.snapshot.disposition {
-        RuntimeDisposition::Running if transition.commands.is_empty() => {
-            return Err(AgentRuntimeError::InvalidTransition(
-                "running snapshot requires a command".into(),
-            ));
-        }
         RuntimeDisposition::Returned if !transition.commands.is_empty() => {
             return Err(AgentRuntimeError::InvalidTransition(
                 "returned snapshot cannot emit commands".into(),

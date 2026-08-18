@@ -226,6 +226,14 @@ fn transition_validation_enforces_revisions_keys_ceilings_and_dispositions() {
     );
     assert_eq!(
         validate_transition(
+            &transition(RuntimeDisposition::Running, Vec::new()),
+            &execution,
+            &ceilings,
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        validate_transition(
             &transition(RuntimeDisposition::Returned, Vec::new()),
             &execution,
             &ceilings,
@@ -302,7 +310,6 @@ fn transition_validation_enforces_revisions_keys_ceilings_and_dispositions() {
     ));
 
     for invalid in [
-        transition(RuntimeDisposition::Running, Vec::new()),
         transition(RuntimeDisposition::Returned, vec![context()]),
         transition(RuntimeDisposition::Blocked, vec![context()]),
         transition(RuntimeDisposition::Terminating, vec![context()]),

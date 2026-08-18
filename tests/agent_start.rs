@@ -6,12 +6,12 @@ use kiteframe::{
     AcceptedUserTask, AgentExecutionView, AgentKernel, AgentLifecycleAction,
     AgentLifecycleAuthorizer, AgentPolicyDecision, AgentRuntime, AgentRuntimeError, AgentSelector,
     AgentStartCommit, CatalogTool, ClosedSchema, CreateSession, EffectKind, GoalContract,
-    GoalPhase, IdempotencyKey, KernelCommand, KernelCommandPayload, OperationalStatus,
-    PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId, PublishedDefinition, RecoverySupport,
-    RequestContext, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeStart,
-    RuntimeStateSnapshot, RuntimeTransition, SessionView, StartAgent, StoreError, StoreLimits,
-    SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences,
-    TaskTarget, ToolCatalogSnapshot,
+    GoalPhase, IdempotencyKey, KernelCommand, KernelCommandPayload, KiteAgentRuntime,
+    OperationalStatus, PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId,
+    PublishedDefinition, RecoverySupport, RequestContext, RuntimeCeilings, RuntimeCommandKey,
+    RuntimeDisposition, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition, SessionView,
+    StartAgent, StoreError, StoreLimits, SubmitUserTask, SuccessCriterion, TaskLifecycle,
+    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -790,6 +790,45 @@ async fn exact_receipt_replays_even_if_a_retried_runtime_output_differs() {
     assert_eq!(fixture.count("agent_commands").await, 1);
 }
 
+#[tokio::test]
+async fn built_in_runtime_atomically_starts_the_frozen_agent_payload() {
+    let Some(fixture) = StartFixture::accepted_version_one().await else {
+        return;
+    };
+    let runtime = Arc::new(KiteAgentRuntime::new(RuntimeCeilings::default()));
+    let authorizer = Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&fixture.store)));
+    let kernel = AgentKernel::new(Arc::clone(&fixture.store), runtime, authorizer);
+
+    let started = kernel
+        .start_agent(
+            &fixture.principal,
+            fixture.start_request("built-in-runtime-start"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(started.lifecycle, TaskLifecycle::Running);
+    assert_eq!(
+        started.operational_status,
+        OperationalStatus::WaitingForHarness
+    );
+    let (kind, payload): (String, serde_json::Value) =
+        sqlx::query_as("SELECT command_kind, payload FROM agent_commands WHERE task_id = $1")
+            .bind(fixture.accepted.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(kind, "invoke_harness");
+    assert_eq!(
+        payload["input"],
+        json!({"repository":"acme/widgets", "pull_request":142})
+    );
+    assert_eq!(payload["tools"][0]["qualifiedName"], "docs/search");
+    assert_eq!(fixture.count("agent_runtime_snapshots").await, 1);
+    assert_eq!(fixture.count("agent_transitions").await, 1);
+    assert_eq!(fixture.count("agent_commands").await, 1);
+}
+
 fn compiled_agent(
     catalog: &ToolCatalogSnapshot,
     existing_name: Option<&str>,
@@ -803,11 +842,11 @@ fn compiled_agent(
         "Inspect the pull request."
     };
     let source = format!(
-        r#"agent {name}(repository: string) -> string {{
-  entry inspect(repository = repository)
+        r#"agent {name}(repository: string, pull_request: integer) -> string {{
+  entry inspect(repository = repository, pull_request = pull_request)
   events ["github.pull_request.changed.v1"]
   limits {{ steps: 20 active_execution_seconds: 30 elapsed_seconds: 60 }}
-  task inspect(repository: string) -> string {{
+  task inspect(repository: string, pull_request: integer) -> string {{
     model reasoning
     prompt """{prompt}"""
     tools [search]

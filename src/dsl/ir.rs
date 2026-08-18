@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
+use serde::de::Error as _;
 use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{CatalogEpochId, CatalogTool};
 
@@ -87,6 +88,39 @@ impl Serialize for CompiledToolBinding {
         state.serialize_field("descriptor_digest", &self.descriptor_digest)?;
         state.serialize_field("descriptor", &self.descriptor.normalized_descriptor())?;
         state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CompiledToolBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StoredBinding {
+            qualified_name: String,
+            catalog_epoch_id: CatalogEpochId,
+            descriptor_digest: String,
+            descriptor: serde_json::Value,
+        }
+
+        let stored = StoredBinding::deserialize(deserializer)?;
+        let descriptor =
+            CatalogTool::from_normalized(&stored.descriptor).map_err(D::Error::custom)?;
+        if descriptor.qualified_name() != stored.qualified_name
+            || descriptor.descriptor_digest() != stored.descriptor_digest
+        {
+            return Err(D::Error::custom(
+                "compiled tool binding does not match its descriptor",
+            ));
+        }
+        Ok(Self {
+            qualified_name: stored.qualified_name,
+            catalog_epoch_id: stored.catalog_epoch_id,
+            descriptor_digest: stored.descriptor_digest,
+            descriptor,
+        })
     }
 }
 
@@ -183,7 +217,7 @@ pub struct CompiledTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_role: Option<ModelRole>,
     pub prompt: String,
-    #[serde(default, skip_deserializing)]
+    #[serde(default)]
     pub tools: Vec<CompiledToolBinding>,
     pub outcomes: BTreeMap<String, CompiledOutcome>,
     pub completion: CompletionContract,
@@ -205,7 +239,7 @@ pub struct CompiledDefinition {
     pub events: Vec<String>,
     pub records: BTreeMap<String, BTreeMap<String, CompiledType>>,
     pub tasks: BTreeMap<String, CompiledTask>,
-    #[serde(default, skip_deserializing)]
+    #[serde(default)]
     pub tool_bindings: Vec<CompiledToolBinding>,
 }
 
