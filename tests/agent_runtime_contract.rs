@@ -375,3 +375,24 @@ fn goal_projection_and_runtime_event_accessors_are_closed_projections() {
     assert_eq!(resumed.event_id(), "event-1");
     assert_eq!(resumed.command_key(), None);
 }
+
+#[test]
+fn frozen_runtime_reference_preserves_the_partial_join_command_delta_contract() {
+    let reference = include_str!("../docs/reference/agent-runtime-and-goal-lifecycle.md");
+    let normalized = reference.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    for required in [
+        "`RuntimeTransition.commands` is the ordered delta of newly proposed work",
+        "`running` normally proposes one or more newly proposed commands",
+        "at least one persisted `pending` or `claimed` sibling command still matches a wait in the full replacement snapshot",
+        "Task 5 must prove that persisted-command/snapshot-wait correspondence atomically before any write",
+    ] {
+        assert!(
+            normalized.contains(required),
+            "runtime reference is missing: {required}"
+        );
+    }
+
+    assert!(!reference.contains("| `running` | one or more commands |"));
+    assert!(!reference.contains("A `running` snapshot with no command"));
+}

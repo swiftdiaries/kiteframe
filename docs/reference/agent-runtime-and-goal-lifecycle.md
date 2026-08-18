@@ -184,20 +184,29 @@ pub struct RuntimeTransition {
 }
 ```
 
+`RuntimeTransition.commands` is the ordered delta of newly proposed work, not
+the complete set of persisted outstanding commands.
+`running` normally proposes one or more newly proposed commands.
+
 `validate_transition` validates ceilings, exact task and goal revisions, a
 1-128 byte idempotency key, snapshot integrity, at most 64 commands, command
 schema/key validity and uniqueness, and at most 65,536 canonical bytes per
 command. Its disposition rules are exact:
 
-| Disposition | Available command shape |
+| Disposition | Newly proposed command shape |
 |---|---|
-| `running` | one or more commands |
+| `running` | normally one or more newly proposed commands; zero only for the structured partial-join exception below |
 | `returned` | no commands |
 | `blocked` | exactly one `BlockGoal` |
 | `terminating` | exactly one `CompleteGoal` or `FailTask` |
 
-A `running` snapshot with no command, a `returned` snapshot with a command, or
-an authority disposition with any other command shape fails closed.
+A `running` snapshot with no newly proposed command is valid only after
+consuming one structured child result while at least one persisted `pending`
+or `claimed` sibling command still matches a wait in the full replacement
+snapshot. Task 5 must prove that persisted-command/snapshot-wait
+correspondence atomically before any write. Any other `running` transition
+with no newly proposed command, a `returned` snapshot with a command, or an
+authority disposition with any other command shape fails closed.
 
 Kernel acceptance maps pending commands to operational status:
 
