@@ -14,6 +14,7 @@ pub struct Application {
     engine: Arc<Engine>,
     mcp: Option<Arc<McpManager>>,
     session_retention: time::Duration,
+    definition_limits: crate::dsl::Limits,
 }
 
 impl Application {
@@ -24,6 +25,7 @@ impl Application {
             engine,
             mcp: None,
             session_retention: time::Duration::days(30),
+            definition_limits: crate::dsl::Limits::default(),
         }
     }
 
@@ -146,8 +148,8 @@ impl Application {
         match command {
             ApplicationCommand::Publish(request) => {
                 let catalog = self.store.current_catalog(session_id.clone()).await?;
-                let workflow =
-                    crate::dsl::compile(&request.source, &catalog, &crate::dsl::Limits::default())
+                let compilation =
+                    crate::dsl::compile_report(&request.source, &catalog, &self.definition_limits)
                         .map_err(|errors| {
                             ProtocolError::Application(
                                 errors
@@ -157,9 +159,29 @@ impl Application {
                                     .join("; "),
                             )
                         })?;
+                if request
+                    .expected_kind
+                    .is_some_and(|expected| expected != compilation.definition.definition_kind)
+                {
+                    return Err(ProtocolError::StableApplication {
+                        code: "definition_kind_mismatch",
+                        message: "published definition kind did not match the method".to_owned(),
+                    });
+                }
+                for diagnostic in &compilation.diagnostics {
+                    if diagnostic.code == "deprecated_workflow" {
+                        tracing::warn!(
+                            definition = %compilation.definition.name,
+                            span_start = diagnostic.span.start,
+                            span_end = diagnostic.span.end,
+                            code = diagnostic.code,
+                            "deprecated definition syntax"
+                        );
+                    }
+                }
                 Ok(ApplicationResult::Published(
                     self.store
-                        .publish(session_id.clone(), &workflow, &request.source)
+                        .publish(session_id.clone(), &compilation.definition, &request.source)
                         .await?,
                 ))
             }

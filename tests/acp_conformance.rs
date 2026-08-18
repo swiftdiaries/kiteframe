@@ -2,10 +2,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use kiteframe::{
-    ApplicationCommand, ApplicationResult, ApplicationSession, AuthenticatedConnection,
-    IdempotencyKey, PermissionChoice, PermissionRequestId, PermissionResponseContext, PrincipalId,
-    ProtocolAdapter, ProtocolConnection, ProtocolError, ProtocolNegotiation, RunId, SessionId,
-    SessionView, TransportKind, V1Adapter,
+    AGENT_RUNTIME_UNAVAILABLE, ApplicationCommand, ApplicationResult, ApplicationSession,
+    AuthenticatedConnection, IdempotencyKey, PermissionChoice, PermissionRequestId,
+    PermissionResponseContext, PrincipalId, ProtocolAdapter, ProtocolConnection, ProtocolError,
+    ProtocolNegotiation, RunId, SessionId, SessionView, TransportKind, V1Adapter,
 };
 use uuid::Uuid;
 
@@ -245,6 +245,124 @@ fn every_advertised_extension_maps_to_one_application_command() {
     }
 }
 
+#[test]
+fn publication_methods_bind_their_expected_definition_kind() {
+    let source = "agent babysit() -> string {}";
+    let ApplicationCommand::Publish(legacy) =
+        V1Adapter::decode_extension("_kiteframe/workflow/publish", json!({"source": source}))
+            .unwrap()
+    else {
+        panic!("expected legacy publication command");
+    };
+    assert_eq!(
+        legacy.expected_kind,
+        Some(kiteframe::dsl::DefinitionKind::Workflow)
+    );
+
+    let ApplicationCommand::Publish(generic) =
+        V1Adapter::decode_extension("_kiteframe/definition/publish", json!({"source": source}))
+            .unwrap()
+    else {
+        panic!("expected generic publication command");
+    };
+    assert_eq!(generic.expected_kind, None);
+
+    #[cfg(feature = "acp-v2")]
+    {
+        use kiteframe::V2Adapter;
+
+        let ApplicationCommand::Publish(legacy) = V2Adapter::new(true)
+            .decode_extension("_kiteframe/workflow/publish", json!({"source": source}))
+            .unwrap()
+        else {
+            panic!("expected v2 legacy publication command");
+        };
+        assert_eq!(
+            legacy.expected_kind,
+            Some(kiteframe::dsl::DefinitionKind::Workflow)
+        );
+        let ApplicationCommand::Publish(generic) = V2Adapter::new(true)
+            .decode_extension("_kiteframe/definition/publish", json!({"source": source}))
+            .unwrap()
+        else {
+            panic!("expected v2 generic publication command");
+        };
+        assert_eq!(generic.expected_kind, None);
+    }
+}
+
+#[test]
+fn publication_response_keeps_legacy_bytes_and_tags_generic_definitions() {
+    let fixture = v1_fixture();
+    let definition = kiteframe::PublishedDefinition {
+        id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+        kind: kiteframe::dsl::DefinitionKind::Workflow,
+        name: "support".to_owned(),
+        version: 7,
+        definition_hash: "sha256:fixture".to_owned(),
+    };
+    assert_eq!(
+        V1Adapter
+            .encode_extension_result(
+                "_kiteframe/workflow/publish",
+                ApplicationResult::Published(definition.clone()),
+            )
+            .unwrap(),
+        fixture.published_response
+    );
+    assert_eq!(
+        V1Adapter
+            .encode_extension_result(
+                "_kiteframe/definition/publish",
+                ApplicationResult::Published(definition),
+            )
+            .unwrap(),
+        json!({
+            "id": "019ff3d8-9d86-7de0-9070-0f0185d5f416",
+            "kind": "workflow",
+            "name": "support",
+            "version": 7,
+            "definitionHash": "sha256:fixture",
+        })
+    );
+}
+
+#[test]
+fn agent_runtime_failure_has_the_same_public_shape_on_every_adapter() {
+    let error = ProtocolError::StableApplication {
+        code: AGENT_RUNTIME_UNAVAILABLE,
+        message: "internal actionable detail".to_owned(),
+    };
+    let encoded = V1Adapter::encode_error(&error);
+    assert_eq!(i32::from(encoded.code), -32000);
+    assert_eq!(encoded.message, "application request failed");
+    assert_eq!(
+        encoded.data,
+        Some(json!({"kiteframe_code": "agent_runtime_unavailable"}))
+    );
+
+    #[cfg(feature = "acp-v2")]
+    {
+        use kiteframe::V2Adapter;
+
+        let encoded = V2Adapter::new(true).encode_error(&error);
+        assert_eq!(i32::from(encoded.code), -32000);
+        assert_eq!(encoded.message, "application request failed");
+        assert_eq!(
+            encoded.data,
+            Some(json!({"kiteframe_code": "agent_runtime_unavailable"}))
+        );
+    }
+
+    assert!(matches!(
+        ProtocolError::from(kiteframe::StoreError::AgentRuntimeUnavailable),
+        ProtocolError::StableApplication {
+            code: AGENT_RUNTIME_UNAVAILABLE,
+            ..
+        }
+    ));
+}
+
 fn command_kind(command: &ApplicationCommand) -> &'static str {
     match command {
         ApplicationCommand::Publish(_) => "publish",
@@ -368,7 +486,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     use kiteframe::{
         Application, ApplicationContext, ApplicationResult, CloseSession, Engine, EngineConfig,
         InProcessToolRegistry, ModelClient, ModelError, ModelRequest, ModelResponse, NewSession,
-        PersistedAuthorizer, PostgresStore, PrincipalId, PublishWorkflow, ResumeSession,
+        PersistedAuthorizer, PostgresStore, PrincipalId, PublishDefinition, ResumeSession,
     };
 
     struct UnusedModel;
@@ -614,7 +732,10 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     let ApplicationResult::Published(definition) = application
         .dispatch(
             &bound_context,
-            ApplicationCommand::Publish(PublishWorkflow { source }),
+            ApplicationCommand::Publish(PublishDefinition {
+                expected_kind: Some(kiteframe::dsl::DefinitionKind::Workflow),
+                source,
+            }),
         )
         .await
         .expect("publish workflow after the initial policy")

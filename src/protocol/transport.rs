@@ -179,6 +179,19 @@ impl ProtocolConnection {
         }
     }
 
+    pub fn encode_extension_result(
+        &self,
+        method: &str,
+        result: crate::ApplicationResult,
+    ) -> Result<Value, crate::ProtocolError> {
+        match self.selected()? {
+            NegotiatedProtocol::V1 => super::V1Adapter.encode_extension_result(method, result),
+            #[cfg(feature = "acp-v2")]
+            NegotiatedProtocol::V2 => super::V2Adapter::new(self._v2_runtime_enabled)
+                .encode_extension_result(method, result),
+        }
+    }
+
     fn selected(&self) -> Result<NegotiatedProtocol, crate::ProtocolError> {
         self.negotiated_protocol()
             .ok_or(crate::ProtocolError::NotNegotiated)
@@ -1062,6 +1075,7 @@ fn logged_method(method: &str) -> &'static str {
         "session/resume" => "session/resume",
         "session/close" => "session/close",
         "_kiteframe/workflow/publish" => "_kiteframe/workflow/publish",
+        "_kiteframe/definition/publish" => "_kiteframe/definition/publish",
         "_kiteframe/run/start" => "_kiteframe/run/start",
         "_kiteframe/run/get" => "_kiteframe/run/get",
         "_kiteframe/run/answer" => "_kiteframe/run/answer",
@@ -1073,20 +1087,7 @@ fn logged_method(method: &str) -> &'static str {
 }
 
 fn protocol_sdk_error(error: crate::ProtocolError) -> agent_client_protocol::Error {
-    match error {
-        crate::ProtocolError::UnsupportedMethod(_) => {
-            agent_client_protocol::Error::method_not_found()
-        }
-        crate::ProtocolError::InvalidPayload(_)
-        | crate::ProtocolError::UnsupportedVersion(_)
-        | crate::ProtocolError::V2Disabled
-        | crate::ProtocolError::McpUnavailable => agent_client_protocol::Error::invalid_params(),
-        crate::ProtocolError::UnexpectedResult(_) => agent_client_protocol::Error::internal_error(),
-        crate::ProtocolError::PermissionCancelled => {
-            agent_client_protocol::Error::request_cancelled()
-        }
-        _ => agent_client_protocol::Error::new(-32000, "application request failed"),
-    }
+    super::types::encode_protocol_error(&error)
 }
 
 #[derive(Clone)]
@@ -1824,6 +1825,7 @@ async fn handle_line(
 struct RpcError {
     code: i32,
     message: String,
+    data: Option<Value>,
 }
 
 impl RpcError {
@@ -1831,6 +1833,7 @@ impl RpcError {
         Self {
             code: -32700,
             message: "Parse error".to_owned(),
+            data: None,
         }
     }
 
@@ -1838,6 +1841,7 @@ impl RpcError {
         Self {
             code: -32600,
             message: "Invalid Request".to_owned(),
+            data: None,
         }
     }
 }
@@ -1848,31 +1852,44 @@ impl From<crate::ProtocolError> for RpcError {
             crate::ProtocolError::UnsupportedMethod(_) => Self {
                 code: -32601,
                 message: "Method not found".to_owned(),
+                data: None,
             },
             crate::ProtocolError::InvalidPayload(_)
             | crate::ProtocolError::UnsupportedVersion(_)
             | crate::ProtocolError::V2Disabled => Self {
                 code: -32602,
                 message: "Invalid params".to_owned(),
+                data: None,
             },
             crate::ProtocolError::UnexpectedResult(_) => Self {
                 code: -32603,
                 message: "Internal error".to_owned(),
+                data: None,
+            },
+            crate::ProtocolError::StableApplication { code, .. } => Self {
+                code: -32000,
+                message: "application request failed".to_owned(),
+                data: Some(serde_json::json!({"kiteframe_code": code})),
             },
             error => Self {
                 code: -32000,
                 message: error.to_string(),
+                data: None,
             },
         }
     }
 }
 
 fn error_response(id: Value, error: RpcError) -> Value {
-    serde_json::json!({
+    let mut response = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {"code": error.code, "message": error.message}
-    })
+    });
+    if let Some(data) = error.data {
+        response["error"]["data"] = data;
+    }
+    response
 }
 
 async fn dispatch_method(
@@ -1932,7 +1949,7 @@ async fn dispatch_application(
     let value = if is_session_method {
         connection.encode_session_result(method, result)
     } else {
-        connection.encode_result(result)
+        connection.encode_extension_result(method, result)
     }?;
     Ok(DispatchOutcome { value })
 }

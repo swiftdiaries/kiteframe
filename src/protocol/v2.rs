@@ -2,6 +2,7 @@ use agent_client_protocol::schema::{ProtocolVersion, v2 as acp};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::dsl::DefinitionKind;
 use crate::{
     AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PolicyRevision, RetryRecovery,
     RunId, Secret, SessionId, SessionPolicy, StartRun,
@@ -9,7 +10,7 @@ use crate::{
 
 use super::{
     ApplicationCommand, ApplicationResult, CloseSession, EventCursor, GetRun, NewSession,
-    PermissionResponseContext, ProtocolAdapter, ProtocolError, PublishWorkflow, ResumeSession,
+    PermissionResponseContext, ProtocolAdapter, ProtocolError, PublishDefinition, ResumeSession,
     UpdateSessionPolicy, encode_application_result,
 };
 
@@ -107,6 +108,11 @@ impl V2Adapter {
         }
         decode(params)
     }
+
+    #[must_use]
+    pub fn encode_error(&self, error: &ProtocolError) -> agent_client_protocol::Error {
+        super::types::encode_protocol_error(error)
+    }
 }
 
 impl ProtocolAdapter for V2Adapter {
@@ -119,7 +125,11 @@ impl ProtocolAdapter for V2Adapter {
             return Err(ProtocolError::V2Disabled);
         }
         match method {
-            "_kiteframe/workflow/publish" => decode(params).map(PublishDto::into_command),
+            "_kiteframe/workflow/publish" => decode(params)
+                .map(|dto: PublishDto| dto.into_command(Some(DefinitionKind::Workflow))),
+            "_kiteframe/definition/publish" => {
+                decode(params).map(|dto: PublishDto| dto.into_command(None))
+            }
             "_kiteframe/run/start" => decode(params).map(StartDto::into_command),
             "_kiteframe/run/get" => decode(params).map(GetDto::into_command),
             "_kiteframe/run/answer" => decode(params).map(AnswerDto::into_command),
@@ -281,8 +291,9 @@ struct PublishDto {
 }
 
 impl PublishDto {
-    fn into_command(self) -> ApplicationCommand {
-        ApplicationCommand::Publish(PublishWorkflow {
+    fn into_command(self, expected_kind: Option<DefinitionKind>) -> ApplicationCommand {
+        ApplicationCommand::Publish(PublishDefinition {
+            expected_kind,
             source: self.source,
         })
     }

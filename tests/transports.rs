@@ -246,6 +246,97 @@ impl RpcPeer for StdioPeer {
     }
 }
 
+struct NdjsonPeer {
+    lines: Lines<BufReader<ReadHalf<tokio::io::DuplexStream>>>,
+    writer: WriteHalf<tokio::io::DuplexStream>,
+    server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    next_id: i64,
+}
+
+impl NdjsonPeer {
+    fn new(application: Arc<Application>, principal: PrincipalId) -> Self {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let connection = AuthenticatedConnection {
+            principal,
+            transport: TransportKind::Stdio,
+        };
+        let server = tokio::spawn(async move {
+            kiteframe::serve_ndjson(
+                BufReader::new(server_reader),
+                server_writer,
+                application.as_ref(),
+                &connection,
+            )
+            .await
+        });
+        Self {
+            lines: BufReader::new(reader).lines(),
+            writer,
+            server: Some(server),
+            next_id: 1,
+        }
+    }
+}
+
+#[async_trait]
+impl RpcPeer for NdjsonPeer {
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write NDJSON request");
+        self.writer.flush().await.expect("flush NDJSON request");
+        let line = self
+            .lines
+            .next_line()
+            .await
+            .expect("read NDJSON response")
+            .expect("NDJSON response before EOF");
+        let response: Value = serde_json::from_str(&line).expect("JSON-RPC NDJSON response");
+        assert_eq!(response["id"], id);
+        response
+    }
+
+    async fn next_message(&mut self) -> Value {
+        let line = self
+            .lines
+            .next_line()
+            .await
+            .expect("read NDJSON message")
+            .expect("NDJSON message before EOF");
+        serde_json::from_str(&line).expect("JSON-RPC NDJSON message")
+    }
+
+    async fn respond(&mut self, id: Value, result: Value) {
+        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        self.writer
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write NDJSON response");
+        self.writer.flush().await.expect("flush NDJSON response");
+    }
+
+    async fn close(&mut self) {
+        self.writer.shutdown().await.expect("close NDJSON input");
+        self.server
+            .take()
+            .expect("NDJSON server")
+            .await
+            .expect("join NDJSON server")
+            .expect("serve NDJSON");
+    }
+}
+
 struct HttpPeer {
     channel: Channel,
     driver: Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>,
@@ -1458,6 +1549,126 @@ async fn exercise<P: RpcPeer + Send>(peer: &mut P, store: &PostgresStore) -> Val
             json!({"sequence": event["sequence"], "kind": event["kind"]})
         }).collect::<Vec<_>>(),
     })
+}
+
+async fn exercise_agent_publication_boundary<P: RpcPeer + Send>(
+    peer: &mut P,
+    protocol_version: u16,
+) -> Value {
+    let initialize = if protocol_version == 1 {
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "agent-boundary", "version": "1.0.0"}
+        })
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "capabilities": {},
+            "info": {"name": "agent-boundary", "version": "1.0.0"}
+        })
+    };
+    success(peer.request("initialize", initialize).await);
+    let new_session = if protocol_version == 1 {
+        json!({"cwd": "/tmp/kiteframe-agent-boundary", "mcpServers": []})
+    } else {
+        json!({"cwd": "/tmp/kiteframe-agent-boundary"})
+    };
+    let session = success(peer.request("session/new", new_session).await);
+    let name = format!("transportagent_{}", Uuid::now_v7().simple());
+    let sentinel = "transport-agent-source-must-not-leak";
+    let source = format!(
+        r#"agent {name}() -> string {{
+  entry inspect()
+  events ["transport.agent.changed.v1"]
+  limits {{ steps: 5 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect() -> string {{
+    model reasoning
+    prompt """{sentinel}"""
+    tools []
+    on done(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let published = success(
+        peer.request("_kiteframe/definition/publish", json!({"source": source}))
+            .await,
+    );
+    assert_eq!(published["kind"], "agent");
+
+    let mismatch = peer
+        .request("_kiteframe/workflow/publish", json!({"source": source}))
+        .await;
+    let runtime = peer
+        .request(
+            "_kiteframe/run/start",
+            json!({
+                "sessionId": session["sessionId"],
+                "workflowName": name,
+                "version": published["version"],
+                "input": {},
+                "idempotencyKey": format!("agent-boundary-{}", Uuid::now_v7())
+            }),
+        )
+        .await;
+
+    for (response, code) in [
+        (&mismatch, "definition_kind_mismatch"),
+        (&runtime, "agent_runtime_unavailable"),
+    ] {
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(response["error"]["message"], "application request failed");
+        assert_eq!(response["error"]["data"], json!({"kiteframe_code": code}));
+        assert!(!response.to_string().contains(sentinel));
+    }
+
+    json!({
+        "kind": published["kind"],
+        "mismatch": mismatch["error"],
+        "runtime": runtime["error"],
+    })
+}
+
+#[tokio::test]
+async fn agent_publication_and_runtime_errors_match_across_all_adapters() {
+    let (application, store) = application().await;
+    let websocket_principal = principal("agent-websocket");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(Secret::new("agent-websocket-secret"), websocket_principal)])
+            .expect("bearer binding"),
+    );
+    let remote = RemoteService::with_v2(
+        application.clone(),
+        authenticator,
+        store.clone(),
+        ready_model(),
+        true,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+
+    let mut acp_v1 = StdioPeer::new(application.clone(), store.clone(), principal("agent-v1"));
+    let acp_v1_result = exercise_agent_publication_boundary(&mut acp_v1, 1).await;
+    acp_v1.close().await;
+
+    let mut acp_v2 = StdioPeer::with_v2(application.clone(), store, principal("agent-v2"), true);
+    let acp_v2_result = exercise_agent_publication_boundary(&mut acp_v2, 2).await;
+    acp_v2.close().await;
+
+    let mut ndjson = NdjsonPeer::new(application, principal("agent-ndjson"));
+    let ndjson_result = exercise_agent_publication_boundary(&mut ndjson, 1).await;
+    ndjson.close().await;
+
+    let mut websocket = WebSocketPeer::connect(server.address, "agent-websocket-secret").await;
+    let websocket_result = exercise_agent_publication_boundary(&mut websocket, 1).await;
+    websocket.close().await;
+
+    assert_eq!(acp_v2_result, acp_v1_result);
+    assert_eq!(ndjson_result, acp_v1_result);
+    assert_eq!(websocket_result, acp_v1_result);
+
+    remote.begin_shutdown();
+    server.stop().await;
 }
 
 #[tokio::test]

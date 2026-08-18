@@ -3,11 +3,14 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::dsl::DefinitionKind;
 use crate::{
     AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PermissionChoice,
     PermissionRequestId, PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission,
     RetryRecovery, RunEvent, RunId, RunView, SessionId, SessionPolicy, SessionView, StartRun,
 };
+
+pub const AGENT_RUNTIME_UNAVAILABLE: &str = "agent_runtime_unavailable";
 
 #[derive(Clone, Debug)]
 pub struct ApplicationContext {
@@ -34,7 +37,8 @@ pub struct CloseSession {
 }
 
 #[derive(Clone, Debug)]
-pub struct PublishWorkflow {
+pub struct PublishDefinition {
+    pub expected_kind: Option<DefinitionKind>,
     pub source: String,
 }
 
@@ -117,7 +121,7 @@ pub enum ApplicationCommand {
     ResumeSession(ResumeSession),
     ListSessions,
     CloseSession(CloseSession),
-    Publish(PublishWorkflow),
+    Publish(PublishDefinition),
     Start(StartRun),
     Get(GetRun),
     Answer(AnswerQuestion),
@@ -159,6 +163,14 @@ pub trait ProtocolAdapter: Send + Sync {
     ) -> Result<Value, ProtocolError>;
 
     fn encode_result(&self, result: ApplicationResult) -> Result<Value, ProtocolError>;
+
+    fn encode_extension_result(
+        &self,
+        method: &str,
+        result: ApplicationResult,
+    ) -> Result<Value, ProtocolError> {
+        encode_extension_application_result(method, result)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +229,8 @@ pub enum ProtocolError {
     SessionMismatch,
     #[error("application error: {0}")]
     Application(String),
+    #[error("application error: {message}")]
+    StableApplication { code: &'static str, message: String },
     #[error("invalid protocol payload: {0}")]
     InvalidPayload(String),
     #[error("unsupported protocol method: {0}")]
@@ -245,13 +259,37 @@ pub enum ProtocolError {
 
 impl From<crate::StoreError> for ProtocolError {
     fn from(error: crate::StoreError) -> Self {
-        Self::Application(error.to_string())
+        match error {
+            crate::StoreError::AgentRuntimeUnavailable => Self::StableApplication {
+                code: AGENT_RUNTIME_UNAVAILABLE,
+                message: "agent definitions require durable goal lifecycle and runtime authority"
+                    .to_owned(),
+            },
+            error => Self::Application(error.to_string()),
+        }
     }
 }
 
 impl From<crate::EngineError> for ProtocolError {
     fn from(error: crate::EngineError) -> Self {
         Self::Application(error.to_string())
+    }
+}
+
+pub(crate) fn encode_protocol_error(error: &ProtocolError) -> agent_client_protocol::Error {
+    match error {
+        ProtocolError::UnsupportedMethod(_) => agent_client_protocol::Error::method_not_found(),
+        ProtocolError::InvalidPayload(_)
+        | ProtocolError::UnsupportedVersion(_)
+        | ProtocolError::V2Disabled
+        | ProtocolError::McpUnavailable => agent_client_protocol::Error::invalid_params(),
+        ProtocolError::UnexpectedResult(_) => agent_client_protocol::Error::internal_error(),
+        ProtocolError::PermissionCancelled => agent_client_protocol::Error::request_cancelled(),
+        ProtocolError::StableApplication { code, .. } => {
+            agent_client_protocol::Error::new(-32000, "application request failed")
+                .data(json!({"kiteframe_code": code}))
+        }
+        _ => agent_client_protocol::Error::new(-32000, "application request failed"),
     }
 }
 
@@ -274,13 +312,33 @@ pub(crate) fn command_session(command: &ApplicationCommand) -> Option<&SessionId
 }
 
 pub(crate) fn encode_application_result(result: ApplicationResult) -> Result<Value, ProtocolError> {
+    encode_application_result_with_kind(result, false)
+}
+
+pub(crate) fn encode_extension_application_result(
+    method: &str,
+    result: ApplicationResult,
+) -> Result<Value, ProtocolError> {
+    encode_application_result_with_kind(result, method == "_kiteframe/definition/publish")
+}
+
+fn encode_application_result_with_kind(
+    result: ApplicationResult,
+    include_definition_kind: bool,
+) -> Result<Value, ProtocolError> {
     Ok(match result {
-        ApplicationResult::Published(definition) => json!({
-            "id": definition.id,
-            "name": definition.name,
-            "version": definition.version,
-            "definitionHash": definition.definition_hash,
-        }),
+        ApplicationResult::Published(definition) => {
+            let mut response = json!({
+                "id": definition.id,
+                "name": definition.name,
+                "version": definition.version,
+                "definitionHash": definition.definition_hash,
+            });
+            if include_definition_kind {
+                response["kind"] = json!(definition.kind);
+            }
+            response
+        }
         ApplicationResult::PolicyUpdated { revision } => {
             json!({ "revision": revision.get() })
         }

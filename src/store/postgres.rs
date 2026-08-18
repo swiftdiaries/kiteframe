@@ -480,34 +480,14 @@ impl PostgresStore {
         if session.get::<String, _>("state") != "active" {
             return Err(StoreError::SessionClosed);
         }
-        let active_runs: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM runs WHERE session_id = $1 AND state IN ('runnable', 'running', 'waiting_for_answer', 'waiting_for_permission', 'outcome_unknown')",
-        )
-        .bind(*request.session_id.as_uuid())
-        .fetch_one(&mut *tx)
-        .await?;
+        let published_definition = resolve_definition_for_start(&mut tx, &request).await?;
+        if published_definition.kind == DefinitionKind::Agent {
+            return Err(StoreError::AgentRuntimeUnavailable);
+        }
         let catalog_epoch = session
             .get::<Option<uuid::Uuid>, _>("current_catalog_epoch")
             .ok_or(StoreError::CatalogScopeViolation)?;
-        let definition = if let Some(version) = request.version {
-            sqlx::query("SELECT id, definition_kind, name, version, definition_hash, tool_bindings, compiled_definition FROM workflow_definitions WHERE name = $1 AND version = $2")
-                .bind(&request.workflow_name)
-                .bind(version as i32)
-                .fetch_optional(&mut *tx)
-                .await?
-        } else {
-            sqlx::query("SELECT id, definition_kind, name, version, definition_hash, tool_bindings, compiled_definition FROM workflow_definitions WHERE name = $1 ORDER BY version DESC LIMIT 1")
-                .bind(&request.workflow_name)
-                .fetch_optional(&mut *tx)
-                .await?
-        }
-        .ok_or(StoreError::DefinitionNotFound)?;
-        if definition_kind(&definition.get::<String, _>("definition_kind"))?
-            == DefinitionKind::Agent
-        {
-            return Err(StoreError::AgentRuntimeUnavailable);
-        }
-        let definition_id = definition.get::<uuid::Uuid, _>("id");
+        let definition_id = published_definition.id;
         if let Some(existing) = sqlx::query(
             "SELECT id, definition_id, input_digest, state, revision FROM runs WHERE session_id = $1 AND start_idempotency_key = $2",
         )
@@ -530,12 +510,18 @@ impl PostgresStore {
             return Ok(RunView {
                 id: crate::RunId::new(existing.get("id")),
                 session_id: request.session_id,
-                definition: definition_from_row(&definition)?,
+                definition: published_definition,
                 root_frame_id: crate::FrameId::new(root.get("id")),
                 state: run_state(&existing.get::<String, _>("state"))?,
                 revision: existing.get::<i64, _>("revision") as u64,
             });
         }
+        let active_runs: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE session_id = $1 AND state IN ('runnable', 'running', 'waiting_for_answer', 'waiting_for_permission', 'outcome_unknown')",
+        )
+        .bind(*request.session_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
         if active_runs
             >= self
                 .limits
@@ -544,6 +530,12 @@ impl PostgresStore {
         {
             return Err(StoreError::QuotaExceeded("active_runs_per_session"));
         }
+        let definition = sqlx::query(
+            "SELECT tool_bindings, compiled_definition FROM workflow_definitions WHERE id = $1",
+        )
+        .bind(definition_id)
+        .fetch_one(&mut *tx)
+        .await?;
         let catalog = sqlx::query(
             "SELECT descriptor_snapshot FROM mcp_catalog_epochs WHERE epoch_id = $1 AND session_id = $2",
         )
@@ -617,7 +609,7 @@ impl PostgresStore {
         Ok(RunView {
             id: crate::RunId::new(run_id),
             session_id: request.session_id,
-            definition: definition_from_row(&definition)?,
+            definition: published_definition,
             root_frame_id: crate::FrameId::new(frame_id),
             state: RunState::Runnable,
             revision: 0,
@@ -2401,6 +2393,33 @@ fn catalog_json(epoch: &ToolCatalogSnapshot) -> Value {
 fn bindings_json(workflow: &CompiledDefinition) -> Value {
     json!(workflow.tool_bindings.iter().map(|binding| json!({"qualified_name": binding.qualified_name, "catalog_epoch_id": binding.catalog_epoch_id, "descriptor_digest": binding.descriptor_digest})).collect::<Vec<_>>())
 }
+
+async fn resolve_definition_for_start(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    request: &StartRun,
+) -> Result<PublishedDefinition, StoreError> {
+    let row = if let Some(version) = request.version {
+        sqlx::query(
+            "SELECT id, definition_kind, name, version, definition_hash \
+             FROM workflow_definitions WHERE name = $1 AND version = $2",
+        )
+        .bind(&request.workflow_name)
+        .bind(version as i32)
+        .fetch_optional(&mut **tx)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT id, definition_kind, name, version, definition_hash \
+             FROM workflow_definitions WHERE name = $1 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(&request.workflow_name)
+        .fetch_optional(&mut **tx)
+        .await?
+    }
+    .ok_or(StoreError::DefinitionNotFound)?;
+    definition_from_row(&row)
+}
+
 fn definition_from_row(row: &sqlx::postgres::PgRow) -> Result<PublishedDefinition, StoreError> {
     Ok(PublishedDefinition {
         id: row.get("id"),
