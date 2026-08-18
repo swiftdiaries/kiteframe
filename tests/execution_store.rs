@@ -667,7 +667,7 @@ async fn execution_fixture_with_agent() -> Option<(
     model reasoning
     prompt """Inspect without running."""
     tools []
-    on done(summary: string) {{ done summary }}
+    on finished(summary: string) {{ done summary }}
   }}
 }}"#
     );

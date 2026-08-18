@@ -31,6 +31,20 @@ CREATE TABLE goal_contracts (
     UNIQUE (task_id, contract_digest)
 );
 
+CREATE FUNCTION reject_user_task_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'user tasks are immutable' USING ERRCODE = '55000';
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER user_tasks_reject_update
+    BEFORE UPDATE ON user_tasks
+    FOR EACH ROW EXECUTE FUNCTION reject_user_task_mutation();
+
+CREATE TRIGGER user_tasks_reject_delete
+    BEFORE DELETE ON user_tasks
+    FOR EACH ROW EXECUTE FUNCTION reject_user_task_mutation();
+
 CREATE FUNCTION reject_goal_contract_mutation() RETURNS trigger AS $$
 BEGIN
     RAISE EXCEPTION 'goal contracts are immutable' USING ERRCODE = '55000';

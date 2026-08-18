@@ -251,6 +251,24 @@ fn rejects_invalid_task_selector_and_target() {
 }
 
 #[test]
+fn rejects_blank_wire_idempotency_keys_at_the_task_boundary() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+
+    for invalid_key in ["", " \t\n "] {
+        let mut value = fixture.clone();
+        value["idempotencyKey"] = serde_json::json!(invalid_key);
+        let request: SubmitUserTask =
+            serde_json::from_value(value).expect("wire deserialization remains transparent");
+
+        assert_eq!(
+            request.validate(),
+            Err(UserTaskError::InvalidIdempotencyKey)
+        );
+    }
+}
+
+#[test]
 fn goal_digest_binds_every_goal_field() {
     assert_goal_digest_changes(|goal| goal.version = 2);
     assert_goal_digest_changes(|goal| goal.objective.push_str(" More."));

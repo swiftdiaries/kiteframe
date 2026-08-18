@@ -28,7 +28,7 @@ fn compiled_babysit_agent() -> CompiledDefinition {
     model reasoning
     prompt """Inspect the pull request."""
     tools []
-    on done(summary: string) { done summary }
+    on finished(summary: string) { done summary }
   }
 }"#;
     compile_definition(&source.replace("babysit_pr", &name))
@@ -43,7 +43,7 @@ fn changed_babysit_agent(name: &str) -> CompiledDefinition {
     model reasoning
     prompt """Inspect the pull request with refreshed evidence."""
     tools []
-    on done(summary: string) { done summary }
+    on finished(summary: string) { done summary }
   }
 }"#;
     compile_definition(&source.replace("babysit_pr", name))
@@ -121,8 +121,14 @@ async fn insert_raw_user_task(
     principal: &PrincipalId,
     definition: &PublishedDefinition,
     request: &SubmitUserTask,
+    request_digest: Option<&str>,
 ) -> UserTaskId {
     let task_id = UserTaskId::new(Uuid::now_v7());
+    let mut accepted_request = request.clone();
+    accepted_request.agent.version = Some(definition.version);
+    let request_digest = request_digest
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| accepted_request.request_digest().unwrap());
     sqlx::query(
         "INSERT INTO user_tasks \
          (id, session_id, principal, definition_id, submission_idempotency_key, \
@@ -134,7 +140,7 @@ async fn insert_raw_user_task(
     .bind(principal.as_str())
     .bind(definition.id)
     .bind(request.idempotency_key.as_str())
-    .bind(request.request_digest().unwrap())
+    .bind(request_digest)
     .bind(serde_json::to_value(&request.target).unwrap())
     .bind(serde_json::to_value(&request.preferences).unwrap())
     .execute(pool)
@@ -203,6 +209,8 @@ fn slice_one_schema_tags_definitions_and_freezes_goals() {
     assert!(migration.contains("DEFAULT 'workflow'"));
     assert!(migration.contains("CREATE TABLE user_tasks"));
     assert!(migration.contains("CREATE TABLE goal_contracts"));
+    assert!(migration.contains("user_tasks_reject_update"));
+    assert!(migration.contains("user_tasks_reject_delete"));
     assert!(migration.contains("goal_contracts_reject_update"));
     assert!(migration.contains("goal_contracts_reject_delete"));
     assert!(migration.contains("ERRCODE = '55000'"));
@@ -467,33 +475,69 @@ async fn missing_task_is_typed() {
 }
 
 #[tokio::test]
-async fn stored_task_rejects_a_workflow_definition() {
+async fn database_rejects_task_mutation_and_replay_keeps_the_snapshot() {
     let Some((store, pool, session, principal, agent)) = setup_agent_store().await else {
         return;
     };
+    let request = submit_request(session.id.clone(), agent.name.clone(), None);
     let accepted = store
-        .submit_user_task(
-            &principal,
-            submit_request(session.id.clone(), agent.name, None),
-        )
+        .submit_user_task(&principal, request.clone())
         .await
         .unwrap();
-    let workflow = compiled_support_workflow();
-    let workflow = store
-        .publish(session.id.clone(), &workflow, &workflow.source)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE user_tasks SET definition_id = $1 WHERE id = $2")
-        .bind(workflow.id)
-        .bind(accepted.id.as_uuid())
-        .execute(&pool)
+    let changed = changed_babysit_agent(&agent.name);
+    let changed = store
+        .publish(session.id.clone(), &changed, &changed.source)
         .await
         .unwrap();
 
-    assert!(matches!(
-        store.get_user_task(session.id, accepted.id).await,
-        Err(StoreError::InvalidData(_)),
-    ));
+    let target_error = sqlx::query(
+        "UPDATE user_tasks SET target = '{\"type\":\"github_pull_request\",\"repository\":\"acme/changed\",\"number\":143}'::jsonb WHERE id = $1",
+    )
+        .bind(accepted.id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    let definition_error = sqlx::query("UPDATE user_tasks SET definition_id = $1 WHERE id = $2")
+        .bind(changed.id)
+        .bind(accepted.id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    let principal_error =
+        sqlx::query("UPDATE user_tasks SET principal = 'other-valid-principal' WHERE id = $1")
+            .bind(accepted.id.as_uuid())
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    let delete_error = sqlx::query("DELETE FROM user_tasks WHERE id = $1")
+        .bind(accepted.id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap_err();
+
+    for error in [
+        target_error,
+        definition_error,
+        principal_error,
+        delete_error,
+    ] {
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("55000")
+        );
+    }
+
+    assert_eq!(
+        store.submit_user_task(&principal, request).await.unwrap(),
+        accepted
+    );
+    assert_eq!(
+        store
+            .get_user_task(session.id, accepted.id.clone())
+            .await
+            .unwrap(),
+        accepted
+    );
 }
 
 #[tokio::test]
@@ -502,7 +546,7 @@ async fn stored_task_without_a_goal_is_invalid_data() {
         return;
     };
     let request = submit_request(session.id.clone(), agent.name.clone(), None);
-    let task_id = insert_raw_user_task(&pool, &principal, &agent, &request).await;
+    let task_id = insert_raw_user_task(&pool, &principal, &agent, &request, None).await;
 
     assert!(matches!(
         store.get_user_task(session.id, task_id).await,
@@ -563,11 +607,39 @@ async fn stored_task_rejects_a_tampered_goal_digest() {
         return;
     };
     let request = submit_request(session.id.clone(), agent.name.clone(), None);
-    let task_id = insert_raw_user_task(&pool, &principal, &agent, &request).await;
+    let task_id = insert_raw_user_task(&pool, &principal, &agent, &request, None).await;
     insert_raw_goal(&pool, &task_id, &request.goal, "sha256:tampered").await;
 
     assert!(matches!(
         store.get_user_task(session.id, task_id).await,
+        Err(StoreError::InvalidData(_)),
+    ));
+}
+
+#[tokio::test]
+async fn corrupted_task_request_digest_is_rejected_on_get_and_replay() {
+    let Some((store, pool, session, principal, agent)) = setup_agent_store().await else {
+        return;
+    };
+    let request = submit_request(session.id.clone(), agent.name.clone(), None);
+    let task_id =
+        insert_raw_user_task(&pool, &principal, &agent, &request, Some("sha256:tampered")).await;
+    insert_raw_goal(
+        &pool,
+        &task_id,
+        &request.goal,
+        &request.goal.digest().unwrap(),
+    )
+    .await;
+
+    assert!(matches!(
+        store
+            .get_user_task(session.id.clone(), task_id.clone())
+            .await,
+        Err(StoreError::InvalidData(_)),
+    ));
+    assert!(matches!(
+        store.submit_user_task(&principal, request).await,
         Err(StoreError::InvalidData(_)),
     ));
 }

@@ -85,7 +85,7 @@ fn agent_source(name: &str, prompt: &str) -> String {
     model reasoning
     prompt """{prompt}"""
     tools []
-    on done(summary: string) {{ done summary }}
+    on finished(summary: string) {{ done summary }}
   }}
 }}"#
     )

@@ -31,7 +31,7 @@ fn compiled_babysit_agent() -> CompiledDefinition {
     model reasoning
     prompt """Inspect the pull request."""
     tools []
-    on done(summary: string) { done summary }
+    on finished(summary: string) { done summary }
   }
 }"#,
     )
@@ -191,7 +191,7 @@ async fn publication_preserves_definition_kind_and_global_name_versions() {
          events [\"test.changed.v1\"] \
          limits {{ steps: 5 active_execution_seconds: 10 elapsed_seconds: 20 }} \
          task t() -> string {{ model reasoning prompt \"\"\"two\"\"\" tools [] \
-         on done() {{ done \"two\" }} }} }}"
+         on finished() {{ done \"two\" }} }} }}"
     ));
 
     let published_workflow = store

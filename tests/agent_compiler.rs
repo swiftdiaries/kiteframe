@@ -230,6 +230,104 @@ fn agents_reuse_recursion_and_parallel_limit_checks() {
 }
 
 #[test]
+fn rejects_every_reserved_word_as_an_agent_definition_name() {
+    let reserved = [
+        "agent",
+        "workflow",
+        "type",
+        "task",
+        "entry",
+        "events",
+        "limits",
+        "model",
+        "reasoning",
+        "coding",
+        "prompt",
+        "tools",
+        "on",
+        "call",
+        "return",
+        "fork",
+        "join",
+        "context",
+        "isolated",
+        "kept",
+        "done",
+        "fail",
+        "ask",
+        "start",
+        "goto",
+        "parallel",
+        "true",
+        "false",
+        "null",
+        "complete_task",
+        "outcome",
+    ];
+
+    for word in reserved {
+        let source = format!(
+            "agent {word}() -> string {{ entry work() \
+             task work() -> string {{ model reasoning prompt \"\"\"x\"\"\" tools [] \
+             on ok() {{ done \"x\" }} }} }}"
+        );
+        let diagnostics = compile_report(&source, &catalog([]), &ceilings()).expect_err(word);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("reserved name")),
+            "missing reserved-name diagnostic for {word}: {diagnostics:?}"
+        );
+        assert!(diagnostics.len() <= 64);
+    }
+}
+
+#[test]
+fn rejects_reserved_names_in_every_agent_author_binding_position() {
+    let cases = [
+        "type workflow { value: string } agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }",
+        "type Evidence { workflow: string } agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }",
+        "agent a(workflow: string) -> string { entry work(workflow = workflow) task work(workflow: string) -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done workflow } } }",
+        "agent a() -> string { entry workflow() task workflow() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }",
+        "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on workflow() { done \"x\" } } }",
+        "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok(workflow: string) { done workflow } } }",
+        "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [workflow] on ok() { done \"x\" } } }",
+        "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { workflow = call child() done workflow } } task child() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }",
+        "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { fork { workflow = call child() } join done workflow } } task child() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }",
+        "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { workflow = ask string \"question\" done workflow } } }",
+    ];
+
+    for source in cases {
+        let diagnostics = compile_report(source, &catalog([]), &ceilings()).expect_err(source);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("reserved name")),
+            "missing reserved-name diagnostic: {diagnostics:?}"
+        );
+        assert!(diagnostics.len() <= 64);
+    }
+}
+
+#[test]
+fn legacy_workflows_keep_contextual_keywords_as_identifiers() {
+    let source = r#"
+type agent { context: string }
+workflow agent(entry: agent) -> agent { start task(entry: entry) }
+task task(entry: agent) -> agent {
+  prompt """x"""
+  tools []
+  on return(result: agent) { done result }
+}
+"#;
+
+    let compiled = compile(source, &catalog([]), &ceilings())
+        .expect("version-one contextual identifiers remain valid");
+    assert_eq!(compiled.definition_kind, DefinitionKind::Workflow);
+    assert_eq!(compiled.dsl_version, 1);
+}
+
+#[test]
 fn published_authoring_example_compiles_as_an_agent() {
     let source = std::fs::read_to_string("examples/babysit_pr.kite").unwrap();
     let compiled = compile(&source, &github_catalog(), &ceilings()).unwrap();

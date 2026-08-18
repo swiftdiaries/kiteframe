@@ -360,9 +360,6 @@ impl PostgresStore {
         request
             .validate()
             .map_err(|error| StoreError::InvalidUserTask(error.to_string()))?;
-        let request_digest = request
-            .request_digest()
-            .map_err(|error| StoreError::InvalidUserTask(error.to_string()))?;
         let goal_digest = request
             .goal
             .digest()
@@ -403,16 +400,29 @@ impl PostgresStore {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some((task_id, stored_digest)) = replay {
-            if stored_digest != request_digest {
+            let accepted =
+                get_user_task_in_tx(&mut tx, request.session_id.clone(), task_id).await?;
+            let mut replay_request = request;
+            if replay_request.agent.version.is_none() {
+                replay_request.agent.version = Some(accepted.definition.version);
+            }
+            let replay_digest = replay_request
+                .request_digest()
+                .map_err(|error| StoreError::InvalidUserTask(error.to_string()))?;
+            if stored_digest != replay_digest {
                 return Err(StoreError::IdempotencyConflict);
             }
-            let accepted = get_user_task_in_tx(&mut tx, request.session_id, task_id).await?;
             tx.commit().await?;
             return Ok(accepted);
         }
 
         let definition =
             resolve_agent_in_tx(&mut tx, &request.agent.name, request.agent.version).await?;
+        let mut accepted_request = request.clone();
+        accepted_request.agent.version = Some(definition.version);
+        let request_digest = accepted_request
+            .request_digest()
+            .map_err(|error| StoreError::InvalidUserTask(error.to_string()))?;
         let task_id = UserTaskId::new(uuid::Uuid::now_v7());
         sqlx::query(
             "INSERT INTO user_tasks \
@@ -2272,7 +2282,8 @@ async fn get_user_task_in_tx(
     task_id: uuid::Uuid,
 ) -> Result<AcceptedUserTask, StoreError> {
     let row = sqlx::query(
-        "SELECT t.id AS task_id, t.session_id, t.principal, t.target, t.preferences, \
+        "SELECT t.id AS task_id, t.session_id, t.principal, t.request_digest, \
+                t.target, t.preferences, \
                 t.state AS task_state, t.revision, t.created_at, \
                 d.id AS definition_id, d.definition_kind, d.name AS definition_name, \
                 d.version AS definition_version, d.definition_hash, \
@@ -2365,6 +2376,15 @@ fn accepted_user_task_from_row(
     validation_request
         .validate()
         .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+    let request_digest: String = row.get("request_digest");
+    let recomputed_request_digest = validation_request
+        .request_digest()
+        .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+    if request_digest != recomputed_request_digest {
+        return Err(stored_data(
+            "user task request digest does not match its contents",
+        ));
+    }
 
     Ok(AcceptedUserTask {
         id: UserTaskId::new(row.get("task_id")),

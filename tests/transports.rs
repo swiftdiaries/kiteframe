@@ -1604,7 +1604,7 @@ async fn exercise_task_api<P: RpcPeer + Send>(
     model coding
     prompt """Inspect the task goal."""
     tools []
-    on done(summary: string) {{ done summary }}
+    on finished(summary: string) {{ done summary }}
   }}
 }}"#
     );
@@ -1691,6 +1691,18 @@ async fn exercise_task_api<P: RpcPeer + Send>(
     ] {
         assert!(!invalid_goal.to_string().contains(secret));
     }
+
+    let mut invalid_idempotency_key = payload.clone();
+    invalid_idempotency_key["idempotencyKey"] = json!(" \t\n ");
+    let invalid_idempotency_key = peer
+        .request("_kiteframe/task/submit", invalid_idempotency_key)
+        .await;
+    assert_eq!(invalid_idempotency_key["error"]["code"], -32602);
+    assert_eq!(
+        invalid_idempotency_key["error"]["message"],
+        "Invalid params"
+    );
+    assert!(invalid_idempotency_key["error"].get("data").is_none());
 
     let missing_agent_name = format!("missingagent_{}", Uuid::now_v7().simple());
     let mut missing_definition = payload.clone();
@@ -1784,7 +1796,7 @@ async fn exercise_agent_publication_boundary<P: RpcPeer + Send>(
     model reasoning
     prompt """{sentinel}"""
     tools []
-    on done(summary: string) {{ done summary }}
+    on finished(summary: string) {{ done summary }}
   }}
 }}"#
     );

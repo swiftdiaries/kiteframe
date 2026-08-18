@@ -119,6 +119,33 @@ fn compiles_the_support_workflow_with_strict_completion_and_immutable_bindings()
 }
 
 #[test]
+fn parser_warnings_and_compiler_errors_share_one_diagnostic_budget() {
+    let missing_tools = (0..80)
+        .map(|index| format!("missing_tool_{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "workflow noisy() -> string {{ start work() }} \
+         task work() -> string {{ prompt \"\"\"x\"\"\" tools [{missing_tools}] \
+         on ok() {{ done missing_value }} }}"
+    );
+
+    let diagnostics =
+        compile_report(&source, &catalog([]), &ceilings()).expect_err("semantic errors fail");
+
+    assert_eq!(diagnostics.len(), 64);
+    assert_eq!(diagnostics[0].code, "deprecated_workflow");
+    assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+    assert_eq!(diagnostics[1].code, "compiler_error");
+    assert!(
+        diagnostics
+            .iter()
+            .skip(1)
+            .all(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    );
+}
+
+#[test]
 fn rejects_missing_or_ambiguous_visible_tool_bindings() {
     let source = r#"
 workflow w() -> string { start t() }

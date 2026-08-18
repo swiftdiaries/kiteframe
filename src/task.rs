@@ -54,6 +54,8 @@ pub enum UserTaskError {
     InvalidRepository,
     #[error("GitHub pull request number must be greater than zero")]
     InvalidPullRequestNumber,
+    #[error("task idempotency key must not be blank")]
+    InvalidIdempotencyKey,
     #[error("task canonicalization failed: {0}")]
     Canonicalization(String),
 }
@@ -92,6 +94,9 @@ impl SubmitUserTask {
         }
         if *number == 0 {
             return Err(UserTaskError::InvalidPullRequestNumber);
+        }
+        if self.idempotency_key.as_str().trim().is_empty() {
+            return Err(UserTaskError::InvalidIdempotencyKey);
         }
         Ok(())
     }

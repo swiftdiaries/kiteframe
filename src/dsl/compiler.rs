@@ -12,7 +12,39 @@ use super::{
     ValueRefAst, parse_report,
 };
 
-const RESERVED_NAMES: &[&str] = &["complete_task", "outcome"];
+const COMPILER_RESERVED_NAMES: &[&str] = &["complete_task", "outcome"];
+const AGENT_RESERVED_WORDS: &[&str] = &[
+    "agent",
+    "workflow",
+    "type",
+    "task",
+    "entry",
+    "events",
+    "limits",
+    "model",
+    "reasoning",
+    "coding",
+    "prompt",
+    "tools",
+    "on",
+    "call",
+    "return",
+    "fork",
+    "join",
+    "context",
+    "isolated",
+    "kept",
+    "done",
+    "fail",
+    "ask",
+    "start",
+    "goto",
+    "parallel",
+    "true",
+    "false",
+    "null",
+];
+const MAX_DIAGNOSTICS: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct Compilation {
@@ -41,14 +73,18 @@ pub fn compile_report(
             max_tokens: 32 * 1024,
             max_identifier_bytes: 256,
             max_nesting: 64,
-            max_diagnostics: 64,
+            max_diagnostics: MAX_DIAGNOSTICS,
         },
     )?;
-    let definition = Compiler::new(source, &parsed.source, catalog, ceilings).compile()?;
-    Ok(Compilation {
-        definition,
-        diagnostics: parsed.diagnostics,
-    })
+    Compiler::new(
+        source,
+        &parsed.source,
+        catalog,
+        ceilings,
+        parsed.diagnostics,
+        MAX_DIAGNOSTICS,
+    )
+    .compile()
 }
 
 struct DefinitionView<'a> {
@@ -71,6 +107,8 @@ struct Compiler<'a> {
     catalog: &'a ToolCatalogSnapshot,
     ceilings: &'a Limits,
     diagnostics: Vec<Diagnostic>,
+    remaining_diagnostics: usize,
+    had_error: bool,
     records: BTreeMap<String, BTreeMap<String, CompiledType>>,
     task_asts: BTreeMap<String, &'a super::TaskAst>,
     task_inputs: BTreeMap<String, BTreeMap<String, CompiledType>>,
@@ -86,6 +124,8 @@ impl<'a> Compiler<'a> {
         ast: &'a SourceFile,
         catalog: &'a ToolCatalogSnapshot,
         ceilings: &'a Limits,
+        diagnostics: Vec<Diagnostic>,
+        max_diagnostics: usize,
     ) -> Self {
         let view = match &ast.definition {
             DefinitionAst::Workflow(workflow) => DefinitionView {
@@ -123,7 +163,9 @@ impl<'a> Compiler<'a> {
             view,
             catalog,
             ceilings,
-            diagnostics: Vec::new(),
+            remaining_diagnostics: max_diagnostics.saturating_sub(diagnostics.len()),
+            diagnostics,
+            had_error: false,
             records: BTreeMap::new(),
             task_asts: BTreeMap::new(),
             task_inputs: BTreeMap::new(),
@@ -134,7 +176,9 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn compile(mut self) -> Result<CompiledDefinition, Vec<Diagnostic>> {
+    fn compile(mut self) -> Result<Compilation, Vec<Diagnostic>> {
+        let definition_name = self.view.name.to_owned();
+        self.reject_reserved(&definition_name, self.view.span);
         self.collect_records();
         self.collect_tasks();
         let inputs = self.compile_fields(self.view.inputs, "definition input");
@@ -162,7 +206,7 @@ impl<'a> Compiler<'a> {
         self.reject_recursive_calls();
         self.reject_unreachable_tasks(&self.view.entry.task);
 
-        if !self.diagnostics.is_empty() {
+        if self.had_error {
             return Err(self.diagnostics);
         }
 
@@ -172,7 +216,9 @@ impl<'a> Compiler<'a> {
             .iter()
             .map(|event| (*event).to_owned())
             .collect::<Vec<_>>();
-        let tool_bindings = self.all_tool_bindings.into_values().collect::<Vec<_>>();
+        let tool_bindings = std::mem::take(&mut self.all_tool_bindings)
+            .into_values()
+            .collect::<Vec<_>>();
         let definition_hash = match self.view.kind {
             DefinitionKind::Workflow => {
                 workflow_definition_hash(self.source, self.view.dsl_version, &tool_bindings)
@@ -183,9 +229,15 @@ impl<'a> Compiler<'a> {
                 &agent_hash_metadata(&events, &entry, &tasks),
                 &tool_bindings,
             ),
-        }
-        .map_err(|error| vec![Diagnostic::new(error, self.ast.span)])?;
-        Ok(CompiledDefinition {
+        };
+        let definition_hash = match definition_hash {
+            Ok(definition_hash) => definition_hash,
+            Err(error) => {
+                self.error(error, self.ast.span);
+                return Err(self.diagnostics);
+            }
+        };
+        let definition = CompiledDefinition {
             dsl_version: self.view.dsl_version,
             definition_kind: self.view.kind,
             name: self.view.name.to_owned(),
@@ -199,6 +251,10 @@ impl<'a> Compiler<'a> {
             records: self.records,
             tasks,
             tool_bindings,
+        };
+        Ok(Compilation {
+            definition,
+            diagnostics: self.diagnostics,
         })
     }
 
@@ -469,6 +525,7 @@ impl<'a> Compiler<'a> {
         caller: Option<&str>,
         fallback_span: Span,
     ) -> CompiledCall {
+        self.reject_reserved(&call.task, call.span);
         if let Some(caller) = caller {
             self.reachability_edges
                 .entry(caller.to_owned())
@@ -485,6 +542,7 @@ impl<'a> Compiler<'a> {
         };
         let mut supplied = BTreeMap::new();
         for ArgumentAst { name, value, span } in &call.arguments {
+            self.reject_reserved(name, *span);
             if supplied.insert(name.clone(), value).is_some() {
                 self.error("call argument is duplicated", *span);
             }
@@ -544,6 +602,7 @@ impl<'a> Compiler<'a> {
             TypeAst::Number => CompiledType::Number,
             TypeAst::Boolean => CompiledType::Boolean,
             TypeAst::Named(name) => {
+                self.reject_reserved(name, span);
                 if !self.records.contains_key(name) {
                     self.error("type references an unknown closed record", span);
                 }
@@ -635,11 +694,11 @@ impl<'a> Compiler<'a> {
         if self.view.kind == DefinitionKind::Agent
             && compiled_limits.elapsed_seconds <= compiled_limits.active_execution_seconds
         {
-            self.diagnostics.push(Diagnostic::error(
+            self.diagnostic_error(
                 "invalid_elapsed_limit",
                 "elapsed_seconds must exceed active_execution_seconds",
                 self.view.span,
-            ));
+            );
         }
     }
 
@@ -726,13 +785,28 @@ impl<'a> Compiler<'a> {
     }
 
     fn reject_reserved(&mut self, name: &str, span: Span) {
-        if RESERVED_NAMES.contains(&name) {
+        if COMPILER_RESERVED_NAMES.contains(&name)
+            || (self.view.kind == DefinitionKind::Agent && AGENT_RESERVED_WORDS.contains(&name))
+        {
             self.error("reserved name is not allowed in definition source", span);
         }
     }
 
     fn error(&mut self, message: impl Into<String>, span: Span) {
-        self.diagnostics.push(Diagnostic::new(message, span));
+        self.had_error = true;
+        if self.remaining_diagnostics > 0 {
+            self.remaining_diagnostics -= 1;
+            self.diagnostics.push(Diagnostic::new(message, span));
+        }
+    }
+
+    fn diagnostic_error(&mut self, code: &'static str, message: impl Into<String>, span: Span) {
+        self.had_error = true;
+        if self.remaining_diagnostics > 0 {
+            self.remaining_diagnostics -= 1;
+            self.diagnostics
+                .push(Diagnostic::error(code, message, span));
+        }
     }
 }
 
