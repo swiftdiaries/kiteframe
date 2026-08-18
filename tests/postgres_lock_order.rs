@@ -5,15 +5,15 @@ use std::time::Duration;
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
-    AgentKernel, AgentRuntime, AgentRuntimeError, AgentSelector, CatalogTool, ClaimAgentCommand,
-    ClosedSchema, CompleteAgentCommand, CreateSession, EffectKind, EvidenceId, FrameCommand,
-    FrameId, GoalContract, IdempotencyKey, KernelCommand, KernelCommandPayload, KiteAgentRuntime,
-    NewChild, NewPermissionRequest, PermissionRequestId, PolicyRevision, PolicyUpdate,
-    PostgresStore, PrincipalId, RecoverySupport, RequestContext, RunId, RuntimeCeilings,
-    RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeStart, RuntimeStateSnapshot,
-    RuntimeTransition, SessionId, StartAgent, StartRun, StoreError, SubmitUserTask,
-    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
-    ToolCatalogSnapshot, UserTaskId,
+    AgentKernel, AgentRuntime, AgentRuntimeError, AgentSelector, CancelUserTask, CatalogTool,
+    ClaimAgentCommand, ClosedSchema, CompleteAgentCommand, CreateSession, EffectKind, EvidenceId,
+    FrameCommand, FrameId, GoalContract, IdempotencyKey, KernelCommand, KernelCommandPayload,
+    KiteAgentRuntime, NewChild, NewPermissionRequest, PauseUserTask, PermissionRequestId,
+    PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId, RecoverySupport, RequestContext,
+    ResumeUserTask, RunId, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent,
+    RuntimeStart, RuntimeStateSnapshot, RuntimeTransition, SessionId, StartAgent, StartRun,
+    StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
+    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -578,6 +578,148 @@ async fn session_close_locks_session_before_ordered_task_and_goal_rows() {
             .lifecycle,
         TaskLifecycle::Cancelled,
     );
+}
+
+#[tokio::test]
+async fn session_close_and_principal_actions_share_the_session_task_goal_prefix() {
+    for action in ["pause", "resume", "cancel"] {
+        let application_name = format!("kf-{action}-close-lock-{}", Uuid::now_v7());
+        let child = child_run(&application_name).await;
+        let task_id = accepted_agent_task(&child).await;
+        let kernel = agent_kernel(&child);
+        let mut current = kernel
+            .start_agent(
+                &child.principal,
+                start_agent_request(&child, task_id.clone(), &format!("start-{action}-close")),
+            )
+            .await
+            .expect("start agent task");
+        if action == "resume" {
+            current = kernel
+                .pause_task(
+                    &child.principal,
+                    PauseUserTask {
+                        session_id: child.session_id.clone(),
+                        task_id: task_id.clone(),
+                        expected_task_revision: current.task_revision,
+                        expected_goal_revision: current.goal_revision,
+                        reason: "Pause before the close race.".to_owned(),
+                        idempotency_key: IdempotencyKey::new("pause-before-close-race").unwrap(),
+                    },
+                )
+                .await
+                .expect("pause before resume race");
+        }
+
+        let mut task_goal_gate = child.store.pool().begin().await.expect("task/goal gate");
+        sqlx::query("SELECT id FROM user_tasks WHERE id = $1 FOR UPDATE")
+            .bind(task_id.as_uuid())
+            .execute(&mut *task_goal_gate)
+            .await
+            .expect("lock task");
+        sqlx::query("SELECT task_id FROM goal_states WHERE task_id = $1 FOR UPDATE")
+            .bind(task_id.as_uuid())
+            .execute(&mut *task_goal_gate)
+            .await
+            .expect("lock goal");
+
+        let close_store = Arc::clone(&child.store);
+        let close_session = child.session_id.clone();
+        let close_principal = child.principal.clone();
+        let mut close = tokio::spawn(async move {
+            close_store
+                .close_session_and_cancel_work(close_session, &close_principal)
+                .await
+        });
+        wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+        let action_kernel = Arc::clone(&kernel);
+        let action_principal = child.principal.clone();
+        let action_session = child.session_id.clone();
+        let action_task_id = task_id.clone();
+        let mut principal_action = tokio::spawn(async move {
+            match action {
+                "pause" => {
+                    action_kernel
+                        .pause_task(
+                            &action_principal,
+                            PauseUserTask {
+                                session_id: action_session,
+                                task_id: action_task_id,
+                                expected_task_revision: current.task_revision,
+                                expected_goal_revision: current.goal_revision,
+                                reason: "Pause during close.".to_owned(),
+                                idempotency_key: IdempotencyKey::new("pause-during-close").unwrap(),
+                            },
+                        )
+                        .await
+                }
+                "resume" => {
+                    action_kernel
+                        .resume_task(
+                            &action_principal,
+                            ResumeUserTask {
+                                session_id: action_session,
+                                task_id: action_task_id,
+                                expected_task_revision: current.task_revision,
+                                expected_goal_revision: current.goal_revision,
+                                idempotency_key: IdempotencyKey::new("resume-during-close")
+                                    .unwrap(),
+                            },
+                        )
+                        .await
+                }
+                "cancel" => {
+                    action_kernel
+                        .cancel_task(
+                            &action_principal,
+                            CancelUserTask {
+                                session_id: action_session,
+                                task_id: action_task_id,
+                                expected_task_revision: current.task_revision,
+                                expected_goal_revision: current.goal_revision,
+                                reason: Some("Cancel during close.".to_owned()),
+                                idempotency_key: IdempotencyKey::new("cancel-during-close")
+                                    .unwrap(),
+                            },
+                        )
+                        .await
+                }
+                _ => unreachable!(),
+            }
+        });
+        wait_for_blocked_connections(&child.store, &application_name, 2).await;
+        task_goal_gate
+            .commit()
+            .await
+            .expect("release task/goal gate");
+
+        let (close_result, action_result) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(&mut close, &mut principal_action)
+        })
+        .await
+        .expect("session close and principal action must not deadlock");
+        close_result
+            .expect("session close task")
+            .expect("session close result");
+        assert!(
+            matches!(
+                action_result.expect("principal action task"),
+                Err(StoreError::SessionClosed)
+            ),
+            "{action} must lose to the session close",
+        );
+        assert_eq!(
+            child
+                .store
+                .get_agent_execution(child.session_id.clone(), task_id)
+                .await
+                .expect("cancelled agent task")
+                .lifecycle,
+            TaskLifecycle::Cancelled,
+        );
+        assert_cancelled(&child, "closed").await;
+    }
 }
 
 #[tokio::test]

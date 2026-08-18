@@ -3,11 +3,11 @@ use std::sync::Arc;
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     AgentCommandContext, AgentCommandId, AgentKernel, AgentRecoveryReport, AgentSelector,
-    ClaimAgentCommand, CompleteAgentCommand, CreateSession, EvidenceId, GoalContract,
-    IdempotencyKey, KiteAgentRuntime, KiteFrameState, PostgresStore, PrincipalId, RuntimeCeilings,
-    RuntimeCommandKey, RuntimeEvent, RuntimeStateSnapshot, SessionView, StartAgent, StoreError,
-    SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
-    ToolCatalogSnapshot, UserTaskId,
+    ClaimAgentCommand, CompleteAgentCommand, CreateSession, EvidenceId, GoalContract, GoalPhase,
+    IdempotencyKey, KiteAgentRuntime, KiteFrameState, OperationalStatus, PostgresStore,
+    PrincipalId, ResumeUserTask, RuntimeCeilings, RuntimeCommandKey, RuntimeEvent,
+    RuntimeStateSnapshot, SessionView, StartAgent, StoreError, SubmitUserTask, SuccessCriterion,
+    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -108,6 +108,14 @@ impl RestartAgentFixture {
         second = call branch(value = right) context kept
       }} join
       done first
+    }}
+    on no_path() {{
+      block goal when 0 {{
+        code: "no_safe_path"
+        explanation: "No safe path remains."
+        evidence: [current_evidence]
+        unlock: ["A policy revision permits retry."]
+      }}
     }}
   }}
   task branch(value: string) -> string {{
@@ -418,6 +426,107 @@ async fn restart_preserves_claim_and_excludes_completed_commands() {
     drop(reopened);
     drop(fixture.kernel);
     drop(fixture.store);
+    database.drop().await;
+}
+
+#[tokio::test]
+async fn restart_excludes_blocked_work_until_authenticated_resume_reproposes_it() {
+    let _guard = RESTART_TEST_LOCK.lock().await;
+    let Some(fixture) = RestartAgentFixture::started_fork().await else {
+        return;
+    };
+    let pending = fixture
+        .store
+        .dispatchable_agent_commands(64)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|command| command.task_id == fixture.task_id)
+        .unwrap();
+    let source = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session.id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: pending.id,
+            expected_command_revision: pending.revision,
+            claimant: "builtin-direct-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new("claim-block-before-restart").unwrap(),
+        })
+        .await
+        .unwrap();
+    let blocked = fixture
+        .kernel
+        .complete_command(
+            &fixture.principal,
+            CompleteAgentCommand {
+                session_id: fixture.session.id.clone(),
+                task_id: fixture.task_id.clone(),
+                command_id: source.id,
+                expected_command_revision: source.revision,
+                idempotency_key: IdempotencyKey::new("block-before-restart").unwrap(),
+                event: RuntimeEvent::HarnessResult {
+                    event_id: "evt-block-before-restart".to_owned(),
+                    command_key: source.key,
+                    outcome: "no_path".to_owned(),
+                    fields: json!({}),
+                    evidence_id: EvidenceId::new(Uuid::now_v7()),
+                    history: vec![],
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.goal_phase, GoalPhase::Blocked);
+    assert_eq!(blocked.operational_status, OperationalStatus::Blocked);
+    let database = fixture.database.clone();
+    let database_url = fixture.database_url.clone();
+    let session_id = fixture.session.id.clone();
+    let task_id = fixture.task_id.clone();
+    let principal = fixture.principal.clone();
+    drop(fixture.kernel);
+    drop(fixture.store);
+
+    let reopened = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    assert_eq!(
+        reopened.recover_agent_commands(32).await.unwrap(),
+        AgentRecoveryReport {
+            pending: 0,
+            claimed: 0,
+        }
+    );
+    let kernel = AgentKernel::new(
+        Arc::clone(&reopened),
+        Arc::new(KiteAgentRuntime::new(RuntimeCeilings::default())),
+        Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&reopened))),
+    );
+    let resumed = kernel
+        .resume_task(
+            &principal,
+            ResumeUserTask {
+                session_id,
+                task_id,
+                expected_task_revision: blocked.task_revision,
+                expected_goal_revision: blocked.goal_revision,
+                idempotency_key: IdempotencyKey::new("resume-after-restart").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resumed.goal_phase, GoalPhase::Active);
+    assert_eq!(
+        resumed.operational_status,
+        OperationalStatus::WaitingForHarness
+    );
+    assert_eq!(
+        reopened.recover_agent_commands(32).await.unwrap(),
+        AgentRecoveryReport {
+            pending: 1,
+            claimed: 0,
+        }
+    );
+    drop(kernel);
+    drop(reopened);
     database.drop().await;
 }
 

@@ -8,8 +8,8 @@ use crate::dsl::{
     CompiledType, CompiledValue, CompletionContract, ContextMode, DefinitionKind,
 };
 use crate::{
-    AcceptedUserTask, ClosedSchema, CriterionAssertion, EvidenceId, GoalContract, PrimitiveValue,
-    TaskTarget, canonical_json,
+    AcceptedUserTask, ClosedSchema, CriterionAssertion, EvidenceId, GoalContract, GoalPhase,
+    OperationalStatus, PrimitiveValue, TaskLifecycle, TaskTarget, canonical_json,
 };
 
 use super::{
@@ -336,6 +336,34 @@ impl AgentRuntime for KiteAgentRuntime {
                     format!("event:{}", input.event.event_id()),
                     &self.ceilings,
                 );
+            }
+            RuntimeEvent::PrincipalResumed { .. } => {
+                if input.execution.lifecycle != TaskLifecycle::Running
+                    || input.execution.operational_status != OperationalStatus::Blocked
+                    || input.execution.goal_phase != GoalPhase::Blocked
+                    || snapshot.disposition != RuntimeDisposition::Blocked
+                {
+                    return Err(AgentRuntimeError::InvalidTransition(
+                        "principal resume requires a blocked execution".into(),
+                    ));
+                }
+                let selected = state
+                    .frames
+                    .iter()
+                    .filter(|(_, frame)| {
+                        frame.state == KiteFrameState::Ready && frame.outcome.is_some()
+                    })
+                    .map(|(id, _)| *id)
+                    .collect::<Vec<_>>();
+                let [frame_id] = selected.as_slice() else {
+                    return Err(AgentRuntimeError::InvalidState(
+                        "blocked snapshot does not select exactly one terminal frame".into(),
+                    ));
+                };
+                let frame = state.frames.get_mut(frame_id).unwrap();
+                frame.outcome = None;
+                frame.statement_index = 0;
+                frame.state = KiteFrameState::Ready;
             }
             _ => {
                 return Err(AgentRuntimeError::InvalidTransition(

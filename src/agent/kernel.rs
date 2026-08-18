@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use crate::{
     AcceptedUserTask, AgentCommandState, AgentExecutionView, AgentRecoveryReport, AgentRuntime,
-    CompleteAgentCommand, FailAgentCommand, KernelCommand, KernelCommandPayload, PolicyRevision,
-    PostgresStore, PrincipalId, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart,
-    StartAgent, StoreError, validate_transition,
+    CancelUserTask, CompleteAgentCommand, FailAgentCommand, GoalPhase, KernelCommand,
+    KernelCommandPayload, PauseUserTask, PolicyRevision, PostgresStore, PrincipalId,
+    ResumeUserTask, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart, StartAgent,
+    StoreError, validate_transition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,12 +233,110 @@ impl AgentKernel {
                 "command failure must produce exactly one FailTask".to_owned(),
             ));
         }
+        let policy = match transition.commands.as_slice() {
+            [
+                KernelCommand {
+                    payload: KernelCommandPayload::CompleteGoal(_),
+                    ..
+                },
+            ] => Some(
+                self.authorizer
+                    .authorize(
+                        principal,
+                        &context.execution.task,
+                        AgentLifecycleAction::CompleteGoal,
+                    )
+                    .await?,
+            ),
+            [
+                KernelCommand {
+                    payload: KernelCommandPayload::BlockGoal(_),
+                    ..
+                },
+            ] => Some(
+                self.authorizer
+                    .authorize(
+                        principal,
+                        &context.execution.task,
+                        AgentLifecycleAction::BlockGoal,
+                    )
+                    .await?,
+            ),
+            _ => None,
+        };
+        if policy.as_ref().is_some_and(|decision| !decision.allowed) {
+            return Err(StoreError::AgentTransitionInvalid(
+                "current policy denied goal transition".to_owned(),
+            ));
+        }
         self.store
-            .commit_agent_command_transition(principal, &request, &transition, None, &self.ceilings)
+            .commit_agent_command_transition(
+                principal,
+                &request,
+                &transition,
+                policy.as_ref(),
+                &self.ceilings,
+            )
             .await
     }
 
     pub async fn recover(&self, limit: i64) -> Result<AgentRecoveryReport, StoreError> {
         self.store.recover_agent_commands(limit).await
+    }
+
+    pub async fn pause_task(
+        &self,
+        principal: &PrincipalId,
+        request: PauseUserTask,
+    ) -> Result<AgentExecutionView, StoreError> {
+        self.store.pause_user_task(principal, request).await
+    }
+
+    pub async fn resume_task(
+        &self,
+        principal: &PrincipalId,
+        request: ResumeUserTask,
+    ) -> Result<AgentExecutionView, StoreError> {
+        let execution = self
+            .store
+            .get_agent_execution(request.session_id.clone(), request.task_id.clone())
+            .await?;
+        let transition = if execution.goal_phase == GoalPhase::Blocked {
+            let seed = self
+                .store
+                .load_agent_start_seed(request.session_id.clone(), request.task_id.clone())
+                .await?;
+            let event = RuntimeEvent::PrincipalResumed {
+                event_id: format!(
+                    "principal-resumed:{}:{}",
+                    request.task_id.as_uuid(),
+                    request.idempotency_key.as_str(),
+                ),
+            };
+            let transition = self
+                .runtime
+                .handle(RuntimeHandle {
+                    execution: &execution,
+                    definition: &seed.definition,
+                    event: &event,
+                })
+                .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+            validate_transition(&transition, &execution, &self.ceilings)
+                .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+            Some(transition)
+        } else {
+            None
+        };
+        self.store
+            .resume_user_task(principal, request, transition.as_ref(), &self.ceilings)
+            .await
+    }
+
+    pub async fn cancel_task(
+        &self,
+        principal: &PrincipalId,
+        request: CancelUserTask,
+    ) -> Result<AgentExecutionView, StoreError> {
+        self.store.cancel_user_task(principal, request).await
     }
 }

@@ -376,6 +376,22 @@ pub enum StoreError {
     AgentRuntimeUnavailable,
     #[error("agent transition is invalid: {0}")]
     AgentTransitionInvalid(String),
+    #[error("user task revision conflict")]
+    TaskRevisionConflict,
+    #[error("goal revision conflict")]
+    GoalRevisionConflict,
+    #[error("goal is already terminal")]
+    GoalAlreadyTerminal,
+    #[error("goal evidence does not cover the accepted criteria")]
+    GoalEvidenceIncomplete,
+    #[error("goal evidence was not found")]
+    GoalEvidenceNotFound,
+    #[error("goal evidence type does not match the criterion")]
+    GoalEvidenceTypeMismatch,
+    #[error("goal evidence source is not authorized")]
+    GoalEvidenceUnauthorized,
+    #[error("goal evidence is stale")]
+    GoalEvidenceStale,
     #[error("agent task has already started or terminated")]
     AgentTaskAlreadyTerminal,
     #[error("frame was not found")]

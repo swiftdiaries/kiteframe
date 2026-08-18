@@ -862,6 +862,105 @@ fn explicit_complete_and_block_goal_statements_emit_only_their_authority_command
 }
 
 #[test]
+fn principal_resumed_is_the_only_valid_blocked_snapshot_restart() {
+    let fixture = RuntimeFixture::simple(
+        r#"on unavailable(reason: string) {
+          block goal when 0 {
+            code: "required_access_unavailable"
+            explanation: reason
+            evidence: [current_evidence]
+            unlock: ["Restore access."]
+          }
+        }"#,
+    );
+    let start = fixture.runtime.start(fixture.start_input()).unwrap();
+    let blocked = fixture
+        .handle_harness_at(
+            start.snapshot.clone(),
+            &start.commands[0],
+            "unavailable",
+            json!({"reason":"GitHub is unavailable"}),
+            1,
+            "evt-block-resume",
+            Uuid::from_u128(132),
+            history(0, "blocked"),
+        )
+        .unwrap();
+    let blocked_state = fixture.decode(&blocked.snapshot);
+    let mut execution =
+        fixture.execution_with_snapshot(blocked.snapshot.clone(), 2, OperationalStatus::Blocked);
+    execution.goal_phase = GoalPhase::Blocked;
+    execution.goal_revision = 1;
+    let event = RuntimeEvent::PrincipalResumed {
+        event_id: "principal-resumed:task:key".to_owned(),
+    };
+    let resumed = fixture
+        .runtime
+        .handle(RuntimeHandle {
+            execution: &execution,
+            definition: &fixture.definition,
+            event: &event,
+        })
+        .unwrap();
+    assert_eq!(resumed.expected_task_revision, 2);
+    assert_eq!(resumed.expected_goal_revision, 1);
+    assert_eq!(resumed.snapshot.disposition, RuntimeDisposition::Running);
+    assert!(matches!(
+        resumed.commands.as_slice(),
+        [KernelCommand {
+            payload: KernelCommandPayload::InvokeHarness(_),
+            ..
+        }]
+    ));
+    let resumed_state = fixture.decode(&resumed.snapshot);
+    let prior = &blocked_state.frames[&KiteFrameId::new(0)];
+    let fresh = &resumed_state.frames[&KiteFrameId::new(0)];
+    assert_eq!(fresh.history, prior.history);
+    assert_eq!(fresh.outcome, None);
+    assert_eq!(fresh.statement_index, 0);
+    assert!(matches!(
+        fresh.state,
+        KiteFrameState::WaitingForHarness { .. }
+    ));
+
+    let active_snapshot = start.snapshot.clone();
+    let active_before = active_snapshot.clone();
+    assert!(matches!(
+        fixture.handle_event(
+            active_snapshot,
+            1,
+            OperationalStatus::WaitingForHarness,
+            &event,
+        ),
+        Err(AgentRuntimeError::InvalidTransition(_)),
+    ));
+    assert_eq!(active_before, start.snapshot);
+
+    let mut paused =
+        fixture.execution_with_snapshot(active_before.clone(), 2, OperationalStatus::Paused);
+    paused.goal_phase = GoalPhase::Paused;
+    assert!(matches!(
+        fixture.runtime.handle(RuntimeHandle {
+            execution: &paused,
+            definition: &fixture.definition,
+            event: &event,
+        }),
+        Err(AgentRuntimeError::InvalidTransition(_)),
+    ));
+
+    let mut forged = fixture.execution_with_snapshot(active_before, 2, OperationalStatus::Blocked);
+    forged.goal_phase = GoalPhase::Blocked;
+    assert!(matches!(
+        fixture.runtime.handle(RuntimeHandle {
+            execution: &forged,
+            definition: &fixture.definition,
+            event: &event,
+        }),
+        Err(AgentRuntimeError::InvalidTransition(_)),
+    ));
+}
+
+#[test]
 fn fail_emits_fail_task_without_goal_authority() {
     let fixture =
         RuntimeFixture::simple(r#"on no_path(reason: string) { fail "no_safe_path" reason }"#);

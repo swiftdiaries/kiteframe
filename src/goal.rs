@@ -5,13 +5,25 @@ use thiserror::Error;
 
 use crate::{AgentCommandId, UserTaskId, canonical_sha256};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GoalPhase {
     Active,
     Paused,
     Blocked,
     Complete,
+}
+
+#[must_use]
+pub const fn goal_edge_allowed(from: GoalPhase, to: GoalPhase) -> bool {
+    matches!(
+        (from, to),
+        (GoalPhase::Active, GoalPhase::Paused)
+            | (GoalPhase::Paused, GoalPhase::Active)
+            | (GoalPhase::Active, GoalPhase::Blocked)
+            | (GoalPhase::Blocked, GoalPhase::Active)
+            | (GoalPhase::Active, GoalPhase::Complete)
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
