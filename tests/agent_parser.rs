@@ -344,7 +344,30 @@ fn hyphenated_identifier_like_text_remains_invalid_outside_goal_criteria() {
     )
     .unwrap_err();
 
-    assert_eq!(diagnostics[0].code, "expected_identifier");
+    assert_eq!(diagnostics[0].code, "unexpected_character");
+}
+
+#[test]
+fn invalid_goal_criterion_token_classes_share_the_stable_diagnostic() {
+    let agent = goal_authority_agent();
+    let invalid_criteria = [
+        "1bad".to_owned(),
+        "\"quoted\"".to_owned(),
+        "criterion.dot".to_owned(),
+        "Bad".to_owned(),
+        "_leading".to_owned(),
+        "a".repeat(65),
+    ];
+
+    for invalid_criterion in invalid_criteria {
+        let source = agent.replace("criterion_one", &invalid_criterion);
+        let diagnostics = parse_report(&source, limits()).unwrap_err();
+
+        assert_eq!(
+            diagnostics[0].code, "invalid_goal_criterion",
+            "{invalid_criterion}",
+        );
+    }
 }
 
 #[test]

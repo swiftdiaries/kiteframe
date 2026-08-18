@@ -690,14 +690,6 @@ impl Parser {
         while !self.at_rbrace() && !self.at_eof() {
             let criterion_start = self.current_span().start;
             let criterion_id = self.goal_criterion_identifier()?;
-            let criterion_span = self.previous_span();
-            if !valid_goal_criterion_id(&criterion_id) {
-                self.error(
-                    "invalid_goal_criterion",
-                    "goal criterion id is invalid",
-                    criterion_span,
-                );
-            }
             self.expect_colon();
             let evidence = self.goal_authority_value()?;
             let span = Span {
@@ -1342,20 +1334,25 @@ impl Parser {
         }
     }
     fn goal_criterion_identifier(&mut self) -> Option<String> {
-        match self.current().kind.clone() {
-            TokenKind::Identifier(value) | TokenKind::InvalidIdentifier(value) => {
-                self.advance();
-                Some(value)
+        let span = self.current_span();
+        let (value, identifier_candidate) = match self.current().kind.clone() {
+            TokenKind::Identifier(value) | TokenKind::GoalCriterionCandidate(value) => {
+                (value, true)
             }
-            _ => {
-                self.error(
-                    "expected_identifier",
-                    "expected identifier",
-                    self.current_span(),
-                );
-                None
-            }
+            TokenKind::String(value)
+            | TokenKind::TripleString(value)
+            | TokenKind::Number(value) => (value, false),
+            _ => (String::new(), false),
+        };
+        self.advance();
+        if !identifier_candidate || !valid_goal_criterion_id(&value) {
+            self.error(
+                "invalid_goal_criterion",
+                "goal criterion id is invalid",
+                span,
+            );
         }
+        Some(value)
     }
     fn take_prompt(&mut self) -> Option<(String, Span)> {
         match self.current().kind.clone() {

@@ -3,7 +3,7 @@ use super::{Diagnostic, Span};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenKind {
     Identifier(String),
-    InvalidIdentifier(String),
+    GoalCriterionCandidate(String),
     String(String),
     TripleString(String),
     Number(String),
@@ -27,6 +27,16 @@ pub(crate) struct Token {
     pub span: Span,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GoalLexState {
+    Outside,
+    Complete,
+    Goal,
+    Criterion,
+    Colon,
+    Evidence,
+}
+
 pub(crate) fn lex(
     source: &str,
     max_tokens: usize,
@@ -42,6 +52,7 @@ pub(crate) fn lex(
         max_identifier_bytes,
         max_diagnostics,
         had_error: false,
+        goal_state: GoalLexState::Outside,
     };
     lexer.run();
     if lexer.had_error {
@@ -60,6 +71,7 @@ struct Lexer<'a> {
     max_identifier_bytes: usize,
     max_diagnostics: usize,
     had_error: bool,
+    goal_state: GoalLexState,
 }
 
 impl Lexer<'_> {
@@ -71,13 +83,15 @@ impl Lexer<'_> {
             }
             let start = self.offset;
             let rest = &self.source[self.offset..];
-            let token = if rest.starts_with("->") {
+            let ch = rest.chars().next().expect("offset is in source");
+            let token = if self.should_lex_goal_criterion(ch) {
+                Some(self.lex_goal_criterion_candidate(start))
+            } else if rest.starts_with("->") {
                 self.offset += 2;
                 Some(TokenKind::Arrow)
             } else if rest.starts_with("\"\"\"") {
                 self.lex_triple_string(start)
             } else {
-                let ch = rest.chars().next().expect("offset is in source");
                 match ch {
                     '{' => {
                         self.offset += 1;
@@ -175,12 +189,10 @@ impl Lexer<'_> {
     }
 
     fn lex_identifier(&mut self, start: usize) -> TokenKind {
-        let mut contains_hyphen = false;
         while let Some(ch) = self.source[self.offset..].chars().next() {
-            if !(matches!(ch, '_' | '-') || ch.is_ascii_alphanumeric()) {
+            if !(ch == '_' || ch.is_ascii_alphanumeric()) {
                 break;
             }
-            contains_hyphen |= ch == '-';
             self.offset += ch.len_utf8();
             if self.offset == self.source.len() {
                 break;
@@ -197,11 +209,35 @@ impl Lexer<'_> {
                 },
             );
         }
-        if contains_hyphen {
-            TokenKind::InvalidIdentifier(value.to_owned())
-        } else {
-            TokenKind::Identifier(value.to_owned())
+        TokenKind::Identifier(value.to_owned())
+    }
+
+    fn should_lex_goal_criterion(&self, ch: char) -> bool {
+        self.goal_state == GoalLexState::Criterion && !matches!(ch, '}' | ',' | ':')
+    }
+
+    fn lex_goal_criterion_candidate(&mut self, start: usize) -> TokenKind {
+        while let Some(ch) = self.source[self.offset..].chars().next() {
+            if ch.is_whitespace() || matches!(ch, ':' | '}') {
+                break;
+            }
+            self.offset += ch.len_utf8();
+            if self.offset == self.source.len() {
+                break;
+            }
         }
+        let value = &self.source[start..self.offset];
+        if value.len() > self.max_identifier_bytes {
+            self.error(
+                "identifier_byte_limit",
+                "identifier exceeds configured byte limit",
+                Span {
+                    start,
+                    end: self.offset,
+                },
+            );
+        }
+        TokenKind::GoalCriterionCandidate(value.to_owned())
     }
 
     fn lex_number(&mut self) -> TokenKind {
@@ -339,6 +375,35 @@ impl Lexer<'_> {
     }
 
     fn push(&mut self, kind: TokenKind, span: Span) {
+        self.goal_state = match self.goal_state {
+            GoalLexState::Outside => match &kind {
+                TokenKind::Identifier(value) if value == "complete" => GoalLexState::Complete,
+                _ => GoalLexState::Outside,
+            },
+            GoalLexState::Complete => match &kind {
+                TokenKind::Identifier(value) if value == "goal" => GoalLexState::Goal,
+                TokenKind::Identifier(value) if value == "complete" => GoalLexState::Complete,
+                _ => GoalLexState::Outside,
+            },
+            GoalLexState::Goal => match kind {
+                TokenKind::LBrace => GoalLexState::Criterion,
+                _ => GoalLexState::Outside,
+            },
+            GoalLexState::Criterion => match kind {
+                TokenKind::RBrace | TokenKind::Eof => GoalLexState::Outside,
+                TokenKind::Comma => GoalLexState::Criterion,
+                _ => GoalLexState::Colon,
+            },
+            GoalLexState::Colon => match kind {
+                TokenKind::Colon => GoalLexState::Evidence,
+                TokenKind::RBrace | TokenKind::Eof => GoalLexState::Outside,
+                _ => GoalLexState::Outside,
+            },
+            GoalLexState::Evidence => match kind {
+                TokenKind::RBrace | TokenKind::Eof => GoalLexState::Outside,
+                _ => GoalLexState::Criterion,
+            },
+        };
         if self.tokens.len() >= self.max_tokens {
             self.error(
                 "token_count_limit",
