@@ -5,11 +5,14 @@ use std::time::Duration;
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
-    AgentSelector, CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand, FrameId,
-    GoalContract, IdempotencyKey, NewChild, NewPermissionRequest, PermissionRequestId,
-    PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId, RecoverySupport, RunId, SessionId,
-    StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskPreferences,
-    TaskTarget, ToolCatalogSnapshot, UserTaskId,
+    AgentKernel, AgentRuntime, AgentRuntimeError, AgentSelector, CatalogTool, ClosedSchema,
+    CreateSession, EffectKind, FrameCommand, FrameId, GoalContract, IdempotencyKey, KernelCommand,
+    KernelCommandPayload, NewChild, NewPermissionRequest, PermissionRequestId, PolicyRevision,
+    PolicyUpdate, PostgresStore, PrincipalId, RecoverySupport, RequestContext, RunId,
+    RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeStart, RuntimeStateSnapshot,
+    RuntimeTransition, SessionId, StartAgent, StartRun, StoreError, SubmitUserTask,
+    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
+    ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -202,6 +205,63 @@ async fn accepted_agent_task(child: &ChildRun) -> UserTaskId {
         .await
         .expect("submit lock agent task")
         .id
+}
+
+struct LockStartRuntime;
+
+impl AgentRuntime for LockStartRuntime {
+    fn validate_agent(
+        &self,
+        _definition: &kiteframe::dsl::CompiledDefinition,
+    ) -> Result<(), AgentRuntimeError> {
+        Ok(())
+    }
+
+    fn start(&self, input: RuntimeStart<'_>) -> Result<RuntimeTransition, AgentRuntimeError> {
+        Ok(RuntimeTransition {
+            idempotency_key: "lock-runtime-start".to_owned(),
+            expected_task_revision: input.execution.task_revision,
+            expected_goal_revision: input.execution.goal_revision,
+            snapshot: RuntimeStateSnapshot::new(
+                RuntimeDisposition::Running,
+                json!({"lockTest": true}),
+                &RuntimeCeilings::default(),
+            )?,
+            commands: vec![KernelCommand {
+                schema_version: 1,
+                key: RuntimeCommandKey::new("context-1")?,
+                payload: KernelCommandPayload::RequestContext(RequestContext {
+                    evidence_type: "github.review_thread".to_owned(),
+                    subject: json!({}),
+                }),
+            }],
+        })
+    }
+
+    fn handle(
+        &self,
+        _input: kiteframe::RuntimeHandle<'_>,
+    ) -> Result<RuntimeTransition, AgentRuntimeError> {
+        unreachable!("lock-order start tests do not handle runtime events")
+    }
+}
+
+fn agent_kernel(child: &ChildRun) -> Arc<AgentKernel> {
+    Arc::new(AgentKernel::new(
+        Arc::clone(&child.store),
+        Arc::new(LockStartRuntime),
+        Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&child.store))),
+    ))
+}
+
+fn start_agent_request(child: &ChildRun, task_id: UserTaskId, key: &str) -> StartAgent {
+    StartAgent {
+        session_id: child.session_id.clone(),
+        task_id,
+        expected_task_revision: 0,
+        expected_goal_revision: 0,
+        idempotency_key: IdempotencyKey::new(key).expect("valid start key"),
+    }
 }
 
 async fn wait_for_blocked_connections(store: &PostgresStore, application_name: &str, minimum: i64) {
@@ -440,6 +500,105 @@ async fn session_close_locks_session_before_ordered_task_and_goal_rows() {
             .lifecycle,
         TaskLifecycle::Cancelled,
     );
+}
+
+#[tokio::test]
+async fn agent_start_and_session_close_share_the_session_task_goal_prefix() {
+    let application_name = format!("kf-start-close-lock-{}", Uuid::now_v7());
+    let child = child_run(&application_name).await;
+    let task_id = accepted_agent_task(&child).await;
+    let kernel = agent_kernel(&child);
+    let mut goal_gate = child.store.pool().begin().await.expect("goal gate");
+    sqlx::query("SELECT task_id FROM goal_states WHERE task_id = $1 FOR UPDATE")
+        .bind(task_id.as_uuid())
+        .execute(&mut *goal_gate)
+        .await
+        .expect("lock goal");
+
+    let start_principal = child.principal.clone();
+    let start_request = start_agent_request(&child, task_id.clone(), "start-close-lock");
+    let mut start =
+        tokio::spawn(async move { kernel.start_agent(&start_principal, start_request).await });
+    wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+    let close_store = Arc::clone(&child.store);
+    let close_session = child.session_id.clone();
+    let close_principal = child.principal.clone();
+    let mut close = tokio::spawn(async move {
+        close_store
+            .close_session_and_cancel_work(close_session, &close_principal)
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 2).await;
+
+    let mut session_probe = child.store.pool().begin().await.expect("session probe");
+    let session_lock = sqlx::query("SELECT id FROM sessions WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(child.session_id.as_uuid())
+        .execute(&mut *session_probe)
+        .await
+        .expect_err("start must retain the session prefix while waiting on the goal");
+    assert_eq!(
+        session_lock.as_database_error().unwrap().code().as_deref(),
+        Some("55P03"),
+    );
+    session_probe
+        .rollback()
+        .await
+        .expect("release session probe");
+    goal_gate.commit().await.expect("release goal gate");
+
+    let (start_result, close_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut start, &mut close)
+    })
+    .await
+    .expect("start and close must terminate without deadlock");
+    start_result
+        .expect("start task")
+        .expect("start transaction");
+    close_result
+        .expect("close task")
+        .expect("close transaction");
+    assert_cancelled(&child, "closed").await;
+}
+
+#[tokio::test]
+async fn concurrent_agent_starts_do_not_invert_the_session_task_goal_prefix() {
+    let application_name = format!("kf-start-prefix-lock-{}", Uuid::now_v7());
+    let child = child_run(&application_name).await;
+    let task_id = accepted_agent_task(&child).await;
+    let kernel = agent_kernel(&child);
+    let mut goal_gate = child.store.pool().begin().await.expect("goal gate");
+    sqlx::query("SELECT task_id FROM goal_states WHERE task_id = $1 FOR UPDATE")
+        .bind(task_id.as_uuid())
+        .execute(&mut *goal_gate)
+        .await
+        .expect("lock goal");
+
+    let first_kernel = kernel.clone();
+    let first_principal = child.principal.clone();
+    let request = start_agent_request(&child, task_id, "same-prefix-start");
+    let first_request = request.clone();
+    let mut first = tokio::spawn(async move {
+        first_kernel
+            .start_agent(&first_principal, first_request)
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+    let second_principal = child.principal.clone();
+    let mut second =
+        tokio::spawn(async move { kernel.start_agent(&second_principal, request).await });
+    wait_for_blocked_connections(&child.store, &application_name, 2).await;
+    goal_gate.commit().await.expect("release goal gate");
+
+    let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut first, &mut second)
+    })
+    .await
+    .expect("concurrent starts must terminate without deadlock");
+    let first_result = first_result.expect("first task").expect("first start");
+    let second_result = second_result.expect("second task").expect("second start");
+    assert_eq!(first_result.task.id, second_result.task.id);
 }
 
 #[tokio::test]

@@ -1,11 +1,13 @@
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
+use std::collections::BTreeSet;
 
 use crate::dsl::{CompiledDefinition, CompiledToolBinding, DefinitionKind};
 use crate::{
-    AgentExecutionView, CatalogEpochId, CatalogTool, EvidenceId, GoalBlocker, GoalPhase,
-    OperationalStatus, PolicyRevision, RuntimeCeilings, RuntimeDisposition, RuntimeStateSnapshot,
-    SessionId, TaskLifecycle, UserTaskId,
+    AgentExecutionView, AgentStartCommit, CatalogEpochId, CatalogTool, EvidenceId, GoalBlocker,
+    GoalPhase, KernelCommand, KernelCommandPayload, OperationalStatus, PolicyRevision, PrincipalId,
+    RuntimeCeilings, RuntimeDisposition, RuntimeStateSnapshot, SessionId, StartAgent,
+    TaskLifecycle, UserTaskId, canonical_sha256,
 };
 
 use super::{
@@ -25,9 +27,33 @@ pub(super) struct LockedAgentAggregate {
     pub(super) operational_status: OperationalStatus,
     pub(super) task_revision: u64,
     pub(super) definition_id: uuid::Uuid,
+    pub(super) definition_hash: String,
     pub(super) goal_phase: GoalPhase,
     pub(super) goal_revision: u64,
     pub(super) current_blocker_id: Option<uuid::Uuid>,
+}
+
+#[allow(dead_code)]
+struct AgentActionReplay {
+    request_digest: String,
+    result_task_revision: u64,
+    result_goal_revision: u64,
+}
+
+impl AgentActionReplay {
+    fn from_row(row: &PgRow) -> Result<Self, StoreError> {
+        Ok(Self {
+            request_digest: row.get("request_digest"),
+            result_task_revision: nonnegative(
+                row.get("result_task_revision"),
+                "agent action task revision is malformed",
+            )?,
+            result_goal_revision: nonnegative(
+                row.get("result_goal_revision"),
+                "agent action goal revision is malformed",
+            )?,
+        })
+    }
 }
 
 impl PostgresStore {
@@ -55,6 +81,293 @@ impl PostgresStore {
             execution: agent_execution_from_row(&row, self.agent_runtime_ceilings())?,
             definition: definition_from_agent_row(&row)?,
         })
+    }
+
+    pub async fn replay_agent_start(
+        &self,
+        principal: &PrincipalId,
+        request: &StartAgent,
+    ) -> Result<Option<AgentExecutionView>, StoreError> {
+        let request_digest = start_request_digest(request)?;
+        let session = sqlx::query("SELECT principal, state FROM sessions WHERE id = $1")
+            .bind(request.session_id.as_uuid())
+            .fetch_optional(self.pool())
+            .await?
+            .ok_or(StoreError::SessionNotFound)?;
+        if session.get::<String, _>("principal") != principal.as_str() {
+            return Err(StoreError::PrincipalMismatch);
+        }
+        if session.get::<String, _>("state") != "active" {
+            return Err(StoreError::SessionClosed);
+        }
+        let task_principal: String = sqlx::query_scalar(
+            "SELECT principal FROM user_tasks WHERE id = $1 AND session_id = $2",
+        )
+        .bind(request.task_id.as_uuid())
+        .bind(request.session_id.as_uuid())
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or(StoreError::UserTaskNotFound)?;
+        if task_principal != principal.as_str() {
+            return Err(StoreError::PrincipalMismatch);
+        }
+        let replay = sqlx::query(
+            "SELECT request_digest, result_task_revision, result_goal_revision \
+             FROM agent_task_actions \
+             WHERE task_id = $1 AND action_kind = 'start' AND idempotency_key = $2",
+        )
+        .bind(request.task_id.as_uuid())
+        .bind(request.idempotency_key.as_str())
+        .fetch_optional(self.pool())
+        .await?
+        .map(|row| AgentActionReplay::from_row(&row))
+        .transpose()?;
+        let Some(replay) = replay else {
+            return Ok(None);
+        };
+        if replay.request_digest != request_digest {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        let execution = self
+            .get_agent_execution(request.session_id.clone(), request.task_id.clone())
+            .await?;
+        Ok(Some(execution))
+    }
+
+    pub async fn commit_agent_start(
+        &self,
+        commit: AgentStartCommit<'_>,
+    ) -> Result<AgentExecutionView, StoreError> {
+        validate_start_commit(&commit)?;
+        let snapshot_bytes = commit
+            .transition
+            .snapshot
+            .canonical_bytes(commit.ceilings)
+            .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
+        let snapshot_digest = commit
+            .transition
+            .snapshot
+            .digest(commit.ceilings)
+            .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
+        let command_digests = commit
+            .transition
+            .commands
+            .iter()
+            .map(canonical_sha256)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        let transition_digest = canonical_sha256(&json!({
+            "expectedTaskRevision": commit.transition.expected_task_revision,
+            "expectedGoalRevision": commit.transition.expected_goal_revision,
+            "snapshot": &commit.transition.snapshot,
+            "commands": &commit.transition.commands,
+        }))
+        .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        let request_digest = start_request_digest(commit.request)?;
+        let operational_status = operational_status_for_commands(
+            commit.transition.snapshot.disposition,
+            &commit.transition.commands,
+        )?;
+        if !commit.policy.allowed {
+            return Err(StoreError::AgentTransitionInvalid(
+                "current policy denied agent start".to_owned(),
+            ));
+        }
+        if !valid_reason_code(&commit.policy.reason_code) {
+            return Err(StoreError::AgentTransitionInvalid(
+                "policy reason code is invalid".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool().begin().await?;
+        let aggregate =
+            lock_agent_aggregate(&mut tx, &commit.request.session_id, &commit.request.task_id)
+                .await?;
+        if aggregate.task_principal != commit.principal.as_str() {
+            return Err(StoreError::PrincipalMismatch);
+        }
+        if aggregate.session_policy_revision != commit.policy.policy_revision {
+            return Err(StoreError::PolicyRevisionConflict);
+        }
+        if let Some(replay) = load_action_replay(
+            &mut tx,
+            &commit.request.task_id,
+            "start",
+            commit.request.idempotency_key.as_str(),
+        )
+        .await?
+        {
+            if replay.request_digest != request_digest {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            tx.commit().await?;
+            let execution = self
+                .get_agent_execution(
+                    commit.request.session_id.clone(),
+                    commit.request.task_id.clone(),
+                )
+                .await?;
+            return Ok(execution);
+        }
+        let has_snapshot: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM agent_runtime_snapshots WHERE task_id = $1)",
+        )
+        .bind(commit.request.task_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        if aggregate.task_lifecycle != TaskLifecycle::Accepted
+            || aggregate.operational_status != OperationalStatus::NotStarted
+            || aggregate.goal_phase != GoalPhase::Active
+            || aggregate.current_blocker_id.is_some()
+            || has_snapshot
+        {
+            return Err(StoreError::AgentTaskAlreadyTerminal);
+        }
+        if commit.request.expected_task_revision != aggregate.task_revision
+            || commit.request.expected_goal_revision != aggregate.goal_revision
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        if aggregate.task_revision != 0
+            || aggregate.goal_revision != 0
+            || commit.transition.expected_task_revision != 0
+            || commit.transition.expected_goal_revision != 0
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "agent start requires initial task and goal revisions".to_owned(),
+            ));
+        }
+        if aggregate.definition_id != commit.frozen_definition_id
+            || aggregate.definition_hash != commit.frozen_definition_hash
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "frozen agent definition changed before start".to_owned(),
+            ));
+        }
+
+        let task_revision = 1_u64;
+        let goal_revision = 0_u64;
+        let transition_id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO agent_transitions \
+             (id, task_id, idempotency_key, request_digest, expected_task_revision, \
+              expected_goal_revision, committed_task_revision, committed_goal_revision, \
+              snapshot_digest, command_digests) \
+             VALUES ($1, $2, $3, $4, 0, 0, 1, 0, $5, $6)",
+        )
+        .bind(transition_id)
+        .bind(commit.request.task_id.as_uuid())
+        .bind(&commit.transition.idempotency_key)
+        .bind(transition_digest)
+        .bind(&snapshot_digest)
+        .bind(serde_json::to_value(&command_digests).map_err(invalid_data)?)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_policy_decisions \
+             (id, task_id, transition_id, action_kind, allowed, policy_revision, reason_code) \
+             VALUES ($1, $2, $3, 'start', TRUE, $4, $5)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(commit.request.task_id.as_uuid())
+        .bind(transition_id)
+        .bind(to_i64(
+            commit.policy.policy_revision.get(),
+            "policy revision is malformed",
+        )?)
+        .bind(&commit.policy.reason_code)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_runtime_snapshots \
+             (task_id, task_revision, schema_version, runtime_id, disposition, payload, \
+              ceiling_bytes, canonical_bytes, snapshot_digest) \
+             VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(commit.request.task_id.as_uuid())
+        .bind(i32::from(commit.transition.snapshot.schema_version))
+        .bind(&commit.transition.snapshot.runtime_id)
+        .bind(runtime_disposition_name(
+            commit.transition.snapshot.disposition,
+        ))
+        .bind(&commit.transition.snapshot.payload)
+        .bind(
+            i32::try_from(commit.transition.snapshot.ceiling_bytes).map_err(|_| {
+                StoreError::RuntimeStateInvalid("snapshot ceiling is malformed".to_owned())
+            })?,
+        )
+        .bind(i32::try_from(snapshot_bytes.len()).map_err(|_| {
+            StoreError::RuntimeStateInvalid("snapshot byte count is malformed".to_owned())
+        })?)
+        .bind(&snapshot_digest)
+        .execute(&mut *tx)
+        .await?;
+        for (ordinal, command) in commit.transition.commands.iter().enumerate() {
+            let payload = command_payload(&command.payload)?;
+            let payload_digest = canonical_sha256(&payload)
+                .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+            sqlx::query(
+                "INSERT INTO agent_commands \
+                 (id, task_id, transition_id, ordinal, schema_version, runtime_key, \
+                  command_kind, payload, payload_digest) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(commit.request.task_id.as_uuid())
+            .bind(transition_id)
+            .bind(i32::try_from(ordinal).map_err(|_| {
+                StoreError::AgentTransitionInvalid("command ordinal is invalid".to_owned())
+            })?)
+            .bind(i32::from(command.schema_version))
+            .bind(command.key.as_str())
+            .bind(command_kind(&command.payload))
+            .bind(payload)
+            .bind(payload_digest)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE user_tasks SET state = 'running', operational_status = $1, revision = 1, \
+             started_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+        )
+        .bind(operational_status_name(operational_status))
+        .bind(commit.request.task_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        append_agent_task_event(
+            &mut tx,
+            &commit.request.task_id,
+            AgentTaskEventKind::AgentStarted,
+            json!({
+                "definition_id": commit.frozen_definition_id,
+                "definition_hash": commit.frozen_definition_hash,
+                "policy_revision": commit.policy.policy_revision.get(),
+                "reason_code": commit.policy.reason_code,
+                "snapshot_digest": snapshot_digest,
+                "command_count": command_digests.len(),
+            }),
+            task_revision,
+            goal_revision,
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_task_actions \
+             (id, task_id, action_kind, idempotency_key, request_digest, \
+              result_task_revision, result_goal_revision) \
+             VALUES ($1, $2, 'start', $3, $4, 1, 0)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(commit.request.task_id.as_uuid())
+        .bind(commit.request.idempotency_key.as_str())
+        .bind(request_digest)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_agent_execution(
+            commit.request.session_id.clone(),
+            commit.request.task_id.clone(),
+        )
+        .await
     }
 
     pub async fn agent_task_events_after(
@@ -123,6 +436,174 @@ impl PostgresStore {
     }
 }
 
+async fn load_action_replay(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &UserTaskId,
+    action_kind: &str,
+    idempotency_key: &str,
+) -> Result<Option<AgentActionReplay>, StoreError> {
+    sqlx::query(
+        "SELECT request_digest, result_task_revision, result_goal_revision \
+         FROM agent_task_actions \
+         WHERE task_id = $1 AND action_kind = $2 AND idempotency_key = $3",
+    )
+    .bind(task_id.as_uuid())
+    .bind(action_kind)
+    .bind(idempotency_key)
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(|row| AgentActionReplay::from_row(&row))
+    .transpose()
+}
+
+fn start_request_digest(request: &StartAgent) -> Result<String, StoreError> {
+    canonical_sha256(&json!({
+        "sessionId": &request.session_id,
+        "taskId": &request.task_id,
+        "expectedTaskRevision": request.expected_task_revision,
+        "expectedGoalRevision": request.expected_goal_revision,
+    }))
+    .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))
+}
+
+fn operational_status_for_commands(
+    disposition: RuntimeDisposition,
+    commands: &[KernelCommand],
+) -> Result<OperationalStatus, StoreError> {
+    if disposition == RuntimeDisposition::Returned && commands.is_empty() {
+        return Ok(OperationalStatus::Finished);
+    }
+    if disposition != RuntimeDisposition::Running || commands.is_empty() {
+        return Err(StoreError::AgentTransitionInvalid(
+            "agent start must return or emit external commands".to_owned(),
+        ));
+    }
+    let first = external_command_status(&commands[0].payload)?;
+    for command in &commands[1..] {
+        if external_command_status(&command.payload)? != first {
+            return Err(StoreError::AgentTransitionInvalid(
+                "agent start emitted mixed external command kinds".to_owned(),
+            ));
+        }
+    }
+    Ok(first)
+}
+
+fn external_command_status(
+    payload: &KernelCommandPayload,
+) -> Result<OperationalStatus, StoreError> {
+    match payload {
+        KernelCommandPayload::InvokeHarness(_) => Ok(OperationalStatus::WaitingForHarness),
+        KernelCommandPayload::RequestContext(_) => Ok(OperationalStatus::WaitingForContext),
+        KernelCommandPayload::WaitForEvent(_) => Ok(OperationalStatus::WaitingForEvent),
+        KernelCommandPayload::RequestApproval(_) => Ok(OperationalStatus::WaitingForApproval),
+        KernelCommandPayload::CompleteGoal(_)
+        | KernelCommandPayload::BlockGoal(_)
+        | KernelCommandPayload::FailTask(_) => Err(StoreError::AgentTransitionInvalid(
+            "agent start cannot emit an internal authority command".to_owned(),
+        )),
+    }
+}
+
+fn validate_start_commit(commit: &AgentStartCommit<'_>) -> Result<(), StoreError> {
+    commit
+        .ceilings
+        .validate()
+        .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+    if !(1..=128).contains(&commit.transition.idempotency_key.len()) {
+        return Err(StoreError::AgentTransitionInvalid(
+            "runtime transition idempotency key is invalid".to_owned(),
+        ));
+    }
+    if commit.transition.commands.len() > commit.ceilings.max_commands_per_transition {
+        return Err(StoreError::AgentTransitionInvalid(
+            "runtime command ceiling exceeded".to_owned(),
+        ));
+    }
+    let mut keys = BTreeSet::new();
+    for command in &commit.transition.commands {
+        if command.schema_version != 1
+            || crate::RuntimeCommandKey::new(command.key.as_str()).is_err()
+            || !keys.insert(command.key.as_str())
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "runtime command envelope is invalid".to_owned(),
+            ));
+        }
+        let bytes = crate::canonical_json(command)
+            .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        if bytes.len() > commit.ceilings.max_command_bytes {
+            return Err(StoreError::AgentTransitionInvalid(
+                "runtime command ceiling exceeded".to_owned(),
+            ));
+        }
+    }
+    operational_status_for_commands(
+        commit.transition.snapshot.disposition,
+        &commit.transition.commands,
+    )?;
+    Ok(())
+}
+
+fn command_kind(payload: &KernelCommandPayload) -> &'static str {
+    match payload {
+        KernelCommandPayload::RequestContext(_) => "request_context",
+        KernelCommandPayload::WaitForEvent(_) => "wait_for_event",
+        KernelCommandPayload::InvokeHarness(_) => "invoke_harness",
+        KernelCommandPayload::RequestApproval(_) => "request_approval",
+        KernelCommandPayload::CompleteGoal(_) => "complete_goal",
+        KernelCommandPayload::BlockGoal(_) => "block_goal",
+        KernelCommandPayload::FailTask(_) => "fail_task",
+    }
+}
+
+fn command_payload(payload: &KernelCommandPayload) -> Result<Value, StoreError> {
+    match payload {
+        KernelCommandPayload::RequestContext(value) => serde_json::to_value(value),
+        KernelCommandPayload::WaitForEvent(value) => serde_json::to_value(value),
+        KernelCommandPayload::InvokeHarness(value) => serde_json::to_value(value),
+        KernelCommandPayload::RequestApproval(value) => serde_json::to_value(value),
+        KernelCommandPayload::CompleteGoal(value) => serde_json::to_value(value),
+        KernelCommandPayload::BlockGoal(value) => serde_json::to_value(value),
+        KernelCommandPayload::FailTask(value) => serde_json::to_value(value),
+    }
+    .map_err(invalid_data)
+}
+
+const fn runtime_disposition_name(disposition: RuntimeDisposition) -> &'static str {
+    match disposition {
+        RuntimeDisposition::Running => "running",
+        RuntimeDisposition::Returned => "returned",
+        RuntimeDisposition::Blocked => "blocked",
+        RuntimeDisposition::Terminating => "terminating",
+    }
+}
+
+const fn operational_status_name(status: OperationalStatus) -> &'static str {
+    match status {
+        OperationalStatus::NotStarted => "not_started",
+        OperationalStatus::Runnable => "runnable",
+        OperationalStatus::WaitingForContext => "waiting_for_context",
+        OperationalStatus::WaitingForEvent => "waiting_for_event",
+        OperationalStatus::WaitingForHarness => "waiting_for_harness",
+        OperationalStatus::WaitingForApproval => "waiting_for_approval",
+        OperationalStatus::Paused => "paused",
+        OperationalStatus::Blocked => "blocked",
+        OperationalStatus::Finished => "finished",
+    }
+}
+
+fn valid_reason_code(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_lowercase())
+        && value.len() <= 64
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn invalid_data(error: serde_json::Error) -> StoreError {
+    StoreError::InvalidData(error.to_string())
+}
+
 #[allow(dead_code)] // Establishes the mandatory prefix before later mutations are added.
 pub(super) async fn lock_agent_aggregate(
     tx: &mut Transaction<'_, Postgres>,
@@ -138,8 +619,11 @@ pub(super) async fn lock_agent_aggregate(
     .await?
     .ok_or(StoreError::SessionNotFound)?;
     let task = sqlx::query(
-        "SELECT principal, state, operational_status, revision, definition_id \
-         FROM user_tasks WHERE id = $1 AND session_id = $2 FOR UPDATE",
+        "SELECT t.principal, t.state, t.operational_status, t.revision, t.definition_id, \
+                d.definition_hash \
+         FROM user_tasks t \
+         JOIN workflow_definitions d ON d.id = t.definition_id \
+         WHERE t.id = $1 AND t.session_id = $2 FOR UPDATE OF t, d",
     )
     .bind(task_id.as_uuid())
     .bind(session_id.as_uuid())
@@ -180,6 +664,7 @@ impl LockedAgentAggregate {
             operational_status: operational_status(&task.get::<String, _>("operational_status"))?,
             task_revision: nonnegative(task.get("revision"), "user task revision is malformed")?,
             definition_id: task.get("definition_id"),
+            definition_hash: task.get("definition_hash"),
             goal_phase: goal_phase(&goal.get::<String, _>("phase"))?,
             goal_revision: nonnegative(goal.get("revision"), "goal revision is malformed")?,
             current_blocker_id: goal.get("current_blocker_id"),

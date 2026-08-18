@@ -5,9 +5,10 @@ use thiserror::Error;
 
 use crate::dsl::{CompiledDefinition, DefinitionKind};
 use crate::{
-    AgentCommandId, AgentExecutionView, CatalogEpochId, FrameId, GoalContract, IdempotencyKey,
-    KernelCommandPayload, PolicyRevision, PrincipalId, RunId, RuntimeCeilings, RuntimeCommandKey,
-    SessionId, TaskPreferences, TaskTarget, UserTaskId,
+    AgentCommandId, AgentExecutionView, AgentPolicyDecision, CatalogEpochId, FrameId, GoalContract,
+    IdempotencyKey, KernelCommandPayload, PolicyRevision, PrincipalId, RunId, RuntimeCeilings,
+    RuntimeCommandKey, RuntimeTransition, SessionId, StartAgent, TaskPreferences, TaskTarget,
+    UserTaskId,
 };
 
 #[derive(Clone, Debug)]
@@ -126,6 +127,16 @@ pub struct AgentTaskEvent {
 pub struct AgentStartSeed {
     pub execution: AgentExecutionView,
     pub definition: CompiledDefinition,
+}
+
+pub struct AgentStartCommit<'a> {
+    pub principal: &'a PrincipalId,
+    pub request: &'a StartAgent,
+    pub frozen_definition_id: uuid::Uuid,
+    pub frozen_definition_hash: &'a str,
+    pub policy: &'a AgentPolicyDecision,
+    pub transition: &'a RuntimeTransition,
+    pub ceilings: &'a RuntimeCeilings,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,6 +361,10 @@ pub enum StoreError {
     InvalidUserTask(String),
     #[error("agent definitions cannot start through the workflow runner")]
     AgentRuntimeUnavailable,
+    #[error("agent transition is invalid: {0}")]
+    AgentTransitionInvalid(String),
+    #[error("agent task has already started or terminated")]
+    AgentTaskAlreadyTerminal,
     #[error("frame was not found")]
     FrameNotFound,
     #[error("execution revision conflict")]

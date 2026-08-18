@@ -18,12 +18,13 @@ pub mod task;
 pub mod tools;
 
 pub use agent::{
-    AgentCommandId, AgentRuntime, AgentRuntimeError, BlockGoal, CompleteGoal, FailTask,
+    AgentCommandId, AgentKernel, AgentLifecycleAction, AgentLifecycleAuthorizer,
+    AgentPolicyDecision, AgentRuntime, AgentRuntimeError, BlockGoal, CompleteGoal, FailTask,
     GoalCriterionProjection, GoalProjection, HarnessStructuralLimits, HarnessTool, InvokeHarness,
     KernelCommand, KernelCommandPayload, RequestApproval, RequestContext, RuntimeCeilings,
     RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeHandle, RuntimeHistoryItem,
-    RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition, WaitForEvent,
-    validate_transition,
+    RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition, TaskOwnerAuthorizer,
+    WaitForEvent, validate_transition,
 };
 pub use config::{ConfigError, HarnessConfig, HarnessMode};
 pub use domain::{
@@ -64,11 +65,12 @@ pub use protocol::{
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
-    AcceptedUserTask, AgentCommandState, AgentCommandView, AgentStartSeed, AgentTaskEvent,
-    AgentTaskEventKind, Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild,
-    NewPermissionRequest, PendingPermission, PolicyUpdate, PostgresStore, PublishedDefinition,
-    Question, RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame,
-    SessionView, StartRun, StoreError, StoreLimits, SuspensionFrame, ToolCallIntent,
+    AcceptedUserTask, AgentCommandState, AgentCommandView, AgentStartCommit, AgentStartSeed,
+    AgentTaskEvent, AgentTaskEventKind, Bindings, CreateSession, FrameCommand, ModelAttempt,
+    NewChild, NewPermissionRequest, PendingPermission, PolicyUpdate, PostgresStore,
+    PublishedDefinition, Question, RecoverableToolCall, RunEvent, RunState, RunToolBinding,
+    RunView, RunnableFrame, SessionView, StartRun, StoreError, StoreLimits, SuspensionFrame,
+    ToolCallIntent,
 };
 pub use task::{
     AgentExecutionView, AgentSelector, CancelUserTask, HarnessRole, OperationalStatus,
