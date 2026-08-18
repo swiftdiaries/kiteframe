@@ -1,6 +1,6 @@
 use std::{collections::HashSet, fmt, time::Duration};
 
-use crate::{PrincipalId, ResponsesConfig, Secret, StoreLimits};
+use crate::{PrincipalId, ResponsesConfig, RuntimeCeilings, Secret, StoreLimits};
 
 #[derive(Clone, Debug)]
 pub enum HarnessMode {
@@ -150,6 +150,31 @@ impl HarnessConfig {
                 value("KITEFRAME_MAX_OPEN_PERMISSION_REQUESTS_PER_SESSION"),
                 32,
             )?,
+            agent_runtime: {
+                let defaults = RuntimeCeilings::default();
+                RuntimeCeilings {
+                    max_snapshot_bytes: parse_agent_runtime_ceiling(
+                        value("KITEFRAME_AGENT_MAX_SNAPSHOT_BYTES"),
+                        defaults.max_snapshot_bytes,
+                    )?,
+                    max_command_bytes: parse_agent_runtime_ceiling(
+                        value("KITEFRAME_AGENT_MAX_COMMAND_BYTES"),
+                        defaults.max_command_bytes,
+                    )?,
+                    max_commands_per_transition: parse_agent_runtime_ceiling(
+                        value("KITEFRAME_AGENT_MAX_COMMANDS_PER_TRANSITION"),
+                        defaults.max_commands_per_transition,
+                    )?,
+                    max_frames: parse_agent_runtime_ceiling(
+                        value("KITEFRAME_AGENT_MAX_FRAMES"),
+                        defaults.max_frames,
+                    )?,
+                    max_history_items_per_frame: parse_agent_runtime_ceiling(
+                        value("KITEFRAME_AGENT_MAX_HISTORY_ITEMS_PER_FRAME"),
+                        defaults.max_history_items_per_frame,
+                    )?,
+                }
+            },
         };
 
         Ok(Self {
@@ -171,6 +196,19 @@ fn parse_quota(value: Option<String>, default: usize) -> Result<usize, ConfigErr
         .map_err(|_| ConfigError::InvalidDeploymentQuota)?;
     if !(1..=4096).contains(&value) {
         return Err(ConfigError::InvalidDeploymentQuota);
+    }
+    Ok(value)
+}
+
+fn parse_agent_runtime_ceiling(
+    value: Option<String>,
+    default: usize,
+) -> Result<usize, ConfigError> {
+    let value = value
+        .map_or(Ok(default), |value| value.parse::<usize>())
+        .map_err(|_| ConfigError::InvalidAgentRuntimeCeiling)?;
+    if !(1..=default).contains(&value) {
+        return Err(ConfigError::InvalidAgentRuntimeCeiling);
     }
     Ok(value)
 }
@@ -253,6 +291,8 @@ pub enum ConfigError {
     InvalidRemoteConnectionLimit,
     #[error("deployment quota values must be between 1 and 4096")]
     InvalidDeploymentQuota,
+    #[error("agent runtime ceilings must be between 1 and their hard maximum")]
+    InvalidAgentRuntimeCeiling,
 }
 
 #[cfg(test)]
@@ -260,6 +300,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{ConfigError, HarnessConfig, HarnessMode};
+    use crate::RuntimeCeilings;
 
     fn config(values: &[(&str, &str)]) -> Result<HarnessConfig, ConfigError> {
         let values = values
@@ -275,6 +316,51 @@ mod tests {
             ("KITEFRAME_RESPONSES_API_KEY", "model-sentinel-secret"),
             ("KITEFRAME_RESPONSES_MODEL", "test-model"),
         ]
+    }
+
+    #[test]
+    fn agent_runtime_ceilings_can_only_lower_the_hard_maxima() {
+        let mut values = vec![
+            ("DATABASE_URL", "postgres://localhost/kiteframe"),
+            ("KITEFRAME_PRINCIPAL", "local-user"),
+            ("KITEFRAME_AGENT_MAX_SNAPSHOT_BYTES", "131072"),
+            ("KITEFRAME_AGENT_MAX_COMMAND_BYTES", "32768"),
+            ("KITEFRAME_AGENT_MAX_COMMANDS_PER_TRANSITION", "32"),
+            ("KITEFRAME_AGENT_MAX_FRAMES", "128"),
+            ("KITEFRAME_AGENT_MAX_HISTORY_ITEMS_PER_FRAME", "128"),
+        ];
+        values.extend(model_values());
+        assert_eq!(
+            config(&values).unwrap().store_limits.agent_runtime,
+            RuntimeCeilings {
+                max_snapshot_bytes: 131_072,
+                max_command_bytes: 32_768,
+                max_commands_per_transition: 32,
+                max_frames: 128,
+                max_history_items_per_frame: 128,
+            },
+        );
+
+        for (name, invalid) in [
+            ("KITEFRAME_AGENT_MAX_SNAPSHOT_BYTES", "262145"),
+            ("KITEFRAME_AGENT_MAX_COMMAND_BYTES", "65537"),
+            ("KITEFRAME_AGENT_MAX_COMMANDS_PER_TRANSITION", "65"),
+            ("KITEFRAME_AGENT_MAX_FRAMES", "257"),
+            ("KITEFRAME_AGENT_MAX_HISTORY_ITEMS_PER_FRAME", "257"),
+            ("KITEFRAME_AGENT_MAX_FRAMES", "0"),
+            ("KITEFRAME_AGENT_MAX_FRAMES", "not-a-number"),
+        ] {
+            let mut invalid_values = vec![
+                ("DATABASE_URL", "postgres://localhost/kiteframe"),
+                ("KITEFRAME_PRINCIPAL", "local-user"),
+                (name, invalid),
+            ];
+            invalid_values.extend(model_values());
+            assert!(matches!(
+                config(&invalid_values),
+                Err(ConfigError::InvalidAgentRuntimeCeiling),
+            ));
+        }
     }
 
     #[test]

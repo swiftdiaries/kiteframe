@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
-    CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand, FrameId, IdempotencyKey,
-    NewChild, NewPermissionRequest, PermissionRequestId, PolicyRevision, PolicyUpdate,
-    PostgresStore, PrincipalId, RecoverySupport, RunId, SessionId, StartRun, StoreError,
-    ToolCatalogSnapshot,
+    AgentSelector, CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand, FrameId,
+    GoalContract, IdempotencyKey, NewChild, NewPermissionRequest, PermissionRequestId,
+    PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId, RecoverySupport, RunId, SessionId,
+    StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskPreferences,
+    TaskTarget, ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -139,6 +140,68 @@ async fn child_run(application_name: &str) -> ChildRun {
             .descriptor_digest()
             .to_owned(),
     }
+}
+
+async fn accepted_agent_task(child: &ChildRun) -> UserTaskId {
+    let name = format!("lock_agent_{}", Uuid::now_v7().simple());
+    let source = format!(
+        r#"agent {name}(repository: string) -> string {{
+  entry inspect(repository = repository)
+  events ["github.pull_request.changed.v1"]
+  limits {{ steps: 20 active_execution_seconds: 30 elapsed_seconds: 60 }}
+  task inspect(repository: string) -> string {{
+    model reasoning
+    prompt """Inspect the pull request."""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let catalog = ToolCatalogSnapshot::new(
+        child.session_id.clone(),
+        Uuid::now_v7(),
+        std::iter::empty::<CatalogTool>(),
+    )
+    .expect("empty agent catalog");
+    let agent = compile(&source, &catalog, &Limits::default()).expect("compile lock agent");
+    let definition = child
+        .store
+        .publish(child.session_id.clone(), &agent, &source)
+        .await
+        .expect("publish lock agent");
+    child
+        .store
+        .submit_user_task(
+            &child.principal,
+            SubmitUserTask {
+                session_id: child.session_id.clone(),
+                agent: AgentSelector {
+                    name: definition.name,
+                    version: Some(definition.version),
+                },
+                target: TaskTarget::GithubPullRequest {
+                    repository: "acme/widgets".to_owned(),
+                    number: 142,
+                },
+                preferences: TaskPreferences { harness_role: None },
+                goal: GoalContract {
+                    version: 1,
+                    objective: "Keep the pull request mergeable".to_owned(),
+                    success: vec![SuccessCriterion {
+                        id: "reviews_resolved".to_owned(),
+                        statement: "All actionable reviews are resolved".to_owned(),
+                        evidence: "github.review_thread".to_owned(),
+                    }],
+                    constraints: vec![],
+                    blocked_when: vec![],
+                },
+                idempotency_key: IdempotencyKey::new(format!("submit-{}", Uuid::now_v7()))
+                    .expect("task idempotency key"),
+            },
+        )
+        .await
+        .expect("submit lock agent task")
+        .id
 }
 
 async fn wait_for_blocked_connections(store: &PostgresStore, application_name: &str, minimum: i64) {
@@ -315,6 +378,68 @@ async fn child_completion_and_session_close_use_the_same_frame_lock_order() {
         "completion failed: {completion_result:?}"
     );
     assert_cancelled(&child, "closed").await;
+}
+
+#[tokio::test]
+async fn session_close_locks_session_before_ordered_task_and_goal_rows() {
+    let application_name = format!("kf-agent-close-lock-{}", Uuid::now_v7());
+    let child = child_run(&application_name).await;
+    let task_id = accepted_agent_task(&child).await;
+    let mut task_goal_gate = child.store.pool().begin().await.expect("task/goal gate");
+    sqlx::query("SELECT id FROM user_tasks WHERE id = $1 FOR UPDATE")
+        .bind(task_id.as_uuid())
+        .execute(&mut *task_goal_gate)
+        .await
+        .expect("lock task");
+    sqlx::query("SELECT task_id FROM goal_states WHERE task_id = $1 FOR UPDATE")
+        .bind(task_id.as_uuid())
+        .execute(&mut *task_goal_gate)
+        .await
+        .expect("lock goal");
+
+    let close_store = Arc::clone(&child.store);
+    let close_session = child.session_id.clone();
+    let close_principal = child.principal.clone();
+    let mut close = tokio::spawn(async move {
+        close_store
+            .close_session_and_cancel_work(close_session, &close_principal)
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+    let mut session_probe = child.store.pool().begin().await.expect("session probe");
+    let session_lock = sqlx::query("SELECT id FROM sessions WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(child.session_id.as_uuid())
+        .execute(&mut *session_probe)
+        .await
+        .expect_err("close must hold the session prefix before waiting on the task");
+    assert_eq!(
+        session_lock.as_database_error().unwrap().code().as_deref(),
+        Some("55P03"),
+    );
+    session_probe
+        .rollback()
+        .await
+        .expect("release session probe");
+    task_goal_gate
+        .commit()
+        .await
+        .expect("release task/goal gate");
+
+    tokio::time::timeout(Duration::from_secs(5), &mut close)
+        .await
+        .expect("session close must terminate")
+        .expect("session close task")
+        .expect("session close result");
+    assert_eq!(
+        child
+            .store
+            .get_agent_execution(child.session_id, task_id)
+            .await
+            .expect("cancelled task")
+            .lifecycle,
+        TaskLifecycle::Cancelled,
+    );
 }
 
 #[tokio::test]

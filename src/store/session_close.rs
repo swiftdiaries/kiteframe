@@ -1,8 +1,8 @@
 use serde_json::json;
 use sqlx::Row;
 
-use super::{PostgresStore, StoreError};
-use crate::{PrincipalId, SessionId};
+use super::{AgentTaskEventKind, PostgresStore, StoreError, agent::append_agent_task_event};
+use crate::{PrincipalId, SessionId, UserTaskId};
 
 impl PostgresStore {
     pub async fn close_session_and_cancel_work(
@@ -23,8 +23,89 @@ impl PostgresStore {
             return Err(StoreError::SessionClosed);
         }
 
-        // The session row blocks new runs. Existing runs are the aggregate
-        // mutexes, so lock them before the frames they own.
+        // Global aggregate order: session, user tasks by id, goal states by
+        // task id, then the legacy run/frame aggregates.
+        let active_tasks = sqlx::query(
+            "SELECT id, revision FROM user_tasks \
+             WHERE session_id = $1 AND state NOT IN ('succeeded', 'failed', 'cancelled') \
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(*session_id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+        let task_ids = active_tasks
+            .iter()
+            .map(|row| row.get::<uuid::Uuid, _>("id"))
+            .collect::<Vec<_>>();
+        let goal_states = sqlx::query(
+            "SELECT task_id, revision FROM goal_states \
+             WHERE task_id = ANY($1) ORDER BY task_id FOR UPDATE",
+        )
+        .bind(&task_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        if goal_states.len() != active_tasks.len() {
+            return Err(StoreError::InvalidData("goal state is absent".to_owned()));
+        }
+
+        for task in &active_tasks {
+            let task_uuid: uuid::Uuid = task.get("id");
+            let task_id = UserTaskId::new(task_uuid);
+            let old_revision = u64::try_from(task.get::<i64, _>("revision"))
+                .map_err(|_| StoreError::InvalidData("user task revision is malformed".into()))?;
+            let task_revision = old_revision
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidData("user task revision is malformed".into()))?;
+            let goal_revision = goal_states
+                .iter()
+                .find(|row| row.get::<uuid::Uuid, _>("task_id") == task_uuid)
+                .and_then(|row| u64::try_from(row.get::<i64, _>("revision")).ok())
+                .ok_or_else(|| StoreError::InvalidData("goal revision is malformed".into()))?;
+
+            sqlx::query(
+                "UPDATE user_tasks SET state = 'cancelled', operational_status = 'finished', \
+                 revision = $1, cancellation_reason = 'session closed', \
+                 finished_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+            )
+            .bind(
+                i64::try_from(task_revision).map_err(|_| {
+                    StoreError::InvalidData("user task revision is malformed".into())
+                })?,
+            )
+            .bind(task_uuid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE agent_runtime_snapshots SET task_revision = $1, \
+                 updated_at = CURRENT_TIMESTAMP WHERE task_id = $2",
+            )
+            .bind(
+                i64::try_from(task_revision).map_err(|_| {
+                    StoreError::InvalidData("user task revision is malformed".into())
+                })?,
+            )
+            .bind(task_uuid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1, \
+                 updated_at = CURRENT_TIMESTAMP \
+                 WHERE task_id = $1 AND state IN ('pending', 'claimed')",
+            )
+            .bind(task_uuid)
+            .execute(&mut *tx)
+            .await?;
+            append_agent_task_event(
+                &mut tx,
+                &task_id,
+                AgentTaskEventKind::TaskCancelled,
+                json!({"reason": "session closed"}),
+                task_revision,
+                goal_revision,
+            )
+            .await?;
+        }
+
         let active_runs = sqlx::query(
             "SELECT id FROM runs WHERE session_id = $1 AND state NOT IN ('completed', 'failed', 'cancelled') ORDER BY id FOR UPDATE",
         )

@@ -14,7 +14,7 @@ use super::{
 
 pub struct PostgresStore {
     pool: PgPool,
-    limits: super::StoreLimits,
+    pub(super) limits: super::StoreLimits,
 }
 
 impl PostgresStore {
@@ -456,6 +456,10 @@ impl PostgresStore {
         .bind(&goal_digest)
         .execute(&mut *tx)
         .await?;
+        sqlx::query("INSERT INTO goal_states (task_id, phase, revision) VALUES ($1, 'active', 0)")
+            .bind(task_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
 
         let accepted = get_user_task_in_tx(&mut tx, request.session_id, *task_id.as_uuid()).await?;
         tx.commit().await?;
@@ -2303,18 +2307,26 @@ async fn get_user_task_in_tx(
     accepted_user_task_from_row(&row)
 }
 
-fn accepted_user_task_from_row(
+pub(super) fn accepted_user_task_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> Result<AcceptedUserTask, StoreError> {
     let stored_data = |message: &str| StoreError::InvalidData(message.to_owned());
     if row.get::<String, _>("task_state") != "accepted" {
         return Err(stored_data("user task state is malformed"));
     }
-    let revision = u64::try_from(row.get::<i64, _>("revision"))
-        .map_err(|_| stored_data("user task revision is malformed"))?;
-    if revision != 0 {
+    let accepted = user_task_from_row(row)?;
+    if accepted.revision != 0 {
         return Err(stored_data("user task revision is malformed"));
     }
+    Ok(accepted)
+}
+
+pub(super) fn user_task_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<AcceptedUserTask, StoreError> {
+    let stored_data = |message: &str| StoreError::InvalidData(message.to_owned());
+    let revision = u64::try_from(row.get::<i64, _>("revision"))
+        .map_err(|_| stored_data("user task revision is malformed"))?;
     let definition = PublishedDefinition {
         id: row.get("definition_id"),
         kind: definition_kind(&row.get::<String, _>("definition_kind"))?,

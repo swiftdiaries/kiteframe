@@ -3,9 +3,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-use crate::dsl::DefinitionKind;
+use crate::dsl::{CompiledDefinition, DefinitionKind};
 use crate::{
-    CatalogEpochId, FrameId, GoalContract, IdempotencyKey, PolicyRevision, PrincipalId, RunId,
+    AgentCommandId, AgentExecutionView, CatalogEpochId, FrameId, GoalContract, IdempotencyKey,
+    KernelCommandPayload, PolicyRevision, PrincipalId, RunId, RuntimeCeilings, RuntimeCommandKey,
     SessionId, TaskPreferences, TaskTarget, UserTaskId,
 };
 
@@ -22,6 +23,7 @@ pub struct StoreLimits {
     pub max_active_sessions_per_principal: usize,
     pub max_active_runs_per_session: usize,
     pub max_open_permission_requests_per_session: usize,
+    pub agent_runtime: RuntimeCeilings,
 }
 
 impl Default for StoreLimits {
@@ -30,8 +32,100 @@ impl Default for StoreLimits {
             max_active_sessions_per_principal: usize::MAX,
             max_active_runs_per_session: usize::MAX,
             max_open_permission_requests_per_session: usize::MAX,
+            agent_runtime: RuntimeCeilings::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentCommandState {
+    Pending,
+    Claimed,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentCommandView {
+    pub id: AgentCommandId,
+    pub task_id: UserTaskId,
+    pub key: RuntimeCommandKey,
+    pub ordinal: u16,
+    pub schema_version: u16,
+    pub payload: KernelCommandPayload,
+    pub payload_digest: String,
+    pub state: AgentCommandState,
+    pub revision: u64,
+    pub claimant: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentTaskEventKind {
+    AgentStarted,
+    CommandClaimed,
+    RuntimeTransitionCommitted,
+    RuntimeCommandUnavailable,
+    GoalCompleted,
+    GoalBlocked,
+    TaskPaused,
+    TaskResumed,
+    TaskCancelled,
+    TaskFailed,
+    TaskSucceeded,
+}
+
+impl AgentTaskEventKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentStarted => "agent.started",
+            Self::CommandClaimed => "command.claimed",
+            Self::RuntimeTransitionCommitted => "runtime.transition_committed",
+            Self::RuntimeCommandUnavailable => "runtime.command_unavailable",
+            Self::GoalCompleted => "goal.completed",
+            Self::GoalBlocked => "goal.blocked",
+            Self::TaskPaused => "task.paused",
+            Self::TaskResumed => "task.resumed",
+            Self::TaskCancelled => "task.cancelled",
+            Self::TaskFailed => "task.failed",
+            Self::TaskSucceeded => "task.succeeded",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "agent.started" => Ok(Self::AgentStarted),
+            "command.claimed" => Ok(Self::CommandClaimed),
+            "runtime.transition_committed" => Ok(Self::RuntimeTransitionCommitted),
+            "runtime.command_unavailable" => Ok(Self::RuntimeCommandUnavailable),
+            "goal.completed" => Ok(Self::GoalCompleted),
+            "goal.blocked" => Ok(Self::GoalBlocked),
+            "task.paused" => Ok(Self::TaskPaused),
+            "task.resumed" => Ok(Self::TaskResumed),
+            "task.cancelled" => Ok(Self::TaskCancelled),
+            "task.failed" => Ok(Self::TaskFailed),
+            "task.succeeded" => Ok(Self::TaskSucceeded),
+            _ => Err(StoreError::InvalidData(
+                "agent task event kind is malformed".to_owned(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentTaskEvent {
+    pub sequence: u64,
+    pub kind: AgentTaskEventKind,
+    pub metadata: serde_json::Value,
+    pub task_revision: u64,
+    pub goal_revision: u64,
+    pub created_at: time::OffsetDateTime,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentStartSeed {
+    pub execution: AgentExecutionView,
+    pub definition: CompiledDefinition,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -264,4 +358,6 @@ pub enum StoreError {
     QuotaExceeded(&'static str),
     #[error("stored data is invalid: {0}")]
     InvalidData(String),
+    #[error("runtime state is invalid: {0}")]
+    RuntimeStateInvalid(String),
 }

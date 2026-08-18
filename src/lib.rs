@@ -64,7 +64,8 @@ pub use protocol::{
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
-    AcceptedUserTask, Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild,
+    AcceptedUserTask, AgentCommandState, AgentCommandView, AgentStartSeed, AgentTaskEvent,
+    AgentTaskEventKind, Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild,
     NewPermissionRequest, PendingPermission, PolicyUpdate, PostgresStore, PublishedDefinition,
     Question, RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame,
     SessionView, StartRun, StoreError, StoreLimits, SuspensionFrame, ToolCallIntent,

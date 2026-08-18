@@ -116,6 +116,17 @@ async fn goal_count(pool: &PgPool, session_id: &SessionId) -> i64 {
     .unwrap()
 }
 
+async fn goal_state_count(pool: &PgPool, session_id: &SessionId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM goal_states g \
+         JOIN user_tasks t ON t.id = g.task_id WHERE t.session_id = $1",
+    )
+    .bind(session_id.as_uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 async fn insert_raw_user_task(
     pool: &PgPool,
     principal: &PrincipalId,
@@ -599,6 +610,58 @@ async fn goal_insert_failure_rolls_back_the_task() {
     assert!(matches!(result, Err(StoreError::Database(_))));
     assert_eq!(task_count(&pool, &session.id).await, 0);
     assert_eq!(goal_count(&pool, &session.id).await, 0);
+}
+
+#[tokio::test]
+async fn goal_state_insert_failure_rolls_back_task_and_goal_contract() {
+    let Some((store, pool, session, principal, agent)) = setup_agent_store().await else {
+        return;
+    };
+    let suffix = Uuid::now_v7().simple().to_string();
+    let function_name = format!("reject_goal_state_insert_{suffix}");
+    let trigger_name = format!("reject_goal_state_insert_{suffix}");
+    sqlx::query(&format!(
+        "CREATE FUNCTION {function_name}() RETURNS trigger AS $$ \
+         BEGIN \
+           IF EXISTS ( \
+             SELECT 1 FROM goal_contracts \
+             WHERE task_id = NEW.task_id \
+               AND objective = 'force post-goal-contract rollback' \
+           ) THEN \
+             RAISE EXCEPTION 'forced goal state insert failure' USING ERRCODE = '55000'; \
+           END IF; \
+           RETURN NEW; \
+         END; \
+         $$ LANGUAGE plpgsql"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER {trigger_name} BEFORE INSERT ON goal_states \
+         FOR EACH ROW EXECUTE FUNCTION {function_name}()"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut request = submit_request(session.id.clone(), agent.name, None);
+    request.goal.objective = "force post-goal-contract rollback".to_owned();
+    let result = store.submit_user_task(&principal, request).await;
+
+    sqlx::query(&format!("DROP TRIGGER {trigger_name} ON goal_states"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP FUNCTION {function_name}()"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert!(matches!(result, Err(StoreError::Database(_))));
+    assert_eq!(task_count(&pool, &session.id).await, 0);
+    assert_eq!(goal_count(&pool, &session.id).await, 0);
+    assert_eq!(goal_state_count(&pool, &session.id).await, 0);
 }
 
 #[tokio::test]
