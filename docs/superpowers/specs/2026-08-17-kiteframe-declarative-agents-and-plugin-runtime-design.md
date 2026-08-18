@@ -74,35 +74,73 @@ foundation; the remaining design is still prospective.
 The minimal workflow compiler and runtime remain implemented. Consolidated
 Slice 1 additionally implements agent authoring and compilation, immutable
 agent publication, authenticated immutable user-task and goal-contract
-acceptance, and restart-safe retrieval. Published agents and accepted task
-intent remain inert: `StartRun` rejects agents before execution persistence.
+acceptance, and restart-safe retrieval. Consolidated Slice 2 now implements
+the exact immutable agent start boundary, provider-free built-in runtime,
+revisioned task/goal/snapshot transitions, command journaling and recovery,
+minimal harness evidence, complete/block authority, authenticated
+pause/resume/cancel, the bounded direct-loop bridge, and private lifecycle
+methods. The generic definition publication and task submit/get methods remain
+private Kiteframe ACP extensions, not the stable plugin protocol designed
+below.
 
-Goal lifecycle, agent execution, stable plugin protocols, semantic channels,
-workers, budgets, connectors, Codex integration, and Cursor or VS Code editor
-integrations are not implemented. The current generic definition publication
-and task submit/get methods are private Kiteframe ACP extensions, not the
-stable plugin protocol designed below.
+Slice 2 transfers the complete durable goal semantics to every persisted
+`InvokeHarness`: the objective; ordered success criteria, each with its id,
+human statement, and evidence type; constraints; and blocked conditions.
+That projection and its durable-goal directive persist across repeated and
+recovered invocations. `complete_task` completes only the bounded harness
+task and emits command-bound `harness.invocation_result` evidence. It cannot
+complete or block the enclosing goal; Rust-only `CompleteGoal` and `BlockGoal`
+remain authoritative.
 
-Final reviewed implementation commits through consolidated Task 8:
+The following are implementation evidence only; later fix and review commits
+are not counted as additional initial implementation commits:
 
-- Tasks 1-3 reconciliation: `6f84b87a65954cbf68742e7944ad0a91be74aa9d`
-- Task 4: `35bcc1580b48a4f57960ad4a39bb1b99fc0f3578`
-- Task 5: `b7c256e9791b5ae18f81dcbf335aab5b04829774`
-- Task 6: `adac874e2bc2a4660e5ce767adca0c063997ead3`
-- Task 7: `a94f81cfd2df230f1a15df4245cbb6f2f9c82245`
-- Task 8: `7c984b005cc2230bdf12c205a2f6e04adeb88713`
+- Task 1: `9dcb4382ec8061c45ab34ac9ded366a39d91d377`
+- Task 2: `127480110ede29691cfc513f17bf43a3c9f76bf3`
+- Task 3: `256f25c7fa19622984e34451d33ff6c697dd9983`
+- Task 4: `1c6ac6bff12203296af70d15db493546c364f529`
+- Task 5: `912862decb9198627623898f373ee5979d61e8a3`
+- Task 6: `066a6e2f0a33dad380a9e67c276a176de10bd79d`
+- Task 7: `84d0ae286ce7557b16920b2381eec18a6419d003`
+- Task 8: `2b119c4bf09f368a4c627c430acefd62bb6b6c31`
 
-Slice 1 closure executed these complete verification commands with the ignored
-worktree-local `.env` supplying `DATABASE_URL`:
+Gate A approval is recorded in
+`.superpowers/sdd/2026-08-17-kiteframe-declarative-agents-slice-2/cross-task-review-1-4-fix-report.md`.
+Gate B approval is recorded in
+`.superpowers/sdd/2026-08-17-kiteframe-declarative-agents-slice-2/cross-task-review-1-8-fix-report.md`.
+The successful Step 10 commands observed at final Gate B approval were:
 
 ```console
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-cd clients/python && uv run ruff check . && uv run pyright && uv run pytest
-cd clients/typescript && bun run typecheck && bun test && bun run build
+(cd clients/python && uv run ruff check . && uv run pyright && uv run pytest)
+(cd clients/typescript && bun run typecheck && bun test && bun run build)
 git diff --check
+git status --short
+git diff --stat
 ```
+
+The final Gate B review also observed these successful commands:
+
+```console
+cargo test --all-features --test agent_runtime_contract --test agent_lifecycle_store --test agent_start --test kite_agent_runtime --test agent_transition_store --test agent_goal_authority --test agent_direct_bridge --test agent_protocol --test e2e_agent_restart --test postgres_lock_order --test repository_shape
+cargo test --all-features --test agent_transition_store exact_completion_replays_when_winner_commits_after_empty_probe -- --exact --nocapture
+cargo check --no-default-features --lib --bin kiteframe-harness
+cargo test --no-default-features --test agent_transition_store
+```
+
+The complete Step 10 run passed 344 Rust tests; the mandated 11-target matrix
+passed 137 tests; the focused completion-race proof passed; the no-default
+feature audit passed; Python reported 24 tests passed and one pre-existing
+live-harness skip; TypeScript typecheck, tests, and build passed; and diff
+checks passed with a clean worktree.
+
+Slices 3–8 and the end-to-end product loop remain unimplemented. In
+particular, this note does not claim the GitHub, Codex, or Cursor/VS Code
+editor path is operational. The GitHub-typed `babysit_pr` goal cannot complete
+from Slice 2 harness evidence alone; later context, connector, and product
+slices must provide the authorized GitHub evidence and product loop.
 
 ## Normative language
 
