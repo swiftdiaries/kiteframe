@@ -107,6 +107,12 @@ impl IsolatedDatabase {
     }
 }
 
+async fn isolated_recovery_store(base_url: &str) -> (IsolatedDatabase, Arc<PostgresStore>) {
+    let database = IsolatedDatabase::create(base_url).await;
+    let store = Arc::new(PostgresStore::connect(&database.url).await.expect("store"));
+    (database, store)
+}
+
 #[tokio::test]
 async fn one_recovery_call_pages_through_more_than_256_model_attempts() {
     let Ok(base_url) = std::env::var("DATABASE_URL") else {
@@ -231,10 +237,10 @@ impl TrustedTool for NotStartedRetryTool {
 
 #[tokio::test]
 async fn direct_recovery_retry_replays_only_a_status_proven_read_only_call() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+    let Ok(base_url) = std::env::var("DATABASE_URL") else {
         return;
     };
-    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let (database, store) = isolated_recovery_store(&base_url).await;
     let session = store
         .create_session(CreateSession {
             principal: PrincipalId::new(format!("retry-{}", Uuid::now_v7())).unwrap(),
@@ -346,14 +352,15 @@ async fn direct_recovery_retry_replays_only_a_status_proven_read_only_call() {
         call.get::<String, _>("idempotency_key"),
         "original-effect-key"
     );
+    database.drop().await;
 }
 
 #[tokio::test]
 async fn unavailable_status_durably_marks_an_effect_outcome_unknown() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+    let Ok(base_url) = std::env::var("DATABASE_URL") else {
         return;
     };
-    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let (database, store) = isolated_recovery_store(&base_url).await;
     let session = store
         .create_session(CreateSession {
             principal: PrincipalId::new(format!("recovery-{}", Uuid::now_v7())).expect("principal"),
@@ -483,6 +490,7 @@ async fn unavailable_status_durably_marks_an_effect_outcome_unknown() {
             .map(|row| row.get("kind"))
             .collect();
     assert!(events.iter().any(|kind| kind == "tool.status_check_intent"));
+    database.drop().await;
 }
 
 #[tokio::test]
@@ -528,10 +536,10 @@ impl ToolResolver for UnattachedResolver {
 
 #[tokio::test]
 async fn recovery_reports_sessions_that_need_fresh_mcp_attachment() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+    let Ok(base_url) = std::env::var("DATABASE_URL") else {
         return;
     };
-    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let (database, store) = isolated_recovery_store(&base_url).await;
     let session = store
         .create_session(CreateSession {
             principal: PrincipalId::new(format!("mcp-wait-{}", Uuid::now_v7())).expect("principal"),
@@ -632,14 +640,15 @@ async fn recovery_reports_sessions_that_need_fresh_mcp_attachment() {
             .sessions_waiting_for_mcp
             >= 1
     );
+    database.drop().await;
 }
 
 #[tokio::test]
 async fn pending_status_is_polled_again_before_retry_budget_exhaustion() {
-    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+    let Ok(base_url) = std::env::var("DATABASE_URL") else {
         return;
     };
-    let store = Arc::new(PostgresStore::connect(&database_url).await.expect("store"));
+    let (database, store) = isolated_recovery_store(&base_url).await;
     let session = store
         .create_session(CreateSession {
             principal: PrincipalId::new(format!("pending-{}", Uuid::now_v7())).expect("principal"),
@@ -747,4 +756,5 @@ async fn pending_status_is_polled_again_before_retry_budget_exhaustion() {
         .expect("run")
         .get("state");
     assert_eq!(state, "outcome_unknown");
+    database.drop().await;
 }
