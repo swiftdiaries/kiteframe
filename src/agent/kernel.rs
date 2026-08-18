@@ -84,6 +84,10 @@ impl AgentKernel {
         }
     }
 
+    pub(crate) fn store(&self) -> &PostgresStore {
+        &self.store
+    }
+
     pub async fn start_agent(
         &self,
         principal: &PrincipalId,

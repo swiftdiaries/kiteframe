@@ -183,6 +183,7 @@ pub struct HarnessTool {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GoalCriterionProjection {
     pub id: String,
+    pub statement: String,
     pub evidence_type: String,
 }
 
@@ -192,6 +193,7 @@ pub struct GoalProjection {
     pub objective: String,
     pub success: Vec<GoalCriterionProjection>,
     pub constraints: Vec<String>,
+    pub blocked_when: Vec<String>,
 }
 
 impl GoalProjection {
@@ -203,10 +205,12 @@ impl GoalProjection {
                 .iter()
                 .map(|criterion| GoalCriterionProjection {
                     id: criterion.id.clone(),
+                    statement: criterion.statement.clone(),
                     evidence_type: criterion.evidence.clone(),
                 })
                 .collect(),
             constraints: contract.constraints.clone(),
+            blocked_when: contract.blocked_when.clone(),
         }
     }
 }

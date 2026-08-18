@@ -34,8 +34,9 @@ pub use domain::{
     PrincipalId, RunId, Secret, SessionId, UserTaskId,
 };
 pub use engine::{
-    AnswerQuestion, CancelRun, Engine, EngineConfig, EngineError, PermissionChoice, RecoveryReport,
-    ResolvePermission, RetryRecovery,
+    AgentCommandDispatcher, AnswerQuestion, CancelRun, DirectLoopHarnessExecutor, Engine,
+    EngineConfig, EngineError, HarnessCommandExecutor, HarnessExecutionError,
+    HarnessExecutionResult, PermissionChoice, RecoveryReport, ResolvePermission, RetryRecovery,
 };
 pub use goal::{
     CriterionAssertion, EvidenceId, EvidenceRecord, EvidenceSourceIdentity, GoalBlocker,

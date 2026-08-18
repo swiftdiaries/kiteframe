@@ -1,6 +1,11 @@
+mod harness;
 mod recovery;
 mod transition;
 
+pub use harness::{
+    AgentCommandDispatcher, DirectLoopHarnessExecutor, HarnessCommandExecutor,
+    HarnessExecutionError, HarnessExecutionResult,
+};
 pub use recovery::RecoveryReport;
 pub use transition::{FrameSnapshot, TransitionError, next_command};
 
@@ -11,12 +16,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::dsl::CompiledType;
 use crate::{
     IdempotencyKey, ModelClient, ModelRequest, NewPermissionRequest, PermissionRequestId,
     PolicyDecision, PolicyRequest, PostgresStore, RecoverySupport, SessionAuthorizer, StoreError,
     ToolCall, ToolError, ToolResolver, ToolStatus, canonical_sha256,
 };
+
+use harness::{completion_tool, parse_completion_item, validate_completion};
 
 pub struct Engine {
     pub store: Arc<PostgresStore>,
@@ -783,29 +789,8 @@ fn permission_resolution_key(
     Ok(format!("{}:{choice}", base.as_str()))
 }
 
-fn completion_tool(task: &crate::dsl::CompiledTask) -> Value {
-    json!({"type":"function", "name":"complete_task", "description":"Complete the current task with one declared outcome.", "parameters":{"type":"object", "additionalProperties":false, "properties":{"outcome":{"type":"string"}, "fields":{"type":"object"}}, "required":["outcome", "fields"]}, "outcomes": task.completion.outcomes})
-}
-
 fn model_tool(binding: crate::RunToolBinding) -> Value {
     json!({"type":"function", "name": binding.qualified_name, "description": binding.descriptor.get("description").and_then(Value::as_str).unwrap_or(""), "parameters": binding.descriptor.get("input").cloned().unwrap_or_else(|| json!({"type":"object","properties":{},"additionalProperties":false}))})
-}
-
-fn completion_from_item(item: &Value) -> Option<(String, Value)> {
-    if item.get("type")?.as_str()? != "function_call"
-        || item.get("name")?.as_str()? != "complete_task"
-    {
-        return None;
-    }
-    let arguments = item.get("arguments")?;
-    let arguments = arguments
-        .as_str()
-        .and_then(|text| serde_json::from_str(text).ok())
-        .unwrap_or_else(|| arguments.clone());
-    Some((
-        arguments.get("outcome")?.as_str()?.to_owned(),
-        arguments.get("fields")?.clone(),
-    ))
 }
 
 fn tool_call_from_item(item: &Value) -> Option<(String, String, Value)> {
@@ -835,52 +820,12 @@ enum ModelAction {
 }
 
 fn action_from_item(item: &Value) -> Option<ModelAction> {
-    completion_from_item(item)
+    parse_completion_item(item)
         .map(|(outcome, fields)| ModelAction::Completion(outcome, fields))
         .or_else(|| {
             tool_call_from_item(item)
                 .map(|(id, name, arguments)| ModelAction::ToolCall(id, name, arguments))
         })
-}
-
-fn validate_completion(
-    task: &crate::dsl::CompiledTask,
-    outcome: &str,
-    fields: &Value,
-) -> Result<(), StoreError> {
-    let expected = task.completion.outcomes.get(outcome).ok_or_else(|| {
-        StoreError::InvalidData("model selected an undeclared outcome".to_owned())
-    })?;
-    let actual = fields.as_object().ok_or_else(|| {
-        StoreError::InvalidData("model completion fields must be an object".to_owned())
-    })?;
-    if actual.len() != expected.len() || expected.keys().any(|field| !actual.contains_key(field)) {
-        return Err(StoreError::InvalidData(
-            "model completion fields do not match the selected outcome".to_owned(),
-        ));
-    }
-    for (name, ty) in expected {
-        if !matches_type(&actual[name], ty) {
-            return Err(StoreError::InvalidData(format!(
-                "model completion field has the wrong type: {name}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn matches_type(value: &Value, ty: &CompiledType) -> bool {
-    match ty {
-        CompiledType::String => value.is_string(),
-        CompiledType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
-        CompiledType::Number => value.is_number(),
-        CompiledType::Boolean => value.is_boolean(),
-        CompiledType::Optional(inner) => value.is_null() || matches_type(value, inner),
-        CompiledType::List(inner) => value
-            .as_array()
-            .is_some_and(|items| items.iter().all(|item| matches_type(item, inner))),
-        CompiledType::Record(_) => value.is_object(),
-    }
 }
 
 #[cfg(test)]

@@ -340,6 +340,22 @@ fn start_is_deterministic_and_emits_one_complete_harness_payload() {
         invocation.goal.objective,
         fixture.execution.task.goal.objective
     );
+    assert_eq!(
+        invocation.goal.success[0].statement,
+        fixture.execution.task.goal.success[0].statement
+    );
+    assert_eq!(
+        invocation.goal.success[0].evidence_type,
+        fixture.execution.task.goal.success[0].evidence
+    );
+    assert_eq!(
+        invocation.goal.constraints,
+        fixture.execution.task.goal.constraints
+    );
+    assert_eq!(
+        invocation.goal.blocked_when,
+        fixture.execution.task.goal.blocked_when
+    );
     assert!(invocation.result_schema.validate_definition().is_ok());
     assert_eq!(
         invocation.result_schema.normalized_json()["properties"]["answer"],

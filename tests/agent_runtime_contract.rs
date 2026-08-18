@@ -364,10 +364,15 @@ fn goal_projection_and_runtime_event_accessors_are_closed_projections() {
     assert_eq!(projection.success.len(), 3);
     assert_eq!(projection.success[0].id, "reviews_resolved");
     assert_eq!(
+        projection.success[0].statement,
+        "All actionable review threads are resolved."
+    );
+    assert_eq!(
         projection.success[0].evidence_type,
         "github.unresolved_reviews"
     );
     assert_eq!(projection.constraints, execution.task.goal.constraints);
+    assert_eq!(projection.blocked_when, execution.task.goal.blocked_when);
 
     let resumed = RuntimeEvent::PrincipalResumed {
         event_id: "event-1".into(),

@@ -1,0 +1,1069 @@
+use std::collections::BTreeSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use kiteframe::dsl::{Limits, compile};
+use kiteframe::{
+    AgentCommandDispatcher, AgentCommandId, AgentCommandView, AgentExecutionView, AgentKernel,
+    AgentSelector, CancelUserTask, CatalogTool, ClaimAgentCommand, ClosedSchema, CreateSession,
+    DirectLoopHarnessExecutor, EffectKind, EvidenceId, EvidenceRecord, EvidenceSourceIdentity,
+    GoalContract, GoalPhase, HarnessCommandExecutor, HarnessExecutionError, IdempotencyKey,
+    InvokeHarness, KernelCommandPayload, ModelClient, ModelError, ModelRequest, ModelResponse,
+    OperationalStatus, PauseUserTask, PostgresStore, PrincipalId, RecoverySupport, RequestContext,
+    RuntimeCeilings, StartAgent, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle,
+    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+    WaitForEvent, canonical_sha256,
+};
+use serde_json::{Value, json};
+use sqlx::{PgPool, Row};
+use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
+
+type ModelFuture = Pin<Box<dyn Future<Output = Result<ModelResponse, ModelError>> + Send>>;
+type ModelHandler = dyn Fn(ModelRequest) -> ModelFuture + Send + Sync;
+static BRIDGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct ScriptedModel {
+    handler: Mutex<Arc<ModelHandler>>,
+    calls: AtomicUsize,
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+impl ScriptedModel {
+    fn new() -> Self {
+        Self {
+            handler: Mutex::new(Arc::new(|_| {
+                Box::pin(async {
+                    Err(ModelError::Protocol(
+                        "scripted model response is not configured".to_owned(),
+                    ))
+                })
+            })),
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn on_request<F, Fut>(&self, handler: F)
+    where
+        F: Fn(ModelRequest) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ModelResponse, ModelError>> + Send + 'static,
+    {
+        *self.handler.lock().unwrap() = Arc::new(move |request| Box::pin(handler(request)));
+    }
+
+    fn complete(&self, outcome: &str, fields: Value) {
+        let outcome = outcome.to_owned();
+        self.on_request(move |_| {
+            let outcome = outcome.clone();
+            let fields = fields.clone();
+            async move {
+                Ok(ModelResponse {
+                    items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "done-1",
+                        "name": "complete_task",
+                        "arguments": {"outcome": outcome, "fields": fields},
+                    })],
+                })
+            }
+        });
+    }
+
+    fn respond_with(&self, item: Value) {
+        self.respond_with_items(vec![item]);
+    }
+
+    fn respond_with_items(&self, items: Vec<Value>) {
+        self.on_request(move |_| {
+            let items = items.clone();
+            async move { Ok(ModelResponse { items }) }
+        });
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn requests(&self) -> Vec<ModelRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelClient for ScriptedModel {
+    async fn respond(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().unwrap().push(request.clone());
+        let handler = self.handler.lock().unwrap().clone();
+        handler(request).await
+    }
+}
+
+struct BridgeFixture {
+    dispatcher: AgentCommandDispatcher,
+    kernel: Arc<AgentKernel>,
+    store: Arc<PostgresStore>,
+    model: Arc<ScriptedModel>,
+    pool: PgPool,
+    principal: PrincipalId,
+    session_id: kiteframe::SessionId,
+    task_id: UserTaskId,
+}
+
+impl BridgeFixture {
+    async fn started() -> Option<Self> {
+        Self::started_with_task(
+            "tools []",
+            r#"on ok(answer: string) { done answer }"#,
+            false,
+        )
+        .await
+    }
+
+    async fn started_with_declared_tool() -> Option<Self> {
+        Self::started_with_task(
+            "tools [search]",
+            r#"on ok(answer: string) { done answer }"#,
+            true,
+        )
+        .await
+    }
+
+    async fn started_with_approval() -> Option<Self> {
+        Self::started_with_task(
+            "tools []",
+            r#"on needs_approval() {
+      answer = ask string "Approve?"
+      done answer
+    }"#,
+            false,
+        )
+        .await
+    }
+
+    async fn started_with_blocking_outcome() -> Option<Self> {
+        Self::started_with_task(
+            "tools []",
+            r#"on unavailable(reason: string) {
+      block goal when 0 {
+        code: "required_access_unavailable"
+        explanation: reason
+        evidence: [current_evidence]
+        unlock: ["Restore the required access."]
+      }
+    }"#,
+            false,
+        )
+        .await
+    }
+
+    async fn started_with_task(tools: &str, outcomes: &str, declared_tool: bool) -> Option<Self> {
+        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+        let principal = PrincipalId::new(format!("agent-bridge-{}", Uuid::now_v7())).unwrap();
+        let session = store
+            .create_session(CreateSession {
+                principal: principal.clone(),
+                working_directory: "/agent-bridge".to_owned(),
+                retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+            })
+            .await
+            .unwrap();
+        let catalog_tools = declared_tool
+            .then(|| {
+                CatalogTool::new(
+                    "docs/search",
+                    "docs",
+                    "Search documents.",
+                    ClosedSchema::object("input", Default::default()),
+                    ClosedSchema::object("output", Default::default()),
+                    BTreeSet::new(),
+                    EffectKind::ReadOnly,
+                    RecoverySupport::NotRequired,
+                )
+                .unwrap()
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        let catalog =
+            ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), catalog_tools).unwrap();
+        store.append_catalog_epoch(&catalog).await.unwrap();
+        let name = format!("bridge_agent_{}", Uuid::now_v7().simple());
+        let source = format!(
+            r#"agent {name}(repository: string, pull_request: integer) -> string {{
+  entry inspect(repository = repository, pull_request = pull_request)
+  limits {{ steps: 20 model_turns_per_task: 3 tool_calls_per_response: 1 parallel_branches: 1 response_item_bytes: 4096 active_execution_seconds: 30 elapsed_seconds: 60 }}
+  task inspect(repository: string, pull_request: integer) -> string {{
+    model reasoning prompt """Inspect and finish one bounded task.""" {tools}
+    {outcomes}
+  }}
+}}"#
+        );
+        let definition = compile(&source, &catalog, &Limits::default()).unwrap();
+        let published = store
+            .publish(session.id.clone(), &definition, &definition.source)
+            .await
+            .unwrap();
+        let accepted = store
+            .submit_user_task(
+                &principal,
+                SubmitUserTask {
+                    session_id: session.id.clone(),
+                    agent: AgentSelector {
+                        name: published.name,
+                        version: Some(published.version),
+                    },
+                    target: TaskTarget::GithubPullRequest {
+                        repository: "acme/widgets".to_owned(),
+                        number: 142,
+                    },
+                    preferences: TaskPreferences { harness_role: None },
+                    goal: GoalContract {
+                        version: 1,
+                        objective: "Resolve review feedback and verify the change.".to_owned(),
+                        success: vec![SuccessCriterion {
+                            id: "reviews_resolved".to_owned(),
+                            statement: "All actionable review threads are resolved.".to_owned(),
+                            evidence: "harness.invocation_result".to_owned(),
+                        }],
+                        constraints: vec!["Never merge the pull request.".to_owned()],
+                        blocked_when: vec![
+                            "Required user or reviewer action remains unavailable.".to_owned(),
+                        ],
+                    },
+                    idempotency_key: IdempotencyKey::new(format!("submit-{}", Uuid::now_v7()))
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let kernel = Arc::new(AgentKernel::new(
+            Arc::clone(&store),
+            Arc::new(kiteframe::KiteAgentRuntime::new(RuntimeCeilings::default())),
+            Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&store))),
+        ));
+        kernel
+            .start_agent(
+                &principal,
+                StartAgent {
+                    session_id: session.id.clone(),
+                    task_id: accepted.id.clone(),
+                    expected_task_revision: 0,
+                    expected_goal_revision: 0,
+                    idempotency_key: IdempotencyKey::new(format!("start-{}", Uuid::now_v7()))
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let model = Arc::new(ScriptedModel::new());
+        let executor = Arc::new(DirectLoopHarnessExecutor::new(model.clone()));
+        let dispatcher = kernel.clone().with_harness_executor(executor);
+        Some(Self {
+            dispatcher,
+            kernel,
+            pool: store.pool().clone(),
+            store,
+            model,
+            principal,
+            session_id: session.id,
+            task_id: accepted.id,
+        })
+    }
+
+    async fn pending_command_id(&self) -> Uuid {
+        *self.pending_command().await.id.as_uuid()
+    }
+
+    async fn pending_command(&self) -> AgentCommandView {
+        self.store
+            .dispatchable_agent_commands(256)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.task_id == self.task_id)
+            .unwrap()
+    }
+
+    async fn current(&self) -> AgentExecutionView {
+        self.store
+            .get_agent_execution(self.session_id.clone(), self.task_id.clone())
+            .await
+            .unwrap()
+    }
+
+    async fn pending_invocation(&self) -> InvokeHarness {
+        let command_id = self.pending_command_id().await;
+        let context = self
+            .store
+            .load_agent_command_context(
+                self.session_id.clone(),
+                self.task_id.clone(),
+                AgentCommandId::new(command_id),
+            )
+            .await
+            .unwrap();
+        let KernelCommandPayload::InvokeHarness(invocation) = context.command.payload else {
+            panic!("pending command must invoke the harness")
+        };
+        invocation
+    }
+
+    async fn evidence(&self) -> Vec<EvidenceRecord> {
+        sqlx::query(
+            "SELECT id, evidence_type, source_identity, content_digest \
+             FROM goal_evidence WHERE task_id = $1 ORDER BY id",
+        )
+        .bind(self.task_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| EvidenceRecord {
+            id: EvidenceId::new(row.get("id")),
+            task_id: self.task_id.clone(),
+            evidence_type: row.get("evidence_type"),
+            source: EvidenceSourceIdentity::BuiltinHarness {
+                command_id: AgentCommandId::new(row.get("source_identity")),
+            },
+            digest: row.get("content_digest"),
+        })
+        .collect()
+    }
+
+    async fn legacy_run_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE session_id = $1")
+            .bind(self.session_id.as_uuid())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn legacy_frame_count(&self) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM frames f JOIN runs r ON r.id = f.run_id WHERE r.session_id = $1",
+        )
+        .bind(self.session_id.as_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn command_state(&self, command_id: &AgentCommandId) -> String {
+        sqlx::query_scalar("SELECT state FROM agent_commands WHERE id = $1")
+            .bind(command_id.as_uuid())
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn event_kinds(&self) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT kind FROM agent_task_events WHERE task_id = $1 ORDER BY sequence",
+        )
+        .bind(self.task_id.as_uuid())
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn snapshot_fingerprint(&self) -> (Value, String, i32, i32) {
+        let row = sqlx::query(
+            "SELECT payload, snapshot_digest, canonical_bytes, ceiling_bytes \
+             FROM agent_runtime_snapshots WHERE task_id = $1",
+        )
+        .bind(self.task_id.as_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        (
+            row.get("payload"),
+            row.get("snapshot_digest"),
+            row.get("canonical_bytes"),
+            row.get("ceiling_bytes"),
+        )
+    }
+
+    async fn cleanup(&self) {
+        let current = self.current().await;
+        if matches!(
+            current.lifecycle,
+            TaskLifecycle::Accepted | TaskLifecycle::Running
+        ) && current.goal_phase != GoalPhase::Complete
+        {
+            self.kernel
+                .cancel_task(
+                    &self.principal,
+                    CancelUserTask {
+                        session_id: self.session_id.clone(),
+                        task_id: self.task_id.clone(),
+                        expected_task_revision: current.task_revision,
+                        expected_goal_revision: current.goal_revision,
+                        reason: Some("Bridge test cleanup.".to_owned()),
+                        idempotency_key: IdempotencyKey::new(format!("cleanup-{}", Uuid::now_v7()))
+                            .unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn invocation_is_persisted_and_claimed_before_model_call() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let command_id = fixture.pending_command_id().await;
+    fixture.model.on_request({
+        let pool = fixture.pool.clone();
+        move |_| {
+            let pool = pool.clone();
+            async move {
+                let state: String =
+                    sqlx::query_scalar("SELECT state FROM agent_commands WHERE id = $1")
+                        .bind(command_id)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(state, "claimed");
+                Ok(ModelResponse {
+                    items: vec![json!({
+                        "type": "function_call",
+                        "call_id": "done-1",
+                        "name": "complete_task",
+                        "arguments": {"outcome": "ok", "fields": {"answer": "done"}},
+                    })],
+                })
+            }
+        }
+    });
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    assert_eq!(fixture.current().await.lifecycle, TaskLifecycle::Succeeded);
+}
+
+#[tokio::test]
+async fn harness_success_mints_evidence_but_does_not_complete_goal() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    fixture.model.complete("ok", json!({"answer": "done"}));
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let view = fixture.current().await;
+    assert_eq!(view.lifecycle, TaskLifecycle::Succeeded);
+    assert_eq!(view.goal_phase, GoalPhase::Active);
+    let evidence = fixture.evidence().await;
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].evidence_type, "harness.invocation_result");
+    assert!(matches!(
+        evidence[0].source,
+        EvidenceSourceIdentity::BuiltinHarness { .. }
+    ));
+    assert_eq!(fixture.legacy_run_count().await, 0);
+    assert_eq!(fixture.legacy_frame_count().await, 0);
+}
+
+#[tokio::test]
+async fn actual_model_request_preserves_the_full_durable_goal_and_authority_boundary() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let invocation = fixture.pending_invocation().await;
+    fixture.model.complete("ok", json!({"answer": "done"}));
+    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+
+    executor.execute(&invocation).await.unwrap();
+    executor.execute(&invocation).await.unwrap();
+
+    let requests = fixture.model.requests();
+    assert_eq!(requests.len(), 2);
+    let expected_goal = json!({
+        "objective": "Resolve review feedback and verify the change.",
+        "success": [{
+            "id": "reviews_resolved",
+            "statement": "All actionable review threads are resolved.",
+            "evidenceType": "harness.invocation_result",
+        }],
+        "constraints": ["Never merge the pull request."],
+        "blockedWhen": ["Required user or reviewer action remains unavailable."],
+    });
+    assert_eq!(requests[0].input[0]["goal"], expected_goal);
+    assert_eq!(requests[1].input[0]["goal"], expected_goal);
+    assert_eq!(requests[0].instructions, requests[1].instructions);
+    for required in [
+        "durable across this invocation and every repeated or recovered invocation",
+        "complete_task function completes only this bounded harness task",
+        "yields invocation evidence",
+        "never completes or blocks the enclosing Kiteframe goal",
+        "Rust kernel's CompleteGoal and BlockGoal authority",
+    ] {
+        assert!(
+            requests[0].instructions.contains(required),
+            "missing durable-goal directive: {required}"
+        );
+    }
+    assert!(
+        requests[0]
+            .instructions
+            .starts_with("Inspect and finish one bounded task.")
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn completion_tool_matches_the_nested_complete_task_arguments_contract() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let invocation = fixture.pending_invocation().await;
+    fixture.model.complete("ok", json!({"answer": "done"}));
+    DirectLoopHarnessExecutor::new(fixture.model.clone())
+        .execute(&invocation)
+        .await
+        .unwrap();
+
+    let requests = fixture.model.requests();
+    let completion = &requests[0].tools[0];
+    assert_eq!(completion["type"], "function");
+    assert_eq!(completion["name"], "complete_task");
+    assert_eq!(
+        completion["parameters"]["required"],
+        json!(["outcome", "fields"])
+    );
+    assert_eq!(
+        completion["parameters"]["properties"]["outcome"]["enum"],
+        json!(["ok"])
+    );
+    assert_eq!(
+        completion["parameters"]["properties"]["fields"]["required"],
+        json!(["answer"])
+    );
+    assert!(completion["parameters"]["properties"]["fields"]["properties"]["answer"].is_object());
+    assert!(completion["parameters"]["properties"]["answer"].is_null());
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn declared_model_tool_fails_closed_without_legacy_or_goal_authority() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started_with_declared_tool().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    fixture.model.respond_with(json!({
+        "type": "function_call",
+        "call_id": "tool-1",
+        "name": "docs/search",
+        "arguments": {},
+    }));
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let view = fixture.current().await;
+    assert_eq!(view.lifecycle, TaskLifecycle::Failed);
+    assert_eq!(view.operational_status, OperationalStatus::Finished);
+    assert_eq!(view.goal_phase, GoalPhase::Active);
+    assert_eq!(fixture.command_state(&command.id).await, "failed");
+    let requests = fixture.model.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tools.len(), 2);
+    assert_eq!(requests[0].tools[0]["name"], "complete_task");
+    assert_eq!(requests[0].tools[1]["name"], "docs/search");
+    assert_eq!(
+        requests[0].tools[1]["parameters"],
+        json!({
+            "type":"object",
+            "name":"input",
+            "required":[],
+            "properties":{},
+            "additionalProperties":false
+        })
+    );
+    assert!(
+        fixture
+            .event_kinds()
+            .await
+            .contains(&"runtime.command_unavailable".to_owned())
+    );
+    assert_eq!(fixture.legacy_run_count().await, 0);
+    assert_eq!(fixture.legacy_frame_count().await, 0);
+}
+
+#[tokio::test]
+async fn bounded_executor_rejects_missing_multiple_invalid_and_oversized_actions() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let invocation = fixture.pending_invocation().await;
+    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+
+    fixture
+        .model
+        .respond_with(json!({"type": "message", "text": "done"}));
+    assert!(matches!(
+        executor.execute(&invocation).await,
+        Err(HarnessExecutionError::InvalidResult(message))
+            if message.contains("exactly one")
+    ));
+
+    fixture.model.respond_with_items(vec![
+        json!({"type":"function_call", "call_id":"done-1", "name":"complete_task", "arguments":{"outcome":"ok", "fields":{"answer":"one"}}}),
+        json!({"type":"function_call", "call_id":"done-2", "name":"complete_task", "arguments":{"outcome":"ok", "fields":{"answer":"two"}}}),
+    ]);
+    assert!(matches!(
+        executor.execute(&invocation).await,
+        Err(HarnessExecutionError::InvalidResult(message))
+            if message.contains("exactly one")
+    ));
+
+    fixture.model.respond_with_items(vec![
+        json!({"type":"function_call", "call_id":"done-3", "name":"complete_task", "arguments":{}}),
+        json!({"type":"function_call", "call_id":"tool-1", "name":"docs/search", "arguments":{}}),
+    ]);
+    assert!(matches!(
+        executor.execute(&invocation).await,
+        Err(HarnessExecutionError::InvalidResult(message))
+            if message.contains("exactly one")
+    ));
+
+    fixture.model.complete("unknown", json!({"answer": "done"}));
+    assert!(matches!(
+        executor.execute(&invocation).await,
+        Err(HarnessExecutionError::InvalidResult(_))
+    ));
+
+    fixture.model.complete("ok", json!({"answer": 7}));
+    assert!(matches!(
+        executor.execute(&invocation).await,
+        Err(HarnessExecutionError::InvalidResult(_))
+    ));
+
+    fixture.model.complete("ok", json!({}));
+    assert!(matches!(
+        executor.execute(&invocation).await,
+        Err(HarnessExecutionError::InvalidResult(message))
+            if message.contains("do not match")
+    ));
+
+    let mut tiny = invocation.clone();
+    tiny.limits.response_item_bytes = 1;
+    fixture.model.complete("ok", json!({"answer": "done"}));
+    assert_eq!(
+        executor.execute(&tiny).await,
+        Err(HarnessExecutionError::InvalidResult(
+            "response_item_limit_exceeded".to_owned()
+        ))
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn bounded_executor_enforces_turn_tool_and_active_time_limits() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let invocation = fixture.pending_invocation().await;
+    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+
+    let calls = fixture.model.calls();
+    let mut no_turns = invocation.clone();
+    no_turns.limits.model_turns_remaining = 0;
+    assert_eq!(
+        executor.execute(&no_turns).await,
+        Err(HarnessExecutionError::Failed(
+            "active_execution_limit_exceeded".to_owned()
+        ))
+    );
+    assert_eq!(fixture.model.calls(), calls);
+
+    let mut no_tools = invocation.clone();
+    no_tools.limits.tool_calls_per_response = 0;
+    fixture.model.respond_with(json!({
+        "type":"function_call", "call_id":"tool-1", "name":"docs/search", "arguments":{}
+    }));
+    assert_eq!(
+        executor.execute(&no_tools).await,
+        Err(HarnessExecutionError::InvalidResult(
+            "tool_call_limit_exceeded".to_owned()
+        ))
+    );
+
+    let mut timed = invocation;
+    timed.limits.active_execution_millis_remaining = 1;
+    fixture.model.on_request(|_| async {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        Ok(ModelResponse { items: vec![] })
+    });
+    assert_eq!(
+        executor.execute(&timed).await,
+        Err(HarnessExecutionError::Failed(
+            "active_execution_limit_exceeded".to_owned()
+        ))
+    );
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+async fn model_and_validation_failures_definitively_fail_the_task_without_goal_authority() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    for mode in ["model", "invalid", "timeout"] {
+        let Some(fixture) = BridgeFixture::started().await else {
+            return;
+        };
+        let command = fixture.pending_command().await;
+        match mode {
+            "model" => fixture
+                .model
+                .on_request(|_| async { Err(ModelError::Unavailable("offline".to_owned())) }),
+            "invalid" => fixture.model.complete("ok", json!({"answer": 7})),
+            "timeout" => fixture.model.on_request(|_| async {
+                tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+                Ok(ModelResponse { items: vec![] })
+            }),
+            _ => unreachable!(),
+        }
+        if mode == "timeout" {
+            sqlx::query(
+                "UPDATE agent_commands SET payload = jsonb_set(payload, \
+                 '{limits,activeExecutionMillisRemaining}', '1'::jsonb), \
+                 payload_digest = $1 WHERE id = $2",
+            )
+            .bind("temporarily-recomputed-below")
+            .bind(command.id.as_uuid())
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+            let payload: Value =
+                sqlx::query_scalar("SELECT payload FROM agent_commands WHERE id = $1")
+                    .bind(command.id.as_uuid())
+                    .fetch_one(&fixture.pool)
+                    .await
+                    .unwrap();
+            let parsed: InvokeHarness = serde_json::from_value(payload).unwrap();
+            let digest = canonical_sha256(&parsed).unwrap();
+            sqlx::query("UPDATE agent_commands SET payload_digest = $1 WHERE id = $2")
+                .bind(digest)
+                .bind(command.id.as_uuid())
+                .execute(&fixture.pool)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+        let view = fixture.current().await;
+        assert_eq!(view.lifecycle, TaskLifecycle::Failed, "mode={mode}");
+        assert_eq!(view.operational_status, OperationalStatus::Finished);
+        assert_eq!(view.goal_phase, GoalPhase::Active);
+        assert_eq!(
+            fixture.command_state(&command.id).await,
+            "completed",
+            "mode={mode}"
+        );
+        let failure: Value = sqlx::query_scalar("SELECT failure FROM user_tasks WHERE id = $1")
+            .bind(fixture.task_id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(failure["code"], "harness_failed");
+        assert_eq!(fixture.legacy_run_count().await, 0, "mode={mode}");
+        assert_eq!(fixture.legacy_frame_count().await, 0, "mode={mode}");
+    }
+}
+
+#[tokio::test]
+async fn request_approval_is_failed_unavailable_without_calling_the_model_again() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started_with_approval().await else {
+        return;
+    };
+    fixture.model.complete("needs_approval", json!({}));
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    assert_eq!(fixture.model.calls(), 1);
+    let approval = fixture.pending_command().await;
+    assert!(matches!(
+        approval.payload,
+        KernelCommandPayload::RequestApproval(_)
+    ));
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let view = fixture.current().await;
+    assert_eq!(view.lifecycle, TaskLifecycle::Failed);
+    assert_eq!(view.operational_status, OperationalStatus::Finished);
+    assert_eq!(view.goal_phase, GoalPhase::Active);
+    assert_eq!(fixture.command_state(&approval.id).await, "failed");
+    assert_eq!(fixture.model.calls(), 1);
+    assert_eq!(fixture.legacy_run_count().await, 0);
+    assert_eq!(fixture.legacy_frame_count().await, 0);
+    assert!(
+        fixture
+            .event_kinds()
+            .await
+            .contains(&"runtime.command_unavailable".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn duplicate_and_foreign_claimed_ticks_never_duplicate_model_work() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    fixture.model.complete("ok", json!({"answer": "done"}));
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(fixture.model.calls(), 1);
+
+    let Some(foreign) = BridgeFixture::started().await else {
+        return;
+    };
+    let pending = foreign.pending_command().await;
+    foreign
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: foreign.session_id.clone(),
+            task_id: foreign.task_id.clone(),
+            command_id: pending.id.clone(),
+            expected_command_revision: pending.revision,
+            claimant: "another-runtime".to_owned(),
+            idempotency_key: IdempotencyKey::new("another-runtime-claim").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(foreign.dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(foreign.model.calls(), 0);
+    assert_eq!(foreign.command_state(&pending.id).await, "claimed");
+}
+
+#[tokio::test]
+async fn restart_resumes_the_builtin_claim_with_the_same_key_and_one_result() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let pending = fixture.pending_command().await;
+    let claim_key = format!("builtin-direct-v1:{}", pending.id.as_uuid());
+    fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session_id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: pending.id.clone(),
+            expected_command_revision: pending.revision,
+            claimant: "builtin-direct-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new(claim_key.clone()).unwrap(),
+        })
+        .await
+        .unwrap();
+    let restarted_kernel = Arc::new(AgentKernel::new(
+        Arc::clone(&fixture.store),
+        Arc::new(kiteframe::KiteAgentRuntime::new(RuntimeCeilings::default())),
+        Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&fixture.store))),
+    ));
+    fixture.model.complete("ok", json!({"answer": "done"}));
+    let restarted = restarted_kernel.with_harness_executor(Arc::new(
+        DirectLoopHarnessExecutor::new(fixture.model.clone()),
+    ));
+
+    assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
+    assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(fixture.model.calls(), 1);
+    let row = sqlx::query(
+        "SELECT state, claimant, claim_idempotency_key FROM agent_commands WHERE id = $1",
+    )
+    .bind(pending.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "completed");
+    assert_eq!(row.get::<String, _>("claimant"), "builtin-direct-v1");
+    assert_eq!(row.get::<String, _>("claim_idempotency_key"), claim_key);
+    assert_eq!(fixture.evidence().await.len(), 1);
+    let committed_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_task_events WHERE task_id = $1 \
+         AND kind = 'runtime.transition_committed'",
+    )
+    .bind(fixture.task_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(committed_events, 1);
+}
+
+#[tokio::test]
+async fn paused_work_is_not_claimed_or_sent_to_the_model() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let pending = fixture.pending_command().await;
+    let current = fixture.current().await;
+    fixture
+        .kernel
+        .pause_task(
+            &fixture.principal,
+            PauseUserTask {
+                session_id: fixture.session_id.clone(),
+                task_id: fixture.task_id.clone(),
+                expected_task_revision: current.task_revision,
+                expected_goal_revision: current.goal_revision,
+                reason: "Pause before dispatch.".to_owned(),
+                idempotency_key: IdempotencyKey::new("pause-before-dispatch").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(fixture.model.calls(), 0);
+    assert_eq!(fixture.command_state(&pending.id).await, "pending");
+}
+
+#[tokio::test]
+async fn blocked_goal_is_not_redispatched_to_the_model() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started_with_blocking_outcome().await else {
+        return;
+    };
+    fixture
+        .model
+        .complete("unavailable", json!({"reason": "GitHub is unavailable"}));
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let blocked = fixture.current().await;
+    assert_eq!(blocked.lifecycle, TaskLifecycle::Running);
+    assert_eq!(blocked.operational_status, OperationalStatus::Blocked);
+    assert_eq!(blocked.goal_phase, GoalPhase::Blocked);
+    assert_eq!(fixture.model.calls(), 1);
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(fixture.model.calls(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_during_model_execution_discards_the_late_result() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    let before_snapshot = fixture.snapshot_fingerprint().await;
+    let before = fixture.current().await;
+    fixture.model.on_request({
+        let kernel = fixture.kernel.clone();
+        let principal = fixture.principal.clone();
+        let session_id = fixture.session_id.clone();
+        let task_id = fixture.task_id.clone();
+        move |_| {
+            let kernel = kernel.clone();
+            let principal = principal.clone();
+            let session_id = session_id.clone();
+            let task_id = task_id.clone();
+            async move {
+                kernel
+                    .cancel_task(
+                        &principal,
+                        CancelUserTask {
+                            session_id,
+                            task_id,
+                            expected_task_revision: before.task_revision,
+                            expected_goal_revision: before.goal_revision,
+                            reason: Some("Cancelled during model execution.".to_owned()),
+                            idempotency_key: IdempotencyKey::new("cancel-during-model").unwrap(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                Ok(ModelResponse {
+                    items: vec![json!({
+                        "type":"function_call", "call_id":"done-late", "name":"complete_task",
+                        "arguments":{"outcome":"ok", "fields":{"answer":"too late"}}
+                    })],
+                })
+            }
+        }
+    });
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let after = fixture.current().await;
+    assert_eq!(after.lifecycle, TaskLifecycle::Cancelled);
+    assert_eq!(after.goal_phase, GoalPhase::Active);
+    assert_eq!(fixture.command_state(&command.id).await, "cancelled");
+    assert_eq!(fixture.evidence().await.len(), 0);
+    assert_eq!(fixture.snapshot_fingerprint().await, before_snapshot);
+}
+
+#[tokio::test]
+async fn fabricated_context_and_event_commands_fail_recovery_integrity_before_dispatch() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    for (kind, payload) in [
+        (
+            "request_context",
+            KernelCommandPayload::RequestContext(RequestContext {
+                evidence_type: "github.context".to_owned(),
+                subject: json!({"repository": "acme/widgets"}),
+            }),
+        ),
+        (
+            "wait_for_event",
+            KernelCommandPayload::WaitForEvent(WaitForEvent {
+                event_type: "github.changed.v1".to_owned(),
+                correlation: json!({"repository": "acme/widgets"}),
+            }),
+        ),
+    ] {
+        let Some(fixture) = BridgeFixture::started().await else {
+            return;
+        };
+        let command = fixture.pending_command().await;
+        let original = sqlx::query(
+            "SELECT command_kind, payload, payload_digest FROM agent_commands WHERE id = $1",
+        )
+        .bind(command.id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        let value = serde_json::to_value(&payload).unwrap();
+        let digest = canonical_sha256(&payload).unwrap();
+        sqlx::query(
+            "UPDATE agent_commands SET command_kind = $1, payload = $2, payload_digest = $3 \
+             WHERE id = $4",
+        )
+        .bind(kind)
+        .bind(value)
+        .bind(digest)
+        .bind(command.id.as_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            fixture.store.recover_agent_commands(8).await,
+            Err(StoreError::RuntimeStateInvalid(_))
+        ));
+        assert_eq!(fixture.model.calls(), 0);
+        assert_eq!(fixture.command_state(&command.id).await, "pending");
+        sqlx::query(
+            "UPDATE agent_commands SET command_kind = $1, payload = $2, payload_digest = $3 \
+             WHERE id = $4",
+        )
+        .bind(original.get::<String, _>("command_kind"))
+        .bind(original.get::<Value, _>("payload"))
+        .bind(original.get::<String, _>("payload_digest"))
+        .bind(command.id.as_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        fixture.cleanup().await;
+    }
+}
