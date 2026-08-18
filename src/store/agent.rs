@@ -138,16 +138,22 @@ impl PostgresStore {
         &self,
         commit: AgentStartCommit<'_>,
     ) -> Result<AgentExecutionView, StoreError> {
-        validate_start_commit(&commit)?;
+        let deployment_ceilings = self.agent_runtime_ceilings();
+        if commit.ceilings != deployment_ceilings {
+            return Err(StoreError::AgentTransitionInvalid(
+                "runtime ceilings do not match deployment configuration".to_owned(),
+            ));
+        }
+        validate_start_commit(&commit, deployment_ceilings)?;
         let snapshot_bytes = commit
             .transition
             .snapshot
-            .canonical_bytes(commit.ceilings)
+            .canonical_bytes(deployment_ceilings)
             .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
         let snapshot_digest = commit
             .transition
             .snapshot
-            .digest(commit.ceilings)
+            .digest(deployment_ceilings)
             .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
         let command_digests = commit
             .transition
@@ -505,9 +511,11 @@ fn external_command_status(
     }
 }
 
-fn validate_start_commit(commit: &AgentStartCommit<'_>) -> Result<(), StoreError> {
-    commit
-        .ceilings
+fn validate_start_commit(
+    commit: &AgentStartCommit<'_>,
+    deployment_ceilings: &RuntimeCeilings,
+) -> Result<(), StoreError> {
+    deployment_ceilings
         .validate()
         .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
     if !(1..=128).contains(&commit.transition.idempotency_key.len()) {
@@ -515,7 +523,7 @@ fn validate_start_commit(commit: &AgentStartCommit<'_>) -> Result<(), StoreError
             "runtime transition idempotency key is invalid".to_owned(),
         ));
     }
-    if commit.transition.commands.len() > commit.ceilings.max_commands_per_transition {
+    if commit.transition.commands.len() > deployment_ceilings.max_commands_per_transition {
         return Err(StoreError::AgentTransitionInvalid(
             "runtime command ceiling exceeded".to_owned(),
         ));
@@ -532,7 +540,7 @@ fn validate_start_commit(commit: &AgentStartCommit<'_>) -> Result<(), StoreError
         }
         let bytes = crate::canonical_json(command)
             .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
-        if bytes.len() > commit.ceilings.max_command_bytes {
+        if bytes.len() > deployment_ceilings.max_command_bytes {
             return Err(StoreError::AgentTransitionInvalid(
                 "runtime command ceiling exceeded".to_owned(),
             ));
@@ -619,11 +627,8 @@ pub(super) async fn lock_agent_aggregate(
     .await?
     .ok_or(StoreError::SessionNotFound)?;
     let task = sqlx::query(
-        "SELECT t.principal, t.state, t.operational_status, t.revision, t.definition_id, \
-                d.definition_hash \
-         FROM user_tasks t \
-         JOIN workflow_definitions d ON d.id = t.definition_id \
-         WHERE t.id = $1 AND t.session_id = $2 FOR UPDATE OF t, d",
+        "SELECT principal, state, operational_status, revision, definition_id \
+         FROM user_tasks WHERE id = $1 AND session_id = $2 FOR UPDATE",
     )
     .bind(task_id.as_uuid())
     .bind(session_id.as_uuid())
@@ -638,8 +643,14 @@ pub(super) async fn lock_agent_aggregate(
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| StoreError::InvalidData("goal state is absent".to_owned()))?;
+    let definition =
+        sqlx::query("SELECT definition_hash FROM workflow_definitions WHERE id = $1 FOR UPDATE")
+            .bind(task.get::<uuid::Uuid, _>("definition_id"))
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or(StoreError::DefinitionNotFound)?;
 
-    let aggregate = LockedAgentAggregate::from_rows(&session, &task, &goal)?;
+    let aggregate = LockedAgentAggregate::from_rows(&session, &task, &goal, &definition)?;
     if aggregate.session_principal != aggregate.task_principal {
         return Err(StoreError::PrincipalMismatch);
     }
@@ -651,7 +662,12 @@ pub(super) async fn lock_agent_aggregate(
 
 impl LockedAgentAggregate {
     #[allow(dead_code)]
-    fn from_rows(session: &PgRow, task: &PgRow, goal: &PgRow) -> Result<Self, StoreError> {
+    fn from_rows(
+        session: &PgRow,
+        task: &PgRow,
+        goal: &PgRow,
+        definition: &PgRow,
+    ) -> Result<Self, StoreError> {
         Ok(Self {
             session_principal: session.get("principal"),
             session_state: session.get("state"),
@@ -664,7 +680,7 @@ impl LockedAgentAggregate {
             operational_status: operational_status(&task.get::<String, _>("operational_status"))?,
             task_revision: nonnegative(task.get("revision"), "user task revision is malformed")?,
             definition_id: task.get("definition_id"),
-            definition_hash: task.get("definition_hash"),
+            definition_hash: definition.get("definition_hash"),
             goal_phase: goal_phase(&goal.get::<String, _>("phase"))?,
             goal_revision: nonnegative(goal.get("revision"), "goal revision is malformed")?,
             current_blocker_id: goal.get("current_blocker_id"),

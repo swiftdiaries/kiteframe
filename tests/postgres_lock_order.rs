@@ -562,6 +562,54 @@ async fn agent_start_and_session_close_share_the_session_task_goal_prefix() {
 }
 
 #[tokio::test]
+async fn agent_start_does_not_lock_the_definition_before_the_goal() {
+    let application_name = format!("kf-start-definition-lock-{}", Uuid::now_v7());
+    let child = child_run(&application_name).await;
+    let task_id = accepted_agent_task(&child).await;
+    let definition_id: Uuid =
+        sqlx::query_scalar("SELECT definition_id FROM user_tasks WHERE id = $1")
+            .bind(task_id.as_uuid())
+            .fetch_one(child.store.pool())
+            .await
+            .expect("find frozen definition");
+    let kernel = agent_kernel(&child);
+    let mut goal_gate = child.store.pool().begin().await.expect("goal gate");
+    sqlx::query("SELECT task_id FROM goal_states WHERE task_id = $1 FOR UPDATE")
+        .bind(task_id.as_uuid())
+        .execute(&mut *goal_gate)
+        .await
+        .expect("lock goal");
+
+    let start_principal = child.principal.clone();
+    let start_request = start_agent_request(&child, task_id, "definition-after-goal");
+    let mut start =
+        tokio::spawn(async move { kernel.start_agent(&start_principal, start_request).await });
+    wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+    let mut definition_probe = child.store.pool().begin().await.expect("definition probe");
+    let definition_lock =
+        sqlx::query("SELECT id FROM workflow_definitions WHERE id = $1 FOR UPDATE NOWAIT")
+            .bind(definition_id)
+            .execute(&mut *definition_probe)
+            .await;
+    assert!(
+        definition_lock.is_ok(),
+        "start locked the definition before acquiring the goal: {definition_lock:?}"
+    );
+    definition_probe
+        .rollback()
+        .await
+        .expect("release definition probe");
+    goal_gate.commit().await.expect("release goal gate");
+
+    tokio::time::timeout(Duration::from_secs(5), &mut start)
+        .await
+        .expect("start must terminate")
+        .expect("start task")
+        .expect("start result");
+}
+
+#[tokio::test]
 async fn concurrent_agent_starts_do_not_invert_the_session_task_goal_prefix() {
     let application_name = format!("kf-start-prefix-lock-{}", Uuid::now_v7());
     let child = child_run(&application_name).await;

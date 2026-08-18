@@ -9,9 +9,9 @@ use kiteframe::{
     GoalPhase, IdempotencyKey, KernelCommand, KernelCommandPayload, OperationalStatus,
     PolicyRevision, PolicyUpdate, PostgresStore, PrincipalId, PublishedDefinition, RecoverySupport,
     RequestContext, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeStart,
-    RuntimeStateSnapshot, RuntimeTransition, SessionView, StartAgent, StoreError, SubmitUserTask,
-    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
-    ToolCatalogSnapshot,
+    RuntimeStateSnapshot, RuntimeTransition, SessionView, StartAgent, StoreError, StoreLimits,
+    SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences,
+    TaskTarget, ToolCatalogSnapshot,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -29,11 +29,18 @@ struct StartFixture {
     store: Arc<PostgresStore>,
     catalog: ToolCatalogSnapshot,
 }
-
 impl StartFixture {
     async fn accepted_version_one() -> Option<Self> {
+        Self::accepted_with_limits(StoreLimits::default()).await
+    }
+
+    async fn accepted_with_limits(limits: StoreLimits) -> Option<Self> {
         let database_url = std::env::var("DATABASE_URL").ok()?;
-        let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+        let store = Arc::new(
+            PostgresStore::connect_with_limits(&database_url, limits)
+                .await
+                .unwrap(),
+        );
         let principal = PrincipalId::new(format!("agent-start-{}", Uuid::now_v7())).unwrap();
         let session = store
             .create_session(CreateSession {
@@ -483,6 +490,86 @@ async fn command_insert_failure_rolls_back_the_entire_start() {
     assert_eq!(view.goal_phase, GoalPhase::Active);
     assert_eq!((view.task_revision, view.goal_revision), (0, 0));
     assert!(view.runtime.is_none());
+    for table in [
+        "agent_runtime_snapshots",
+        "agent_transitions",
+        "agent_commands",
+        "agent_policy_decisions",
+        "agent_task_events",
+        "agent_task_actions",
+    ] {
+        assert_eq!(fixture.count(table).await, 0, "unexpected row in {table}");
+    }
+}
+
+#[tokio::test]
+async fn caller_cannot_override_deployment_ceilings_or_commit_partial_start_state() {
+    let deployment_ceilings = RuntimeCeilings {
+        max_snapshot_bytes: 1,
+        ..RuntimeCeilings::default()
+    };
+    let Some(fixture) = StartFixture::accepted_with_limits(StoreLimits {
+        agent_runtime: deployment_ceilings,
+        ..StoreLimits::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let request = fixture.start_request("caller-ceiling-override");
+    let seed = fixture
+        .store
+        .load_agent_start_seed(fixture.session.id.clone(), fixture.accepted.id.clone())
+        .await
+        .unwrap();
+    let policy = TaskOwnerAuthorizer::new(Arc::clone(&fixture.store))
+        .authorize(
+            &fixture.principal,
+            &fixture.accepted,
+            AgentLifecycleAction::Start,
+        )
+        .await
+        .unwrap();
+    let transition = fixture
+        .runtime
+        .start(RuntimeStart {
+            execution: &seed.execution,
+            definition: &seed.definition,
+        })
+        .unwrap();
+    assert!(transition.snapshot.canonical_byte_count > 1);
+    let caller_ceilings = RuntimeCeilings::default();
+
+    assert!(matches!(
+        fixture
+            .store
+            .commit_agent_start(AgentStartCommit {
+                principal: &fixture.principal,
+                request: &request,
+                frozen_definition_id: fixture.accepted.definition.id,
+                frozen_definition_hash: &fixture.accepted.definition.definition_hash,
+                policy: &policy,
+                transition: &transition,
+                ceilings: &caller_ceilings,
+            })
+            .await,
+        Err(StoreError::AgentTransitionInvalid(message))
+            if message == "runtime ceilings do not match deployment configuration"
+    ));
+    let task: (String, i64) =
+        sqlx::query_as("SELECT state, revision FROM user_tasks WHERE id = $1")
+            .bind(fixture.accepted.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    let goal_revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM goal_states WHERE task_id = $1")
+            .bind(fixture.accepted.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(task, ("accepted".to_owned(), 0));
+    assert_eq!(goal_revision, 0);
     for table in [
         "agent_runtime_snapshots",
         "agent_transitions",
