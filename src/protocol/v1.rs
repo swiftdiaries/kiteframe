@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    ApplicationCommand, ApplicationResult, EventCursor, GetRun, NewSession,
+    ApplicationCommand, ApplicationResult, EventCursor, GetRun, GetUserTask, NewSession,
     PermissionResponseContext, ProtocolAdapter, ProtocolError, PublishDefinition, ResumeSession,
     UpdateSessionPolicy, encode_application_result,
 };
@@ -97,6 +97,8 @@ impl ProtocolAdapter for V1Adapter {
             "_kiteframe/definition/publish" => {
                 decode(params).map(|dto: PublishDto| dto.into_command(None))
             }
+            "_kiteframe/task/submit" => decode(params).map(ApplicationCommand::SubmitTask),
+            "_kiteframe/task/get" => decode(params).map(GetTaskDto::into_command),
             "_kiteframe/run/start" => decode(params).map(StartDto::into_command),
             "_kiteframe/run/get" => decode(params).map(GetDto::into_command),
             "_kiteframe/run/answer" => decode(params).map(AnswerDto::into_command),
@@ -223,6 +225,24 @@ fn mcp_servers(servers: Vec<acp::McpServer>) -> Result<Vec<McpServerConfig>, Pro
 }
 
 type Meta = Option<serde_json::Map<String, Value>>;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetTaskDto {
+    session_id: SessionId,
+    task_id: crate::UserTaskId,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl GetTaskDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::GetTask(GetUserTask {
+            session_id: self.session_id,
+            task_id: self.task_id,
+        })
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

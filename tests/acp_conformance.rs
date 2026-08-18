@@ -130,6 +130,35 @@ fn fixture_application_session(cwd: &str) -> ApplicationSession {
     }
 }
 
+fn accepted_task_fixture() -> kiteframe::AcceptedUserTask {
+    let request: kiteframe::SubmitUserTask =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    kiteframe::AcceptedUserTask {
+        id: kiteframe::UserTaskId::new(
+            Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f417").unwrap(),
+        ),
+        session_id: request.session_id,
+        principal: PrincipalId::new("user_456").unwrap(),
+        definition: kiteframe::PublishedDefinition {
+            id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+            kind: kiteframe::dsl::DefinitionKind::Agent,
+            name: request.agent.name,
+            version: request.agent.version.unwrap(),
+            definition_hash: "sha256:agent-fixture".to_owned(),
+        },
+        target: request.target,
+        preferences: request.preferences,
+        goal_digest: request.goal.digest().unwrap(),
+        goal: request.goal,
+        revision: 0,
+        created_at: time::OffsetDateTime::parse(
+            "2026-08-18T12:34:56Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap(),
+    }
+}
+
 fn permission_context() -> PermissionResponseContext {
     PermissionResponseContext::new(
         SessionId::new(Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f413").unwrap()),
@@ -292,6 +321,65 @@ fn publication_methods_bind_their_expected_definition_kind() {
 }
 
 #[test]
+fn task_submission_decodes_without_a_wire_principal() {
+    let payload: Value =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    let ApplicationCommand::SubmitTask(v1_request) =
+        V1Adapter::decode_extension("_kiteframe/task/submit", payload.clone()).unwrap()
+    else {
+        panic!("expected v1 SubmitTask");
+    };
+    assert_eq!(v1_request.agent.name, "babysit_pr");
+    assert_eq!(v1_request.goal.version, 1);
+
+    #[cfg(feature = "acp-v2")]
+    {
+        use kiteframe::V2Adapter;
+
+        let ApplicationCommand::SubmitTask(v2_request) = V2Adapter::new(true)
+            .decode_extension("_kiteframe/task/submit", payload.clone())
+            .unwrap()
+        else {
+            panic!("expected v2 SubmitTask");
+        };
+        assert_eq!(v2_request, v1_request);
+    }
+
+    let mut invalid = payload;
+    invalid
+        .as_object_mut()
+        .unwrap()
+        .insert("principal".to_owned(), json!("spoofed-user"));
+    assert!(matches!(
+        V1Adapter::decode_extension("_kiteframe/task/submit", invalid),
+        Err(ProtocolError::InvalidPayload(_))
+    ));
+}
+
+#[test]
+fn task_get_decodes_a_closed_session_scoped_payload() {
+    let session_id = Uuid::now_v7();
+    let task_id = Uuid::now_v7();
+    let ApplicationCommand::GetTask(request) = V1Adapter::decode_extension(
+        "_kiteframe/task/get",
+        json!({"sessionId": session_id, "taskId": task_id, "_meta": {"trace": "ok"}}),
+    )
+    .unwrap() else {
+        panic!("expected GetTask");
+    };
+    assert_eq!(request.session_id.as_uuid(), &session_id);
+    assert_eq!(request.task_id.as_uuid(), &task_id);
+
+    assert!(matches!(
+        V1Adapter::decode_extension(
+            "_kiteframe/task/get",
+            json!({"sessionId": session_id, "taskId": task_id, "unknown": true}),
+        ),
+        Err(ProtocolError::InvalidPayload(_))
+    ));
+}
+
+#[test]
 fn publication_response_keeps_legacy_bytes_and_tags_generic_definitions() {
     let fixture = v1_fixture();
     let definition = kiteframe::PublishedDefinition {
@@ -324,6 +412,30 @@ fn publication_response_keeps_legacy_bytes_and_tags_generic_definitions() {
             "version": 7,
             "definitionHash": "sha256:fixture",
         })
+    );
+}
+
+#[test]
+fn accepted_task_encoding_is_shared_and_omits_retry_state() {
+    let task = accepted_task_fixture();
+    let v1 = V1Adapter
+        .encode_result(ApplicationResult::Task(task.clone()))
+        .unwrap();
+    assert_eq!(v1["principal"], "user_456");
+    assert_eq!(v1["agent"]["kind"], "agent");
+    assert_eq!(v1["agent"]["name"], "babysit_pr");
+    assert_eq!(v1["goal"]["version"], 1);
+    assert_eq!(v1["goal"]["success"].as_array().unwrap().len(), 3);
+    assert_eq!(v1["revision"], 0);
+    assert!(v1.get("idempotencyKey").is_none());
+    assert!(v1.get("state").is_none());
+
+    #[cfg(feature = "acp-v2")]
+    assert_eq!(
+        kiteframe::V2Adapter::new(true)
+            .encode_result(ApplicationResult::Task(task))
+            .unwrap(),
+        v1
     );
 }
 
@@ -363,9 +475,41 @@ fn agent_runtime_failure_has_the_same_public_shape_on_every_adapter() {
     ));
 }
 
+#[test]
+fn task_errors_use_fixed_messages_and_stable_codes() {
+    for (error, stable) in [
+        (
+            kiteframe::StoreError::AgentDefinitionRequired,
+            "agent_definition_required",
+        ),
+        (
+            kiteframe::StoreError::DefinitionNotFound,
+            "definition_not_found",
+        ),
+        (
+            kiteframe::StoreError::UserTaskNotFound,
+            "user_task_not_found",
+        ),
+    ] {
+        let encoded = V1Adapter::encode_error(&ProtocolError::from(error));
+        assert_eq!(i32::from(encoded.code), -32000);
+        assert_eq!(encoded.message, "application request failed");
+        assert_eq!(encoded.data.unwrap()["kiteframe_code"], stable);
+    }
+
+    let encoded = V1Adapter::encode_error(&ProtocolError::from(
+        kiteframe::StoreError::InvalidUserTask("private objective".to_owned()),
+    ));
+    assert_eq!(i32::from(encoded.code), -32602);
+    assert_eq!(encoded.message, "Invalid params");
+    assert!(encoded.data.is_none());
+}
+
 fn command_kind(command: &ApplicationCommand) -> &'static str {
     match command {
         ApplicationCommand::Publish(_) => "publish",
+        ApplicationCommand::SubmitTask(_) => "task_submit",
+        ApplicationCommand::GetTask(_) => "task_get",
         ApplicationCommand::Start(_) => "start",
         ApplicationCommand::Get(_) => "get",
         ApplicationCommand::Answer(_) => "answer",
@@ -381,6 +525,11 @@ fn command_kind(command: &ApplicationCommand) -> &'static str {
 fn command_snapshot(command: &ApplicationCommand) -> Value {
     match command {
         ApplicationCommand::Publish(request) => json!({"source": request.source}),
+        ApplicationCommand::SubmitTask(request) => serde_json::to_value(request).unwrap(),
+        ApplicationCommand::GetTask(request) => json!({
+            "sessionId": request.session_id.as_uuid(),
+            "taskId": request.task_id.as_uuid(),
+        }),
         ApplicationCommand::Start(request) => json!({
             "sessionId": request.session_id.as_uuid(),
             "workflowName": request.workflow_name,

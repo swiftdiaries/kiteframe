@@ -8,6 +8,7 @@ use crate::{
     AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PermissionChoice,
     PermissionRequestId, PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission,
     RetryRecovery, RunEvent, RunId, RunView, SessionId, SessionPolicy, SessionView, StartRun,
+    SubmitUserTask,
 };
 
 pub const AGENT_RUNTIME_UNAVAILABLE: &str = "agent_runtime_unavailable";
@@ -45,6 +46,12 @@ pub struct PublishDefinition {
 #[derive(Clone, Debug)]
 pub struct GetRun {
     pub run_id: RunId,
+}
+
+#[derive(Clone, Debug)]
+pub struct GetUserTask {
+    pub session_id: SessionId,
+    pub task_id: crate::UserTaskId,
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +129,8 @@ pub enum ApplicationCommand {
     ListSessions,
     CloseSession(CloseSession),
     Publish(PublishDefinition),
+    SubmitTask(SubmitUserTask),
+    GetTask(GetUserTask),
     Start(StartRun),
     Get(GetRun),
     Answer(AnswerQuestion),
@@ -135,6 +144,7 @@ pub enum ApplicationCommand {
 #[derive(Clone, Debug)]
 pub enum ApplicationResult {
     Published(PublishedDefinition),
+    Task(crate::AcceptedUserTask),
     Run(RunView),
     PolicyUpdated { revision: PolicyRevision },
     Events(Vec<RunEvent>),
@@ -257,9 +267,30 @@ pub enum ProtocolError {
     UnexpectedResult(String),
 }
 
+impl ProtocolError {
+    pub(crate) fn from_task_store(error: crate::StoreError) -> Self {
+        if matches!(error, crate::StoreError::IdempotencyConflict) {
+            return Self::StableApplication {
+                code: "idempotency_conflict",
+                message: "durable task request failed".to_owned(),
+            };
+        }
+        error.into()
+    }
+}
+
 impl From<crate::StoreError> for ProtocolError {
     fn from(error: crate::StoreError) -> Self {
+        if let Some(code) = stable_store_error(&error) {
+            return Self::StableApplication {
+                code,
+                message: "durable task request failed".to_owned(),
+            };
+        }
         match error {
+            crate::StoreError::InvalidUserTask(_) => {
+                Self::InvalidPayload("user task failed validation".to_owned())
+            }
             crate::StoreError::AgentRuntimeUnavailable => Self::StableApplication {
                 code: AGENT_RUNTIME_UNAVAILABLE,
                 message: "agent definitions require durable goal lifecycle and runtime authority"
@@ -267,6 +298,15 @@ impl From<crate::StoreError> for ProtocolError {
             },
             error => Self::Application(error.to_string()),
         }
+    }
+}
+
+fn stable_store_error(error: &crate::StoreError) -> Option<&'static str> {
+    match error {
+        crate::StoreError::AgentDefinitionRequired => Some("agent_definition_required"),
+        crate::StoreError::DefinitionNotFound => Some("definition_not_found"),
+        crate::StoreError::UserTaskNotFound => Some("user_task_not_found"),
+        _ => None,
     }
 }
 
@@ -302,6 +342,8 @@ pub(crate) fn command_session(command: &ApplicationCommand) -> Option<&SessionId
         ApplicationCommand::ResolvePermission(request) => Some(&request.session_id),
         ApplicationCommand::Cancel(request) => Some(&request.session_id),
         ApplicationCommand::RetryRecovery(request) => Some(&request.session_id),
+        ApplicationCommand::SubmitTask(request) => Some(&request.session_id),
+        ApplicationCommand::GetTask(request) => Some(&request.session_id),
         ApplicationCommand::NewSession(_)
         | ApplicationCommand::ListSessions
         | ApplicationCommand::Publish(_)
@@ -339,6 +381,24 @@ fn encode_application_result_with_kind(
             }
             response
         }
+        ApplicationResult::Task(task) => json!({
+            "id": task.id.as_uuid(),
+            "sessionId": task.session_id.as_uuid(),
+            "principal": task.principal.as_str(),
+            "agent": {
+                "id": task.definition.id,
+                "kind": task.definition.kind,
+                "name": task.definition.name,
+                "version": task.definition.version,
+                "definitionHash": task.definition.definition_hash,
+            },
+            "target": task.target,
+            "preferences": task.preferences,
+            "goal": task.goal,
+            "goalDigest": task.goal_digest,
+            "revision": task.revision,
+            "createdAt": task.created_at.to_string(),
+        }),
         ApplicationResult::PolicyUpdated { revision } => {
             json!({ "revision": revision.get() })
         }
@@ -386,7 +446,10 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::{IdempotencyKey, SessionId, StartRun};
+    use crate::{
+        AgentSelector, GoalContract, HarnessRole, IdempotencyKey, SessionId, StartRun,
+        SubmitUserTask, SuccessCriterion, TaskPreferences, TaskTarget, UserTaskId,
+    };
 
     use super::{ApplicationCommand, command_session};
 
@@ -401,5 +464,43 @@ mod tests {
             idempotency_key: IdempotencyKey::new("start").unwrap(),
         });
         assert_eq!(command_session(&command), Some(&session));
+    }
+
+    #[test]
+    fn task_commands_expose_their_session_for_connection_binding() {
+        let session = SessionId::new(Uuid::now_v7());
+        let submit = ApplicationCommand::SubmitTask(SubmitUserTask {
+            session_id: session.clone(),
+            agent: AgentSelector {
+                name: "babysit_pr".to_owned(),
+                version: Some(1),
+            },
+            target: TaskTarget::GithubPullRequest {
+                repository: "acme/payments".to_owned(),
+                number: 142,
+            },
+            preferences: TaskPreferences {
+                harness_role: Some(HarnessRole::Coding),
+            },
+            goal: GoalContract {
+                version: 1,
+                objective: "Address review feedback".to_owned(),
+                success: vec![SuccessCriterion {
+                    id: "reviews_resolved".to_owned(),
+                    statement: "All actionable reviews are resolved".to_owned(),
+                    evidence: "github.unresolved_reviews".to_owned(),
+                }],
+                constraints: vec![],
+                blocked_when: vec![],
+            },
+            idempotency_key: IdempotencyKey::new("submit-142").unwrap(),
+        });
+        let get = ApplicationCommand::GetTask(super::GetUserTask {
+            session_id: session.clone(),
+            task_id: UserTaskId::new(Uuid::now_v7()),
+        });
+
+        assert_eq!(command_session(&submit), Some(&session));
+        assert_eq!(command_session(&get), Some(&session));
     }
 }

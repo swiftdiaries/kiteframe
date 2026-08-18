@@ -185,6 +185,18 @@ impl Application {
                         .await?,
                 ))
             }
+            ApplicationCommand::SubmitTask(request) => self
+                .store
+                .submit_user_task(&context.connection_principal, request)
+                .await
+                .map(ApplicationResult::Task)
+                .map_err(ProtocolError::from_task_store),
+            ApplicationCommand::GetTask(request) => self
+                .store
+                .get_user_task(request.session_id, request.task_id)
+                .await
+                .map(ApplicationResult::Task)
+                .map_err(ProtocolError::from_task_store),
             ApplicationCommand::UpdatePolicy(request) => {
                 let catalog = self.store.current_catalog(session_id.clone()).await?;
                 let revision = self

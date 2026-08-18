@@ -1080,8 +1080,11 @@ fn logged_method(method: &str) -> &'static str {
         "_kiteframe/run/get" => "_kiteframe/run/get",
         "_kiteframe/run/answer" => "_kiteframe/run/answer",
         "_kiteframe/run/cancel" => "_kiteframe/run/cancel",
+        "_kiteframe/run/recovery/retry" => "_kiteframe/run/recovery/retry",
         "_kiteframe/session/policy/update" => "_kiteframe/session/policy/update",
         "_kiteframe/run/event" => "_kiteframe/run/event",
+        "_kiteframe/task/submit" => "_kiteframe/task/submit",
+        "_kiteframe/task/get" => "_kiteframe/task/get",
         _ => "unknown",
     }
 }
@@ -1870,6 +1873,11 @@ impl From<crate::ProtocolError> for RpcError {
                 code: -32000,
                 message: "application request failed".to_owned(),
                 data: Some(serde_json::json!({"kiteframe_code": code})),
+            },
+            crate::ProtocolError::MissingSession | crate::ProtocolError::SessionMismatch => Self {
+                code: -32000,
+                message: "application request failed".to_owned(),
+                data: None,
             },
             error => Self {
                 code: -32000,

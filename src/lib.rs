@@ -45,9 +45,10 @@ pub use protocol::V2Adapter;
 pub use protocol::{
     AGENT_RUNTIME_UNAVAILABLE, Application, ApplicationCommand, ApplicationContext,
     ApplicationResult, ApplicationSession, AuthenticatedConnection, CloseSession, EventCursor,
-    GetRun, NegotiatedProtocol, NewSession, PermissionResponseContext, ProtocolAdapter,
-    ProtocolConnection, ProtocolError, ProtocolNegotiation, PublishDefinition, ResumeSession,
-    StaticBearerAuthenticator, TransportKind, UpdateSessionPolicy, V1Adapter, serve_ndjson,
+    GetRun, GetUserTask, NegotiatedProtocol, NewSession, PermissionResponseContext,
+    ProtocolAdapter, ProtocolConnection, ProtocolError, ProtocolNegotiation, PublishDefinition,
+    ResumeSession, StaticBearerAuthenticator, TransportKind, UpdateSessionPolicy, V1Adapter,
+    serve_ndjson,
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{

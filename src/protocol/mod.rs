@@ -12,8 +12,8 @@ pub use transport::{
 };
 pub use types::{
     AGENT_RUNTIME_UNAVAILABLE, ApplicationCommand, ApplicationContext, ApplicationResult,
-    ApplicationSession, CloseSession, EventCursor, GetRun, NegotiatedProtocol, NewSession,
-    PermissionResponseContext, ProtocolAdapter, ProtocolError, ProtocolNegotiation,
+    ApplicationSession, CloseSession, EventCursor, GetRun, GetUserTask, NegotiatedProtocol,
+    NewSession, PermissionResponseContext, ProtocolAdapter, ProtocolError, ProtocolNegotiation,
     PublishDefinition, ResumeSession, UpdateSessionPolicy,
 };
 pub(crate) use types::{command_session, encode_application_result};
