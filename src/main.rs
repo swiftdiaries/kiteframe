@@ -456,10 +456,24 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::{
+        future::pending,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use async_trait::async_trait;
-    use kiteframe::{ModelError, ModelResponse};
+    use kiteframe::dsl::{Limits, compile};
+    use kiteframe::{
+        AgentSelector, CancelUserTask, ClaimAgentCommand, CreateSession, GoalContract,
+        IdempotencyKey, ModelError, ModelResponse, PrincipalId, StartAgent, SubmitUserTask,
+        SuccessCriterion, TaskPreferences, TaskTarget, ToolCatalogSnapshot,
+    };
+    use time::{Duration as TimeDuration, OffsetDateTime};
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -505,13 +519,114 @@ mod tests {
         assert!(ready.load(Ordering::Acquire));
     }
 
+    struct ActiveWorkModel {
+        entered: Mutex<Option<oneshot::Sender<()>>>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    struct MarkCancelled(Arc<AtomicBool>);
+
+    impl Drop for MarkCancelled {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    #[async_trait]
+    impl ModelClient for ActiveWorkModel {
+        async fn respond(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+            if request
+                .input
+                .first()
+                .and_then(|item| item["goal"]["objective"].as_str())
+                != Some("Prove recovered scheduler shutdown cancellation.")
+            {
+                return Err(ModelError::Unavailable(
+                    "non-target work is outside this scheduler test".to_owned(),
+                ));
+            }
+            let _cancelled = MarkCancelled(self.cancelled.clone());
+            if let Some(entered) = self.entered.lock().expect("entered lock").take() {
+                let _ = entered.send(());
+            }
+            pending::<Result<ModelResponse, ModelError>>().await
+        }
+    }
+
     #[tokio::test]
-    async fn scheduler_accepts_the_shared_agent_dispatcher_and_stops_before_work() {
+    async fn scheduler_dispatches_recovered_builtin_claim_and_cancels_active_work_on_shutdown() {
         let Ok(database_url) = std::env::var("DATABASE_URL") else {
             return;
         };
         let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
-        let model: Arc<dyn ModelClient> = Arc::new(RecoveringModel(AtomicUsize::new(0)));
+        let principal = PrincipalId::new(format!("scheduler-owner-{}", Uuid::now_v7())).unwrap();
+        let session = store
+            .create_session(CreateSession {
+                principal: principal.clone(),
+                working_directory: "/scheduler-active-work".to_owned(),
+                retention_until: OffsetDateTime::now_utc() + TimeDuration::days(1),
+            })
+            .await
+            .unwrap();
+        let catalog = ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), []).unwrap();
+        store.append_catalog_epoch(&catalog).await.unwrap();
+        let name = format!("scheduler_agent_{}", Uuid::now_v7().simple());
+        let source = format!(
+            r#"agent {name}(repository: string, pull_request: integer) -> string {{
+  entry inspect(repository = repository, pull_request = pull_request)
+  limits {{ steps: 2 active_execution_seconds: 30 elapsed_seconds: 60 }}
+  task inspect(repository: string, pull_request: integer) -> string {{
+    model reasoning
+    prompt """Wait until the scheduler is cancelled."""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+        );
+        let compiled = compile(&source, &catalog, &Limits::default()).unwrap();
+        let published = store
+            .publish(session.id.clone(), &compiled, &source)
+            .await
+            .unwrap();
+        let accepted = store
+            .submit_user_task(
+                &principal,
+                SubmitUserTask {
+                    session_id: session.id.clone(),
+                    agent: AgentSelector {
+                        name: published.name,
+                        version: Some(published.version),
+                    },
+                    target: TaskTarget::GithubPullRequest {
+                        repository: "acme/scheduler".to_owned(),
+                        number: 142,
+                    },
+                    preferences: TaskPreferences { harness_role: None },
+                    goal: GoalContract {
+                        version: 1,
+                        objective: "Prove recovered scheduler shutdown cancellation.".to_owned(),
+                        success: vec![SuccessCriterion {
+                            id: "scheduler_cancelled".to_owned(),
+                            statement: "Active scheduler work was cancelled on shutdown."
+                                .to_owned(),
+                            evidence: "harness.invocation_result".to_owned(),
+                        }],
+                        constraints: vec!["Do not wait without a timeout.".to_owned()],
+                        blocked_when: vec!["The model gate is never entered.".to_owned()],
+                    },
+                    idempotency_key: IdempotencyKey::new(format!("submit-{}", Uuid::now_v7()))
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let gated = Arc::new(ActiveWorkModel {
+            entered: Mutex::new(Some(entered_tx)),
+            cancelled: cancelled.clone(),
+        });
+        let model: Arc<dyn ModelClient> = gated;
         let engine = Arc::new(Engine {
             store: store.clone(),
             model: model.clone(),
@@ -519,15 +634,93 @@ mod tests {
             authorizer: Arc::new(PersistedAuthorizer::new(store.clone())),
             config: EngineConfig::default(),
         });
-        let application = Application::new(store, engine.clone());
+        let application = Application::new(store.clone(), engine.clone());
+        let kernel = application.agent_kernel();
+        kernel
+            .start_agent(
+                &principal,
+                StartAgent {
+                    session_id: session.id.clone(),
+                    task_id: accepted.id.clone(),
+                    expected_task_revision: 0,
+                    expected_goal_revision: 0,
+                    idempotency_key: IdempotencyKey::new(format!("start-{}", Uuid::now_v7()))
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let pending = store
+            .dispatchable_agent_commands(engine.config.scheduler_batch_size)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|command| command.task_id == accepted.id)
+            .expect("target command is dispatchable");
+        let claimed = store
+            .claim_agent_command(ClaimAgentCommand {
+                session_id: session.id.clone(),
+                task_id: accepted.id.clone(),
+                command_id: pending.id.clone(),
+                expected_command_revision: pending.revision,
+                claimant: "builtin-direct-v1".to_owned(),
+                idempotency_key: IdempotencyKey::new(format!(
+                    "builtin-direct-v1:{}",
+                    pending.id.as_uuid()
+                ))
+                .unwrap(),
+            })
+            .await
+            .unwrap();
         let dispatcher = Arc::new(
-            application
-                .agent_kernel()
+            kernel
+                .clone()
                 .with_harness_executor(Arc::new(kiteframe::DirectLoopHarnessExecutor::new(model))),
         );
-        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let scheduler = tokio::spawn(run_scheduler(engine, dispatcher, shutdown_rx));
 
-        run_scheduler(engine, dispatcher, shutdown_rx)
+        tokio::time::timeout(Duration::from_secs(3), entered_rx)
+            .await
+            .expect("recovered built-in claim must be dispatched")
+            .expect("model entry sender must remain live");
+        let persisted: (String, String, i64) =
+            sqlx::query_as("SELECT state, claimant, revision FROM agent_commands WHERE id = $1")
+                .bind(claimed.id.as_uuid())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(persisted.0, "claimed");
+        assert_eq!(persisted.1, "builtin-direct-v1");
+        assert_eq!(persisted.2, i64::try_from(claimed.revision).unwrap());
+
+        shutdown_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), scheduler)
+            .await
+            .expect("scheduler shutdown is bounded")
+            .expect("scheduler task joins")
+            .expect("scheduler exits cleanly");
+        assert!(cancelled.load(Ordering::Acquire));
+        let after: (String, String, i64) =
+            sqlx::query_as("SELECT state, claimant, revision FROM agent_commands WHERE id = $1")
+                .bind(claimed.id.as_uuid())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(after, persisted);
+        kernel
+            .cancel_task(
+                &principal,
+                CancelUserTask {
+                    session_id: session.id,
+                    task_id: accepted.id,
+                    expected_task_revision: 1,
+                    expected_goal_revision: 0,
+                    reason: Some("Scheduler test cleanup.".to_owned()),
+                    idempotency_key: IdempotencyKey::new(format!("cleanup-{}", Uuid::now_v7()))
+                        .unwrap(),
+                },
+            )
             .await
             .unwrap();
     }

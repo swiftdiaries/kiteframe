@@ -13,7 +13,7 @@ use kiteframe::{
     HarnessExecutionError, IdempotencyKey, InvokeHarness, KernelCommandPayload, ModelClient,
     ModelError, ModelRequest, ModelResponse, OperationalStatus, PauseUserTask, PostgresStore,
     PrincipalId, RecoverySupport, RequestContext, RuntimeCeilings, RuntimeEvent, StartAgent,
-    StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
+    StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
     TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId, WaitForEvent, canonical_sha256,
 };
 use serde_json::{Value, json};
@@ -398,6 +398,73 @@ impl BridgeFixture {
             .unwrap()
     }
 
+    async fn seed_legacy_run_with_history(&self) -> kiteframe::RunId {
+        let catalog = self
+            .store
+            .current_catalog(self.session_id.clone())
+            .await
+            .unwrap();
+        let name = format!("legacy_bridge_{}", Uuid::now_v7().simple());
+        let source = format!(
+            "workflow {name}() -> string {{ start inspect() }} task inspect() -> string {{ prompt \"\"\"legacy history\"\"\" tools [] on ok(answer: string) {{ done answer }} }}"
+        );
+        let definition = compile(&source, &catalog, &Limits::default()).unwrap();
+        let published = self
+            .store
+            .publish(self.session_id.clone(), &definition, &source)
+            .await
+            .unwrap();
+        let run = self
+            .store
+            .start_run(StartRun {
+                session_id: self.session_id.clone(),
+                workflow_name: published.name,
+                version: Some(published.version),
+                input: json!({}),
+                idempotency_key: IdempotencyKey::new(format!("legacy-{}", Uuid::now_v7())).unwrap(),
+            })
+            .await
+            .unwrap();
+        let attempt = self
+            .store
+            .begin_model_attempt(
+                run.root_frame_id.clone(),
+                0,
+                json!({"prompt": "immutable legacy prompt"}),
+            )
+            .await
+            .unwrap();
+        self.store
+            .commit_model_attempt(
+                run.root_frame_id,
+                attempt.attempt,
+                attempt.revision,
+                vec![json!({"type": "message", "text": "immutable legacy result"})],
+            )
+            .await
+            .unwrap();
+        run.id
+    }
+
+    async fn legacy_fingerprint(&self, run_id: &kiteframe::RunId) -> Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object( \
+                 'run', (SELECT to_jsonb(r) FROM runs r WHERE r.id = $1), \
+                 'frames', (SELECT COALESCE(jsonb_agg(to_jsonb(f) ORDER BY f.id), '[]'::jsonb) \
+                     FROM frames f WHERE f.run_id = $1), \
+                 'history', (SELECT COALESCE(jsonb_agg(to_jsonb(m) ORDER BY m.frame_id, m.attempt, m.position, m.direction), '[]'::jsonb) \
+                     FROM model_items m JOIN frames f ON f.id = m.frame_id WHERE f.run_id = $1), \
+                 'events', (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.sequence), '[]'::jsonb) \
+                     FROM events e WHERE e.run_id = $1), \
+                 'toolBindings', (SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY b.qualified_name), '[]'::jsonb) \
+                     FROM run_tool_bindings b WHERE b.run_id = $1))",
+        )
+        .bind(run_id.as_uuid())
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
     async fn event_kinds(&self) -> Vec<String> {
         sqlx::query_scalar(
             "SELECT kind FROM agent_task_events WHERE task_id = $1 ORDER BY sequence",
@@ -510,6 +577,8 @@ async fn harness_success_mints_evidence_but_does_not_complete_goal() {
     let Some(fixture) = BridgeFixture::started().await else {
         return;
     };
+    let legacy_run = fixture.seed_legacy_run_with_history().await;
+    let legacy_before = fixture.legacy_fingerprint(&legacy_run).await;
     fixture.model.complete("ok", json!({"answer": "done"}));
 
     assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
@@ -523,8 +592,9 @@ async fn harness_success_mints_evidence_but_does_not_complete_goal() {
         evidence[0].source,
         EvidenceSourceIdentity::BuiltinHarness { .. }
     ));
-    assert_eq!(fixture.legacy_run_count().await, 0);
-    assert_eq!(fixture.legacy_frame_count().await, 0);
+    assert_eq!(fixture.legacy_run_count().await, 1);
+    assert_eq!(fixture.legacy_frame_count().await, 1);
+    assert_eq!(fixture.legacy_fingerprint(&legacy_run).await, legacy_before);
 }
 
 #[tokio::test]

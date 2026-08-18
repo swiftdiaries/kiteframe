@@ -1,16 +1,52 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use kiteframe::dsl::{DefinitionKind, Limits, compile};
 use kiteframe::{
-    CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand, IdempotencyKey, NewChild,
-    NewPermissionRequest, PermissionRequestId, PolicyRevision, PostgresStore, PrincipalId,
-    PublishedDefinition, Question, RecoverySupport, SessionView, StartRun, StoreError, StoreLimits,
-    ToolCatalogSnapshot,
+    AgentKernel, AgentSelector, CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand,
+    GoalContract, IdempotencyKey, KiteAgentRuntime, NewChild, NewPermissionRequest,
+    PermissionRequestId, PolicyRevision, PostgresStore, PrincipalId, PublishedDefinition, Question,
+    RecoverySupport, RuntimeCeilings, SessionView, StartAgent, StartRun, StoreError, StoreLimits,
+    SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
+    ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::json;
 use sqlx::Row;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
+
+async fn agent_goal_fingerprint(store: &PostgresStore, task_id: &UserTaskId) -> serde_json::Value {
+    sqlx::query_scalar(
+        "SELECT jsonb_build_object( \
+             'definition', (SELECT to_jsonb(d) FROM workflow_definitions d \
+                 JOIN user_tasks t ON t.definition_id = d.id WHERE t.id = $1), \
+             'task', (SELECT to_jsonb(t) FROM user_tasks t WHERE t.id = $1), \
+             'goalContract', (SELECT to_jsonb(g) FROM goal_contracts g WHERE g.task_id = $1), \
+             'goalState', (SELECT to_jsonb(g) FROM goal_states g WHERE g.task_id = $1), \
+             'snapshots', (SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s.task_id), '[]'::jsonb) \
+                 FROM agent_runtime_snapshots s WHERE s.task_id = $1), \
+             'transitions', (SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.id), '[]'::jsonb) \
+                 FROM agent_transitions t WHERE t.task_id = $1), \
+             'commands', (SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY c.id), '[]'::jsonb) \
+                 FROM agent_commands c WHERE c.task_id = $1), \
+             'policies', (SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY p.id), '[]'::jsonb) \
+                 FROM agent_policy_decisions p WHERE p.task_id = $1), \
+             'evidence', (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.id), '[]'::jsonb) \
+                 FROM goal_evidence e WHERE e.task_id = $1), \
+             'assertions', (SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.criterion_id), '[]'::jsonb) \
+                 FROM goal_criterion_assertions a WHERE a.task_id = $1), \
+             'blockers', (SELECT COALESCE(jsonb_agg(to_jsonb(b) ORDER BY b.id), '[]'::jsonb) \
+                 FROM goal_blockers b WHERE b.task_id = $1), \
+             'actions', (SELECT COALESCE(jsonb_agg(to_jsonb(a) ORDER BY a.id), '[]'::jsonb) \
+                 FROM agent_task_actions a WHERE a.task_id = $1), \
+             'events', (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.sequence), '[]'::jsonb) \
+                 FROM agent_task_events e WHERE e.task_id = $1))",
+    )
+    .bind(task_id.as_uuid())
+    .fetch_one(store.pool())
+    .await
+    .expect("fingerprint agent and goal state")
+}
 
 #[tokio::test]
 async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
@@ -18,12 +54,15 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         eprintln!("skipping execution store test: DATABASE_URL is not configured");
         return;
     };
-    let store = PostgresStore::connect(&database_url)
-        .await
-        .expect("connect store");
+    let store = Arc::new(
+        PostgresStore::connect(&database_url)
+            .await
+            .expect("connect store"),
+    );
+    let principal = PrincipalId::new(format!("alice-{}", Uuid::now_v7())).unwrap();
     let session = store
         .create_session(CreateSession {
-            principal: PrincipalId::new(format!("alice-{}", Uuid::now_v7())).unwrap(),
+            principal: principal.clone(),
             working_directory: "/work".to_owned(),
             retention_until: OffsetDateTime::now_utc() + Duration::days(1),
         })
@@ -36,6 +75,75 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         .append_catalog_epoch(&catalog)
         .await
         .expect("append catalog");
+
+    let agent_name = format!("execution_store_agent_{}", Uuid::now_v7().simple());
+    let agent_source = format!(
+        r#"agent {agent_name}(repository: string, pull_request: integer) -> string {{
+  entry inspect(repository = repository, pull_request = pull_request)
+  limits {{ steps: 2 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect(repository: string, pull_request: integer) -> string {{
+    model reasoning
+    prompt """Keep the agent state immutable during legacy work."""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let agent_definition = compile(&agent_source, &catalog, &Limits::default()).unwrap();
+    let published_agent = store
+        .publish(session.id.clone(), &agent_definition, &agent_source)
+        .await
+        .expect("publish agent for noninterference");
+    let accepted_agent = store
+        .submit_user_task(
+            &principal,
+            SubmitUserTask {
+                session_id: session.id.clone(),
+                agent: AgentSelector {
+                    name: published_agent.name,
+                    version: Some(published_agent.version),
+                },
+                target: TaskTarget::GithubPullRequest {
+                    repository: "acme/immutable-agent".to_owned(),
+                    number: 142,
+                },
+                preferences: TaskPreferences { harness_role: None },
+                goal: GoalContract {
+                    version: 1,
+                    objective: "Keep agent authority isolated from legacy execution.".to_owned(),
+                    success: vec![SuccessCriterion {
+                        id: "agent_unchanged".to_owned(),
+                        statement: "The agent and goal fingerprint remains exact.".to_owned(),
+                        evidence: "harness.invocation_result".to_owned(),
+                    }],
+                    constraints: vec![
+                        "Do not mutate agent state from legacy execution.".to_owned(),
+                    ],
+                    blocked_when: vec!["The isolation invariant cannot be verified.".to_owned()],
+                },
+                idempotency_key: IdempotencyKey::new(format!("agent-{}", Uuid::now_v7())).unwrap(),
+            },
+        )
+        .await
+        .expect("submit agent for noninterference");
+    let kernel = AgentKernel::new(
+        store.clone(),
+        Arc::new(KiteAgentRuntime::new(RuntimeCeilings::default())),
+        Arc::new(TaskOwnerAuthorizer::new(store.clone())),
+    );
+    kernel
+        .start_agent(
+            &principal,
+            StartAgent {
+                session_id: session.id.clone(),
+                task_id: accepted_agent.id.clone(),
+                expected_task_revision: 0,
+                expected_goal_revision: 0,
+                idempotency_key: IdempotencyKey::new(format!("start-{}", Uuid::now_v7())).unwrap(),
+            },
+        )
+        .await
+        .expect("start agent for noninterference");
 
     let workflow_name = format!("w{}", Uuid::now_v7().simple());
     let source = format!(
@@ -304,6 +412,7 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         )
         .await
         .expect("resume parent");
+    let agent_before = agent_goal_fingerprint(&store, &accepted_agent.id).await;
     store
         .apply_frame_command(
             started.root_frame_id.clone(),
@@ -312,6 +421,10 @@ async fn start_run_snapshots_definition_and_replays_only_identical_requests() {
         )
         .await
         .expect("complete root frame");
+    assert_eq!(
+        agent_goal_fingerprint(&store, &accepted_agent.id).await,
+        agent_before
+    );
     let cancellable = store
         .start_run(StartRun {
             session_id: session.id.clone(),

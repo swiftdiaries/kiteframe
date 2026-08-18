@@ -1844,6 +1844,7 @@ async fn exercise_agent_lifecycle<P: RpcPeer + Send>(
     store: &PostgresStore,
     protocol_version: u16,
     expected_principal: &PrincipalId,
+    agent_name: &str,
 ) -> Value {
     let initialize = if protocol_version == 1 {
         json!({
@@ -1865,7 +1866,6 @@ async fn exercise_agent_lifecycle<P: RpcPeer + Send>(
         json!({"cwd": "/tmp/kiteframe-agent-lifecycle"})
     };
     let session = success(peer.request("session/new", new_session).await);
-    let agent_name = format!("lifecycle_agent_{}", Uuid::now_v7().simple());
     let source = format!(
         r#"agent {agent_name}(repository: string, pull_request: integer) -> string {{
   entry inspect(repository = repository, pull_request = pull_request)
@@ -1973,10 +1973,8 @@ async fn exercise_agent_lifecycle<P: RpcPeer + Send>(
         peer.request("_kiteframe/task/pause", pause_payload.clone())
             .await,
     );
-    assert_eq!(
-        paused,
-        success(peer.request("_kiteframe/task/pause", pause_payload).await)
-    );
+    let pause_replay = success(peer.request("_kiteframe/task/pause", pause_payload).await);
+    assert_eq!(paused, pause_replay);
     let resumed = success(
         peer.request(
             "_kiteframe/task/resume",
@@ -2011,10 +2009,8 @@ async fn exercise_agent_lifecycle<P: RpcPeer + Send>(
         peer.request("_kiteframe/task/events", events_payload.clone())
             .await,
     );
-    assert_eq!(
-        events,
-        success(peer.request("_kiteframe/task/events", events_payload).await)
-    );
+    let events_replay = success(peer.request("_kiteframe/task/events", events_payload).await);
+    assert_eq!(events, events_replay);
     let kinds = events["events"]
         .as_array()
         .unwrap()
@@ -2100,32 +2096,20 @@ async fn exercise_agent_lifecycle<P: RpcPeer + Send>(
     assert_eq!(closed["error"]["code"], -32000);
     assert_eq!(closed["error"]["message"], "application request failed");
 
-    json!({
-        "start": {
-            "lifecycle": started["lifecycle"],
-            "operationalStatus": started["operationalStatus"],
-            "goalPhase": started["goal"]["phase"],
-            "runtimeId": started["runtime"]["runtimeId"],
-            "runtimeHasPayload": started["runtime"].get("payload").is_some(),
-        },
-        "pause": {
-            "lifecycle": paused["lifecycle"],
-            "operationalStatus": paused["operationalStatus"],
-            "goalPhase": paused["goal"]["phase"],
-        },
-        "resume": {
-            "lifecycle": resumed["lifecycle"],
-            "operationalStatus": resumed["operationalStatus"],
-            "goalPhase": resumed["goal"]["phase"],
-        },
-        "cancel": {
-            "lifecycle": cancelled["lifecycle"],
-            "operationalStatus": cancelled["operationalStatus"],
-            "goalPhase": cancelled["goal"]["phase"],
-        },
-        "events": kinds,
+    let mut result = json!({
+        "published": published,
+        "accepted": accepted,
+        "started": started,
+        "startReplay": replay,
+        "fetched": fetched,
         "stale": stale["error"],
         "staleGoal": stale_goal["error"],
+        "paused": paused,
+        "pauseReplay": pause_replay,
+        "resumed": resumed,
+        "cancelled": cancelled,
+        "events": events,
+        "eventsReplay": events_replay,
         "changedReplay": changed_replay["error"],
         "invalidCursor": invalid_cursor["error"],
         "zeroLimit": zero_limit["error"],
@@ -2133,17 +2117,42 @@ async fn exercise_agent_lifecycle<P: RpcPeer + Send>(
         "unknown": unknown["error"],
         "missing": missing["error"],
         "closed": closed["error"],
-    })
+    });
+    normalize_adapter_nondeterminism(&mut result, None);
+    result
+}
+
+fn normalize_adapter_nondeterminism(value: &mut Value, key: Option<&str>) {
+    if key == Some("createdAt") {
+        *value = json!("<created-at>");
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                normalize_adapter_nondeterminism(value, Some(key));
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                normalize_adapter_nondeterminism(value, None);
+            }
+        }
+        Value::String(candidate) if Uuid::parse_str(candidate).is_ok() => {
+            *candidate = "<uuid>".to_owned();
+        }
+        _ => {}
+    }
 }
 
 #[tokio::test]
 async fn private_agent_lifecycle_matches_across_acp_v1_v2_ndjson_and_websocket() {
     let (application, store) = application().await;
-    let websocket_principal = principal("lifecycle-websocket");
+    let lifecycle_principal = principal("lifecycle-owner");
     let authenticator = Arc::new(
         BearerAuthenticator::new([(
             Secret::new("lifecycle-websocket-secret"),
-            websocket_principal.clone(),
+            lifecycle_principal.clone(),
         )])
         .unwrap(),
     );
@@ -2156,35 +2165,376 @@ async fn private_agent_lifecycle_matches_across_acp_v1_v2_ndjson_and_websocket()
     );
     remote.mark_ready();
     let server = TestServer::start(&remote).await;
+    let agent_name = format!("lifecycle_agent_{}", Uuid::now_v7().simple());
 
-    let v1_principal = principal("lifecycle-v1");
-    let mut v1 = StdioPeer::new(application.clone(), store.clone(), v1_principal.clone());
-    let v1_result = exercise_agent_lifecycle(&mut v1, &store, 1, &v1_principal).await;
+    let mut v1 = StdioPeer::new(
+        application.clone(),
+        store.clone(),
+        lifecycle_principal.clone(),
+    );
+    let v1_result =
+        exercise_agent_lifecycle(&mut v1, &store, 1, &lifecycle_principal, &agent_name).await;
     v1.close().await;
 
-    let v2_principal = principal("lifecycle-v2");
     let mut v2 = StdioPeer::with_v2(
         application.clone(),
         store.clone(),
-        v2_principal.clone(),
+        lifecycle_principal.clone(),
         true,
     );
-    let v2_result = exercise_agent_lifecycle(&mut v2, &store, 2, &v2_principal).await;
+    let v2_result =
+        exercise_agent_lifecycle(&mut v2, &store, 2, &lifecycle_principal, &agent_name).await;
     v2.close().await;
 
-    let ndjson_principal = principal("lifecycle-ndjson");
-    let mut ndjson = NdjsonPeer::new(application.clone(), ndjson_principal.clone());
-    let ndjson_result = exercise_agent_lifecycle(&mut ndjson, &store, 1, &ndjson_principal).await;
+    let mut ndjson = NdjsonPeer::new(application.clone(), lifecycle_principal.clone());
+    let ndjson_result =
+        exercise_agent_lifecycle(&mut ndjson, &store, 1, &lifecycle_principal, &agent_name).await;
     ndjson.close().await;
 
     let mut websocket = WebSocketPeer::connect(server.address, "lifecycle-websocket-secret").await;
     let websocket_result =
-        exercise_agent_lifecycle(&mut websocket, &store, 1, &websocket_principal).await;
+        exercise_agent_lifecycle(&mut websocket, &store, 1, &lifecycle_principal, &agent_name)
+            .await;
     websocket.close().await;
 
     assert_eq!(v2_result, v1_result);
     assert_eq!(ndjson_result, v1_result);
     assert_eq!(websocket_result, v1_result);
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+async fn initialize_agent_peer<P: RpcPeer + Send>(peer: &mut P, protocol_version: u16) {
+    let initialize = if protocol_version == 1 {
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "agent-isolation", "version": "1.0.0"}
+        })
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "capabilities": {},
+            "info": {"name": "agent-isolation", "version": "1.0.0"}
+        })
+    };
+    success(peer.request("initialize", initialize).await);
+}
+
+async fn new_agent_session<P: RpcPeer + Send>(peer: &mut P, protocol_version: u16) -> Value {
+    let params = if protocol_version == 1 {
+        json!({"cwd": "/tmp/kiteframe-agent-isolation", "mcpServers": []})
+    } else {
+        json!({"cwd": "/tmp/kiteframe-agent-isolation"})
+    };
+    success(peer.request("session/new", params).await)
+}
+
+async fn exercise_agent_connection_isolation<Owner, Foreign, SamePrincipal>(
+    owner: &mut Owner,
+    foreign: &mut Foreign,
+    same_principal: &mut SamePrincipal,
+    protocol_version: u16,
+    agent_name: &str,
+    expected_principal: &PrincipalId,
+) -> Value
+where
+    Owner: RpcPeer + Send,
+    Foreign: RpcPeer + Send,
+    SamePrincipal: RpcPeer + Send,
+{
+    initialize_agent_peer(owner, protocol_version).await;
+    initialize_agent_peer(foreign, protocol_version).await;
+    initialize_agent_peer(same_principal, protocol_version).await;
+    let owner_session = new_agent_session(owner, protocol_version).await;
+    let foreign_session = new_agent_session(foreign, protocol_version).await;
+    let _same_principal_session = new_agent_session(same_principal, protocol_version).await;
+
+    let source = format!(
+        r#"agent {agent_name}(repository: string, pull_request: integer) -> string {{
+  entry inspect(repository = repository, pull_request = pull_request)
+  limits {{ steps: 2 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect(repository: string, pull_request: integer) -> string {{
+    model reasoning
+    prompt """Inspect one bounded pull request."""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let published = success(
+        owner
+            .request("_kiteframe/definition/publish", json!({"source": source}))
+            .await,
+    );
+    let mut submission: Value =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    submission["sessionId"] = owner_session["sessionId"].clone();
+    submission["agent"] = json!({"name": agent_name, "version": published["version"]});
+    submission["idempotencyKey"] = json!(format!("isolation-{agent_name}"));
+    let accepted = success(owner.request("_kiteframe/task/submit", submission).await);
+    assert_eq!(accepted["principal"], expected_principal.as_str());
+
+    let owner_request = json!({
+        "sessionId": owner_session["sessionId"],
+        "taskId": accepted["id"]
+    });
+    let foreign_rejection = foreign
+        .request(
+            "_kiteframe/agent/get",
+            json!({
+                "sessionId": foreign_session["sessionId"],
+                "taskId": accepted["id"]
+            }),
+        )
+        .await;
+    let same_principal_other_session_rejection = same_principal
+        .request("_kiteframe/agent/get", owner_request)
+        .await;
+    let expected = json!({"code": -32000, "message": "application request failed"});
+    assert_eq!(foreign_rejection["error"], expected);
+    assert_eq!(same_principal_other_session_rejection["error"], expected);
+
+    let mut result = json!({
+        "published": published,
+        "accepted": accepted,
+        "foreignPrincipal": foreign_rejection["error"],
+        "samePrincipalOtherSession": same_principal_other_session_rejection["error"],
+    });
+    normalize_adapter_nondeterminism(&mut result, None);
+    result
+}
+
+#[tokio::test]
+async fn agent_connection_and_session_isolation_matches_across_all_adapters() {
+    let (application, store) = application().await;
+    let owner_principal = principal("isolation-owner");
+    let foreign_principal = principal("isolation-foreign");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([
+            (
+                Secret::new("isolation-owner-secret"),
+                owner_principal.clone(),
+            ),
+            (
+                Secret::new("isolation-owner-second-secret"),
+                owner_principal.clone(),
+            ),
+            (
+                Secret::new("isolation-foreign-secret"),
+                foreign_principal.clone(),
+            ),
+        ])
+        .expect("bearer bindings"),
+    );
+    let remote = RemoteService::with_v2(
+        application.clone(),
+        authenticator,
+        store.clone(),
+        ready_model(),
+        true,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+    let agent_name = format!("isolation_agent_{}", Uuid::now_v7().simple());
+
+    let mut v1_owner = StdioPeer::new(application.clone(), store.clone(), owner_principal.clone());
+    let mut v1_foreign = StdioPeer::new(
+        application.clone(),
+        store.clone(),
+        foreign_principal.clone(),
+    );
+    let mut v1_same = StdioPeer::new(application.clone(), store.clone(), owner_principal.clone());
+    let v1 = exercise_agent_connection_isolation(
+        &mut v1_owner,
+        &mut v1_foreign,
+        &mut v1_same,
+        1,
+        &agent_name,
+        &owner_principal,
+    )
+    .await;
+    v1_owner.close().await;
+    v1_foreign.close().await;
+    v1_same.close().await;
+
+    let mut v2_owner = StdioPeer::with_v2(
+        application.clone(),
+        store.clone(),
+        owner_principal.clone(),
+        true,
+    );
+    let mut v2_foreign = StdioPeer::with_v2(
+        application.clone(),
+        store.clone(),
+        foreign_principal.clone(),
+        true,
+    );
+    let mut v2_same = StdioPeer::with_v2(
+        application.clone(),
+        store.clone(),
+        owner_principal.clone(),
+        true,
+    );
+    let v2 = exercise_agent_connection_isolation(
+        &mut v2_owner,
+        &mut v2_foreign,
+        &mut v2_same,
+        2,
+        &agent_name,
+        &owner_principal,
+    )
+    .await;
+    v2_owner.close().await;
+    v2_foreign.close().await;
+    v2_same.close().await;
+
+    let mut ndjson_owner = NdjsonPeer::new(application.clone(), owner_principal.clone());
+    let mut ndjson_foreign = NdjsonPeer::new(application.clone(), foreign_principal);
+    let mut ndjson_same = NdjsonPeer::new(application, owner_principal.clone());
+    let ndjson = exercise_agent_connection_isolation(
+        &mut ndjson_owner,
+        &mut ndjson_foreign,
+        &mut ndjson_same,
+        1,
+        &agent_name,
+        &owner_principal,
+    )
+    .await;
+    ndjson_owner.close().await;
+    ndjson_foreign.close().await;
+    ndjson_same.close().await;
+
+    let mut websocket_owner =
+        WebSocketPeer::connect(server.address, "isolation-owner-secret").await;
+    let mut websocket_foreign =
+        WebSocketPeer::connect(server.address, "isolation-foreign-secret").await;
+    let mut websocket_same =
+        WebSocketPeer::connect(server.address, "isolation-owner-second-secret").await;
+    let websocket = exercise_agent_connection_isolation(
+        &mut websocket_owner,
+        &mut websocket_foreign,
+        &mut websocket_same,
+        1,
+        &agent_name,
+        &owner_principal,
+    )
+    .await;
+    websocket_owner.close().await;
+    websocket_foreign.close().await;
+    websocket_same.close().await;
+
+    assert_eq!(v2, v1);
+    assert_eq!(ndjson, v1);
+    assert_eq!(websocket, v1);
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+async fn exercise_legacy_and_agent_error_boundary<P: RpcPeer + Send>(peer: &mut P, ndjson: bool) {
+    success(
+        peer.request(
+            "initialize",
+            json!({
+                "protocolVersion": 1,
+                "clientCapabilities": {},
+                "clientInfo": {"name": "legacy-error-boundary", "version": "1.0.0"}
+            }),
+        )
+        .await,
+    );
+
+    let mcp_unavailable = peer
+        .request(
+            "session/new",
+            json!({
+                "cwd": "/tmp/kiteframe-legacy-errors",
+                "mcpServers": [{
+                    "type": "http",
+                    "name": "docs",
+                    "url": "http://127.0.0.1:3010/mcp",
+                    "headers": []
+                }]
+            }),
+        )
+        .await;
+    let expected_mcp = if ndjson {
+        json!({
+            "code": -32000,
+            "message": "MCP attachment is not enabled for this harness"
+        })
+    } else {
+        json!({"code": -32602, "message": "Invalid params"})
+    };
+    assert_eq!(
+        mcp_unavailable,
+        json!({"jsonrpc": "2.0", "id": 2, "error": expected_mcp})
+    );
+
+    let session = success(
+        peer.request(
+            "session/new",
+            json!({"cwd": "/tmp/kiteframe-legacy-errors", "mcpServers": []}),
+        )
+        .await,
+    );
+    let application_fallback = peer
+        .request("_kiteframe/workflow/publish", json!({"source": "!"}))
+        .await;
+    let expected_application = if ndjson {
+        json!({
+            "code": -32000,
+            "message": "application error: unexpected character"
+        })
+    } else {
+        json!({"code": -32000, "message": "application request failed"})
+    };
+    assert_eq!(
+        application_fallback,
+        json!({"jsonrpc": "2.0", "id": 4, "error": expected_application})
+    );
+
+    let agent_fallback = peer
+        .request(
+            "_kiteframe/agent/get",
+            json!({"sessionId": session["sessionId"], "taskId": Uuid::now_v7()}),
+        )
+        .await;
+    assert_eq!(
+        agent_fallback,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "error": {"code": -32000, "message": "application request failed"}
+        })
+    );
+}
+
+#[tokio::test]
+async fn legacy_errors_keep_base_ndjson_and_websocket_bytes_while_agent_errors_are_coarse() {
+    let (application, store) = application().await;
+    let websocket_principal = principal("legacy-errors-websocket");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(
+            Secret::new("legacy-errors-websocket-secret"),
+            websocket_principal,
+        )])
+        .expect("bearer binding"),
+    );
+    let remote = RemoteService::new(application.clone(), authenticator, store, ready_model());
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+
+    let mut ndjson = NdjsonPeer::new(application, principal("legacy-errors-ndjson"));
+    exercise_legacy_and_agent_error_boundary(&mut ndjson, true).await;
+    ndjson.close().await;
+
+    let mut websocket =
+        WebSocketPeer::connect(server.address, "legacy-errors-websocket-secret").await;
+    exercise_legacy_and_agent_error_boundary(&mut websocket, false).await;
+    websocket.close().await;
 
     remote.begin_shutdown();
     server.stop().await;
@@ -3071,6 +3421,22 @@ async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures
         )
         .await,
     );
+    let invalid_start = peer
+        .request(
+            "_kiteframe/agent/start",
+            json!({
+                "sessionId": created["sessionId"],
+                "taskId": accepted_agent_task["id"],
+                "expectedTaskRevision": 1,
+                "expectedGoalRevision": 0,
+                "idempotencyKey": "sentinel-invalid-start-key"
+            }),
+        )
+        .await;
+    assert_eq!(
+        invalid_start["error"]["data"]["kiteframe_code"],
+        "task_transition_invalid"
+    );
     let stale_pause = peer
         .request(
             "_kiteframe/task/pause",
@@ -3172,6 +3538,7 @@ async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures
     assert!(logs.contains("_kiteframe/task/pause"));
     assert!(logs.contains("_kiteframe/task/cancel"));
     assert!(logs.contains("\"error_code\":\"revision_conflict\""));
+    assert!(logs.contains("\"error_code\":\"task_transition_invalid\""));
     assert!(logs.contains("\"task_revision\":1"));
     assert!(logs.contains("\"task_revision\":2"));
     assert!(!logs.contains("sentinel-bearer-secret"));
@@ -3186,6 +3553,7 @@ async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures
         "sentinel-owner/sentinel-repository",
         "sentinel-stale-pause-reason",
         "sentinel-stale-pause-key",
+        "sentinel-invalid-start-key",
         "sentinel-pause-reason",
         "sentinel-pause-key",
         "sentinel-cancel-reason",

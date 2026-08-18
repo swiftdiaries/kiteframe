@@ -1033,14 +1033,12 @@ impl HandleDispatchFrom<Client> for SemanticHandler {
                     )
                 };
                 let succeeded = result.is_ok();
-                tracing::info!(
-                    method = logged_method(&method),
-                    transport = ?self.connection.authenticated.transport,
-                    success = result.is_ok(),
+                log_acp_request(
+                    &method,
+                    &self.connection.authenticated.transport,
+                    result.is_ok(),
                     error_code,
-                    task_revision = task_revision.unwrap_or_default(),
-                    task_revision_known = task_revision.is_some(),
-                    "ACP request handled"
+                    task_revision,
                 );
                 responder.respond_with_result(result.map(|outcome| outcome.value))?;
                 if succeeded {
@@ -1095,6 +1093,24 @@ fn logged_task_revision(method: &str, params: &Value) -> Option<u64> {
         | "_kiteframe/task/cancel" => params.get("expectedTaskRevision")?.as_u64(),
         _ => None,
     }
+}
+
+fn log_acp_request(
+    method: &str,
+    transport: &crate::TransportKind,
+    success: bool,
+    error_code: &'static str,
+    task_revision: Option<u64>,
+) {
+    tracing::info!(
+        method = logged_method(method),
+        transport = ?transport,
+        success,
+        error_code,
+        task_revision = task_revision.unwrap_or_default(),
+        task_revision_known = task_revision.is_some(),
+        "ACP request handled"
+    );
 }
 
 fn logged_protocol_error(error: &crate::ProtocolError) -> &'static str {
@@ -1873,13 +1889,14 @@ async fn handle_line(
     if !valid_envelope || !valid_id {
         return Some(error_response(request_id, RpcError::invalid_request()));
     }
-    let response = dispatch_method(application, connection, &request.method, request.params).await;
+    let method = request.method;
+    let response = dispatch_method(application, connection, &method, request.params).await;
     if notification {
         return None;
     }
     Some(match response {
         Ok(value) => serde_json::json!({"jsonrpc": "2.0", "id": request_id, "result": value}),
-        Err(error) => error_response(request_id, RpcError::from(error)),
+        Err(error) => error_response(request_id, RpcError::from_method(&method, error)),
     })
 }
 
@@ -1906,6 +1923,37 @@ impl RpcError {
             data: None,
         }
     }
+
+    fn from_method(method: &str, error: crate::ProtocolError) -> Self {
+        if is_agent_lifecycle_method(method) {
+            return match error {
+                crate::ProtocolError::UnsupportedMethod(_)
+                | crate::ProtocolError::InvalidPayload(_)
+                | crate::ProtocolError::UnsupportedVersion(_)
+                | crate::ProtocolError::V2Disabled
+                | crate::ProtocolError::UnexpectedResult(_)
+                | crate::ProtocolError::StableApplication { .. } => Self::from(error),
+                _ => Self {
+                    code: -32000,
+                    message: "application request failed".to_owned(),
+                    data: None,
+                },
+            };
+        }
+        Self::from(error)
+    }
+}
+
+fn is_agent_lifecycle_method(method: &str) -> bool {
+    matches!(
+        method,
+        "_kiteframe/agent/start"
+            | "_kiteframe/agent/get"
+            | "_kiteframe/task/pause"
+            | "_kiteframe/task/resume"
+            | "_kiteframe/task/cancel"
+            | "_kiteframe/task/events"
+    )
 }
 
 impl From<crate::ProtocolError> for RpcError {
@@ -1918,8 +1966,7 @@ impl From<crate::ProtocolError> for RpcError {
             },
             crate::ProtocolError::InvalidPayload(_)
             | crate::ProtocolError::UnsupportedVersion(_)
-            | crate::ProtocolError::V2Disabled
-            | crate::ProtocolError::McpUnavailable => Self {
+            | crate::ProtocolError::V2Disabled => Self {
                 code: -32602,
                 message: "Invalid params".to_owned(),
                 data: None,
@@ -1934,9 +1981,14 @@ impl From<crate::ProtocolError> for RpcError {
                 message: "application request failed".to_owned(),
                 data: Some(serde_json::json!({"kiteframe_code": code})),
             },
-            _ => Self {
+            crate::ProtocolError::MissingSession | crate::ProtocolError::SessionMismatch => Self {
                 code: -32000,
                 message: "application request failed".to_owned(),
+                data: None,
+            },
+            error => Self {
+                code: -32000,
+                message: error.to_string(),
                 data: None,
             },
         }
@@ -2019,13 +2071,39 @@ async fn dispatch_application(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::BTreeSet,
+        io::Write,
+        sync::{Arc, Mutex},
+    };
 
     use super::{
         AdmissionCleanup, BearerAuthenticator, ConnectionAuthenticator, StaticBearerAuthenticator,
     };
     use crate::{PrincipalId, Secret};
     use http::{HeaderMap, HeaderValue, header::AUTHORIZATION};
+
+    #[derive(Clone)]
+    struct CaptureLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CaptureLogs {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Write for CaptureLogs {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log capture poisoned").extend(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     async fn admission_reservation() -> (
         Arc<super::AdmissionReservation>,
@@ -2237,5 +2315,99 @@ mod tests {
 
         let ndjson_error = super::RpcError::from(crate::ProtocolError::V2Disabled);
         assert_eq!(ndjson_error.code, -32602);
+    }
+
+    #[test]
+    fn lifecycle_failure_logs_use_only_allowlisted_coarse_metadata() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(CaptureLogs(captured.clone()))
+            .finish();
+        let sensitive_params = serde_json::json!({
+            "expectedTaskRevision": 7,
+            "objective": "sentinel-objective",
+            "constraints": ["sentinel-constraint"],
+            "blockedWhen": ["sentinel-blocked"],
+            "repository": "sentinel-owner/sentinel-repository",
+            "idempotencyKey": "sentinel-idempotency-key",
+            "evidenceId": "019ff3d8-9d86-7de0-9070-0f0185d5f413",
+            "evidenceDigest": "sentinel-evidence-digest",
+            "prompt": "sentinel-prompt",
+            "modelOutput": "sentinel-model-output"
+        });
+        let revision = super::logged_task_revision("_kiteframe/agent/start", &sensitive_params);
+        let failures = [
+            crate::ProtocolError::from(crate::StoreError::AgentTransitionInvalid(
+                "sentinel-invalid-start-detail".to_owned(),
+            )),
+            crate::ProtocolError::from(crate::StoreError::GoalEvidenceIncomplete),
+        ];
+
+        tracing::subscriber::with_default(subscriber, || {
+            for error in &failures {
+                super::log_acp_request(
+                    "_kiteframe/agent/start",
+                    &crate::TransportKind::Stdio,
+                    false,
+                    super::logged_protocol_error(error),
+                    revision,
+                );
+            }
+        });
+
+        let logs = String::from_utf8(captured.lock().expect("log capture poisoned").clone())
+            .expect("logs are UTF-8");
+        let entries = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON log"))
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        let allowed = BTreeSet::from([
+            "error_code",
+            "message",
+            "method",
+            "success",
+            "task_revision",
+            "task_revision_known",
+            "transport",
+        ]);
+        let codes = entries
+            .iter()
+            .map(|entry| {
+                let fields = entry["fields"].as_object().expect("structured log fields");
+                assert_eq!(
+                    fields.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+                    allowed
+                );
+                assert_eq!(fields["method"], "_kiteframe/agent/start");
+                assert_eq!(fields["task_revision"], 7);
+                assert_eq!(fields["task_revision_known"], true);
+                assert_eq!(fields["success"], false);
+                fields["error_code"].as_str().unwrap().to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            codes,
+            BTreeSet::from([
+                "agent_transition_invalid".to_owned(),
+                "goal_evidence_invalid".to_owned(),
+            ])
+        );
+        for sensitive in [
+            "sentinel-objective",
+            "sentinel-constraint",
+            "sentinel-blocked",
+            "sentinel-owner/sentinel-repository",
+            "sentinel-idempotency-key",
+            "019ff3d8-9d86-7de0-9070-0f0185d5f413",
+            "sentinel-evidence-digest",
+            "sentinel-prompt",
+            "sentinel-model-output",
+            "sentinel-invalid-start-detail",
+        ] {
+            assert!(!logs.contains(sensitive), "log leaked: {sensitive}");
+        }
     }
 }

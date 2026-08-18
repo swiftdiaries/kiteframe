@@ -69,8 +69,9 @@ The implemented Slice 2 path provides immutable exact-version start, a pure
 built-in `kite.v1` runtime, revisioned task/goal/snapshot transitions, an
 ordered command journal, evidence-backed complete/block authority,
 pause/resume/cancel, restart recovery, and a bounded direct-loop harness
-executor. The process scheduler shares the same kernel, model client, and
-durable dispatcher used by the application.
+executor. The main process scheduler owns the durable agent dispatcher and
+builds it from the application's shared kernel and the same model client used
+by `Engine`.
 
 These ACP extensions are private application methods, not a public provider or
 plugin protocol:
