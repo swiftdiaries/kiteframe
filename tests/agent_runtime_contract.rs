@@ -384,6 +384,7 @@ fn frozen_runtime_reference_preserves_the_partial_join_command_delta_contract() 
     for required in [
         "`RuntimeTransition.commands` is the ordered delta of newly proposed work",
         "`running` normally proposes one or more newly proposed commands",
+        "A `running` transition with zero newly proposed commands is valid only after consuming one structured child result in a structured partial join",
         "at least one persisted `pending` or `claimed` sibling command still matches a wait in the full replacement snapshot",
         "Task 5 must prove that persisted-command/snapshot-wait correspondence atomically before any write",
     ] {
