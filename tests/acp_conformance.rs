@@ -476,25 +476,17 @@ fn agent_runtime_failure_has_the_same_public_shape_on_every_adapter() {
 }
 
 #[test]
-fn task_errors_use_fixed_messages_and_stable_codes() {
-    for (error, stable) in [
-        (
-            kiteframe::StoreError::AgentDefinitionRequired,
-            "agent_definition_required",
-        ),
-        (
-            kiteframe::StoreError::DefinitionNotFound,
-            "definition_not_found",
-        ),
-        (
-            kiteframe::StoreError::UserTaskNotFound,
-            "user_task_not_found",
-        ),
+fn general_store_errors_do_not_gain_task_specific_codes() {
+    for error in [
+        kiteframe::StoreError::AgentDefinitionRequired,
+        kiteframe::StoreError::DefinitionNotFound,
+        kiteframe::StoreError::UserTaskNotFound,
+        kiteframe::StoreError::IdempotencyConflict,
     ] {
         let encoded = V1Adapter::encode_error(&ProtocolError::from(error));
         assert_eq!(i32::from(encoded.code), -32000);
         assert_eq!(encoded.message, "application request failed");
-        assert_eq!(encoded.data.unwrap()["kiteframe_code"], stable);
+        assert!(encoded.data.is_none());
     }
 
     let encoded = V1Adapter::encode_error(&ProtocolError::from(

@@ -1576,6 +1576,24 @@ async fn exercise_task_api<P: RpcPeer + Send>(
         json!({"cwd": "/tmp/kiteframe-task-api"})
     };
     let session = success(peer.request("session/new", new_session).await);
+    let missing_workflow = peer
+        .request(
+            "_kiteframe/run/start",
+            json!({
+                "sessionId": session["sessionId"],
+                "workflowName": format!("missingworkflow_{}", Uuid::now_v7().simple()),
+                "version": 1,
+                "input": {},
+                "idempotencyKey": format!("missing-workflow-{}", Uuid::now_v7()),
+            }),
+        )
+        .await;
+    assert_eq!(missing_workflow["error"]["code"], -32000);
+    assert!(
+        missing_workflow["error"].get("data").is_none(),
+        "legacy run-start errors must not gain task codes: {missing_workflow}"
+    );
+
     let agent_name = format!("taskagent_{}", Uuid::now_v7().simple());
     let source = format!(
         r#"agent {agent_name}() -> string {{

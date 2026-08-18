@@ -269,24 +269,22 @@ pub enum ProtocolError {
 
 impl ProtocolError {
     pub(crate) fn from_task_store(error: crate::StoreError) -> Self {
-        if matches!(error, crate::StoreError::IdempotencyConflict) {
-            return Self::StableApplication {
-                code: "idempotency_conflict",
-                message: "durable task request failed".to_owned(),
-            };
+        let code = match error {
+            crate::StoreError::AgentDefinitionRequired => "agent_definition_required",
+            crate::StoreError::DefinitionNotFound => "definition_not_found",
+            crate::StoreError::UserTaskNotFound => "user_task_not_found",
+            crate::StoreError::IdempotencyConflict => "idempotency_conflict",
+            error => return error.into(),
+        };
+        Self::StableApplication {
+            code,
+            message: "durable task request failed".to_owned(),
         }
-        error.into()
     }
 }
 
 impl From<crate::StoreError> for ProtocolError {
     fn from(error: crate::StoreError) -> Self {
-        if let Some(code) = stable_store_error(&error) {
-            return Self::StableApplication {
-                code,
-                message: "durable task request failed".to_owned(),
-            };
-        }
         match error {
             crate::StoreError::InvalidUserTask(_) => {
                 Self::InvalidPayload("user task failed validation".to_owned())
@@ -298,15 +296,6 @@ impl From<crate::StoreError> for ProtocolError {
             },
             error => Self::Application(error.to_string()),
         }
-    }
-}
-
-fn stable_store_error(error: &crate::StoreError) -> Option<&'static str> {
-    match error {
-        crate::StoreError::AgentDefinitionRequired => Some("agent_definition_required"),
-        crate::StoreError::DefinitionNotFound => Some("definition_not_found"),
-        crate::StoreError::UserTaskNotFound => Some("user_task_not_found"),
-        _ => None,
     }
 }
 
