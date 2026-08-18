@@ -19,8 +19,8 @@ fn compile_definition(source: &str) -> CompiledDefinition {
 }
 
 fn compiled_babysit_agent() -> CompiledDefinition {
-    compile_definition(
-        r#"agent babysit_pr(repository: string) -> string {
+    let name = format!("babysit_pr_{}", Uuid::now_v7().simple());
+    let source = r#"agent babysit_pr(repository: string) -> string {
   entry inspect(repository = repository)
   events ["github.pull_request.changed.v1"]
   limits { steps: 20 active_execution_seconds: 30 elapsed_seconds: 60 }
@@ -30,13 +30,12 @@ fn compiled_babysit_agent() -> CompiledDefinition {
     tools []
     on done(summary: string) { done summary }
   }
-}"#,
-    )
+}"#;
+    compile_definition(&source.replace("babysit_pr", &name))
 }
 
-fn changed_babysit_agent() -> CompiledDefinition {
-    compile_definition(
-        r#"agent babysit_pr(repository: string) -> string {
+fn changed_babysit_agent(name: &str) -> CompiledDefinition {
+    let source = r#"agent babysit_pr(repository: string) -> string {
   entry inspect(repository = repository)
   events ["github.pull_request.changed.v1"]
   limits { steps: 21 active_execution_seconds: 30 elapsed_seconds: 60 }
@@ -46,19 +45,19 @@ fn changed_babysit_agent() -> CompiledDefinition {
     tools []
     on done(summary: string) { done summary }
   }
-}"#,
-    )
+}"#;
+    compile_definition(&source.replace("babysit_pr", name))
 }
 
 fn compiled_support_workflow() -> CompiledDefinition {
     compile_definition(
         r#"workflow support(ticket: string) -> string {
   start triage(ticket: ticket)
-  task triage(ticket: string) -> string {
-    prompt """Triage the support request."""
-    tools []
-    on done(answer: string) { done answer }
-  }
+}
+task triage(ticket: string) -> string {
+  prompt """Triage the support request."""
+  tools []
+  on done(answer: string) { done answer }
 }"#,
     )
 }
@@ -192,7 +191,7 @@ async fn exact_version_is_respected() {
     let Some((store, _pool, session, principal, version_one)) = setup_agent_store().await else {
         return;
     };
-    let changed = changed_babysit_agent();
+    let changed = changed_babysit_agent(&version_one.name);
     let version_two = store
         .publish(session.id.clone(), &changed, &changed.source)
         .await
@@ -223,7 +222,7 @@ async fn replay_keeps_the_original_version_while_a_fresh_key_selects_latest() {
         .submit_user_task(&principal, original_request.clone())
         .await
         .unwrap();
-    let changed = changed_babysit_agent();
+    let changed = changed_babysit_agent(&version_one.name);
     let version_two = store
         .publish(session.id.clone(), &changed, &changed.source)
         .await

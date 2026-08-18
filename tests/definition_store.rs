@@ -1,10 +1,12 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use kiteframe::dsl::{CompiledDefinition, DefinitionKind, Limits, compile};
 use kiteframe::{CreateSession, IdempotencyKey, PostgresStore, PrincipalId, StartRun, StoreError};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use time::{Duration, OffsetDateTime};
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -39,11 +41,11 @@ fn compiled_support_workflow() -> CompiledDefinition {
     compile_definition(
         r#"workflow support(ticket: string) -> string {
   start triage(ticket: ticket)
-  task triage(ticket: string) -> string {
-    prompt """Triage the support request."""
-    tools []
-    on done(answer: string) { done answer }
-  }
+}
+task triage(ticket: string) -> string {
+  prompt """Triage the support request."""
+  tools []
+  on done(answer: string) { done answer }
 }"#,
     )
 }
@@ -227,4 +229,78 @@ async fn publication_preserves_definition_kind_and_global_name_versions() {
         .await
         .unwrap();
     assert_eq!(run_count, 0);
+}
+
+#[tokio::test]
+async fn concurrent_identical_publications_replay_one_definition() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        eprintln!("skipping definition store test: DATABASE_URL is not configured");
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let principal = PrincipalId::new(format!("definition-race-{}", Uuid::now_v7())).unwrap();
+    let session = store
+        .create_session(CreateSession {
+            principal,
+            working_directory: "/definition-race".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let name = format!("concurrent_{}", Uuid::now_v7().simple());
+    let definition = compile_definition(&format!(
+        "workflow {name}() -> string {{ start t() }} \
+         task t() -> string {{ prompt \"\"\"race\"\"\" tools [] on done() {{ done \"one\" }} }}"
+    ));
+    let mut blocker = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(&name)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let publish = |store: Arc<PostgresStore>, barrier: Arc<Barrier>| {
+        let session_id = session.id.clone();
+        let definition = definition.clone();
+        async move {
+            barrier.wait().await;
+            store
+                .publish(session_id, &definition, &definition.source)
+                .await
+        }
+    };
+    let first = tokio::spawn(publish(store.clone(), barrier.clone()));
+    let second = tokio::spawn(publish(store.clone(), barrier.clone()));
+    barrier.wait().await;
+
+    let mut waiting = 0_i64;
+    for _ in 0..200 {
+        waiting = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_locks \
+             WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database \
+             WHERE datname = current_database()) AND NOT granted",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        if waiting >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(waiting >= 2, "both publications reached the name lock");
+    blocker.rollback().await.unwrap();
+
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap().unwrap();
+    let second = second.unwrap().unwrap();
+    assert_eq!(first, second);
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM workflow_definitions WHERE definition_hash = $1")
+            .bind(&definition.definition_hash)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored, 1);
 }

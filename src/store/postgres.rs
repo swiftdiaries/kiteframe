@@ -2166,6 +2166,9 @@ impl PostgresStore {
             .bind(&workflow.name)
             .execute(&mut *tx)
             .await?;
+        if let Some(row) = sqlx::query("SELECT id, definition_kind, name, version, definition_hash FROM workflow_definitions WHERE definition_hash = $1").bind(&workflow.definition_hash).fetch_optional(&mut *tx).await? {
+            return definition_from_row(&row);
+        }
         let version: i32 = sqlx::query(
             "SELECT COALESCE(MAX(version), 0) + 1 AS version FROM workflow_definitions WHERE name = $1",
         )
