@@ -208,16 +208,30 @@ impl AgentKernel {
                 request.command_id.clone(),
             )
             .await?;
-        if context.execution.goal_phase == GoalPhase::Complete {
-            return Err(StoreError::GoalAlreadyTerminal);
-        }
-        if context.execution.lifecycle != TaskLifecycle::Running
+        let stale_context_error = if context.execution.goal_phase == GoalPhase::Complete {
+            Some(StoreError::GoalAlreadyTerminal)
+        } else if context.execution.lifecycle != TaskLifecycle::Running
             || context.execution.operational_status == OperationalStatus::Finished
         {
-            return Err(StoreError::AgentTaskAlreadyTerminal);
-        }
-        if context.command.state != AgentCommandState::Claimed {
-            return Err(StoreError::RevisionConflict);
+            Some(StoreError::AgentTaskAlreadyTerminal)
+        } else if context.command.state != AgentCommandState::Claimed {
+            Some(StoreError::RevisionConflict)
+        } else {
+            None
+        };
+        if let Some(error) = stale_context_error {
+            // The initial read-only receipt probe can race a winning completion.
+            // Once context exposes terminal or consumed state, the winner is
+            // committed and its receipt is visible, so resolve exact replay or
+            // conflict before returning the context-derived error.
+            if let Some(replay) = self
+                .store
+                .replay_agent_command_completion(principal, &request)
+                .await?
+            {
+                return Ok(replay);
+            }
+            return Err(error);
         }
         if request.event.command_key() != Some(&context.command.key) {
             return Err(StoreError::AgentTransitionInvalid(

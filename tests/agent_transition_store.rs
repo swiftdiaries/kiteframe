@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
 
 use kiteframe::dsl::{CompiledDefinition, Limits, compile};
 use kiteframe::{
@@ -17,7 +17,49 @@ use kiteframe::{
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
+use tokio::sync::Notify;
+use tracing::Subscriber;
+use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::layer::Context;
+use tracing_subscriber::{Layer, prelude::*};
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct EmptyCompletionProbeGate {
+    armed: Arc<AtomicBool>,
+    reached: Arc<Notify>,
+    release: Arc<Barrier>,
+}
+
+impl<S> Layer<S> for EmptyCompletionProbeGate
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+        #[derive(Default)]
+        struct EventFields(String);
+
+        impl Visit for EventFields {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                write!(&mut self.0, " {}={value:?}", field.name()).unwrap();
+            }
+        }
+
+        let mut fields = EventFields::default();
+        event.record(&mut fields);
+        if event.metadata().target() == "sqlx::query"
+            && fields
+                .0
+                .contains("SELECT completion_idempotency_key, completion_request_digest")
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            self.reached.notify_one();
+            self.release.wait();
+        }
+    }
+}
 
 struct CountingRuntime {
     inner: KiteAgentRuntime,
@@ -571,6 +613,68 @@ async fn concurrent_completion_races_commit_exactly_one_transition() {
             1,
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_completion_replays_when_winner_commits_after_empty_probe() {
+    let Some(fixture) = TransitionFixture::started_simple_agent().await else {
+        return;
+    };
+    let command = fixture
+        .claim_first("builtin-direct-v1", "claim-stale-empty-probe")
+        .await;
+    let request = fixture.completion(
+        &command,
+        "evt-stale-empty-probe",
+        "ok",
+        json!({"answer":"x"}),
+    );
+    let reached = Arc::new(Notify::new());
+    let release = Arc::new(Barrier::new(2));
+    let subscriber = tracing_subscriber::registry().with(EmptyCompletionProbeGate {
+        armed: Arc::new(AtomicBool::new(true)),
+        reached: Arc::clone(&reached),
+        release: Arc::clone(&release),
+    });
+    let losing_kernel = Arc::clone(&fixture.kernel);
+    let losing_principal = fixture.principal.clone();
+    let losing_request = request.clone();
+    let loser = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                async move {
+                    losing_kernel
+                        .complete_command(&losing_principal, losing_request)
+                        .await
+                }
+                .with_subscriber(subscriber),
+            )
+    });
+
+    reached.notified().await;
+    let winner = fixture
+        .kernel
+        .complete_command(&fixture.principal, request)
+        .await
+        .unwrap();
+    release.wait();
+    let replay = tokio::task::spawn_blocking(move || loser.join().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(replay.task_revision, winner.task_revision);
+    assert_eq!(replay.goal_revision, winner.goal_revision);
+    assert_eq!(fixture.runtime.handle_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture
+            .transition_count_for("event:evt-stale-empty-probe")
+            .await,
+        1,
+    );
 }
 
 #[tokio::test]
