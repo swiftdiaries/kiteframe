@@ -37,6 +37,23 @@ agent babysit_pr(repository: string, pull_request: integer) -> string {
       } join
       done first
     }
+
+    on merged() {
+      complete goal {
+        reviews_resolved: current_evidence
+        checks_passed: current_evidence
+        pull_request_merged: current_evidence
+      }
+    }
+
+    on blocked(reason: string) {
+      block goal when 0 {
+        code: "required_actor_unavailable"
+        explanation: reason
+        evidence: [current_evidence]
+        unlock: ["The required actor responds."]
+      }
+    }
   }
 
   task repair_reviews(review_ids: [string]) -> string {

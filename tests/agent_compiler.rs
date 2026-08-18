@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use kiteframe::dsl::{
-    CompiledDefinition, CompiledStatement, ContextMode, DefinitionKind, Limits, ModelRole, compile,
-    compile_report,
+    CompiledDefinition, CompiledStatement, CompiledValue, ContextMode, DefinitionKind, Limits,
+    ModelRole, compile, compile_report,
 };
 use kiteframe::{
     CatalogTool, ClosedSchema, EffectKind, RecoverySupport, SessionId, ToolCatalogSnapshot,
@@ -73,6 +73,8 @@ fn version_one_json_defaults_to_workflow_and_legacy_context() {
     let round_trip = serde_json::to_value(&compiled).unwrap();
     assert!(round_trip.get("definition_kind").is_none());
     assert!(round_trip.get("events").is_none());
+    assert!(!json.contains("complete_goal"));
+    assert!(!json.contains("block_goal"));
 }
 
 #[test]
@@ -107,6 +109,54 @@ fn compiles_agent_metadata_and_reuses_graph_safety_checks() {
     else {
         panic!("compare starts with a compiled fork");
     };
+    let CompiledStatement::CompleteGoal { criterion_evidence } =
+        &compiled.tasks["inspect_pr"].outcomes["merged"].statements[0]
+    else {
+        panic!("merged has explicit goal authority");
+    };
+    assert_eq!(
+        criterion_evidence,
+        &std::collections::BTreeMap::from([
+            (
+                "checks_passed".to_owned(),
+                CompiledValue::Binding("current_evidence".to_owned()),
+            ),
+            (
+                "pull_request_merged".to_owned(),
+                CompiledValue::Binding("current_evidence".to_owned()),
+            ),
+            (
+                "reviews_resolved".to_owned(),
+                CompiledValue::Binding("current_evidence".to_owned()),
+            ),
+        ]),
+    );
+    let CompiledStatement::BlockGoal {
+        blocked_when_index,
+        reason_code,
+        explanation,
+        evidence,
+        unlock_conditions,
+    } = &compiled.tasks["inspect_pr"].outcomes["blocked"].statements[0]
+    else {
+        panic!("blocked has explicit goal authority");
+    };
+    assert_eq!(*blocked_when_index, 0);
+    assert_eq!(
+        reason_code,
+        &CompiledValue::String("required_actor_unavailable".to_owned())
+    );
+    assert_eq!(explanation, &CompiledValue::Binding("reason".to_owned()));
+    assert_eq!(
+        evidence,
+        &[CompiledValue::Binding("current_evidence".to_owned())]
+    );
+    assert_eq!(
+        unlock_conditions,
+        &[CompiledValue::String(
+            "The required actor responds.".to_owned()
+        )]
+    );
     let actual = json!({
         "definition_hash": compiled.definition_hash,
         "definition_kind": compiled.definition_kind,
@@ -332,4 +382,25 @@ fn published_authoring_example_compiles_as_an_agent() {
     let source = std::fs::read_to_string("examples/babysit_pr.kite").unwrap();
     let compiled = compile(&source, &github_catalog(), &ceilings()).unwrap();
     assert_eq!(compiled.definition_kind, DefinitionKind::Agent);
+}
+
+#[test]
+fn current_evidence_is_immutable_and_string_typed_in_agent_outcomes() {
+    let current_evidence_bindings = [
+        "agent a(current_evidence: string) -> string { entry work(value = current_evidence) task work(value: string) -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { complete goal { c: current_evidence } } } }",
+        "agent a(value: string) -> string { entry work(current_evidence = value) task work(current_evidence: string) -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { complete goal { c: current_evidence } } } }",
+        "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok(current_evidence: string) { complete goal { c: current_evidence } } } }",
+    ];
+    for source in current_evidence_bindings {
+        let diagnostics = compile_report(source, &catalog([]), &ceilings()).unwrap_err();
+        assert_eq!(diagnostics[0].code, "reserved_current_evidence_binding");
+    }
+
+    let wrong_type = "agent a() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok(evidence: integer) { complete goal { c: evidence } } } }";
+    let diagnostics = compile_report(wrong_type, &catalog([]), &ceilings()).unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|item| item.message.contains("value type does not match"))
+    );
 }

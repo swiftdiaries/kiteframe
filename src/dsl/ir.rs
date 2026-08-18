@@ -151,6 +151,16 @@ pub enum CompiledStatement {
         code: CompiledValue,
         message: CompiledValue,
     },
+    CompleteGoal {
+        criterion_evidence: BTreeMap<String, CompiledValue>,
+    },
+    BlockGoal {
+        blocked_when_index: u16,
+        reason_code: CompiledValue,
+        explanation: CompiledValue,
+        evidence: Vec<CompiledValue>,
+        unlock_conditions: Vec<CompiledValue>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]

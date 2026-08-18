@@ -114,6 +114,23 @@ pub struct ArgumentAst {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CriterionEvidenceAst {
+    pub criterion_id: String,
+    pub evidence: ValueRefAst,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockGoalAst {
+    pub blocked_when_index: u16,
+    pub reason_code: ValueRefAst,
+    pub explanation: ValueRefAst,
+    pub evidence: Vec<ValueRefAst>,
+    pub unlock_conditions: Vec<ValueRefAst>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatementAst {
     Call(CallAst),
     Parallel(Vec<CallAst>),
@@ -128,6 +145,8 @@ pub enum StatementAst {
         code: ValueRefAst,
         message: ValueRefAst,
     },
+    CompleteGoal(Vec<CriterionEvidenceAst>),
+    BlockGoal(BlockGoalAst),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

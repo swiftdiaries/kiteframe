@@ -632,6 +632,16 @@ impl Parser {
             let message = self.value()?;
             return Some((StatementAst::Fail { code, message }, true));
         }
+        if self.keyword("complete") {
+            return self
+                .complete_goal(syntax)
+                .map(|value| (StatementAst::CompleteGoal(value), true));
+        }
+        if self.keyword("block") {
+            return self
+                .block_goal(syntax)
+                .map(|value| (StatementAst::BlockGoal(value), true));
+        }
         let binding = self.identifier()?;
         self.expect_equals();
         if self.keyword("call") {
@@ -656,6 +666,290 @@ impl Parser {
             );
             None
         }
+    }
+
+    fn complete_goal(&mut self, syntax: DefinitionSyntax) -> Option<Vec<CriterionEvidenceAst>> {
+        let start = self.previous_span().start;
+        if syntax != DefinitionSyntax::Agent {
+            self.error(
+                "complete_goal_requires_agent",
+                "complete goal is available only in agent outcomes",
+                self.previous_span(),
+            );
+        }
+        if !self.keyword("goal") {
+            self.error(
+                "complete_goal_requires_agent",
+                "complete must be followed by goal",
+                self.current_span(),
+            );
+            return None;
+        }
+        self.expect_lbrace();
+        let mut criteria = Vec::new();
+        while !self.at_rbrace() && !self.at_eof() {
+            let criterion_start = self.current_span().start;
+            let criterion_id = self.goal_criterion_identifier()?;
+            let criterion_span = self.previous_span();
+            if !valid_goal_criterion_id(&criterion_id) {
+                self.error(
+                    "invalid_goal_criterion",
+                    "goal criterion id is invalid",
+                    criterion_span,
+                );
+            }
+            self.expect_colon();
+            let evidence = self.goal_authority_value()?;
+            let span = Span {
+                start: criterion_start,
+                end: self.previous_span().end,
+            };
+            if criteria
+                .iter()
+                .any(|criterion: &CriterionEvidenceAst| criterion.criterion_id == criterion_id)
+            {
+                self.error(
+                    "duplicate_goal_criterion",
+                    "goal completion criterion is duplicated",
+                    span,
+                );
+            }
+            criteria.push(CriterionEvidenceAst {
+                criterion_id,
+                evidence,
+                span,
+            });
+            if self.optional_comma() {
+                self.error(
+                    "invalid_goal_criterion",
+                    "goal completion criteria are separated by whitespace",
+                    self.previous_span(),
+                );
+            }
+        }
+        self.expect_rbrace();
+        if criteria.is_empty() {
+            self.error(
+                "empty_goal_completion",
+                "complete goal requires at least one criterion",
+                Span {
+                    start,
+                    end: self.previous_span().end,
+                },
+            );
+        }
+        Some(criteria)
+    }
+
+    fn block_goal(&mut self, syntax: DefinitionSyntax) -> Option<BlockGoalAst> {
+        let start = self.previous_span().start;
+        if syntax != DefinitionSyntax::Agent {
+            self.error(
+                "block_goal_requires_agent",
+                "block goal is available only in agent outcomes",
+                self.previous_span(),
+            );
+        }
+        if !self.keyword("goal") {
+            self.error(
+                "block_goal_requires_agent",
+                "block must be followed by goal",
+                self.current_span(),
+            );
+            return None;
+        }
+        if !self.keyword("when") {
+            self.error(
+                "invalid_blocked_when_index",
+                "block goal requires a blocked-when index",
+                self.current_span(),
+            );
+            return None;
+        }
+        let blocked_when_index = self.blocked_when_index()?;
+        self.expect_lbrace();
+
+        let mut reason_code = None;
+        let mut explanation = None;
+        let mut evidence = None;
+        let mut unlock_conditions = None;
+        while !self.at_rbrace() && !self.at_eof() {
+            let field_span = self.current_span();
+            let field = self.identifier()?;
+            self.expect_colon();
+            match field.as_str() {
+                "code" => {
+                    let value = self.goal_authority_value()?;
+                    if reason_code.replace(value).is_some() {
+                        self.error(
+                            "duplicate_block_goal_field",
+                            "block goal field is duplicated",
+                            field_span,
+                        );
+                    }
+                }
+                "explanation" => {
+                    let value = self.goal_authority_value()?;
+                    if explanation.replace(value).is_some() {
+                        self.error(
+                            "duplicate_block_goal_field",
+                            "block goal field is duplicated",
+                            field_span,
+                        );
+                    }
+                }
+                "evidence" => {
+                    let value = self.goal_authority_values("empty_block_evidence")?;
+                    if evidence.replace(value).is_some() {
+                        self.error(
+                            "duplicate_block_goal_field",
+                            "block goal field is duplicated",
+                            field_span,
+                        );
+                    }
+                }
+                "unlock" => {
+                    let value = self.goal_authority_values("empty_unlock_conditions")?;
+                    if unlock_conditions.replace(value).is_some() {
+                        self.error(
+                            "duplicate_block_goal_field",
+                            "block goal field is duplicated",
+                            field_span,
+                        );
+                    }
+                }
+                _ => {
+                    self.error(
+                        "missing_block_goal_field",
+                        "block goal contains an unknown field",
+                        field_span,
+                    );
+                    self.skip_block_goal_field_value()?;
+                }
+            }
+            if self.optional_comma() {
+                self.error(
+                    "missing_block_goal_field",
+                    "block goal fields are separated by whitespace",
+                    self.previous_span(),
+                );
+            }
+        }
+        self.expect_rbrace();
+        let span = Span {
+            start,
+            end: self.previous_span().end,
+        };
+        let reason_code = reason_code.unwrap_or_else(|| {
+            self.error("missing_block_goal_field", "block goal requires code", span);
+            ValueRefAst::String(String::new())
+        });
+        let explanation = explanation.unwrap_or_else(|| {
+            self.error(
+                "missing_block_goal_field",
+                "block goal requires explanation",
+                span,
+            );
+            ValueRefAst::String(String::new())
+        });
+        let evidence = evidence.unwrap_or_else(|| {
+            self.error(
+                "missing_block_goal_field",
+                "block goal requires evidence",
+                span,
+            );
+            Vec::new()
+        });
+        let unlock_conditions = unlock_conditions.unwrap_or_else(|| {
+            self.error(
+                "missing_block_goal_field",
+                "block goal requires unlock",
+                span,
+            );
+            Vec::new()
+        });
+        Some(BlockGoalAst {
+            blocked_when_index,
+            reason_code,
+            explanation,
+            evidence,
+            unlock_conditions,
+            span,
+        })
+    }
+
+    fn blocked_when_index(&mut self) -> Option<u16> {
+        let span = self.current_span();
+        let TokenKind::Number(value) = self.current().kind.clone() else {
+            self.error(
+                "invalid_blocked_when_index",
+                "blocked-when index must be an unsigned decimal u16",
+                span,
+            );
+            self.advance();
+            return None;
+        };
+        self.advance();
+        match value.parse::<u16>() {
+            Ok(index) => Some(index),
+            _ => {
+                self.error(
+                    "invalid_blocked_when_index",
+                    "blocked-when index must be an unsigned decimal u16",
+                    span,
+                );
+                None
+            }
+        }
+    }
+
+    fn goal_authority_value(&mut self) -> Option<ValueRefAst> {
+        let span = self.current_span();
+        let value = self.value()?;
+        if !matches!(value, ValueRefAst::Binding(_) | ValueRefAst::String(_)) {
+            self.error(
+                "goal_authority_value_must_be_string",
+                "goal authority values must be strings or string bindings",
+                span,
+            );
+        }
+        Some(value)
+    }
+
+    fn goal_authority_values(&mut self, empty_code: &'static str) -> Option<Vec<ValueRefAst>> {
+        let span = self.current_span();
+        self.expect_lbracket();
+        let mut values = Vec::new();
+        while !self.at_rbracket() && !self.at_eof() {
+            values.push(self.goal_authority_value()?);
+            if !self.optional_comma() && !self.at_rbracket() {
+                self.error(
+                    "expected_goal_authority_value_separator",
+                    "expected comma or closing bracket",
+                    self.current_span(),
+                );
+                return None;
+            }
+        }
+        self.expect_rbracket();
+        if values.is_empty() {
+            self.error(empty_code, "goal authority list must not be empty", span);
+        }
+        Some(values)
+    }
+
+    fn skip_block_goal_field_value(&mut self) -> Option<()> {
+        if self.at_lbracket() {
+            self.advance();
+            while !self.at_rbracket() && !self.at_eof() {
+                self.value()?;
+                self.optional_comma();
+            }
+            self.expect_rbracket();
+        } else {
+            self.value()?;
+        }
+        Some(())
     }
 
     fn parallel(&mut self, syntax: DefinitionSyntax) -> Option<Vec<CallAst>> {
@@ -1047,6 +1341,22 @@ impl Parser {
             }
         }
     }
+    fn goal_criterion_identifier(&mut self) -> Option<String> {
+        match self.current().kind.clone() {
+            TokenKind::Identifier(value) | TokenKind::InvalidIdentifier(value) => {
+                self.advance();
+                Some(value)
+            }
+            _ => {
+                self.error(
+                    "expected_identifier",
+                    "expected identifier",
+                    self.current_span(),
+                );
+                None
+            }
+        }
+    }
     fn take_prompt(&mut self) -> Option<(String, Span)> {
         match self.current().kind.clone() {
             TokenKind::TripleString(value) => {
@@ -1207,6 +1517,13 @@ fn valid_event_type(value: &str) -> bool {
         return false;
     }
     components.into_iter().all(valid_event_component)
+}
+
+fn valid_goal_criterion_id(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 64
+        && matches!(bytes.next(), Some(b'a'..=b'z'))
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn valid_event_component(component: &str) -> bool {

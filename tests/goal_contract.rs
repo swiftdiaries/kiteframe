@@ -2,7 +2,11 @@ use std::fs;
 
 use kiteframe::goal::{GoalContract, GoalContractError};
 use kiteframe::task::{HarnessRole, SubmitUserTask, TaskTarget, UserTaskError};
-use kiteframe::{IdempotencyKey, SessionId};
+use kiteframe::{
+    AgentCommandId, CancelUserTask, CriterionAssertion, EvidenceId, EvidenceRecord,
+    EvidenceSourceIdentity, GoalBlocker, GoalPhase, IdempotencyKey, OperationalStatus,
+    PauseUserTask, ResumeUserTask, SessionId, StartAgent, TaskLifecycle, UserTaskId,
+};
 use uuid::Uuid;
 
 fn valid_request() -> SubmitUserTask {
@@ -38,6 +42,10 @@ fn reviewed_user_task_contract_is_checked_in() {
 
     assert!(reference.contains("GoalContract is immutable"));
     assert!(reference.contains("Slice 2 owns goal phases"));
+    assert!(
+        reference.contains("| `CompleteGoal` accepted | `succeeded` | `finished` | `complete` |")
+    );
+    assert!(reference.contains("A `HarnessResult` supplies an invocation outcome only"));
     let value: serde_json::Value = serde_json::from_str(&fixture).unwrap();
     assert_eq!(value["target"]["type"], "github_pull_request");
     assert_eq!(value["goal"]["success"].as_array().unwrap().len(), 3);
@@ -329,4 +337,100 @@ fn request_digest_excludes_only_idempotency_key() {
             .blocked_when
             .push("Another blocked condition.".into());
     });
+}
+
+#[test]
+fn lifecycle_commands_and_evidence_have_closed_stable_wire_shapes() {
+    assert_eq!(serde_json::to_value(GoalPhase::Active).unwrap(), "active");
+    assert_eq!(
+        serde_json::to_value(TaskLifecycle::Cancelled).unwrap(),
+        "cancelled"
+    );
+    assert_eq!(
+        serde_json::to_value(OperationalStatus::WaitingForHarness).unwrap(),
+        "waiting_for_harness"
+    );
+
+    let session_id = SessionId::new(Uuid::from_u128(1));
+    let task_id = UserTaskId::new(Uuid::from_u128(2));
+    let idempotency_key = IdempotencyKey::new("command-1").unwrap();
+    let start = StartAgent {
+        session_id: session_id.clone(),
+        task_id: task_id.clone(),
+        expected_task_revision: 3,
+        expected_goal_revision: 4,
+        idempotency_key: idempotency_key.clone(),
+    };
+    let pause = PauseUserTask {
+        session_id: session_id.clone(),
+        task_id: task_id.clone(),
+        expected_task_revision: 3,
+        expected_goal_revision: 4,
+        reason: "principal requested a pause".into(),
+        idempotency_key: idempotency_key.clone(),
+    };
+    let resume = ResumeUserTask {
+        session_id: session_id.clone(),
+        task_id: task_id.clone(),
+        expected_task_revision: 3,
+        expected_goal_revision: 4,
+        idempotency_key: idempotency_key.clone(),
+    };
+    let cancel = CancelUserTask {
+        session_id,
+        task_id: task_id.clone(),
+        expected_task_revision: 3,
+        expected_goal_revision: 4,
+        reason: None,
+        idempotency_key,
+    };
+    for value in [
+        serde_json::to_value(start).unwrap(),
+        serde_json::to_value(pause).unwrap(),
+        serde_json::to_value(resume).unwrap(),
+        serde_json::to_value(cancel).unwrap(),
+    ] {
+        assert_eq!(value["expectedTaskRevision"], 3);
+        assert_eq!(value["expectedGoalRevision"], 4);
+        assert_eq!(value["idempotencyKey"], "command-1");
+    }
+
+    let evidence_id = EvidenceId::new(Uuid::from_u128(3));
+    let record = EvidenceRecord {
+        id: evidence_id.clone(),
+        task_id,
+        evidence_type: "github.required_checks".into(),
+        source: EvidenceSourceIdentity::BuiltinHarness {
+            command_id: AgentCommandId::new(Uuid::from_u128(4)),
+        },
+        digest: "evidence-digest".into(),
+    };
+    let wire = serde_json::to_value(&record).unwrap();
+    assert_eq!(wire["evidenceType"], "github.required_checks");
+    assert_eq!(wire["source"]["kind"], "builtin_harness");
+    assert_eq!(
+        serde_json::from_value::<EvidenceRecord>(wire.clone()).unwrap(),
+        record
+    );
+    let mut unknown = wire;
+    unknown["unknown"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<EvidenceRecord>(unknown).is_err());
+
+    let assertion = CriterionAssertion {
+        criterion_id: "checks_passed".into(),
+        evidence_id: evidence_id.clone(),
+    };
+    assert_eq!(
+        serde_json::to_value(assertion).unwrap()["criterionId"],
+        "checks_passed"
+    );
+    let blocker = GoalBlocker {
+        blocked_when_index: 0,
+        reason_code: "actor_unavailable".into(),
+        explanation: "The actor is unavailable.".into(),
+        evidence_ids: vec![evidence_id],
+        unlock_conditions: vec!["The actor responds.".into()],
+        goal_revision: 5,
+    };
+    assert_eq!(serde_json::to_value(blocker).unwrap()["goalRevision"], 5);
 }

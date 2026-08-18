@@ -328,6 +328,9 @@ impl<'a> Compiler<'a> {
             for (field, ty) in &fields {
                 self.insert_binding(&mut scope, field, ty.clone(), outcome.span);
             }
+            if self.view.kind == DefinitionKind::Agent {
+                scope.insert("current_evidence".to_owned(), CompiledType::String);
+            }
             let statements =
                 self.compile_statements(name, &result, &mut scope, &outcome.statements);
             completion_outcomes.insert(outcome.name.clone(), fields.clone());
@@ -513,6 +516,51 @@ impl<'a> Compiler<'a> {
                         message: self.compiled_value(message),
                     });
                 }
+                StatementAst::CompleteGoal(criteria) => {
+                    let mut criterion_evidence = BTreeMap::new();
+                    for criterion in criteria {
+                        self.expect_value_type(
+                            &criterion.evidence,
+                            scope,
+                            &CompiledType::String,
+                            criterion.span,
+                        );
+                        if criterion_evidence
+                            .insert(
+                                criterion.criterion_id.clone(),
+                                self.compiled_value(&criterion.evidence),
+                            )
+                            .is_some()
+                        {
+                            self.error("goal completion criterion is duplicated", criterion.span);
+                        }
+                    }
+                    compiled.push(CompiledStatement::CompleteGoal { criterion_evidence });
+                }
+                StatementAst::BlockGoal(block) => {
+                    for value in std::iter::once(&block.reason_code)
+                        .chain(std::iter::once(&block.explanation))
+                        .chain(block.evidence.iter())
+                        .chain(block.unlock_conditions.iter())
+                    {
+                        self.expect_value_type(value, scope, &CompiledType::String, block.span);
+                    }
+                    compiled.push(CompiledStatement::BlockGoal {
+                        blocked_when_index: block.blocked_when_index,
+                        reason_code: self.compiled_value(&block.reason_code),
+                        explanation: self.compiled_value(&block.explanation),
+                        evidence: block
+                            .evidence
+                            .iter()
+                            .map(|value| self.compiled_value(value))
+                            .collect(),
+                        unlock_conditions: block
+                            .unlock_conditions
+                            .iter()
+                            .map(|value| self.compiled_value(value))
+                            .collect(),
+                    });
+                }
             }
         }
         compiled
@@ -587,6 +635,16 @@ impl<'a> Compiler<'a> {
         let mut compiled = BTreeMap::new();
         for field in fields {
             self.reject_reserved(&field.name, field.span);
+            if self.view.kind == DefinitionKind::Agent
+                && kind != "record field"
+                && field.name == "current_evidence"
+            {
+                self.diagnostic_error(
+                    "reserved_current_evidence_binding",
+                    "current_evidence is an immutable kernel binding",
+                    field.span,
+                );
+            }
             let ty = self.compile_type(&field.ty, field.span);
             if compiled.insert(field.name.clone(), ty).is_some() {
                 self.error(format!("{kind} is duplicated"), field.span);
@@ -899,7 +957,9 @@ fn agent_hash_metadata(
                     }
                     CompiledStatement::Ask { .. }
                     | CompiledStatement::Done { .. }
-                    | CompiledStatement::Fail { .. } => {}
+                    | CompiledStatement::Fail { .. }
+                    | CompiledStatement::CompleteGoal { .. }
+                    | CompiledStatement::BlockGoal { .. } => {}
                 }
             }
         }

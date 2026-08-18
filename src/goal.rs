@@ -3,7 +3,64 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::canonical_sha256;
+use crate::{AgentCommandId, UserTaskId, canonical_sha256};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalPhase {
+    Active,
+    Paused,
+    Blocked,
+    Complete,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct EvidenceId(uuid::Uuid);
+
+impl EvidenceId {
+    pub const fn new(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+
+    pub const fn as_uuid(&self) -> &uuid::Uuid {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum EvidenceSourceIdentity {
+    BuiltinHarness { command_id: AgentCommandId },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceRecord {
+    pub id: EvidenceId,
+    pub task_id: UserTaskId,
+    pub evidence_type: String,
+    pub source: EvidenceSourceIdentity,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CriterionAssertion {
+    pub criterion_id: String,
+    pub evidence_id: EvidenceId,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GoalBlocker {
+    pub blocked_when_index: u16,
+    pub reason_code: String,
+    pub explanation: String,
+    pub evidence_ids: Vec<EvidenceId>,
+    pub unlock_conditions: Vec<String>,
+    pub goal_revision: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

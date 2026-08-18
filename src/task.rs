@@ -1,7 +1,88 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{GoalContract, GoalContractError, IdempotencyKey, SessionId, canonical_sha256};
+use crate::{
+    AcceptedUserTask, GoalBlocker, GoalContract, GoalContractError, GoalPhase, IdempotencyKey,
+    RuntimeStateSnapshot, SessionId, UserTaskId, canonical_sha256,
+};
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskLifecycle {
+    Accepted,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationalStatus {
+    NotStarted,
+    Runnable,
+    WaitingForContext,
+    WaitingForEvent,
+    WaitingForHarness,
+    WaitingForApproval,
+    Paused,
+    Blocked,
+    Finished,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartAgent {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub expected_task_revision: u64,
+    pub expected_goal_revision: u64,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PauseUserTask {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub expected_task_revision: u64,
+    pub expected_goal_revision: u64,
+    pub reason: String,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResumeUserTask {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub expected_task_revision: u64,
+    pub expected_goal_revision: u64,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CancelUserTask {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub expected_task_revision: u64,
+    pub expected_goal_revision: u64,
+    pub reason: Option<String>,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentExecutionView {
+    pub task: AcceptedUserTask,
+    pub lifecycle: TaskLifecycle,
+    pub operational_status: OperationalStatus,
+    pub task_revision: u64,
+    pub goal_phase: GoalPhase,
+    pub goal_revision: u64,
+    pub blocker: Option<GoalBlocker>,
+    pub runtime: Option<RuntimeStateSnapshot>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

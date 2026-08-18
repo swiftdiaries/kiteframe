@@ -93,6 +93,11 @@ pub fn next_command(
                 .to_owned(),
             schema: closed_schema(definition, answer_type)?,
         })),
+        CompiledStatement::CompleteGoal { .. } | CompiledStatement::BlockGoal { .. } => {
+            Err(TransitionError::Corrupt(
+                "agent goal authority statement is invalid in a legacy workflow".to_owned(),
+            ))
+        }
     }
 }
 

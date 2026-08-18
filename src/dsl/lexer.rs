@@ -3,6 +3,7 @@ use super::{Diagnostic, Span};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TokenKind {
     Identifier(String),
+    InvalidIdentifier(String),
     String(String),
     TripleString(String),
     Number(String),
@@ -174,10 +175,12 @@ impl Lexer<'_> {
     }
 
     fn lex_identifier(&mut self, start: usize) -> TokenKind {
+        let mut contains_hyphen = false;
         while let Some(ch) = self.source[self.offset..].chars().next() {
-            if !(ch == '_' || ch.is_ascii_alphanumeric()) {
+            if !(matches!(ch, '_' | '-') || ch.is_ascii_alphanumeric()) {
                 break;
             }
+            contains_hyphen |= ch == '-';
             self.offset += ch.len_utf8();
             if self.offset == self.source.len() {
                 break;
@@ -194,7 +197,11 @@ impl Lexer<'_> {
                 },
             );
         }
-        TokenKind::Identifier(value.to_owned())
+        if contains_hyphen {
+            TokenKind::InvalidIdentifier(value.to_owned())
+        } else {
+            TokenKind::Identifier(value.to_owned())
+        }
     }
 
     fn lex_number(&mut self) -> TokenKind {

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use kiteframe::dsl::{Limits, compile};
+use kiteframe::dsl::{CompiledStatement, CompiledValue, Limits, compile};
 use kiteframe::engine::{FrameSnapshot, TransitionError, next_command};
 use kiteframe::{FrameCommand, SessionId, ToolCatalogSnapshot};
 use serde_json::json;
@@ -232,4 +232,45 @@ fn accepts_required_nullable_scalar_answers_and_rejects_corrupt_record_ir() {
         ),
         Err(TransitionError::Corrupt(message)) if message.contains("record type is absent")
     ));
+}
+
+#[test]
+fn rejects_agent_goal_authority_statements_in_legacy_workflow_ir() {
+    let mut workflow = workflow();
+    let statements = [
+        CompiledStatement::CompleteGoal {
+            criterion_evidence: BTreeMap::new(),
+        },
+        CompiledStatement::BlockGoal {
+            blocked_when_index: 0,
+            reason_code: CompiledValue::String("blocked".into()),
+            explanation: CompiledValue::String("blocked".into()),
+            evidence: Vec::new(),
+            unlock_conditions: Vec::new(),
+        },
+    ];
+
+    for statement in statements {
+        workflow
+            .tasks
+            .get_mut("t")
+            .unwrap()
+            .outcomes
+            .get_mut("ok")
+            .unwrap()
+            .statements[0] = statement;
+        assert!(matches!(
+            next_command(
+                &workflow,
+                &FrameSnapshot {
+                    task_name: "t".to_owned(),
+                    outcome: "ok".to_owned(),
+                    statement_index: 0,
+                    bindings: BTreeMap::new(),
+                },
+            ),
+            Err(TransitionError::Corrupt(message))
+                if message == "agent goal authority statement is invalid in a legacy workflow"
+        ));
+    }
 }

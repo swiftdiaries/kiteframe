@@ -20,17 +20,23 @@ fn limits() -> ParseLimits {
 fn reviewed_agent_language_contract_is_checked_in() {
     let reference =
         fs::read_to_string("docs/reference/kite-language.md").expect("language reference exists");
+    let runtime = fs::read_to_string("docs/reference/agent-runtime-and-goal-lifecycle.md")
+        .expect("runtime reference exists");
     let fixture = fs::read_to_string("tests/fixtures/dsl/agent_babysit_pr.kite")
         .expect("agent fixture exists");
 
     assert!(reference.contains("agent-definition"));
     assert!(reference.contains("workflow-definition (deprecated)"));
-    assert!(reference.contains(
-        "Agents are immutable and publishable in consolidated Slice 1, but not executable."
-    ));
-    assert!(reference.contains("`StartRun` rejects agents with `agent_runtime_unavailable`"));
+    assert!(reference.contains("complete-goal"));
+    assert!(reference.contains("block-goal"));
+    assert!(reference.contains("`reserved_current_evidence_binding`"));
+    assert!(reference.contains("Legacy `StartRun` still rejects agents"));
     assert!(!reference.contains("Publication must reject them before persistence"));
+    assert!(runtime.contains("snapshot bytes | 262,144"));
+    assert!(runtime.contains("`HarnessResult` supplies only an invocation outcome"));
     assert!(fixture.starts_with("agent babysit_pr("));
+    assert!(fixture.contains("complete goal"));
+    assert!(fixture.contains("block goal when 0"));
     assert!(fixture.ends_with("}\n"));
 }
 
@@ -187,4 +193,193 @@ task t() -> string { prompt """x""" tools [] on ok() { done "x" } }"#,
             .iter()
             .any(|diagnostic| diagnostic.code == "invalid_workflow_body")
     );
+}
+
+#[test]
+fn parses_explicit_agent_goal_authority_statements() {
+    let source = r#"
+agent goal_agent(blocker: string) -> string {
+  entry work(blocker = blocker)
+  task work(blocker: string) -> string {
+    model reasoning
+    prompt """Choose a declared terminal path."""
+    tools []
+    on complete_it() {
+      complete goal { criterion_one: current_evidence }
+    }
+    on block_it() {
+      block goal when 0 {
+        code: "required_actor_unavailable"
+        explanation: blocker
+        evidence: [current_evidence]
+        unlock: ["The required actor responds."]
+      }
+    }
+  }
+}
+"#;
+    let report = parse_report(source, limits()).unwrap();
+    let DefinitionAst::Agent(agent) = report.source.definition else {
+        panic!()
+    };
+    assert!(matches!(
+        agent.tasks[0].outcomes[0].statements[0],
+        StatementAst::CompleteGoal(_),
+    ));
+    assert!(matches!(
+        agent.tasks[0].outcomes[1].statements[0],
+        StatementAst::BlockGoal(_),
+    ));
+}
+
+fn goal_authority_agent() -> String {
+    r#"
+agent goal_agent(blocker: string) -> string {
+  entry work(blocker = blocker)
+  task work(blocker: string) -> string {
+    model reasoning
+    prompt """Choose a declared terminal path."""
+    tools []
+    on complete_it() {
+      complete goal { criterion_one: current_evidence }
+    }
+    on block_it() {
+      block goal when 0 {
+        code: "required_actor_unavailable"
+        explanation: blocker
+        evidence: [current_evidence]
+        unlock: ["The required actor responds."]
+      }
+    }
+  }
+}
+"#
+    .to_owned()
+}
+
+#[test]
+fn goal_authority_syntax_fails_closed() {
+    let agent = goal_authority_agent();
+    let cases = [
+        (
+            agent.replace("criterion_one: current_evidence", ""),
+            "empty_goal_completion",
+        ),
+        (
+            agent.replace(
+                "criterion_one: current_evidence",
+                "criterion_one: current_evidence criterion_one: current_evidence",
+            ),
+            "duplicate_goal_criterion",
+        ),
+        (
+            agent.replace("criterion_one", "Bad-ID"),
+            "invalid_goal_criterion",
+        ),
+        (
+            agent.replace("when 0", "when 65536"),
+            "invalid_blocked_when_index",
+        ),
+        (
+            agent.replace("when 0", "when later"),
+            "invalid_blocked_when_index",
+        ),
+        (
+            agent.replace("evidence: [current_evidence]", "evidence: []"),
+            "empty_block_evidence",
+        ),
+        (
+            agent.replace("unlock: [\"The required actor responds.\"]", "unlock: []"),
+            "empty_unlock_conditions",
+        ),
+        (
+            agent.replace("explanation: blocker", "explanation: 1"),
+            "goal_authority_value_must_be_string",
+        ),
+        (
+            agent.replace("code: \"required_actor_unavailable\"", "code: 1"),
+            "goal_authority_value_must_be_string",
+        ),
+        (
+            agent.replace("evidence: [current_evidence]", "evidence: [1]"),
+            "goal_authority_value_must_be_string",
+        ),
+        (
+            agent.replace("unlock: [\"The required actor responds.\"]", "unlock: [1]"),
+            "goal_authority_value_must_be_string",
+        ),
+        (
+            agent.replace(
+                "code: \"required_actor_unavailable\"",
+                "unknown: \"required_actor_unavailable\"",
+            ),
+            "missing_block_goal_field",
+        ),
+        (
+            agent.replace(
+                "code: \"required_actor_unavailable\"",
+                "code: \"required_actor_unavailable\" code: \"again\"",
+            ),
+            "duplicate_block_goal_field",
+        ),
+        (
+            agent.replace("explanation: blocker", ""),
+            "missing_block_goal_field",
+        ),
+    ];
+    for (source, expected) in cases {
+        assert_eq!(
+            parse_report(&source, limits()).unwrap_err()[0].code,
+            expected,
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn hyphenated_identifier_like_text_remains_invalid_outside_goal_criteria() {
+    let diagnostics = parse_report(
+        "agent bad-name() -> string { entry work() task work() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }",
+        limits(),
+    )
+    .unwrap_err();
+
+    assert_eq!(diagnostics[0].code, "expected_identifier");
+}
+
+#[test]
+fn goal_authority_operations_are_agent_only_and_terminal() {
+    let complete_workflow = r#"
+workflow w() -> string { start t() }
+task t() -> string {
+  prompt """x"""
+  tools []
+  on ok() { complete goal { criterion_one: "evidence" } }
+}
+"#;
+    let block_workflow = complete_workflow.replace(
+        "complete goal { criterion_one: \"evidence\" }",
+        "block goal when 0 { code: \"blocked\" explanation: \"blocked\" evidence: [\"evidence\"] unlock: [\"later\"] }",
+    );
+    for (source, expected) in [
+        (complete_workflow.to_owned(), "complete_goal_requires_agent"),
+        (block_workflow, "block_goal_requires_agent"),
+    ] {
+        let diagnostics = parse_report(&source, limits()).unwrap_err();
+        assert!(diagnostics.iter().any(|item| item.code == expected));
+    }
+
+    for terminal in [
+        "complete goal { criterion_one: current_evidence }",
+        "block goal when 0 { code: \"blocked\" explanation: blocker evidence: [current_evidence] unlock: [\"later\"] }",
+    ] {
+        let source = goal_authority_agent().replace(
+            "complete goal { criterion_one: current_evidence }",
+            &format!("{terminal} done blocker"),
+        );
+        assert_eq!(
+            parse_report(&source, limits()).unwrap_err()[0].code,
+            "statement_after_terminal",
+        );
+    }
 }
