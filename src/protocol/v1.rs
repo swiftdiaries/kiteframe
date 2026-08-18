@@ -4,14 +4,15 @@ use agent_client_protocol::schema::{ProtocolVersion, v1 as acp};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::dsl::DefinitionKind;
 use crate::{
     AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PolicyRevision, RetryRecovery,
     RunId, Secret, SessionId, SessionPolicy, StartRun,
 };
 
 use super::{
-    ApplicationCommand, ApplicationResult, EventCursor, GetRun, NewSession,
-    PermissionResponseContext, ProtocolAdapter, ProtocolError, PublishWorkflow, ResumeSession,
+    ApplicationCommand, ApplicationResult, EventCursor, GetRun, GetUserTask, NewSession,
+    PermissionResponseContext, ProtocolAdapter, ProtocolError, PublishDefinition, ResumeSession,
     UpdateSessionPolicy, encode_application_result,
 };
 
@@ -77,6 +78,11 @@ impl V1Adapter {
     ) -> Result<ApplicationCommand, ProtocolError> {
         <Self as ProtocolAdapter>::decode_extension(&Self, method, params)
     }
+
+    #[must_use]
+    pub fn encode_error(error: &ProtocolError) -> agent_client_protocol::Error {
+        super::types::encode_protocol_error(error)
+    }
 }
 
 impl ProtocolAdapter for V1Adapter {
@@ -86,7 +92,13 @@ impl ProtocolAdapter for V1Adapter {
         params: Value,
     ) -> Result<ApplicationCommand, ProtocolError> {
         match method {
-            "_kiteframe/workflow/publish" => decode(params).map(PublishDto::into_command),
+            "_kiteframe/workflow/publish" => decode(params)
+                .map(|dto: PublishDto| dto.into_command(Some(DefinitionKind::Workflow))),
+            "_kiteframe/definition/publish" => {
+                decode(params).map(|dto: PublishDto| dto.into_command(None))
+            }
+            "_kiteframe/task/submit" => decode(params).map(ApplicationCommand::SubmitTask),
+            "_kiteframe/task/get" => decode(params).map(GetTaskDto::into_command),
             "_kiteframe/run/start" => decode(params).map(StartDto::into_command),
             "_kiteframe/run/get" => decode(params).map(GetDto::into_command),
             "_kiteframe/run/answer" => decode(params).map(AnswerDto::into_command),
@@ -216,6 +228,24 @@ type Meta = Option<serde_json::Map<String, Value>>;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetTaskDto {
+    session_id: SessionId,
+    task_id: crate::UserTaskId,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl GetTaskDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::GetTask(GetUserTask {
+            session_id: self.session_id,
+            task_id: self.task_id,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PublishDto {
     source: String,
     #[serde(default, rename = "_meta")]
@@ -223,8 +253,9 @@ struct PublishDto {
 }
 
 impl PublishDto {
-    fn into_command(self) -> ApplicationCommand {
-        ApplicationCommand::Publish(PublishWorkflow {
+    fn into_command(self, expected_kind: Option<DefinitionKind>) -> ApplicationCommand {
+        ApplicationCommand::Publish(PublishDefinition {
+            expected_kind,
             source: self.source,
         })
     }

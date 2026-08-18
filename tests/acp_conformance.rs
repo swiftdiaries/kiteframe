@@ -2,10 +2,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use kiteframe::{
-    ApplicationCommand, ApplicationResult, ApplicationSession, AuthenticatedConnection,
-    IdempotencyKey, PermissionChoice, PermissionRequestId, PermissionResponseContext, PrincipalId,
-    ProtocolAdapter, ProtocolConnection, ProtocolError, ProtocolNegotiation, RunId, SessionId,
-    SessionView, TransportKind, V1Adapter,
+    AGENT_RUNTIME_UNAVAILABLE, ApplicationCommand, ApplicationResult, ApplicationSession,
+    AuthenticatedConnection, IdempotencyKey, PermissionChoice, PermissionRequestId,
+    PermissionResponseContext, PrincipalId, ProtocolAdapter, ProtocolConnection, ProtocolError,
+    ProtocolNegotiation, RunId, SessionId, SessionView, TransportKind, V1Adapter,
 };
 use uuid::Uuid;
 
@@ -130,6 +130,35 @@ fn fixture_application_session(cwd: &str) -> ApplicationSession {
     }
 }
 
+fn accepted_task_fixture() -> kiteframe::AcceptedUserTask {
+    let request: kiteframe::SubmitUserTask =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    kiteframe::AcceptedUserTask {
+        id: kiteframe::UserTaskId::new(
+            Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f417").unwrap(),
+        ),
+        session_id: request.session_id,
+        principal: PrincipalId::new("user_456").unwrap(),
+        definition: kiteframe::PublishedDefinition {
+            id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+            kind: kiteframe::dsl::DefinitionKind::Agent,
+            name: request.agent.name,
+            version: request.agent.version.unwrap(),
+            definition_hash: "sha256:agent-fixture".to_owned(),
+        },
+        target: request.target,
+        preferences: request.preferences,
+        goal_digest: request.goal.digest().unwrap(),
+        goal: request.goal,
+        revision: 0,
+        created_at: time::OffsetDateTime::parse(
+            "2026-08-18T12:34:56Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap(),
+    }
+}
+
 fn permission_context() -> PermissionResponseContext {
     PermissionResponseContext::new(
         SessionId::new(Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f413").unwrap()),
@@ -183,6 +212,7 @@ fn v1_standard_responses_use_sdk_dtos_and_permission_reaches_core() {
             .encode_result(ApplicationResult::Published(
                 kiteframe::PublishedDefinition {
                     id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+                    kind: kiteframe::dsl::DefinitionKind::Workflow,
                     name: "support".to_owned(),
                     version: 7,
                     definition_hash: "sha256:fixture".to_owned(),
@@ -244,9 +274,234 @@ fn every_advertised_extension_maps_to_one_application_command() {
     }
 }
 
+#[test]
+fn publication_methods_bind_their_expected_definition_kind() {
+    let source = "agent babysit() -> string {}";
+    let ApplicationCommand::Publish(legacy) =
+        V1Adapter::decode_extension("_kiteframe/workflow/publish", json!({"source": source}))
+            .unwrap()
+    else {
+        panic!("expected legacy publication command");
+    };
+    assert_eq!(
+        legacy.expected_kind,
+        Some(kiteframe::dsl::DefinitionKind::Workflow)
+    );
+
+    let ApplicationCommand::Publish(generic) =
+        V1Adapter::decode_extension("_kiteframe/definition/publish", json!({"source": source}))
+            .unwrap()
+    else {
+        panic!("expected generic publication command");
+    };
+    assert_eq!(generic.expected_kind, None);
+
+    #[cfg(feature = "acp-v2")]
+    {
+        use kiteframe::V2Adapter;
+
+        let ApplicationCommand::Publish(legacy) = V2Adapter::new(true)
+            .decode_extension("_kiteframe/workflow/publish", json!({"source": source}))
+            .unwrap()
+        else {
+            panic!("expected v2 legacy publication command");
+        };
+        assert_eq!(
+            legacy.expected_kind,
+            Some(kiteframe::dsl::DefinitionKind::Workflow)
+        );
+        let ApplicationCommand::Publish(generic) = V2Adapter::new(true)
+            .decode_extension("_kiteframe/definition/publish", json!({"source": source}))
+            .unwrap()
+        else {
+            panic!("expected v2 generic publication command");
+        };
+        assert_eq!(generic.expected_kind, None);
+    }
+}
+
+#[test]
+fn task_submission_decodes_without_a_wire_principal() {
+    let payload: Value =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    let ApplicationCommand::SubmitTask(v1_request) =
+        V1Adapter::decode_extension("_kiteframe/task/submit", payload.clone()).unwrap()
+    else {
+        panic!("expected v1 SubmitTask");
+    };
+    assert_eq!(v1_request.agent.name, "babysit_pr");
+    assert_eq!(v1_request.goal.version, 1);
+
+    #[cfg(feature = "acp-v2")]
+    {
+        use kiteframe::V2Adapter;
+
+        let ApplicationCommand::SubmitTask(v2_request) = V2Adapter::new(true)
+            .decode_extension("_kiteframe/task/submit", payload.clone())
+            .unwrap()
+        else {
+            panic!("expected v2 SubmitTask");
+        };
+        assert_eq!(v2_request, v1_request);
+    }
+
+    let mut invalid = payload;
+    invalid
+        .as_object_mut()
+        .unwrap()
+        .insert("principal".to_owned(), json!("spoofed-user"));
+    assert!(matches!(
+        V1Adapter::decode_extension("_kiteframe/task/submit", invalid),
+        Err(ProtocolError::InvalidPayload(_))
+    ));
+}
+
+#[test]
+fn task_get_decodes_a_closed_session_scoped_payload() {
+    let session_id = Uuid::now_v7();
+    let task_id = Uuid::now_v7();
+    let ApplicationCommand::GetTask(request) = V1Adapter::decode_extension(
+        "_kiteframe/task/get",
+        json!({"sessionId": session_id, "taskId": task_id, "_meta": {"trace": "ok"}}),
+    )
+    .unwrap() else {
+        panic!("expected GetTask");
+    };
+    assert_eq!(request.session_id.as_uuid(), &session_id);
+    assert_eq!(request.task_id.as_uuid(), &task_id);
+
+    assert!(matches!(
+        V1Adapter::decode_extension(
+            "_kiteframe/task/get",
+            json!({"sessionId": session_id, "taskId": task_id, "unknown": true}),
+        ),
+        Err(ProtocolError::InvalidPayload(_))
+    ));
+}
+
+#[test]
+fn publication_response_keeps_legacy_bytes_and_tags_generic_definitions() {
+    let fixture = v1_fixture();
+    let definition = kiteframe::PublishedDefinition {
+        id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+        kind: kiteframe::dsl::DefinitionKind::Workflow,
+        name: "support".to_owned(),
+        version: 7,
+        definition_hash: "sha256:fixture".to_owned(),
+    };
+    assert_eq!(
+        V1Adapter
+            .encode_extension_result(
+                "_kiteframe/workflow/publish",
+                ApplicationResult::Published(definition.clone()),
+            )
+            .unwrap(),
+        fixture.published_response
+    );
+    assert_eq!(
+        V1Adapter
+            .encode_extension_result(
+                "_kiteframe/definition/publish",
+                ApplicationResult::Published(definition),
+            )
+            .unwrap(),
+        json!({
+            "id": "019ff3d8-9d86-7de0-9070-0f0185d5f416",
+            "kind": "workflow",
+            "name": "support",
+            "version": 7,
+            "definitionHash": "sha256:fixture",
+        })
+    );
+}
+
+#[test]
+fn accepted_task_encoding_is_shared_and_omits_retry_state() {
+    let task = accepted_task_fixture();
+    let v1 = V1Adapter
+        .encode_result(ApplicationResult::Task(task.clone()))
+        .unwrap();
+    assert_eq!(v1["principal"], "user_456");
+    assert_eq!(v1["agent"]["kind"], "agent");
+    assert_eq!(v1["agent"]["name"], "babysit_pr");
+    assert_eq!(v1["goal"]["version"], 1);
+    assert_eq!(v1["goal"]["success"].as_array().unwrap().len(), 3);
+    assert_eq!(v1["revision"], 0);
+    assert!(v1.get("idempotencyKey").is_none());
+    assert!(v1.get("state").is_none());
+
+    #[cfg(feature = "acp-v2")]
+    assert_eq!(
+        kiteframe::V2Adapter::new(true)
+            .encode_result(ApplicationResult::Task(task))
+            .unwrap(),
+        v1
+    );
+}
+
+#[test]
+fn agent_runtime_failure_has_the_same_public_shape_on_every_adapter() {
+    let error = ProtocolError::StableApplication {
+        code: AGENT_RUNTIME_UNAVAILABLE,
+        message: "internal actionable detail".to_owned(),
+    };
+    let encoded = V1Adapter::encode_error(&error);
+    assert_eq!(i32::from(encoded.code), -32000);
+    assert_eq!(encoded.message, "application request failed");
+    assert_eq!(
+        encoded.data,
+        Some(json!({"kiteframe_code": "agent_runtime_unavailable"}))
+    );
+
+    #[cfg(feature = "acp-v2")]
+    {
+        use kiteframe::V2Adapter;
+
+        let encoded = V2Adapter::new(true).encode_error(&error);
+        assert_eq!(i32::from(encoded.code), -32000);
+        assert_eq!(encoded.message, "application request failed");
+        assert_eq!(
+            encoded.data,
+            Some(json!({"kiteframe_code": "agent_runtime_unavailable"}))
+        );
+    }
+
+    assert!(matches!(
+        ProtocolError::from(kiteframe::StoreError::AgentRuntimeUnavailable),
+        ProtocolError::StableApplication {
+            code: AGENT_RUNTIME_UNAVAILABLE,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn general_store_errors_do_not_gain_task_specific_codes() {
+    for error in [
+        kiteframe::StoreError::AgentDefinitionRequired,
+        kiteframe::StoreError::DefinitionNotFound,
+        kiteframe::StoreError::UserTaskNotFound,
+        kiteframe::StoreError::IdempotencyConflict,
+    ] {
+        let encoded = V1Adapter::encode_error(&ProtocolError::from(error));
+        assert_eq!(i32::from(encoded.code), -32000);
+        assert_eq!(encoded.message, "application request failed");
+        assert!(encoded.data.is_none());
+    }
+
+    let encoded = V1Adapter::encode_error(&ProtocolError::from(
+        kiteframe::StoreError::InvalidUserTask("private objective".to_owned()),
+    ));
+    assert_eq!(i32::from(encoded.code), -32602);
+    assert_eq!(encoded.message, "Invalid params");
+    assert!(encoded.data.is_none());
+}
+
 fn command_kind(command: &ApplicationCommand) -> &'static str {
     match command {
         ApplicationCommand::Publish(_) => "publish",
+        ApplicationCommand::SubmitTask(_) => "task_submit",
+        ApplicationCommand::GetTask(_) => "task_get",
         ApplicationCommand::Start(_) => "start",
         ApplicationCommand::Get(_) => "get",
         ApplicationCommand::Answer(_) => "answer",
@@ -262,6 +517,11 @@ fn command_kind(command: &ApplicationCommand) -> &'static str {
 fn command_snapshot(command: &ApplicationCommand) -> Value {
     match command {
         ApplicationCommand::Publish(request) => json!({"source": request.source}),
+        ApplicationCommand::SubmitTask(request) => serde_json::to_value(request).unwrap(),
+        ApplicationCommand::GetTask(request) => json!({
+            "sessionId": request.session_id.as_uuid(),
+            "taskId": request.task_id.as_uuid(),
+        }),
         ApplicationCommand::Start(request) => json!({
             "sessionId": request.session_id.as_uuid(),
             "workflowName": request.workflow_name,
@@ -367,7 +627,7 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     use kiteframe::{
         Application, ApplicationContext, ApplicationResult, CloseSession, Engine, EngineConfig,
         InProcessToolRegistry, ModelClient, ModelError, ModelRequest, ModelResponse, NewSession,
-        PersistedAuthorizer, PostgresStore, PrincipalId, PublishWorkflow, ResumeSession,
+        PersistedAuthorizer, PostgresStore, PrincipalId, PublishDefinition, ResumeSession,
     };
 
     struct UnusedModel;
@@ -613,7 +873,10 @@ async fn dispatcher_owns_durable_session_lifecycle_and_principal_binding() {
     let ApplicationResult::Published(definition) = application
         .dispatch(
             &bound_context,
-            ApplicationCommand::Publish(PublishWorkflow { source }),
+            ApplicationCommand::Publish(PublishDefinition {
+                expected_kind: Some(kiteframe::dsl::DefinitionKind::Workflow),
+                source,
+            }),
         )
         .await
         .expect("publish workflow after the initial policy")
@@ -973,6 +1236,7 @@ mod v2 {
                 .encode_result(ApplicationResult::Published(
                     kiteframe::PublishedDefinition {
                         id: Uuid::parse_str("019ff3d8-9d86-7de0-9070-0f0185d5f416").unwrap(),
+                        kind: kiteframe::dsl::DefinitionKind::Workflow,
                         name: "support".to_owned(),
                         version: 7,
                         definition_hash: "sha256:fixture".to_owned(),

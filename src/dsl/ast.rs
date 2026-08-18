@@ -6,8 +6,13 @@ use super::Span;
 pub struct SourceFile {
     pub span: Span,
     pub records: Vec<RecordAst>,
-    pub workflow: WorkflowAst,
-    pub tasks: Vec<TaskAst>,
+    pub definition: DefinitionAst,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DefinitionAst {
+    Workflow(WorkflowAst),
+    Agent(AgentAst),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,6 +36,25 @@ pub struct WorkflowAst {
     pub result: TypeAst,
     pub entry: CallAst,
     pub limits: BTreeMap<String, u64>,
+    pub tasks: Vec<TaskAst>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentAst {
+    pub name: String,
+    pub inputs: Vec<FieldAst>,
+    pub result: TypeAst,
+    pub entry: CallAst,
+    pub events: Vec<EventDeclarationAst>,
+    pub limits: BTreeMap<String, u64>,
+    pub tasks: Vec<TaskAst>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventDeclarationAst {
+    pub event_type: String,
     pub span: Span,
 }
 
@@ -39,10 +63,17 @@ pub struct TaskAst {
     pub name: String,
     pub inputs: Vec<FieldAst>,
     pub result: TypeAst,
+    pub model_role: Option<ModelRoleAst>,
     pub prompt: PromptAst,
     pub tools: Vec<String>,
     pub outcomes: Vec<OutcomeAst>,
     pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelRoleAst {
+    Reasoning,
+    Coding,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,7 +95,15 @@ pub struct CallAst {
     pub binding: Option<String>,
     pub task: String,
     pub arguments: Vec<ArgumentAst>,
+    pub context: ContextModeAst,
     pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextModeAst {
+    Legacy,
+    Isolated,
+    Kept,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

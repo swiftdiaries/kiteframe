@@ -1,0 +1,50 @@
+{
+  "definition_hash": "ab96a5d797a6a0cdf68631d8a530acb7e49e4327590d807b0807ac934641b91a",
+  "definition_kind": "agent",
+  "dsl_version": 2,
+  "events": [
+    "github.pull_request.changed.v1",
+    "github.review.submitted.v1",
+    "github.required_checks.changed.v1"
+  ],
+  "model_roles": {
+    "inspect_branch": "reasoning",
+    "inspect_pr": "reasoning",
+    "repair_reviews": "coding"
+  },
+  "contexts": {
+    "entry": "isolated",
+    "repair": "kept",
+    "refresh": "isolated",
+    "compare": ["isolated", "isolated"]
+  },
+  "tool_bindings": [
+    {
+      "qualified_name": "github/context",
+      "catalog_epoch_id": "00000000-0000-0000-0000-000000000007",
+      "descriptor_digest": "b14e6d38d9519bb5e871f050842fb92cf65b7e32a7beb177be640741e863d5d1",
+      "descriptor": {
+        "qualified_name": "github/context",
+        "server_alias": "github",
+        "description": "A visible test tool.",
+        "input": {
+          "type": "object",
+          "name": "input",
+          "additionalProperties": false,
+          "required": [],
+          "properties": {}
+        },
+        "output": {
+          "type": "object",
+          "name": "output",
+          "additionalProperties": false,
+          "required": [],
+          "properties": {}
+        },
+        "capabilities": [],
+        "effect": "read_only",
+        "recovery": "not_required"
+      }
+    }
+  ]
+}

@@ -5,40 +5,110 @@ use serde::Serialize;
 use crate::{ToolCatalogSnapshot, canonical_sha256};
 
 use super::{
-    ArgumentAst, CallAst, CompiledCall, CompiledCallBinding, CompiledOutcome, CompiledStatement,
-    CompiledTask, CompiledToolBinding, CompiledType, CompiledValue, CompiledWorkflow,
-    CompletionContract, Diagnostic, FieldAst, Limits, SourceFile, Span, StatementAst, TypeAst,
-    ValueRefAst, parse,
+    ArgumentAst, CallAst, CompiledCall, CompiledCallBinding, CompiledDefinition, CompiledOutcome,
+    CompiledStatement, CompiledTask, CompiledToolBinding, CompiledType, CompiledValue,
+    CompletionContract, ContextMode, ContextModeAst, DefinitionAst, DefinitionKind, Diagnostic,
+    FieldAst, Limits, ModelRole, ModelRoleAst, SourceFile, Span, StatementAst, TaskAst, TypeAst,
+    ValueRefAst, parse_report,
 };
 
-const DSL_VERSION: u8 = 1;
-const RESERVED_NAMES: &[&str] = &["complete_task", "outcome"];
+const COMPILER_RESERVED_NAMES: &[&str] = &["complete_task", "outcome"];
+const AGENT_RESERVED_WORDS: &[&str] = &[
+    "agent",
+    "workflow",
+    "type",
+    "task",
+    "entry",
+    "events",
+    "limits",
+    "model",
+    "reasoning",
+    "coding",
+    "prompt",
+    "tools",
+    "on",
+    "call",
+    "return",
+    "fork",
+    "join",
+    "context",
+    "isolated",
+    "kept",
+    "done",
+    "fail",
+    "ask",
+    "start",
+    "goto",
+    "parallel",
+    "true",
+    "false",
+    "null",
+];
+const MAX_DIAGNOSTICS: usize = 64;
 
-/// Parses and compiles one author-authored workflow against a principal-visible catalog.
+#[derive(Clone, Debug)]
+pub struct Compilation {
+    pub definition: CompiledDefinition,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Parses and compiles one author-authored definition against a principal-visible catalog.
 pub fn compile(
     source: &str,
     catalog: &ToolCatalogSnapshot,
     ceilings: &Limits,
-) -> Result<CompiledWorkflow, Vec<Diagnostic>> {
-    let parsed = parse(
+) -> Result<CompiledDefinition, Vec<Diagnostic>> {
+    compile_report(source, catalog, ceilings).map(|value| value.definition)
+}
+
+pub fn compile_report(
+    source: &str,
+    catalog: &ToolCatalogSnapshot,
+    ceilings: &Limits,
+) -> Result<Compilation, Vec<Diagnostic>> {
+    let parsed = parse_report(
         source,
         super::ParseLimits {
             max_source_bytes: 256 * 1024,
             max_tokens: 32 * 1024,
             max_identifier_bytes: 256,
             max_nesting: 64,
-            max_diagnostics: 64,
+            max_diagnostics: MAX_DIAGNOSTICS,
         },
     )?;
-    Compiler::new(source, &parsed, catalog, ceilings).compile()
+    Compiler::new(
+        source,
+        &parsed.source,
+        catalog,
+        ceilings,
+        parsed.diagnostics,
+        MAX_DIAGNOSTICS,
+    )
+    .compile()
+}
+
+struct DefinitionView<'a> {
+    kind: DefinitionKind,
+    dsl_version: u8,
+    name: &'a str,
+    inputs: &'a [FieldAst],
+    result: &'a TypeAst,
+    entry: &'a CallAst,
+    limits: &'a BTreeMap<String, u64>,
+    events: Vec<&'a str>,
+    tasks: &'a [TaskAst],
+    span: Span,
 }
 
 struct Compiler<'a> {
     source: &'a str,
     ast: &'a SourceFile,
+    view: DefinitionView<'a>,
     catalog: &'a ToolCatalogSnapshot,
     ceilings: &'a Limits,
     diagnostics: Vec<Diagnostic>,
+    remaining_diagnostics: usize,
+    had_error: bool,
     records: BTreeMap<String, BTreeMap<String, CompiledType>>,
     task_asts: BTreeMap<String, &'a super::TaskAst>,
     task_inputs: BTreeMap<String, BTreeMap<String, CompiledType>>,
@@ -54,13 +124,48 @@ impl<'a> Compiler<'a> {
         ast: &'a SourceFile,
         catalog: &'a ToolCatalogSnapshot,
         ceilings: &'a Limits,
+        diagnostics: Vec<Diagnostic>,
+        max_diagnostics: usize,
     ) -> Self {
+        let view = match &ast.definition {
+            DefinitionAst::Workflow(workflow) => DefinitionView {
+                kind: DefinitionKind::Workflow,
+                dsl_version: 1,
+                name: &workflow.name,
+                inputs: &workflow.inputs,
+                result: &workflow.result,
+                entry: &workflow.entry,
+                limits: &workflow.limits,
+                events: Vec::new(),
+                tasks: &workflow.tasks,
+                span: workflow.span,
+            },
+            DefinitionAst::Agent(agent) => DefinitionView {
+                kind: DefinitionKind::Agent,
+                dsl_version: 2,
+                name: &agent.name,
+                inputs: &agent.inputs,
+                result: &agent.result,
+                entry: &agent.entry,
+                limits: &agent.limits,
+                events: agent
+                    .events
+                    .iter()
+                    .map(|event| event.event_type.as_str())
+                    .collect(),
+                tasks: &agent.tasks,
+                span: agent.span,
+            },
+        };
         Self {
             source,
             ast,
+            view,
             catalog,
             ceilings,
-            diagnostics: Vec::new(),
+            remaining_diagnostics: max_diagnostics.saturating_sub(diagnostics.len()),
+            diagnostics,
+            had_error: false,
             records: BTreeMap::new(),
             task_asts: BTreeMap::new(),
             task_inputs: BTreeMap::new(),
@@ -71,25 +176,22 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    fn compile(mut self) -> Result<CompiledWorkflow, Vec<Diagnostic>> {
+    fn compile(mut self) -> Result<Compilation, Vec<Diagnostic>> {
+        let definition_name = self.view.name.to_owned();
+        self.reject_reserved(&definition_name, self.view.span);
         self.collect_records();
         self.collect_tasks();
-        let inputs = self.compile_fields(&self.ast.workflow.inputs, "workflow input");
-        let result = self.compile_type(&self.ast.workflow.result, self.ast.workflow.span);
+        let inputs = self.compile_fields(self.view.inputs, "definition input");
+        let result = self.compile_type(self.view.result, self.view.span);
         self.check_limits();
 
-        let entry = self.compile_call(
-            &self.ast.workflow.entry,
-            &inputs,
-            None,
-            self.ast.workflow.span,
-        );
-        if let Some(entry_task) = self.task_results.get(&self.ast.workflow.entry.task)
+        let entry = self.compile_call(self.view.entry, &inputs, None, self.view.span);
+        if let Some(entry_task) = self.task_results.get(&self.view.entry.task)
             && *entry_task != result
         {
             self.error(
-                "workflow entry task result must match workflow result",
-                self.ast.workflow.entry.span,
+                "definition entry task result must match definition result",
+                self.view.entry.span,
             );
         }
 
@@ -102,27 +204,57 @@ impl<'a> Compiler<'a> {
         }
 
         self.reject_recursive_calls();
-        self.reject_unreachable_tasks(&self.ast.workflow.entry.task);
+        self.reject_unreachable_tasks(&self.view.entry.task);
 
-        if !self.diagnostics.is_empty() {
+        if self.had_error {
             return Err(self.diagnostics);
         }
 
-        let tool_bindings = self.all_tool_bindings.into_values().collect::<Vec<_>>();
-        let definition_hash = definition_hash(self.source, &tool_bindings)
-            .map_err(|error| vec![Diagnostic::new(error, self.ast.span)])?;
-        Ok(CompiledWorkflow {
-            dsl_version: DSL_VERSION,
-            name: self.ast.workflow.name.clone(),
+        let events = self
+            .view
+            .events
+            .iter()
+            .map(|event| (*event).to_owned())
+            .collect::<Vec<_>>();
+        let tool_bindings = std::mem::take(&mut self.all_tool_bindings)
+            .into_values()
+            .collect::<Vec<_>>();
+        let definition_hash = match self.view.kind {
+            DefinitionKind::Workflow => {
+                workflow_definition_hash(self.source, self.view.dsl_version, &tool_bindings)
+            }
+            DefinitionKind::Agent => agent_definition_hash(
+                self.source,
+                self.view.dsl_version,
+                &agent_hash_metadata(&events, &entry, &tasks),
+                &tool_bindings,
+            ),
+        };
+        let definition_hash = match definition_hash {
+            Ok(definition_hash) => definition_hash,
+            Err(error) => {
+                self.error(error, self.ast.span);
+                return Err(self.diagnostics);
+            }
+        };
+        let definition = CompiledDefinition {
+            dsl_version: self.view.dsl_version,
+            definition_kind: self.view.kind,
+            name: self.view.name.to_owned(),
             source: self.source.to_owned(),
             definition_hash,
             inputs,
             result,
             entry,
-            limits: self.ast.workflow.limits.clone(),
+            limits: self.view.limits.clone(),
+            events,
             records: self.records,
             tasks,
             tool_bindings,
+        };
+        Ok(Compilation {
+            definition,
+            diagnostics: self.diagnostics,
         })
     }
 
@@ -145,7 +277,7 @@ impl<'a> Compiler<'a> {
     }
 
     fn collect_tasks(&mut self) {
-        for task in &self.ast.tasks {
+        for task in self.view.tasks {
             self.reject_reserved(&task.name, task.span);
             if self.task_asts.insert(task.name.clone(), task).is_some() {
                 self.error("task declaration is duplicated", task.span);
@@ -205,6 +337,10 @@ impl<'a> Compiler<'a> {
         Some(CompiledTask {
             inputs,
             result,
+            model_role: task.model_role.map(|role| match role {
+                ModelRoleAst::Reasoning => ModelRole::Reasoning,
+                ModelRoleAst::Coding => ModelRole::Coding,
+            }),
             prompt: task.prompt.text.clone(),
             tools,
             outcomes,
@@ -230,6 +366,8 @@ impl<'a> Compiler<'a> {
                 .iter()
                 .filter(|(qualified, _)| {
                     *qualified == declared
+                        || (self.view.kind == DefinitionKind::Agent
+                            && qualified.replace('/', "_") == *declared)
                         || qualified
                             .rsplit_once('/')
                             .is_some_and(|(_, short)| short == declared)
@@ -302,7 +440,7 @@ impl<'a> Compiler<'a> {
                     }
                     if calls.len() as u64 > self.effective_limit("parallel_branches") {
                         self.error(
-                            "parallel branch count exceeds workflow limit",
+                            "parallel branch count exceeds definition limit",
                             self.ast.span,
                         );
                     }
@@ -387,6 +525,7 @@ impl<'a> Compiler<'a> {
         caller: Option<&str>,
         fallback_span: Span,
     ) -> CompiledCall {
+        self.reject_reserved(&call.task, call.span);
         if let Some(caller) = caller {
             self.reachability_edges
                 .entry(caller.to_owned())
@@ -398,10 +537,12 @@ impl<'a> Compiler<'a> {
             return CompiledCall {
                 task: call.task.clone(),
                 arguments: BTreeMap::new(),
+                context: compile_context(call.context),
             };
         };
         let mut supplied = BTreeMap::new();
         for ArgumentAst { name, value, span } in &call.arguments {
+            self.reject_reserved(name, *span);
             if supplied.insert(name.clone(), value).is_some() {
                 self.error("call argument is duplicated", *span);
             }
@@ -434,6 +575,7 @@ impl<'a> Compiler<'a> {
         CompiledCall {
             task: call.task.clone(),
             arguments,
+            context: compile_context(call.context),
         }
     }
 
@@ -460,6 +602,7 @@ impl<'a> Compiler<'a> {
             TypeAst::Number => CompiledType::Number,
             TypeAst::Boolean => CompiledType::Boolean,
             TypeAst::Named(name) => {
+                self.reject_reserved(name, span);
                 if !self.records.contains_key(name) {
                     self.error("type references an unknown closed record", span);
                 }
@@ -539,13 +682,23 @@ impl<'a> Compiler<'a> {
     }
 
     fn check_limits(&mut self) {
-        for (name, value) in &self.ast.workflow.limits {
+        for (name, value) in self.view.limits {
             if *value > self.ceiling(name) {
                 self.error(
-                    "workflow limit exceeds deployment ceiling",
-                    self.ast.workflow.span,
+                    "definition limit exceeds deployment ceiling",
+                    self.view.span,
                 );
             }
+        }
+        let compiled_limits = self.compiled_limits();
+        if self.view.kind == DefinitionKind::Agent
+            && compiled_limits.elapsed_seconds <= compiled_limits.active_execution_seconds
+        {
+            self.diagnostic_error(
+                "invalid_elapsed_limit",
+                "elapsed_seconds must exceed active_execution_seconds",
+                self.view.span,
+            );
         }
     }
 
@@ -557,17 +710,29 @@ impl<'a> Compiler<'a> {
             "parallel_branches" => self.ceilings.parallel_branches,
             "response_item_bytes" => self.ceilings.response_item_bytes,
             "active_execution_seconds" => self.ceilings.active_execution_seconds,
+            "elapsed_seconds" => self.ceilings.elapsed_seconds,
             _ => 0,
         }
     }
 
     fn effective_limit(&self, name: &str) -> u64 {
-        self.ast
-            .workflow
+        self.view
             .limits
             .get(name)
             .copied()
             .unwrap_or_else(|| self.ceiling(name))
+    }
+
+    fn compiled_limits(&self) -> Limits {
+        Limits {
+            steps: self.effective_limit("steps"),
+            model_turns_per_task: self.effective_limit("model_turns_per_task"),
+            tool_calls_per_response: self.effective_limit("tool_calls_per_response"),
+            parallel_branches: self.effective_limit("parallel_branches"),
+            response_item_bytes: self.effective_limit("response_item_bytes"),
+            active_execution_seconds: self.effective_limit("active_execution_seconds"),
+            elapsed_seconds: self.effective_limit("elapsed_seconds"),
+        }
     }
 
     fn reject_recursive_calls(&mut self) {
@@ -614,19 +779,34 @@ impl<'a> Compiler<'a> {
         let all_tasks = self.task_asts.keys().cloned().collect::<Vec<_>>();
         for task in all_tasks {
             if !reachable.contains(&task) {
-                self.error("task is unreachable from workflow start", self.ast.span);
+                self.error("task is unreachable from definition entry", self.ast.span);
             }
         }
     }
 
     fn reject_reserved(&mut self, name: &str, span: Span) {
-        if RESERVED_NAMES.contains(&name) {
-            self.error("reserved name is not allowed in workflow source", span);
+        if COMPILER_RESERVED_NAMES.contains(&name)
+            || (self.view.kind == DefinitionKind::Agent && AGENT_RESERVED_WORDS.contains(&name))
+        {
+            self.error("reserved name is not allowed in definition source", span);
         }
     }
 
     fn error(&mut self, message: impl Into<String>, span: Span) {
-        self.diagnostics.push(Diagnostic::new(message, span));
+        self.had_error = true;
+        if self.remaining_diagnostics > 0 {
+            self.remaining_diagnostics -= 1;
+            self.diagnostics.push(Diagnostic::new(message, span));
+        }
+    }
+
+    fn diagnostic_error(&mut self, code: &'static str, message: impl Into<String>, span: Span) {
+        self.had_error = true;
+        if self.remaining_diagnostics > 0 {
+            self.remaining_diagnostics -= 1;
+            self.diagnostics
+                .push(Diagnostic::error(code, message, span));
+        }
     }
 }
 
@@ -637,7 +817,19 @@ fn nullable(ty: CompiledType) -> CompiledType {
     }
 }
 
-fn definition_hash(source: &str, tool_bindings: &[CompiledToolBinding]) -> Result<String, String> {
+fn compile_context(context: ContextModeAst) -> ContextMode {
+    match context {
+        ContextModeAst::Legacy => ContextMode::Legacy,
+        ContextModeAst::Isolated => ContextMode::Isolated,
+        ContextModeAst::Kept => ContextMode::Kept,
+    }
+}
+
+fn workflow_definition_hash(
+    source: &str,
+    dsl_version: u8,
+    tool_bindings: &[CompiledToolBinding],
+) -> Result<String, String> {
     #[derive(Serialize)]
     struct Identity<'a> {
         dsl_version: u8,
@@ -655,8 +847,99 @@ fn definition_hash(source: &str, tool_bindings: &[CompiledToolBinding]) -> Resul
         })
         .collect();
     canonical_sha256(&Identity {
-        dsl_version: DSL_VERSION,
+        dsl_version,
         source,
+        descriptors,
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Default)]
+struct AgentHashMetadata {
+    events: Vec<String>,
+    model_roles: BTreeMap<String, ModelRole>,
+    contexts: BTreeMap<String, ContextMode>,
+}
+
+fn agent_hash_metadata(
+    events: &[String],
+    entry: &CompiledCall,
+    tasks: &BTreeMap<String, CompiledTask>,
+) -> AgentHashMetadata {
+    let mut metadata = AgentHashMetadata {
+        events: events.to_vec(),
+        ..AgentHashMetadata::default()
+    };
+    metadata.contexts.insert("entry".to_owned(), entry.context);
+    for (task_name, task) in tasks {
+        if let Some(role) = task.model_role {
+            metadata.model_roles.insert(task_name.clone(), role);
+        }
+        for (outcome_name, outcome) in &task.outcomes {
+            for (statement_index, statement) in outcome.statements.iter().enumerate() {
+                let prefix = format!("{task_name}.{outcome_name}.{statement_index}");
+                match statement {
+                    CompiledStatement::Call { call, .. } => {
+                        metadata
+                            .contexts
+                            .insert(format!("{prefix}.call"), call.context);
+                    }
+                    CompiledStatement::Parallel { calls } => {
+                        for (branch_index, binding) in calls.iter().enumerate() {
+                            metadata.contexts.insert(
+                                format!("{prefix}.parallel.{branch_index}"),
+                                binding.call.context,
+                            );
+                        }
+                    }
+                    CompiledStatement::Goto { call } => {
+                        metadata
+                            .contexts
+                            .insert(format!("{prefix}.goto"), call.context);
+                    }
+                    CompiledStatement::Ask { .. }
+                    | CompiledStatement::Done { .. }
+                    | CompiledStatement::Fail { .. } => {}
+                }
+            }
+        }
+    }
+    metadata
+}
+
+fn agent_definition_hash(
+    source: &str,
+    dsl_version: u8,
+    metadata: &AgentHashMetadata,
+    tool_bindings: &[CompiledToolBinding],
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct Identity<'a> {
+        dsl_version: u8,
+        definition_kind: DefinitionKind,
+        source: &'a str,
+        events: &'a [String],
+        model_roles: &'a BTreeMap<String, ModelRole>,
+        contexts: &'a BTreeMap<String, ContextMode>,
+        descriptors: BTreeMap<&'a str, serde_json::Value>,
+    }
+
+    let descriptors = tool_bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.qualified_name.as_str(),
+                binding.descriptor.normalized_descriptor(),
+            )
+        })
+        .collect();
+    canonical_sha256(&Identity {
+        dsl_version,
+        definition_kind: DefinitionKind::Agent,
+        source,
+        events: &metadata.events,
+        model_roles: &metadata.model_roles,
+        contexts: &metadata.contexts,
         descriptors,
     })
     .map_err(|error| error.to_string())

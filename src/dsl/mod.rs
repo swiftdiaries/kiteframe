@@ -6,7 +6,7 @@ mod lexer;
 mod parser;
 
 pub use ast::*;
-pub use compiler::compile;
+pub use compiler::{Compilation, compile, compile_report};
 pub use diagnostic::*;
 pub use ir::*;
-pub use parser::{ParseLimits, parse};
+pub use parser::{ParseLimits, ParseReport, parse, parse_report};

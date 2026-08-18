@@ -1,4 +1,7 @@
-use kiteframe::dsl::{ParseLimits, StatementAst, TypeAst, ValueRefAst, parse};
+use kiteframe::dsl::{
+    DefinitionAst, DiagnosticSeverity, ParseLimits, StatementAst, TypeAst, ValueRefAst, parse,
+    parse_report,
+};
 
 const SUPPORT: &str = include_str!("fixtures/dsl/support.kite");
 
@@ -13,6 +16,34 @@ fn limits() -> ParseLimits {
 }
 
 #[test]
+fn legacy_workflow_parses_with_a_bounded_deprecation_warning() {
+    let report = parse_report(SUPPORT, limits()).expect("workflow remains valid");
+    assert!(matches!(
+        report.source.definition,
+        DefinitionAst::Workflow(_)
+    ));
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].severity, DiagnosticSeverity::Warning);
+    assert_eq!(report.diagnostics[0].code, "deprecated_workflow");
+}
+
+#[test]
+fn workflow_warnings_share_the_bounded_diagnostic_budget_with_errors() {
+    let diagnostics = parse_report(
+        "workflow incomplete() -> string {}",
+        ParseLimits {
+            max_diagnostics: 1,
+            ..limits()
+        },
+    )
+    .expect_err("the workflow is missing its start declaration and tasks");
+
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].code, "deprecated_workflow");
+    assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+}
+
+#[test]
 fn parses_the_approved_support_workflow_with_every_control_operation() {
     let source = parse(SUPPORT, limits()).expect("the approved example parses");
 
@@ -23,12 +54,15 @@ fn parses_the_approved_support_workflow_with_every_control_operation() {
         source.records[0].fields[2].ty,
         TypeAst::List(Box::new(TypeAst::String))
     );
-    assert_eq!(source.workflow.name, "support");
-    assert_eq!(source.workflow.entry.task, "triage");
-    assert_eq!(source.workflow.limits["steps"], 100);
-    assert_eq!(source.tasks.len(), 4);
+    let DefinitionAst::Workflow(workflow) = &source.definition else {
+        panic!("support fixture is a workflow");
+    };
+    assert_eq!(workflow.name, "support");
+    assert_eq!(workflow.entry.task, "triage");
+    assert_eq!(workflow.limits["steps"], 100);
+    assert_eq!(workflow.tasks.len(), 4);
 
-    let triage = source
+    let triage = workflow
         .tasks
         .iter()
         .find(|task| task.name == "triage")
@@ -50,7 +84,7 @@ fn parses_the_approved_support_workflow_with_every_control_operation() {
         matches!(triage.outcomes[2].statements.as_slice(), [StatementAst::Ask { binding, answer_type: TypeAst::String, question: ValueRefAst::Binding(question) }, StatementAst::Goto(_)] if binding == "answer" && question == "question")
     );
 
-    let logs = source
+    let logs = workflow
         .tasks
         .iter()
         .find(|task| task.name == "inspect_logs")
@@ -109,7 +143,20 @@ task task() -> string { prompt """unterminated tools [] on ok() { done "x" } }"#
     assert!(
         errors
             .iter()
-            .any(|error| error.message.contains("unterminated triple-quoted prompt"))
+            .all(|error| error.severity == DiagnosticSeverity::Error)
+    );
+    assert!(errors.iter().all(|error| {
+        !error.code.is_empty()
+            && error
+                .code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    }));
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.code == "unterminated_triple_quoted_prompt"
+                && error.message.contains("unterminated triple-quoted prompt"))
     );
 
     let invalid_escape = parse(
@@ -120,7 +167,8 @@ task task() -> string { prompt """unterminated tools [] on ok() { done "x" } }"#
     assert!(
         invalid_escape
             .iter()
-            .any(|error| error.message.contains("invalid string escape"))
+            .any(|error| error.code == "invalid_string_escape"
+                && error.message.contains("invalid string escape"))
     );
 
     let zero_budget = parse(
@@ -193,8 +241,11 @@ fn parses_decimal_numeric_literals_without_confusing_workflow_limits() {
     )
     .expect("decimal number literals are part of the value grammar");
 
+    let DefinitionAst::Workflow(workflow) = &source.definition else {
+        panic!("decimal fixture is a workflow");
+    };
     assert!(matches!(
-        source.tasks[0].outcomes[0].statements.as_slice(),
+        workflow.tasks[0].outcomes[0].statements.as_slice(),
         [StatementAst::Done(ValueRefAst::Number(value))] if value == "-1.25"
     ));
 }

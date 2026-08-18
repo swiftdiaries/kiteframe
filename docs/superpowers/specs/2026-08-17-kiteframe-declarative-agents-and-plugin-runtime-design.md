@@ -65,9 +65,44 @@ Historical package-first, PyO3, Deep Agents, and model-authored graph designs
 remain superseded. NXL is a design reference, not a syntax, runtime, or wire
 compatibility target.
 
-This document is a design artifact. It is not evidence that the plugin
-architecture, agent language, IDE extension, or `babysit_pr` product has been
-implemented.
+This document is a design artifact, not implementation evidence. The
+non-normative implementation-status note below records the narrower completed
+foundation; the remaining design is still prospective.
+
+### Non-normative implementation status
+
+The minimal workflow compiler and runtime remain implemented. Consolidated
+Slice 1 additionally implements agent authoring and compilation, immutable
+agent publication, authenticated immutable user-task and goal-contract
+acceptance, and restart-safe retrieval. Published agents and accepted task
+intent remain inert: `StartRun` rejects agents before execution persistence.
+
+Goal lifecycle, agent execution, stable plugin protocols, semantic channels,
+workers, budgets, connectors, Codex integration, and Cursor or VS Code editor
+integrations are not implemented. The current generic definition publication
+and task submit/get methods are private Kiteframe ACP extensions, not the
+stable plugin protocol designed below.
+
+Final reviewed implementation commits through consolidated Task 8:
+
+- Tasks 1-3 reconciliation: `6f84b87a65954cbf68742e7944ad0a91be74aa9d`
+- Task 4: `35bcc1580b48a4f57960ad4a39bb1b99fc0f3578`
+- Task 5: `b7c256e9791b5ae18f81dcbf335aab5b04829774`
+- Task 6: `adac874e2bc2a4660e5ce767adca0c063997ead3`
+- Task 7: `a94f81cfd2df230f1a15df4245cbb6f2f9c82245`
+- Task 8: `7c984b005cc2230bdf12c205a2f6e04adeb88713`
+
+Slice 1 closure executed these complete verification commands with the ignored
+worktree-local `.env` supplying `DATABASE_URL`:
+
+```console
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cd clients/python && uv run ruff check . && uv run pyright && uv run pytest
+cd clients/typescript && bun run typecheck && bun test && bun run build
+git diff --check
+```
 
 ## Normative language
 

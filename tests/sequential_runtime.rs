@@ -283,7 +283,11 @@ async fn permitted_model_tool_call_replays_output_then_completes() {
     store.append_catalog_epoch(&catalog).await.unwrap();
     let name = format!("w{}", Uuid::now_v7().simple());
     let source = format!(
-        "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}"
+        "workflow {name}() -> string {{ start t() }} \
+         task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] \
+         on ok(answer: string) {{ child = call finish(value: answer) done child }} }} \
+         task finish(value: string) -> string {{ prompt \"\"\"finish\"\"\" tools [] \
+         on ok(answer: string) {{ done answer }} }}"
     );
     let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
     let definition = store
@@ -325,6 +329,9 @@ async fn permitted_model_tool_call_replays_output_then_completes() {
         vec![
             json!({"type":"function_call","call_id":"complete-1","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"done"}}}),
         ],
+        vec![
+            json!({"type":"function_call","call_id":"complete-child","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"done"}}}),
+        ],
     ]))));
     let engine = Engine {
         store: store.clone(),
@@ -336,13 +343,105 @@ async fn permitted_model_tool_call_replays_output_then_completes() {
     assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
     assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
     assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
-    let state: String = sqlx::query("SELECT state FROM runs WHERE id = $1")
+    let root_output: Option<Value> = sqlx::query("SELECT output FROM runs WHERE id = $1")
         .bind(*run.id.as_uuid())
         .fetch_one(store.pool())
         .await
         .unwrap()
-        .get("state");
-    assert_eq!(state, "completed");
+        .get("output");
+    assert_eq!(root_output, None);
+
+    assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
+    assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
+    let child_state: String =
+        sqlx::query("SELECT state FROM frames WHERE run_id = $1 AND parent_frame_id = $2")
+            .bind(*run.id.as_uuid())
+            .bind(*run.root_frame_id.as_uuid())
+            .fetch_one(store.pool())
+            .await
+            .unwrap()
+            .get("state");
+    let root_output: Option<Value> = sqlx::query("SELECT output FROM runs WHERE id = $1")
+        .bind(*run.id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap()
+        .get("output");
+    assert_eq!(child_state, "completed");
+    assert_eq!(root_output, None);
+
+    assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
+    let row = sqlx::query("SELECT state, output FROM runs WHERE id = $1")
+        .bind(*run.id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "completed");
+    assert_eq!(row.get::<Option<Value>, _>("output"), Some(json!("done")));
+}
+
+#[tokio::test]
+async fn legacy_fail_statement_durably_fails_the_run() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("legacy-fail-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/work".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .unwrap();
+    let catalog = ToolCatalogSnapshot::new(session.id.clone(), Uuid::now_v7(), []).unwrap();
+    store.append_catalog_epoch(&catalog).await.unwrap();
+    let name = format!("legacyfail{}", Uuid::now_v7().simple());
+    let source = format!(
+        "workflow {name}() -> string {{ start t() }} \
+         task t() -> string {{ prompt \"\"\"x\"\"\" tools [] \
+         on rejected() {{ fail \"legacy_failure\" \"expected\" }} }}"
+    );
+    let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+    let definition = store
+        .publish(session.id.clone(), &workflow, &source)
+        .await
+        .unwrap();
+    let run = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: definition.name,
+            version: Some(definition.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    let engine = Engine {
+        store: store.clone(),
+        model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([vec![json!({
+            "type":"function_call",
+            "call_id":"reject",
+            "name":"complete_task",
+            "arguments":{"outcome":"rejected","fields":{}}
+        })]])))),
+        tools: Arc::new(InProcessToolRegistry::new()),
+        authorizer: Arc::new(AllowAll),
+        config: EngineConfig::default(),
+    };
+
+    assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
+    assert_eq!(engine.tick_run(run.id.clone()).await.unwrap(), 1);
+    let row = sqlx::query("SELECT state, failure FROM runs WHERE id = $1")
+        .bind(*run.id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "failed");
+    assert_eq!(
+        row.get::<Value, _>("failure"),
+        json!({"code":"legacy_failure","message":"expected"}),
+    );
 }
 
 #[tokio::test]

@@ -1,0 +1,47 @@
+{
+  "dsl_version": 1,
+  "name": "legacy_minimal",
+  "source": "workflow legacy_minimal() -> string { start finish() }\ntask finish() -> string { prompt \"\"\"Finish.\"\"\" tools [] on ok() { done \"done\" } }\n",
+  "definition_hash": "4dd0cbb3b3a207b855cd7376a9c47cd8cfe1a38f2b0275f75e3cbe304cb95056",
+  "inputs": {},
+  "result": {
+    "kind": "string"
+  },
+  "entry": {
+    "task": "finish",
+    "arguments": {}
+  },
+  "limits": {},
+  "records": {},
+  "tasks": {
+    "finish": {
+      "inputs": {},
+      "result": {
+        "kind": "string"
+      },
+      "prompt": "Finish.",
+      "tools": [],
+      "outcomes": {
+        "ok": {
+          "fields": {},
+          "statements": [
+            {
+              "operation": "done",
+              "value": {
+                "kind": "string",
+                "value": "done"
+              }
+            }
+          ]
+        }
+      },
+      "completion": {
+        "outcomes": {
+          "ok": {}
+        },
+        "required_nullable_fields": {}
+      }
+    }
+  },
+  "tool_bindings": []
+}

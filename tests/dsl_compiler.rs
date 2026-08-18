@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use kiteframe::dsl::{Limits, compile};
+use kiteframe::dsl::{
+    CompiledStatement, ContextMode, DefinitionKind, DiagnosticSeverity, Limits, compile,
+    compile_report,
+};
 use kiteframe::{
     CatalogTool, ClosedSchema, EffectKind, RecoverySupport, SessionId, ToolCatalogSnapshot,
 };
@@ -17,6 +20,7 @@ fn ceilings() -> Limits {
         parallel_branches: 4,
         response_item_bytes: 16 * 1024,
         active_execution_seconds: 300,
+        elapsed_seconds: u64::MAX,
     }
 }
 
@@ -43,6 +47,14 @@ fn catalog(tools: impl IntoIterator<Item = CatalogTool>) -> ToolCatalogSnapshot 
         .expect("test catalog is valid")
 }
 
+fn support_catalog() -> ToolCatalogSnapshot {
+    catalog([
+        tool("docs/search_docs"),
+        tool("logs/search_logs"),
+        tool("metrics/search_metrics"),
+    ])
+}
+
 #[test]
 fn compiles_the_support_workflow_with_strict_completion_and_immutable_bindings() {
     let catalog = catalog([
@@ -51,10 +63,23 @@ fn compiles_the_support_workflow_with_strict_completion_and_immutable_bindings()
         tool("metrics/search_metrics"),
     ]);
 
-    let compiled = compile(SUPPORT, &catalog, &ceilings()).expect("support compiles");
+    let report = compile_report(SUPPORT, &catalog, &ceilings()).expect("support compiles");
+    assert_eq!(report.diagnostics.len(), 1);
+    assert_eq!(report.diagnostics[0].severity, DiagnosticSeverity::Warning);
+    assert_eq!(report.diagnostics[0].code, "deprecated_workflow");
+    let compiled = report.definition;
 
     assert_eq!(compiled.dsl_version, 1);
+    assert_eq!(compiled.definition_kind, DefinitionKind::Workflow);
     assert_eq!(compiled.name, "support");
+    assert_eq!(compiled.entry.context, ContextMode::Legacy);
+    assert!(compiled.events.is_empty());
+    assert!(
+        compiled
+            .tasks
+            .values()
+            .all(|task| task.model_role.is_none())
+    );
     assert_eq!(compiled.tool_bindings.len(), 3);
     assert_eq!(
         compiled
@@ -82,6 +107,42 @@ fn compiles_the_support_workflow_with_strict_completion_and_immutable_bindings()
     assert!(completion.required_nullable_fields.contains_key("answer"));
     assert!(completion.required_nullable_fields.contains_key("query"));
     assert_eq!(triage.tools[0].qualified_name, "docs/search_docs");
+    let CompiledStatement::Parallel { calls } = &triage.outcomes["investigate"].statements[0]
+    else {
+        panic!("investigation starts with parallel calls");
+    };
+    assert!(
+        calls
+            .iter()
+            .all(|binding| binding.call.context == ContextMode::Legacy)
+    );
+}
+
+#[test]
+fn parser_warnings_and_compiler_errors_share_one_diagnostic_budget() {
+    let missing_tools = (0..80)
+        .map(|index| format!("missing_tool_{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "workflow noisy() -> string {{ start work() }} \
+         task work() -> string {{ prompt \"\"\"x\"\"\" tools [{missing_tools}] \
+         on ok() {{ done missing_value }} }}"
+    );
+
+    let diagnostics =
+        compile_report(&source, &catalog([]), &ceilings()).expect_err("semantic errors fail");
+
+    assert_eq!(diagnostics.len(), 64);
+    assert_eq!(diagnostics[0].code, "deprecated_workflow");
+    assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Warning);
+    assert_eq!(diagnostics[1].code, "compiler_error");
+    assert!(
+        diagnostics
+            .iter()
+            .skip(1)
+            .all(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+    );
 }
 
 #[test]
@@ -109,6 +170,20 @@ task t() -> string { prompt """x""" tools [search] on ok() { done "x" } }
             .iter()
             .any(|error| error.message.contains("ambiguous"))
     );
+}
+
+#[test]
+fn workflow_short_tool_name_wins_over_agent_identifier_safe_collision() {
+    let source = r#"
+workflow w() -> string { start t() }
+task t() -> string { prompt """x""" tools [x_y] on ok() { done "x" } }
+"#;
+
+    let compiled = compile(source, &catalog([tool("a/x_y"), tool("x/y")]), &ceilings())
+        .expect("legacy short-name matching ignores agent qualified aliases");
+
+    assert_eq!(compiled.tasks["t"].tools.len(), 1);
+    assert_eq!(compiled.tasks["t"].tools[0].qualified_name, "a/x_y");
 }
 
 #[test]
@@ -208,11 +283,7 @@ task t() -> string { prompt """x""" tools [search] on ok() { done "x" } }
 
 #[test]
 fn freezes_the_support_compilation_output() {
-    let catalog = catalog([
-        tool("docs/search_docs"),
-        tool("logs/search_logs"),
-        tool("metrics/search_metrics"),
-    ]);
+    let catalog = support_catalog();
     let compiled = compile(SUPPORT, &catalog, &ceilings()).expect("support compiles");
 
     let actual = json!({
@@ -229,4 +300,35 @@ fn freezes_the_support_compilation_output() {
             .expect("golden fixture is valid JSON");
 
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn legacy_workflow_identity_and_json_remain_version_one() {
+    let compiled = compile(SUPPORT, &support_catalog(), &ceilings()).unwrap();
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/dsl/support.compiled.json")).unwrap();
+
+    assert_eq!(compiled.dsl_version, 1);
+    assert_eq!(compiled.definition_kind, DefinitionKind::Workflow);
+    assert_eq!(compiled.definition_hash, expected["definition_hash"]);
+    let legacy_projection = json!({
+        "definition_hash": compiled.definition_hash,
+        "entry": compiled.entry,
+        "tool_bindings": compiled.tool_bindings.iter().map(|binding| json!({
+            "qualified_name": binding.qualified_name,
+            "catalog_epoch_id": binding.catalog_epoch_id,
+            "descriptor_digest": binding.descriptor_digest,
+        })).collect::<Vec<_>>(),
+    });
+    assert_eq!(legacy_projection, expected);
+    let json = serde_json::to_value(compiled).unwrap();
+    assert!(json.get("definition_kind").is_none());
+    assert!(json.get("events").is_none());
+    assert!(
+        json["tasks"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|task| task.get("model_role").is_none())
+    );
 }

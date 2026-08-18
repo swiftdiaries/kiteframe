@@ -13,12 +13,23 @@ pub struct ParseLimits {
     pub max_diagnostics: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParseReport {
+    pub source: SourceFile,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
 pub fn parse(source: &str, limits: ParseLimits) -> Result<SourceFile, Vec<Diagnostic>> {
+    parse_report(source, limits).map(|report| report.source)
+}
+
+pub fn parse_report(source: &str, limits: ParseLimits) -> Result<ParseReport, Vec<Diagnostic>> {
     if source.len() > limits.max_source_bytes {
         return Err(if limits.max_diagnostics == 0 {
             Vec::new()
         } else {
-            vec![Diagnostic::new(
+            vec![Diagnostic::error(
+                "source_byte_limit",
                 "source exceeds configured byte limit",
                 Span {
                     start: limits.max_source_bytes,
@@ -44,7 +55,12 @@ pub fn parse(source: &str, limits: ParseLimits) -> Result<SourceFile, Vec<Diagno
     if parser.had_error {
         Err(parser.diagnostics)
     } else {
-        value.ok_or_else(Vec::new)
+        value
+            .map(|source| ParseReport {
+                source,
+                diagnostics: parser.diagnostics,
+            })
+            .ok_or_else(Vec::new)
     }
 }
 
@@ -56,12 +72,18 @@ struct Parser {
     had_error: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DefinitionSyntax {
+    Workflow,
+    Agent,
+}
+
 impl Parser {
     fn source_file(&mut self, source_len: usize) -> Option<SourceFile> {
         let mut records = Vec::new();
-        let mut workflow = None;
-        let mut saw_workflow = false;
-        let mut tasks = Vec::new();
+        let mut definition = None;
+        let mut saw_definition = false;
+        let mut workflow_tasks = Vec::new();
         while !self.at_eof() {
             if self.keyword("type") {
                 if let Some(record) = self.record() {
@@ -69,31 +91,52 @@ impl Parser {
                 }
             } else if self.keyword("workflow") {
                 let declaration_span = self.previous_span();
+                self.warning(
+                    "deprecated_workflow",
+                    "workflow definitions are deprecated",
+                    declaration_span,
+                );
                 let item = self.workflow();
-                if saw_workflow {
+                if saw_definition {
                     self.error(
+                        "workflow_definition_count",
                         "a source file contains exactly one workflow",
                         declaration_span,
                     );
                 } else {
-                    workflow = item;
-                    saw_workflow = true;
+                    definition = item.map(DefinitionAst::Workflow);
+                    saw_definition = true;
+                }
+            } else if self.keyword("agent") {
+                let declaration_span = self.previous_span();
+                let item = self.agent();
+                if saw_definition {
+                    self.error(
+                        "definition_count",
+                        "a source file contains exactly one definition",
+                        declaration_span,
+                    );
+                } else {
+                    definition = item.map(DefinitionAst::Agent);
+                    saw_definition = true;
                 }
             } else if self.keyword("task") {
-                if let Some(task) = self.task() {
-                    tasks.push(task);
+                if let Some(task) = self.task(false) {
+                    workflow_tasks.push(task);
                 }
             } else {
                 self.error(
+                    "expected_top_level_declaration",
                     "expected type, workflow, or task declaration",
                     self.current_span(),
                 );
                 self.advance();
             }
         }
-        let Some(workflow) = workflow else {
-            if !saw_workflow {
+        let Some(definition) = definition else {
+            if !saw_definition {
                 self.error(
+                    "workflow_definition_count",
                     "a source file contains exactly one workflow",
                     Span {
                         start: 0,
@@ -103,17 +146,36 @@ impl Parser {
             }
             return None;
         };
-        if tasks.is_empty() {
-            self.error("a source file requires at least one task", workflow.span);
-        }
+        let definition = match definition {
+            DefinitionAst::Workflow(mut workflow) => {
+                if workflow_tasks.is_empty() {
+                    self.error(
+                        "workflow_task_required",
+                        "a source file requires at least one task",
+                        workflow.span,
+                    );
+                }
+                workflow.tasks = workflow_tasks;
+                DefinitionAst::Workflow(workflow)
+            }
+            DefinitionAst::Agent(agent) => {
+                if !workflow_tasks.is_empty() {
+                    self.error(
+                        "unexpected_top_level_task",
+                        "top-level tasks are only allowed with workflow definitions",
+                        workflow_tasks[0].span,
+                    );
+                }
+                DefinitionAst::Agent(agent)
+            }
+        };
         Some(SourceFile {
             span: Span {
                 start: 0,
                 end: source_len,
             },
             records,
-            workflow,
-            tasks,
+            definition,
         })
     }
 
@@ -161,18 +223,25 @@ impl Parser {
             if self.keyword("start") {
                 if entry.is_some() {
                     self.error(
+                        "duplicate_workflow_start",
                         "workflow has duplicate start declaration",
                         self.previous_span(),
                     );
                 }
-                entry = self.call(None);
+                entry = self.call(None, DefinitionSyntax::Workflow);
             } else if self.keyword("limits") {
                 self.expect_lbrace();
                 while !self.at_rbrace() && !self.at_eof() {
                     let key = self.identifier()?;
                     self.expect_colon();
                     let (value, span) = self.number()?;
-                    if !matches!(
+                    if key == "elapsed_seconds" {
+                        self.error(
+                            "elapsed_seconds_requires_agent",
+                            "unsupported workflow limit",
+                            span,
+                        );
+                    } else if !matches!(
                         key.as_str(),
                         "steps"
                             | "model_turns_per_task"
@@ -181,19 +250,32 @@ impl Parser {
                             | "response_item_bytes"
                             | "active_execution_seconds"
                     ) {
-                        self.error("unsupported workflow limit", span);
+                        self.error(
+                            "unsupported_workflow_limit",
+                            "unsupported workflow limit",
+                            span,
+                        );
                     }
                     if value == 0 {
-                        self.error("workflow limit must be positive", span);
+                        self.error(
+                            "non_positive_workflow_limit",
+                            "workflow limit must be positive",
+                            span,
+                        );
                     }
                     if limits.insert(key, value).is_some() {
-                        self.error("workflow limit is duplicated", span);
+                        self.error(
+                            "duplicate_workflow_limit",
+                            "workflow limit is duplicated",
+                            span,
+                        );
                     }
                     self.optional_comma();
                 }
                 self.expect_rbrace();
             } else {
                 self.error(
+                    "invalid_workflow_body",
                     "workflow body accepts only start and limits",
                     self.current_span(),
                 );
@@ -203,6 +285,7 @@ impl Parser {
         self.expect_rbrace();
         let Some(entry) = entry else {
             self.error(
+                "missing_workflow_start",
                 "workflow requires a start declaration",
                 Span {
                     start,
@@ -217,6 +300,7 @@ impl Parser {
             result,
             entry,
             limits,
+            tasks: Vec::new(),
             span: Span {
                 start,
                 end: self.previous_span().end,
@@ -224,18 +308,130 @@ impl Parser {
         })
     }
 
-    fn task(&mut self) -> Option<TaskAst> {
+    fn agent(&mut self) -> Option<AgentAst> {
         let start = self.previous_span().start;
         let name = self.identifier()?;
         let inputs = self.fields_in_parens()?;
         self.expect_arrow();
         let result = self.ty(0)?;
         self.expect_lbrace();
+        let mut entry = None;
+        let mut events = None;
+        let mut limits = BTreeMap::new();
+        let mut saw_limits = false;
+        let mut tasks = Vec::new();
+        while !self.at_rbrace() && !self.at_eof() {
+            if self.keyword("entry") {
+                if entry.is_some() {
+                    self.error(
+                        "duplicate_agent_entry",
+                        "agent has duplicate entry declaration",
+                        self.previous_span(),
+                    );
+                }
+                entry = self.call(None, DefinitionSyntax::Agent);
+            } else if self.keyword("events") {
+                let value = self.events()?;
+                if events.replace(value).is_some() {
+                    self.error(
+                        "duplicate_agent_events",
+                        "agent has duplicate events declaration",
+                        self.previous_span(),
+                    );
+                }
+            } else if self.keyword("limits") {
+                if saw_limits {
+                    self.error(
+                        "duplicate_agent_limits",
+                        "agent has duplicate limits declaration",
+                        self.previous_span(),
+                    );
+                }
+                saw_limits = true;
+                self.agent_limits(&mut limits)?;
+            } else if self.keyword("task") {
+                if let Some(task) = self.task(true) {
+                    tasks.push(task);
+                }
+            } else if self.keyword("agent") {
+                self.error(
+                    "nested_agent_not_allowed",
+                    "agent definitions cannot be nested",
+                    self.previous_span(),
+                );
+                self.skip_declaration_body();
+            } else {
+                self.error(
+                    "invalid_agent_body",
+                    "agent body accepts only entry, events, limits, and task declarations",
+                    self.current_span(),
+                );
+                self.advance();
+            }
+        }
+        self.expect_rbrace();
+        let span = Span {
+            start,
+            end: self.previous_span().end,
+        };
+        let Some(entry) = entry else {
+            self.error(
+                "missing_agent_entry",
+                "agent requires an entry declaration",
+                span,
+            );
+            return None;
+        };
+        if tasks.is_empty() {
+            self.error(
+                "missing_agent_task",
+                "agent requires at least one task",
+                span,
+            );
+        }
+        Some(AgentAst {
+            name,
+            inputs,
+            result,
+            entry,
+            events: events.unwrap_or_default(),
+            limits,
+            tasks,
+            span,
+        })
+    }
+
+    fn task(&mut self, is_agent: bool) -> Option<TaskAst> {
+        let start = self.previous_span().start;
+        let name = self.identifier()?;
+        let inputs = self.fields_in_parens()?;
+        self.expect_arrow();
+        let result = self.ty(0)?;
+        self.expect_lbrace();
+        let mut model_role = None;
         let mut prompt = None;
         let mut tools = None;
         let mut outcomes = Vec::new();
         while !self.at_rbrace() && !self.at_eof() {
-            if self.keyword("prompt") {
+            if self.keyword("model") {
+                let role_span = self.current_span();
+                let role = self.model_role()?;
+                if is_agent {
+                    if model_role.replace(role).is_some() {
+                        self.error(
+                            "duplicate_agent_task_model",
+                            "agent task has duplicate model declaration",
+                            role_span,
+                        );
+                    }
+                } else {
+                    self.error(
+                        "model_role_requires_agent",
+                        "workflow tasks do not accept model declarations",
+                        role_span,
+                    );
+                }
+            } else if self.keyword("prompt") {
                 let token = self.take_prompt()?;
                 if prompt
                     .replace(PromptAst {
@@ -244,19 +440,33 @@ impl Parser {
                     })
                     .is_some()
                 {
-                    self.error("task has duplicate prompt", token.1);
+                    self.error(
+                        "duplicate_task_prompt",
+                        "task has duplicate prompt",
+                        token.1,
+                    );
                 }
             } else if self.keyword("tools") {
                 let list = self.tool_list()?;
                 if tools.replace(list).is_some() {
-                    self.error("task has duplicate tools declaration", self.previous_span());
+                    self.error(
+                        "duplicate_task_tools",
+                        "task has duplicate tools declaration",
+                        self.previous_span(),
+                    );
                 }
             } else if self.keyword("on") {
-                if let Some(outcome) = self.outcome() {
+                let syntax = if is_agent {
+                    DefinitionSyntax::Agent
+                } else {
+                    DefinitionSyntax::Workflow
+                };
+                if let Some(outcome) = self.outcome(syntax) {
                     outcomes.push(outcome);
                 }
             } else {
                 self.error(
+                    "invalid_task_body",
                     "task body accepts only prompt, tools, and outcomes",
                     self.current_span(),
                 );
@@ -271,7 +481,7 @@ impl Parser {
         let prompt = match prompt {
             Some(value) => value,
             None => {
-                self.error("task requires a prompt", span);
+                self.error("missing_task_prompt", "task requires a prompt", span);
                 PromptAst {
                     text: String::new(),
                     span,
@@ -281,17 +491,33 @@ impl Parser {
         let tools = match tools {
             Some(value) => value,
             None => {
-                self.error("task requires a tools declaration", span);
+                self.error(
+                    "missing_task_tools",
+                    "task requires a tools declaration",
+                    span,
+                );
                 Vec::new()
             }
         };
         if outcomes.is_empty() {
-            self.error("task requires at least one outcome", span);
+            self.error(
+                "task_outcome_required",
+                "task requires at least one outcome",
+                span,
+            );
+        }
+        if is_agent && model_role.is_none() {
+            self.error(
+                "missing_model_role",
+                "agent task requires a model declaration",
+                span,
+            );
         }
         Some(TaskAst {
             name,
             inputs,
             result,
+            model_role,
             prompt,
             tools,
             outcomes,
@@ -299,7 +525,7 @@ impl Parser {
         })
     }
 
-    fn outcome(&mut self) -> Option<OutcomeAst> {
+    fn outcome(&mut self, syntax: DefinitionSyntax) -> Option<OutcomeAst> {
         let start = self.previous_span().start;
         let name = self.identifier()?;
         let fields = self.fields_in_parens()?;
@@ -309,13 +535,14 @@ impl Parser {
         while !self.at_rbrace() && !self.at_eof() {
             if terminal {
                 self.error(
+                    "statement_after_terminal",
                     "statements are not allowed after a terminal control operation",
                     self.current_span(),
                 );
                 self.advance();
                 continue;
             }
-            let Some((statement, is_terminal)) = self.statement() else {
+            let Some((statement, is_terminal)) = self.statement(syntax) else {
                 self.advance();
                 continue;
             };
@@ -328,10 +555,14 @@ impl Parser {
             end: self.previous_span().end,
         };
         if statements.is_empty() {
-            self.error("outcome must not be empty", span);
+            self.error("empty_outcome", "outcome must not be empty", span);
         }
         if !terminal {
-            self.error("outcome must end in goto, done, or fail", span);
+            self.error(
+                "missing_terminal_statement",
+                "outcome must end in goto, done, or fail",
+                span,
+            );
         }
         Some(OutcomeAst {
             name,
@@ -341,15 +572,56 @@ impl Parser {
         })
     }
 
-    fn statement(&mut self) -> Option<(StatementAst, bool)> {
+    fn statement(&mut self, syntax: DefinitionSyntax) -> Option<(StatementAst, bool)> {
         if self.keyword("parallel") {
+            if syntax == DefinitionSyntax::Agent {
+                self.error(
+                    "agent_parallel_unsupported",
+                    "agent outcomes use fork instead of parallel",
+                    self.previous_span(),
+                );
+            }
             return self
-                .parallel()
+                .parallel(syntax)
                 .map(|value| (StatementAst::Parallel(value), false));
         }
         if self.keyword("goto") {
+            if syntax == DefinitionSyntax::Agent {
+                self.error(
+                    "goto_requires_workflow",
+                    "agent outcomes use return instead of goto",
+                    self.previous_span(),
+                );
+            }
             return self
-                .call(None)
+                .call(None, syntax)
+                .map(|value| (StatementAst::Goto(value), true));
+        }
+        if self.keyword("fork") {
+            if syntax == DefinitionSyntax::Workflow {
+                self.error(
+                    "workflow_fork_unsupported",
+                    "workflow outcomes use parallel instead of fork",
+                    self.previous_span(),
+                );
+                return self
+                    .fork()
+                    .map(|value| (StatementAst::Parallel(value), false));
+            }
+            return self
+                .fork()
+                .map(|value| (StatementAst::Parallel(value), false));
+        }
+        if self.keyword("return") {
+            if syntax == DefinitionSyntax::Workflow {
+                self.error(
+                    "return_requires_agent",
+                    "workflow outcomes use goto instead of return",
+                    self.previous_span(),
+                );
+            }
+            return self
+                .call(None, syntax)
                 .map(|value| (StatementAst::Goto(value), true));
         }
         if self.keyword("done") {
@@ -363,7 +635,7 @@ impl Parser {
         let binding = self.identifier()?;
         self.expect_equals();
         if self.keyword("call") {
-            self.call(Some(binding))
+            self.call(Some(binding), syntax)
                 .map(|value| (StatementAst::Call(value), false))
         } else if self.keyword("ask") {
             let answer_type = self.ty(0)?;
@@ -377,12 +649,16 @@ impl Parser {
                 false,
             ))
         } else {
-            self.error("binding accepts only call or ask", self.current_span());
+            self.error(
+                "invalid_binding_statement",
+                "binding accepts only call or ask",
+                self.current_span(),
+            );
             None
         }
     }
 
-    fn parallel(&mut self) -> Option<Vec<CallAst>> {
+    fn parallel(&mut self, syntax: DefinitionSyntax) -> Option<Vec<CallAst>> {
         self.expect_lbrace();
         let mut calls = Vec::new();
         while !self.at_rbrace() && !self.at_eof() {
@@ -390,21 +666,69 @@ impl Parser {
             self.expect_equals();
             if !self.keyword("call") {
                 self.error(
+                    "invalid_parallel_statement",
                     "parallel contains only call statements",
                     self.current_span(),
                 );
                 return None;
             }
-            calls.push(self.call(Some(binding))?);
+            calls.push(self.call(Some(binding), syntax)?);
         }
         self.expect_rbrace();
         if calls.is_empty() {
-            self.error("parallel block must not be empty", self.previous_span());
+            self.error(
+                "empty_parallel_block",
+                "parallel block must not be empty",
+                self.previous_span(),
+            );
         }
         Some(calls)
     }
 
-    fn call(&mut self, binding: Option<String>) -> Option<CallAst> {
+    fn fork(&mut self) -> Option<Vec<CallAst>> {
+        self.expect_lbrace();
+        let mut calls = Vec::new();
+        while !self.at_rbrace() && !self.at_eof() {
+            if self.keyword("call") {
+                self.error(
+                    "fork_call_requires_binding",
+                    "fork calls require a result binding",
+                    self.previous_span(),
+                );
+                calls.push(self.call(None, DefinitionSyntax::Agent)?);
+                continue;
+            }
+            let binding = self.identifier()?;
+            self.expect_equals();
+            if !self.keyword("call") {
+                self.error(
+                    "invalid_fork_statement",
+                    "fork contains only bound call statements",
+                    self.current_span(),
+                );
+                return None;
+            }
+            calls.push(self.call(Some(binding), DefinitionSyntax::Agent)?);
+        }
+        self.expect_rbrace();
+        if calls.is_empty() {
+            self.error(
+                "empty_fork",
+                "fork block must not be empty",
+                self.previous_span(),
+            );
+        }
+        if !self.keyword("join") {
+            self.error(
+                "missing_fork_join",
+                "fork block must end with join",
+                self.current_span(),
+            );
+        }
+        Some(calls)
+    }
+
+    fn call(&mut self, binding: Option<String>, syntax: DefinitionSyntax) -> Option<CallAst> {
         let start = self.current_span().start;
         let task = self.identifier()?;
         self.expect_lparen();
@@ -412,7 +736,10 @@ impl Parser {
         while !self.at_rparen() && !self.at_eof() {
             let arg_start = self.current_span().start;
             let name = self.identifier()?;
-            self.expect_colon();
+            match syntax {
+                DefinitionSyntax::Workflow => self.expect_colon(),
+                DefinitionSyntax::Agent => self.expect_equals(),
+            }
             let value = self.value()?;
             arguments.push(ArgumentAst {
                 name,
@@ -423,20 +750,178 @@ impl Parser {
                 },
             });
             if !self.optional_comma() && !self.at_rparen() {
-                self.error("expected comma or closing parenthesis", self.current_span());
+                self.error(
+                    "expected_argument_separator",
+                    "expected comma or closing parenthesis",
+                    self.current_span(),
+                );
                 return None;
             }
         }
         self.expect_rparen();
+        let context = match syntax {
+            DefinitionSyntax::Workflow => {
+                if self.keyword("context") {
+                    let span = self.previous_span();
+                    self.identifier()?;
+                    self.error(
+                        "workflow_context_unsupported",
+                        "workflow calls do not accept context modes",
+                        span,
+                    );
+                }
+                ContextModeAst::Legacy
+            }
+            DefinitionSyntax::Agent => {
+                if !self.keyword("context") {
+                    ContextModeAst::Isolated
+                } else {
+                    let span = self.current_span();
+                    match self.identifier()?.as_str() {
+                        "isolated" => ContextModeAst::Isolated,
+                        "kept" => ContextModeAst::Kept,
+                        _ => {
+                            self.error(
+                                "invalid_context_mode",
+                                "agent context mode must be isolated or kept",
+                                span,
+                            );
+                            ContextModeAst::Isolated
+                        }
+                    }
+                }
+            }
+        };
         Some(CallAst {
             binding,
             task,
             arguments,
+            context,
             span: Span {
                 start,
                 end: self.previous_span().end,
             },
         })
+    }
+
+    fn events(&mut self) -> Option<Vec<EventDeclarationAst>> {
+        self.expect_lbracket();
+        let mut events = Vec::new();
+        while !self.at_rbracket() && !self.at_eof() {
+            let span = self.current_span();
+            let TokenKind::String(event_type) = self.current().kind.clone() else {
+                self.error("expected_event_name", "expected event-name string", span);
+                return None;
+            };
+            self.advance();
+            if !valid_event_type(&event_type) {
+                self.error(
+                    "invalid_agent_event",
+                    "event name must be a versioned semantic event string",
+                    span,
+                );
+            }
+            if events
+                .iter()
+                .any(|event: &EventDeclarationAst| event.event_type == event_type)
+            {
+                self.error(
+                    "duplicate_agent_event",
+                    "agent event name is duplicated",
+                    span,
+                );
+            }
+            events.push(EventDeclarationAst { event_type, span });
+            if !self.optional_comma() && !self.at_rbracket() {
+                self.error(
+                    "expected_event_separator",
+                    "expected comma or closing bracket",
+                    self.current_span(),
+                );
+                return None;
+            }
+        }
+        self.expect_rbracket();
+        if events.is_empty() {
+            self.error(
+                "empty_agent_events",
+                "events declaration requires at least one event name",
+                self.previous_span(),
+            );
+        }
+        Some(events)
+    }
+
+    fn agent_limits(&mut self, limits: &mut BTreeMap<String, u64>) -> Option<()> {
+        self.expect_lbrace();
+        while !self.at_rbrace() && !self.at_eof() {
+            let key = self.identifier()?;
+            self.expect_colon();
+            let (value, span) = self.number()?;
+            if !matches!(
+                key.as_str(),
+                "steps"
+                    | "model_turns_per_task"
+                    | "tool_calls_per_response"
+                    | "parallel_branches"
+                    | "response_item_bytes"
+                    | "active_execution_seconds"
+                    | "elapsed_seconds"
+            ) {
+                self.error("unsupported_agent_limit", "unsupported agent limit", span);
+            }
+            if value == 0 {
+                self.error(
+                    "non_positive_agent_limit",
+                    "agent limit must be positive",
+                    span,
+                );
+            }
+            if limits.insert(key, value).is_some() {
+                self.error("duplicate_agent_limit", "agent limit is duplicated", span);
+            }
+            self.optional_comma();
+        }
+        self.expect_rbrace();
+        Some(())
+    }
+
+    fn model_role(&mut self) -> Option<ModelRoleAst> {
+        let span = self.current_span();
+        match self.identifier()?.as_str() {
+            "reasoning" => Some(ModelRoleAst::Reasoning),
+            "coding" => Some(ModelRoleAst::Coding),
+            _ => {
+                self.error(
+                    "invalid_agent_model_role",
+                    "agent model role must be reasoning or coding",
+                    span,
+                );
+                None
+            }
+        }
+    }
+
+    fn skip_declaration_body(&mut self) {
+        while !self.at_lbrace() && !self.at_eof() {
+            self.advance();
+        }
+        if !self.at_lbrace() {
+            return;
+        }
+        let mut depth = 0usize;
+        while !self.at_eof() {
+            if self.at_lbrace() {
+                depth += 1;
+            } else if self.at_rbrace() {
+                depth -= 1;
+                if depth == 0 {
+                    self.advance();
+                    return;
+                }
+            }
+            self.advance();
+        }
     }
 
     fn tool_list(&mut self) -> Option<Vec<String>> {
@@ -445,7 +930,11 @@ impl Parser {
         while !self.at_rbracket() && !self.at_eof() {
             tools.push(self.identifier()?);
             if !self.optional_comma() && !self.at_rbracket() {
-                self.error("expected comma or closing bracket", self.current_span());
+                self.error(
+                    "expected_tool_separator",
+                    "expected comma or closing bracket",
+                    self.current_span(),
+                );
                 return None;
             }
         }
@@ -470,7 +959,11 @@ impl Parser {
                 },
             });
             if !self.optional_comma() && !self.at_rparen() {
-                self.error("expected comma or closing parenthesis", self.current_span());
+                self.error(
+                    "expected_field_separator",
+                    "expected comma or closing parenthesis",
+                    self.current_span(),
+                );
                 return None;
             }
         }
@@ -480,7 +973,11 @@ impl Parser {
 
     fn ty(&mut self, depth: usize) -> Option<TypeAst> {
         if depth >= self.limits.max_nesting {
-            self.error("type nesting exceeds configured limit", self.current_span());
+            self.error(
+                "type_nesting_limit",
+                "type nesting exceeds configured limit",
+                self.current_span(),
+            );
             return None;
         }
         let mut ty = if self.at_lbracket() {
@@ -524,7 +1021,11 @@ impl Parser {
                 }
             }
             _ => {
-                self.error("expected a binding or literal value", self.current_span());
+                self.error(
+                    "expected_value",
+                    "expected a binding or literal value",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -537,7 +1038,11 @@ impl Parser {
                 Some(value)
             }
             _ => {
-                self.error("expected identifier", self.current_span());
+                self.error(
+                    "expected_identifier",
+                    "expected identifier",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -550,7 +1055,11 @@ impl Parser {
                 Some((value, span))
             }
             _ => {
-                self.error("expected triple-quoted prompt", self.current_span());
+                self.error(
+                    "expected_triple_quoted_prompt",
+                    "expected triple-quoted prompt",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -560,14 +1069,22 @@ impl Parser {
             TokenKind::Number(ref value) => {
                 let span = self.current_span();
                 let Ok(value) = value.parse() else {
-                    self.error("expected positive integer", span);
+                    self.error(
+                        "expected_positive_integer",
+                        "expected positive integer",
+                        span,
+                    );
                     return None;
                 };
                 self.advance();
                 Some((value, span))
             }
             _ => {
-                self.error("expected positive integer", self.current_span());
+                self.error(
+                    "expected_positive_integer",
+                    "expected positive integer",
+                    self.current_span(),
+                );
                 None
             }
         }
@@ -611,7 +1128,11 @@ impl Parser {
         if matches(&self.current().kind) {
             self.advance();
         } else {
-            self.error(&format!("expected {expected}"), self.current_span());
+            self.error(
+                "expected_token",
+                &format!("expected {expected}"),
+                self.current_span(),
+            );
         }
     }
     fn optional_comma(&mut self) -> bool {
@@ -624,6 +1145,9 @@ impl Parser {
     }
     fn at_lbracket(&self) -> bool {
         matches!(self.current().kind, TokenKind::LBracket)
+    }
+    fn at_lbrace(&self) -> bool {
+        matches!(self.current().kind, TokenKind::LBrace)
     }
     fn at_rbracket(&self) -> bool {
         matches!(self.current().kind, TokenKind::RBracket)
@@ -654,10 +1178,39 @@ impl Parser {
             self.position += 1;
         }
     }
-    fn error(&mut self, message: &str, span: Span) {
+    fn error(&mut self, code: &'static str, message: &str, span: Span) {
         self.had_error = true;
         if self.diagnostics.len() < self.limits.max_diagnostics {
-            self.diagnostics.push(Diagnostic::new(message, span));
+            self.diagnostics
+                .push(Diagnostic::error(code, message, span));
         }
     }
+    fn warning(&mut self, code: &'static str, message: &str, span: Span) {
+        if self.diagnostics.len() < self.limits.max_diagnostics {
+            self.diagnostics
+                .push(Diagnostic::warning(code, message, span));
+        }
+    }
+}
+
+fn valid_event_type(value: &str) -> bool {
+    let mut components = value.split('.').collect::<Vec<_>>();
+    let Some(version) = components.pop() else {
+        return false;
+    };
+    if components.len() < 2
+        || !version.starts_with('v')
+        || version[1..].is_empty()
+        || version[1..].starts_with('0')
+        || !version[1..].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    components.into_iter().all(valid_event_component)
+}
+
+fn valid_event_component(component: &str) -> bool {
+    let mut bytes = component.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_lowercase())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }

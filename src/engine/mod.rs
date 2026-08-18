@@ -761,8 +761,8 @@ impl Engine {
     }
 }
 
-fn active_execution_limit_millis(workflow: &crate::dsl::CompiledWorkflow) -> u64 {
-    workflow
+fn active_execution_limit_millis(definition: &crate::dsl::CompiledDefinition) -> u64 {
+    definition
         .limits
         .get("active_execution_seconds")
         .copied()

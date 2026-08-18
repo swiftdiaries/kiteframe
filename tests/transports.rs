@@ -246,6 +246,97 @@ impl RpcPeer for StdioPeer {
     }
 }
 
+struct NdjsonPeer {
+    lines: Lines<BufReader<ReadHalf<tokio::io::DuplexStream>>>,
+    writer: WriteHalf<tokio::io::DuplexStream>,
+    server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    next_id: i64,
+}
+
+impl NdjsonPeer {
+    fn new(application: Arc<Application>, principal: PrincipalId) -> Self {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(client);
+        let (server_reader, server_writer) = tokio::io::split(server);
+        let connection = AuthenticatedConnection {
+            principal,
+            transport: TransportKind::Stdio,
+        };
+        let server = tokio::spawn(async move {
+            kiteframe::serve_ndjson(
+                BufReader::new(server_reader),
+                server_writer,
+                application.as_ref(),
+                &connection,
+            )
+            .await
+        });
+        Self {
+            lines: BufReader::new(reader).lines(),
+            writer,
+            server: Some(server),
+            next_id: 1,
+        }
+    }
+}
+
+#[async_trait]
+impl RpcPeer for NdjsonPeer {
+    async fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        self.writer
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .expect("write NDJSON request");
+        self.writer.flush().await.expect("flush NDJSON request");
+        let line = self
+            .lines
+            .next_line()
+            .await
+            .expect("read NDJSON response")
+            .expect("NDJSON response before EOF");
+        let response: Value = serde_json::from_str(&line).expect("JSON-RPC NDJSON response");
+        assert_eq!(response["id"], id);
+        response
+    }
+
+    async fn next_message(&mut self) -> Value {
+        let line = self
+            .lines
+            .next_line()
+            .await
+            .expect("read NDJSON message")
+            .expect("NDJSON message before EOF");
+        serde_json::from_str(&line).expect("JSON-RPC NDJSON message")
+    }
+
+    async fn respond(&mut self, id: Value, result: Value) {
+        let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+        self.writer
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write NDJSON response");
+        self.writer.flush().await.expect("flush NDJSON response");
+    }
+
+    async fn close(&mut self) {
+        self.writer.shutdown().await.expect("close NDJSON input");
+        self.server
+            .take()
+            .expect("NDJSON server")
+            .await
+            .expect("join NDJSON server")
+            .expect("serve NDJSON");
+    }
+}
+
 struct HttpPeer {
     channel: Channel,
     driver: Option<tokio::task::JoinHandle<agent_client_protocol::Result<()>>>,
@@ -1460,6 +1551,422 @@ async fn exercise<P: RpcPeer + Send>(peer: &mut P, store: &PostgresStore) -> Val
     })
 }
 
+async fn exercise_task_api<P: RpcPeer + Send>(
+    peer: &mut P,
+    protocol_version: u16,
+    expected_principal: &PrincipalId,
+) -> Value {
+    let initialize = if protocol_version == 1 {
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "task-api", "version": "1.0.0"}
+        })
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "capabilities": {},
+            "info": {"name": "task-api", "version": "1.0.0"}
+        })
+    };
+    success(peer.request("initialize", initialize).await);
+    let new_session = if protocol_version == 1 {
+        json!({"cwd": "/tmp/kiteframe-task-api", "mcpServers": []})
+    } else {
+        json!({"cwd": "/tmp/kiteframe-task-api"})
+    };
+    let session = success(peer.request("session/new", new_session).await);
+    let missing_workflow = peer
+        .request(
+            "_kiteframe/run/start",
+            json!({
+                "sessionId": session["sessionId"],
+                "workflowName": format!("missingworkflow_{}", Uuid::now_v7().simple()),
+                "version": 1,
+                "input": {},
+                "idempotencyKey": format!("missing-workflow-{}", Uuid::now_v7()),
+            }),
+        )
+        .await;
+    assert_eq!(missing_workflow["error"]["code"], -32000);
+    assert!(
+        missing_workflow["error"].get("data").is_none(),
+        "legacy run-start errors must not gain task codes: {missing_workflow}"
+    );
+
+    let agent_name = format!("taskagent_{}", Uuid::now_v7().simple());
+    let source = format!(
+        r#"agent {agent_name}() -> string {{
+  entry inspect()
+  events ["transport.task.changed.v1"]
+  limits {{ steps: 5 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect() -> string {{
+    model coding
+    prompt """Inspect the task goal."""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let published = success(
+        peer.request("_kiteframe/definition/publish", json!({"source": source}))
+            .await,
+    );
+    let mut payload: Value =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    payload["sessionId"] = session["sessionId"].clone();
+    payload["agent"] = json!({"name": agent_name, "version": published["version"]});
+
+    let mut spoofed = payload.clone();
+    spoofed["principal"] = json!("spoofed-user");
+    let spoofed = peer.request("_kiteframe/task/submit", spoofed).await;
+    assert_eq!(spoofed["error"]["code"], -32602);
+
+    let first = success(
+        peer.request("_kiteframe/task/submit", payload.clone())
+            .await,
+    );
+    let replay = success(
+        peer.request("_kiteframe/task/submit", payload.clone())
+            .await,
+    );
+    assert_eq!(first["id"], replay["id"]);
+    assert_eq!(first["principal"], expected_principal.as_str());
+    assert_eq!(first["sessionId"], session["sessionId"]);
+    assert_eq!(first["agent"]["kind"], "agent");
+    assert_eq!(first["agent"]["name"], payload["agent"]["name"]);
+    assert_eq!(first["target"], payload["target"]);
+    assert_eq!(first["preferences"], payload["preferences"]);
+    assert_eq!(first["goal"], payload["goal"]);
+    assert_eq!(first["revision"], 0);
+    assert!(first.get("idempotencyKey").is_none());
+    assert!(first.get("state").is_none());
+
+    let fetched = success(
+        peer.request(
+            "_kiteframe/task/get",
+            json!({"sessionId": session["sessionId"], "taskId": first["id"]}),
+        )
+        .await,
+    );
+    assert_eq!(fetched, first);
+
+    let mismatch = peer
+        .request(
+            "_kiteframe/task/get",
+            json!({"sessionId": Uuid::now_v7(), "taskId": first["id"]}),
+        )
+        .await;
+    assert_eq!(mismatch["error"]["code"], -32000);
+    assert_eq!(mismatch["error"]["message"], "application request failed");
+    assert!(mismatch["error"].get("data").is_none());
+
+    let missing = peer
+        .request(
+            "_kiteframe/task/get",
+            json!({"sessionId": session["sessionId"], "taskId": Uuid::now_v7()}),
+        )
+        .await;
+    assert_eq!(missing["error"]["code"], -32000);
+    assert_eq!(
+        missing["error"]["data"]["kiteframe_code"],
+        "user_task_not_found"
+    );
+
+    let mut unknown_nested = payload.clone();
+    unknown_nested["goal"]["unknown"] = json!(true);
+    let unknown_nested = peer.request("_kiteframe/task/submit", unknown_nested).await;
+    assert_eq!(unknown_nested["error"]["code"], -32602);
+
+    let mut invalid_goal = payload.clone();
+    invalid_goal["goal"]["objective"] = json!(" ");
+    let invalid_goal = peer.request("_kiteframe/task/submit", invalid_goal).await;
+    assert_eq!(invalid_goal["error"]["code"], -32602);
+    assert_eq!(invalid_goal["error"]["message"], "Invalid params");
+    for secret in [
+        "Address actionable review feedback",
+        "acme/payments",
+        "Never merge the pull request",
+        "submit-babysit-pr-142",
+    ] {
+        assert!(!invalid_goal.to_string().contains(secret));
+    }
+
+    let mut invalid_idempotency_key = payload.clone();
+    invalid_idempotency_key["idempotencyKey"] = json!(" \t\n ");
+    let invalid_idempotency_key = peer
+        .request("_kiteframe/task/submit", invalid_idempotency_key)
+        .await;
+    assert_eq!(invalid_idempotency_key["error"]["code"], -32602);
+    assert_eq!(
+        invalid_idempotency_key["error"]["message"],
+        "Invalid params"
+    );
+    assert!(invalid_idempotency_key["error"].get("data").is_none());
+
+    let missing_agent_name = format!("missingagent_{}", Uuid::now_v7().simple());
+    let mut missing_definition = payload.clone();
+    missing_definition["agent"] = json!({"name": missing_agent_name, "version": 1});
+    missing_definition["idempotencyKey"] = json!(format!("missing-definition-{}", Uuid::now_v7()));
+    let missing_definition = peer
+        .request("_kiteframe/task/submit", missing_definition)
+        .await;
+    assert_eq!(
+        missing_definition["error"]["data"]["kiteframe_code"],
+        "definition_not_found"
+    );
+
+    let workflow_name = format!("taskworkflow_{}", Uuid::now_v7().simple());
+    let workflow_source = format!(
+        "workflow {workflow_name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [] on ok(answer: string) {{ done answer }} }}"
+    );
+    let workflow = success(
+        peer.request(
+            "_kiteframe/definition/publish",
+            json!({"source": workflow_source}),
+        )
+        .await,
+    );
+    let mut wrong_kind = payload.clone();
+    wrong_kind["agent"] = json!({"name": workflow_name, "version": workflow["version"]});
+    wrong_kind["idempotencyKey"] = json!(format!("wrong-kind-{}", Uuid::now_v7()));
+    let wrong_kind = peer.request("_kiteframe/task/submit", wrong_kind).await;
+    assert_eq!(
+        wrong_kind["error"]["data"]["kiteframe_code"],
+        "agent_definition_required"
+    );
+
+    let mut conflict = payload;
+    conflict["target"]["number"] = json!(143);
+    let conflict = peer.request("_kiteframe/task/submit", conflict).await;
+    assert_eq!(conflict["error"]["code"], -32000);
+    assert_eq!(
+        conflict["error"]["data"]["kiteframe_code"],
+        "idempotency_conflict"
+    );
+
+    json!({
+        "taskId": first["id"],
+        "sessionId": session["sessionId"],
+        "contract": {
+            "agent": {
+                "kind": first["agent"]["kind"],
+                "version": first["agent"]["version"],
+            },
+            "target": first["target"],
+            "preferences": first["preferences"],
+            "goal": first["goal"],
+            "revision": first["revision"],
+        },
+    })
+}
+
+async fn exercise_agent_publication_boundary<P: RpcPeer + Send>(
+    peer: &mut P,
+    protocol_version: u16,
+) -> Value {
+    let initialize = if protocol_version == 1 {
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "agent-boundary", "version": "1.0.0"}
+        })
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "capabilities": {},
+            "info": {"name": "agent-boundary", "version": "1.0.0"}
+        })
+    };
+    success(peer.request("initialize", initialize).await);
+    let new_session = if protocol_version == 1 {
+        json!({"cwd": "/tmp/kiteframe-agent-boundary", "mcpServers": []})
+    } else {
+        json!({"cwd": "/tmp/kiteframe-agent-boundary"})
+    };
+    let session = success(peer.request("session/new", new_session).await);
+    let name = format!("transportagent_{}", Uuid::now_v7().simple());
+    let sentinel = "transport-agent-source-must-not-leak";
+    let source = format!(
+        r#"agent {name}() -> string {{
+  entry inspect()
+  events ["transport.agent.changed.v1"]
+  limits {{ steps: 5 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect() -> string {{
+    model reasoning
+    prompt """{sentinel}"""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let published = success(
+        peer.request("_kiteframe/definition/publish", json!({"source": source}))
+            .await,
+    );
+    assert_eq!(published["kind"], "agent");
+
+    let mismatch = peer
+        .request("_kiteframe/workflow/publish", json!({"source": source}))
+        .await;
+    let runtime = peer
+        .request(
+            "_kiteframe/run/start",
+            json!({
+                "sessionId": session["sessionId"],
+                "workflowName": name,
+                "version": published["version"],
+                "input": {},
+                "idempotencyKey": format!("agent-boundary-{}", Uuid::now_v7())
+            }),
+        )
+        .await;
+
+    for (response, code) in [
+        (&mismatch, "definition_kind_mismatch"),
+        (&runtime, "agent_runtime_unavailable"),
+    ] {
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(response["error"]["message"], "application request failed");
+        assert_eq!(response["error"]["data"], json!({"kiteframe_code": code}));
+        assert!(!response.to_string().contains(sentinel));
+    }
+
+    json!({
+        "kind": published["kind"],
+        "mismatch": mismatch["error"],
+        "runtime": runtime["error"],
+    })
+}
+
+#[tokio::test]
+async fn agent_publication_and_runtime_errors_match_across_all_adapters() {
+    let (application, store) = application().await;
+    let websocket_principal = principal("agent-websocket");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(Secret::new("agent-websocket-secret"), websocket_principal)])
+            .expect("bearer binding"),
+    );
+    let remote = RemoteService::with_v2(
+        application.clone(),
+        authenticator,
+        store.clone(),
+        ready_model(),
+        true,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+
+    let mut acp_v1 = StdioPeer::new(application.clone(), store.clone(), principal("agent-v1"));
+    let acp_v1_result = exercise_agent_publication_boundary(&mut acp_v1, 1).await;
+    acp_v1.close().await;
+
+    let mut acp_v2 = StdioPeer::with_v2(application.clone(), store, principal("agent-v2"), true);
+    let acp_v2_result = exercise_agent_publication_boundary(&mut acp_v2, 2).await;
+    acp_v2.close().await;
+
+    let mut ndjson = NdjsonPeer::new(application, principal("agent-ndjson"));
+    let ndjson_result = exercise_agent_publication_boundary(&mut ndjson, 1).await;
+    ndjson.close().await;
+
+    let mut websocket = WebSocketPeer::connect(server.address, "agent-websocket-secret").await;
+    let websocket_result = exercise_agent_publication_boundary(&mut websocket, 1).await;
+    websocket.close().await;
+
+    assert_eq!(acp_v2_result, acp_v1_result);
+    assert_eq!(ndjson_result, acp_v1_result);
+    assert_eq!(websocket_result, acp_v1_result);
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn authenticated_task_submit_and_get_match_across_all_remote_transports() {
+    let (application, store) = application().await;
+    let websocket_principal = principal("task-websocket");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(
+            Secret::new("task-websocket-secret"),
+            websocket_principal.clone(),
+        )])
+        .expect("bearer binding"),
+    );
+    let remote = RemoteService::with_v2(
+        application.clone(),
+        authenticator,
+        store.clone(),
+        ready_model(),
+        true,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+
+    let v1_principal = principal("task-v1");
+    let mut acp_v1 = StdioPeer::new(application.clone(), store.clone(), v1_principal.clone());
+    let v1_result = exercise_task_api(&mut acp_v1, 1, &v1_principal).await;
+    acp_v1.close().await;
+
+    let isolated_principal = principal("task-isolated");
+    let mut isolated = StdioPeer::new(application.clone(), store.clone(), isolated_principal);
+    success(
+        isolated
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {},
+                    "clientInfo": {"name": "task-isolation", "version": "1.0.0"}
+                }),
+            )
+            .await,
+    );
+    let isolated_session = success(
+        isolated
+            .request(
+                "session/new",
+                json!({"cwd": "/tmp/kiteframe-task-isolation", "mcpServers": []}),
+            )
+            .await,
+    );
+    let isolated_get = isolated
+        .request(
+            "_kiteframe/task/get",
+            json!({
+                "sessionId": isolated_session["sessionId"],
+                "taskId": v1_result["taskId"],
+            }),
+        )
+        .await;
+    assert_eq!(isolated_get["error"]["code"], -32000);
+    assert_eq!(
+        isolated_get["error"]["data"]["kiteframe_code"],
+        "user_task_not_found"
+    );
+    isolated.close().await;
+
+    let v2_principal = principal("task-v2");
+    let mut acp_v2 = StdioPeer::with_v2(application.clone(), store, v2_principal.clone(), true);
+    let v2_result = exercise_task_api(&mut acp_v2, 2, &v2_principal).await;
+    acp_v2.close().await;
+
+    let ndjson_principal = principal("task-ndjson");
+    let mut ndjson = NdjsonPeer::new(application, ndjson_principal.clone());
+    let ndjson_result = exercise_task_api(&mut ndjson, 1, &ndjson_principal).await;
+    ndjson.close().await;
+
+    let mut websocket = WebSocketPeer::connect(server.address, "task-websocket-secret").await;
+    let websocket_result = exercise_task_api(&mut websocket, 1, &websocket_principal).await;
+    websocket.close().await;
+
+    assert_eq!(v2_result["contract"], v1_result["contract"]);
+    assert_eq!(ndjson_result["contract"], v1_result["contract"]);
+    assert_eq!(websocket_result["contract"], v1_result["contract"]);
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn stdio_websocket_and_streamable_http_are_application_equivalent() {
     let (application, store) = application().await;
@@ -2119,6 +2626,23 @@ async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures
             .await
             .is_err()
     );
+    let mut invalid_task: Value =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    invalid_task["sessionId"] = created["sessionId"].clone();
+    invalid_task["goal"]["objective"] = json!(" ");
+    let invalid_task = peer.request("_kiteframe/task/submit", invalid_task).await;
+    assert_eq!(invalid_task["error"]["code"], -32602);
+    assert_eq!(invalid_task["error"]["message"], "Invalid params");
+    let missing_task = peer
+        .request(
+            "_kiteframe/task/get",
+            json!({"sessionId": created["sessionId"], "taskId": Uuid::now_v7()}),
+        )
+        .await;
+    assert_eq!(
+        missing_task["error"]["data"]["kiteframe_code"],
+        "user_task_not_found"
+    );
     store
         .append_catalog_epoch(
             &ToolCatalogSnapshot::new(session_id.clone(), Uuid::now_v7(), [])
@@ -2185,8 +2709,18 @@ async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures
     let logs = String::from_utf8(captured.lock().expect("log capture poisoned").clone())
         .expect("logs are UTF-8");
     assert!(logs.contains("ACP request handled"));
+    assert!(logs.contains("_kiteframe/task/submit"));
+    assert!(logs.contains("_kiteframe/task/get"));
     assert!(!logs.contains("sentinel-bearer-secret"));
     assert!(!logs.contains("sentinel-private-content"));
+    for secret in [
+        "Address actionable review feedback",
+        "acme/payments",
+        "Never merge the pull request",
+        "submit-babysit-pr-142",
+    ] {
+        assert!(!logs.contains(secret), "log leaked: {secret}");
+    }
 }
 
 #[test]

@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use kiteframe::dsl::{Limits, compile};
+use kiteframe::dsl::{DefinitionKind, Limits, compile};
 use kiteframe::{
     CatalogTool, ClosedSchema, CreateSession, EffectKind, FrameCommand, IdempotencyKey, NewChild,
     NewPermissionRequest, PermissionRequestId, PolicyRevision, PostgresStore, PrincipalId,
-    Question, RecoverySupport, StartRun, StoreError, StoreLimits, ToolCatalogSnapshot,
+    PublishedDefinition, Question, RecoverySupport, SessionView, StartRun, StoreError, StoreLimits,
+    ToolCatalogSnapshot,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -625,6 +626,100 @@ async fn concurrent_active_run_quota_admits_exactly_one_distinct_request() {
         (Ok(_), Err(StoreError::QuotaExceeded("active_runs_per_session")))
         | (Err(StoreError::QuotaExceeded("active_runs_per_session")), Ok(_)) => {}
         results => panic!("expected one creation and one quota rejection, got {results:?}"),
+    }
+}
+
+async fn execution_fixture_with_agent() -> Option<(
+    PostgresStore,
+    sqlx::PgPool,
+    SessionView,
+    PublishedDefinition,
+)> {
+    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let store = PostgresStore::connect_with_limits(
+        &database_url,
+        StoreLimits {
+            max_active_runs_per_session: 0,
+            ..StoreLimits::default()
+        },
+    )
+    .await
+    .expect("agent boundary store");
+    let session = store
+        .create_session(CreateSession {
+            principal: PrincipalId::new(format!("agent-start-{}", Uuid::now_v7())).unwrap(),
+            working_directory: "/agent-start".to_owned(),
+            retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+        })
+        .await
+        .expect("agent boundary session");
+    let catalog = store
+        .current_catalog(session.id.clone())
+        .await
+        .expect("initial catalog");
+    let name = format!("agentstart_{}", Uuid::now_v7().simple());
+    let source = format!(
+        r#"agent {name}() -> string {{
+  entry inspect()
+  events ["test.agent.changed.v1"]
+  limits {{ steps: 5 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect() -> string {{
+    model reasoning
+    prompt """Inspect without running."""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let compiled = compile(&source, &catalog, &Limits::default()).expect("agent compiles");
+    assert_eq!(compiled.definition_kind, DefinitionKind::Agent);
+    let agent = store
+        .publish(session.id.clone(), &compiled, &source)
+        .await
+        .expect("publish agent");
+    let pool = store.pool().clone();
+    Some((store, pool, session, agent))
+}
+
+#[tokio::test]
+async fn legacy_run_start_rejects_agent_without_execution_rows() {
+    let Some((store, pool, session, agent)) = execution_fixture_with_agent().await else {
+        eprintln!("skipping agent execution-boundary test: DATABASE_URL is not configured");
+        return;
+    };
+    let error = store
+        .start_run(StartRun {
+            session_id: session.id.clone(),
+            workflow_name: agent.name,
+            version: Some(agent.version),
+            input: json!({}),
+            idempotency_key: IdempotencyKey::new("must-not-run-agent").unwrap(),
+        })
+        .await
+        .expect_err("agents are inert in the foundation slice");
+    assert!(matches!(error, StoreError::AgentRuntimeUnavailable));
+
+    for (table, query) in [
+        ("runs", "SELECT COUNT(*) FROM runs WHERE session_id = $1"),
+        (
+            "frames",
+            "SELECT COUNT(*) FROM frames f JOIN runs r ON r.id = f.run_id WHERE r.session_id = $1",
+        ),
+        (
+            "events",
+            "SELECT COUNT(*) FROM events e JOIN runs r ON r.id = e.run_id WHERE r.session_id = $1",
+        ),
+        (
+            "run_tool_bindings",
+            "SELECT COUNT(*) FROM run_tool_bindings b JOIN runs r ON r.id = b.run_id WHERE r.session_id = $1",
+        ),
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .bind(*session.id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "unexpected row in {table}");
     }
 }
 

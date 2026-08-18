@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::dsl::{CompiledStatement, CompiledType, CompiledValue, CompiledWorkflow};
+use crate::dsl::{CompiledDefinition, CompiledStatement, CompiledType, CompiledValue};
 use crate::{Bindings, ClosedSchema, FrameCommand, NewChild, Question};
 
 #[derive(Clone, Debug)]
@@ -16,7 +16,7 @@ pub struct FrameSnapshot {
 
 #[derive(Debug, Error)]
 pub enum TransitionError {
-    #[error("compiled workflow is corrupt: {0}")]
+    #[error("compiled definition is corrupt: {0}")]
     Corrupt(String),
     #[error("binding was not present: {0}")]
     MissingBinding(String),
@@ -25,10 +25,10 @@ pub enum TransitionError {
 }
 
 pub fn next_command(
-    workflow: &CompiledWorkflow,
+    definition: &CompiledDefinition,
     frame: &FrameSnapshot,
 ) -> Result<FrameCommand, TransitionError> {
-    let task = workflow
+    let task = definition
         .tasks
         .get(&frame.task_name)
         .ok_or_else(|| TransitionError::Corrupt("frame task is absent".to_owned()))?;
@@ -91,13 +91,13 @@ pub fn next_command(
                 .as_str()
                 .ok_or_else(|| TransitionError::Corrupt("question is not a string".to_owned()))?
                 .to_owned(),
-            schema: closed_schema(workflow, answer_type)?,
+            schema: closed_schema(definition, answer_type)?,
         })),
     }
 }
 
 fn closed_schema(
-    workflow: &CompiledWorkflow,
+    definition: &CompiledDefinition,
     ty: &CompiledType,
 ) -> Result<ClosedSchema, TransitionError> {
     match ty {
@@ -106,15 +106,15 @@ fn closed_schema(
         CompiledType::Number => Ok(ClosedSchema::number()),
         CompiledType::Boolean => Ok(ClosedSchema::boolean()),
         CompiledType::Optional(inner) => {
-            Ok(ClosedSchema::nullable(closed_schema(workflow, inner)?))
+            Ok(ClosedSchema::nullable(closed_schema(definition, inner)?))
         }
-        CompiledType::List(inner) => Ok(ClosedSchema::array(closed_schema(workflow, inner)?)),
-        CompiledType::Record(name) => workflow
+        CompiledType::List(inner) => Ok(ClosedSchema::array(closed_schema(definition, inner)?)),
+        CompiledType::Record(name) => definition
             .records
             .get(name)
             .ok_or_else(|| TransitionError::Corrupt(format!("record type is absent: {name}")))?
             .iter()
-            .map(|(name, ty)| Ok((name.clone(), closed_schema(workflow, ty)?)))
+            .map(|(name, ty)| Ok((name.clone(), closed_schema(definition, ty)?)))
             .collect::<Result<std::collections::BTreeMap<_, _>, TransitionError>>()
             .map(|properties| ClosedSchema::object("answer", properties)),
     }
