@@ -5,13 +5,14 @@ use serde_json::Value;
 use crate::dsl::DefinitionKind;
 use crate::{
     AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PolicyRevision, RetryRecovery,
-    RunId, Secret, SessionId, SessionPolicy, StartRun,
+    RunId, Secret, SessionId, SessionPolicy, StartRun, UserTaskId,
 };
 
 use super::{
-    ApplicationCommand, ApplicationResult, CloseSession, EventCursor, GetRun, GetUserTask,
-    NewSession, PermissionResponseContext, ProtocolAdapter, ProtocolError, PublishDefinition,
-    ResumeSession, UpdateSessionPolicy, encode_application_result,
+    AgentEventCursor, ApplicationCommand, ApplicationResult, CloseSession, EventCursor,
+    GetAgentExecution, GetRun, GetUserTask, NewSession, PermissionResponseContext, ProtocolAdapter,
+    ProtocolError, PublishDefinition, ResumeSession, UpdateSessionPolicy,
+    encode_application_result,
 };
 
 /// Draft ACP v2 adapter. Constructing the adapter is compile-time gated, and
@@ -132,6 +133,12 @@ impl ProtocolAdapter for V2Adapter {
             }
             "_kiteframe/task/submit" => decode(params).map(ApplicationCommand::SubmitTask),
             "_kiteframe/task/get" => decode(params).map(GetTaskDto::into_command),
+            "_kiteframe/agent/start" => decode(params).map(ApplicationCommand::StartAgent),
+            "_kiteframe/agent/get" => decode(params).map(GetAgentExecutionDto::into_command),
+            "_kiteframe/task/pause" => decode(params).map(ApplicationCommand::PauseTask),
+            "_kiteframe/task/resume" => decode(params).map(ApplicationCommand::ResumeTask),
+            "_kiteframe/task/cancel" => decode(params).map(ApplicationCommand::CancelTask),
+            "_kiteframe/task/events" => decode(params).map(AgentEventCursorDto::into_command),
             "_kiteframe/run/start" => decode(params).map(StartDto::into_command),
             "_kiteframe/run/get" => decode(params).map(GetDto::into_command),
             "_kiteframe/run/answer" => decode(params).map(AnswerDto::into_command),
@@ -283,6 +290,46 @@ fn mcp_servers(servers: Vec<acp::McpServer>) -> Result<Vec<McpServerConfig>, Pro
 }
 
 type Meta = Option<serde_json::Map<String, Value>>;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GetAgentExecutionDto {
+    session_id: SessionId,
+    task_id: UserTaskId,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl GetAgentExecutionDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::GetAgentExecution(GetAgentExecution {
+            session_id: self.session_id,
+            task_id: self.task_id,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentEventCursorDto {
+    session_id: SessionId,
+    task_id: UserTaskId,
+    after: i64,
+    limit: u32,
+    #[serde(default, rename = "_meta")]
+    _meta: Meta,
+}
+
+impl AgentEventCursorDto {
+    fn into_command(self) -> ApplicationCommand {
+        ApplicationCommand::ReplayAgentEvents(AgentEventCursor {
+            session_id: self.session_id,
+            task_id: self.task_id,
+            after: self.after,
+            limit: self.limit,
+        })
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

@@ -47,9 +47,19 @@ does not create runs, frames, events, model items, tool calls, or permission
 requests.
 
 The authenticated application exposes `_kiteframe/task/submit` and
-`_kiteframe/task/get` as private Kiteframe ACP extension methods. Along with
-`_kiteframe/definition/publish`, these are not a stable plugin protocol and do
-not grant runtime authority.
+`_kiteframe/task/get` as private Kiteframe ACP extension methods. Mutable
+execution uses `_kiteframe/agent/start`, `_kiteframe/agent/get`,
+`_kiteframe/task/pause`, `_kiteframe/task/resume`,
+`_kiteframe/task/cancel`, and ordered `_kiteframe/task/events`. ACP v1, gated
+ACP v2, NDJSON, and WebSocket return the same bounded read model and coarse
+fixed failures. Along with `_kiteframe/definition/publish`, these are private
+application methods rather than a stable plugin protocol.
+
+The connection owns the principal and active session. Lifecycle payloads deny
+unknown fields and cannot carry a wire principal. Start, pause, resume, and
+cancel also pass the connection principal to the authoritative kernel; get and
+event replay remain session scoped. Event replay accepts a non-negative cursor
+and a limit from 1 through 1,000.
 
 ## Lifecycle and optimistic commands
 
@@ -108,6 +118,24 @@ the goal phase. Root `done` can succeed the task while leaving the goal phase
 unchanged. Harness text, a model claim, or a successful tool response is never
 goal-completion authority by itself.
 
-This task freezes the contract surface. Later Slice 2 tasks add durable
-command/evidence persistence, plugin lifecycle, semantic channels, workers,
-budgets, connectors, and editor integrations without redefining these types.
+The direct-loop harness receives the durable full goal projection on every
+invocation: objective; each success criterion's id, human statement, and
+evidence type; constraints; and blocked conditions. Its closed `complete_task`
+result completes only the bounded invocation and can mint only
+`harness.invocation_result` evidence. Only Rust-runtime `CompleteGoal` and
+`BlockGoal` commands can exercise goal authority.
+
+Slice 2 implements durable command/evidence persistence, revisioned
+transitions, lifecycle authority, direct-loop dispatch, restart recovery, and
+the private read/control surface. It does not implement canonical
+context/event resolution, a public plugin/provider lifecycle or external
+runtime transport, semantic channels, workers/leases, budgets/profiles,
+connectors, secrets, Codex integration, or editor integrations. In particular,
+the GitHub-typed `babysit_pr` goal cannot complete from Slice 2's
+harness-invocation evidence alone; later context/connector work must supply
+authorized GitHub evidence.
+
+Late harness results and bounded failures that lose a cancellation/terminal
+race are retained idempotently on the already-terminal command for audit. They
+cannot advance task, goal, snapshot, evidence, action, or event state; exact
+replay is a no-op and conflicting late content fails closed.

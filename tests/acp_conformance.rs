@@ -482,6 +482,7 @@ fn general_store_errors_do_not_gain_task_specific_codes() {
         kiteframe::StoreError::DefinitionNotFound,
         kiteframe::StoreError::UserTaskNotFound,
         kiteframe::StoreError::IdempotencyConflict,
+        kiteframe::StoreError::RevisionConflict,
     ] {
         let encoded = V1Adapter::encode_error(&ProtocolError::from(error));
         assert_eq!(i32::from(encoded.code), -32000);

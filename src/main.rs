@@ -11,9 +11,9 @@ use std::{
 use agent_client_protocol::{ConnectTo, Stdio};
 use kiteframe::protocol::transport::{AcpService, BearerAuthenticator, RemoteService};
 use kiteframe::{
-    Application, AuthenticatedConnection, Engine, EngineConfig, HarnessConfig, HarnessMode,
-    McpLimits, McpManager, ModelClient, ModelRequest, PersistedAuthorizer, PostgresStore,
-    ResponsesClient, TransportKind,
+    AgentCommandDispatcher, Application, AuthenticatedConnection, DirectLoopHarnessExecutor,
+    Engine, EngineConfig, HarnessConfig, HarnessMode, McpLimits, McpManager, ModelClient,
+    ModelRequest, PersistedAuthorizer, PostgresStore, ResponsesClient, TransportKind,
 };
 use tokio::sync::watch;
 
@@ -53,21 +53,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             outcomes_unknown = recovery.outcomes_unknown,
             "startup recovery complete"
         );
-        let application =
-            Arc::new(Application::new(store.clone(), engine.clone()).with_mcp_manager(mcp));
+        let application = Application::new(store.clone(), engine.clone()).with_mcp_manager(mcp);
+        let agent_recovery = application
+            .agent_kernel()
+            .recover(engine.config.scheduler_batch_size)
+            .await?;
+        tracing::info!(
+            pending = agent_recovery.pending,
+            claimed = agent_recovery.claimed,
+            "agent command recovery complete"
+        );
+        let agent_dispatcher = Arc::new(
+            application
+                .agent_kernel()
+                .with_harness_executor(Arc::new(DirectLoopHarnessExecutor::new(model.clone()))),
+        );
+        let application = Arc::new(application);
 
         match config.mode {
             HarnessMode::Stdio => {
                 let principal = config
                     .local_principal
                     .expect("validated stdio configuration has a local principal");
-                run_stdio(application, engine, principal, config.acp_v2_enabled).await?;
+                run_stdio(
+                    application,
+                    engine,
+                    agent_dispatcher,
+                    principal,
+                    config.acp_v2_enabled,
+                )
+                .await?;
             }
             HarnessMode::Server { bind } => {
                 let max_remote_connections = config.max_remote_connections;
                 let model_ready = Arc::new(AtomicBool::new(false));
                 update_model_health(model.as_ref(), &model_ready).await;
-                let _model_health_monitor = ModelHealthMonitor::start(model, model_ready.clone());
+                let _model_health_monitor =
+                    ModelHealthMonitor::start(model.clone(), model_ready.clone());
                 let authenticator = Arc::new(BearerAuthenticator::new(
                     config
                         .bearer_bindings
@@ -82,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     config.acp_v2_enabled,
                     max_remote_connections,
                 );
-                run_remote(bind, remote, engine).await?;
+                run_remote(bind, remote, engine, agent_dispatcher).await?;
             }
         }
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -238,6 +260,7 @@ impl Drop for ProcessLock {
 async fn run_stdio(
     application: Arc<Application>,
     engine: Arc<Engine>,
+    agent_dispatcher: Arc<AgentCommandDispatcher>,
     principal: kiteframe::PrincipalId,
     v2_runtime_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -252,7 +275,7 @@ async fn run_stdio(
         v2_runtime_enabled,
     );
     let mut serving = Box::pin(service.clone().connect_to(Stdio::new()));
-    let mut scheduling = Box::pin(run_scheduler(engine, shutdown_rx));
+    let mut scheduling = Box::pin(run_scheduler(engine, agent_dispatcher, shutdown_rx));
 
     tokio::select! {
         result = &mut serving => {
@@ -298,6 +321,7 @@ async fn run_remote(
     bind: std::net::SocketAddr,
     remote: RemoteService,
     engine: Arc<Engine>,
+    agent_dispatcher: Arc<AgentCommandDispatcher>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local_address = listener.local_addr()?;
@@ -311,7 +335,7 @@ async fn run_remote(
             })
             .await
     });
-    let mut scheduling = Box::pin(run_scheduler(engine, shutdown_rx));
+    let mut scheduling = Box::pin(run_scheduler(engine, agent_dispatcher, shutdown_rx));
     remote.mark_ready();
     tracing::info!(bind = %local_address, "remote ACP service ready");
 
@@ -381,6 +405,7 @@ async fn shutdown_signal() -> io::Result<()> {
 
 async fn run_scheduler(
     engine: Arc<Engine>,
+    agent_dispatcher: Arc<AgentCommandDispatcher>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), kiteframe::EngineError> {
     loop {
@@ -394,7 +419,13 @@ async fn run_scheduler(
                 }
                 continue;
             }
-            result = engine.tick_until_idle() => match result {
+            result = async {
+                let legacy = engine.tick_until_idle().await?;
+                let agents = agent_dispatcher
+                    .tick_agent_commands(engine.config.scheduler_batch_size)
+                    .await?;
+                Ok::<usize, kiteframe::EngineError>(legacy + agents)
+            } => match result {
                 Ok(applied) => applied,
                 Err(error) => {
                     tracing::warn!(error = %error, "scheduler tick failed; retaining service availability");
@@ -472,5 +503,32 @@ mod tests {
 
         update_model_health(&model, &ready).await;
         assert!(ready.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn scheduler_accepts_the_shared_agent_dispatcher_and_stops_before_work() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+        let model: Arc<dyn ModelClient> = Arc::new(RecoveringModel(AtomicUsize::new(0)));
+        let engine = Arc::new(Engine {
+            store: store.clone(),
+            model: model.clone(),
+            tools: Arc::new(kiteframe::InProcessToolRegistry::new()),
+            authorizer: Arc::new(PersistedAuthorizer::new(store.clone())),
+            config: EngineConfig::default(),
+        });
+        let application = Application::new(store, engine.clone());
+        let dispatcher = Arc::new(
+            application
+                .agent_kernel()
+                .with_harness_executor(Arc::new(kiteframe::DirectLoopHarnessExecutor::new(model))),
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+
+        run_scheduler(engine, dispatcher, shutdown_rx)
+            .await
+            .unwrap();
     }
 }

@@ -5,10 +5,11 @@ use thiserror::Error;
 
 use crate::dsl::DefinitionKind;
 use crate::{
-    AnswerQuestion, CancelRun, IdempotencyKey, McpServerConfig, PermissionChoice,
-    PermissionRequestId, PolicyRevision, PrincipalId, PublishedDefinition, ResolvePermission,
-    RetryRecovery, RunEvent, RunId, RunView, SessionId, SessionPolicy, SessionView, StartRun,
-    SubmitUserTask,
+    AgentExecutionView, AgentTaskEvent, AnswerQuestion, CancelRun, CancelUserTask, IdempotencyKey,
+    McpServerConfig, PauseUserTask, PermissionChoice, PermissionRequestId, PolicyRevision,
+    PrincipalId, PublishedDefinition, ResolvePermission, ResumeUserTask, RetryRecovery, RunEvent,
+    RunId, RunView, SessionId, SessionPolicy, SessionView, StartAgent, StartRun, SubmitUserTask,
+    UserTaskId,
 };
 
 pub const AGENT_RUNTIME_UNAVAILABLE: &str = "agent_runtime_unavailable";
@@ -52,6 +53,20 @@ pub struct GetRun {
 pub struct GetUserTask {
     pub session_id: SessionId,
     pub task_id: crate::UserTaskId,
+}
+
+#[derive(Clone, Debug)]
+pub struct GetAgentExecution {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentEventCursor {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub after: i64,
+    pub limit: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +146,12 @@ pub enum ApplicationCommand {
     Publish(PublishDefinition),
     SubmitTask(SubmitUserTask),
     GetTask(GetUserTask),
+    StartAgent(StartAgent),
+    GetAgentExecution(GetAgentExecution),
+    PauseTask(PauseUserTask),
+    ResumeTask(ResumeUserTask),
+    CancelTask(CancelUserTask),
+    ReplayAgentEvents(AgentEventCursor),
     Start(StartRun),
     Get(GetRun),
     Answer(AnswerQuestion),
@@ -142,9 +163,14 @@ pub enum ApplicationCommand {
 }
 
 #[derive(Clone, Debug)]
+// The private lifecycle contract intentionally keeps the frozen unboxed
+// `AgentExecution(AgentExecutionView)` variant consumed by both ACP adapters.
+#[allow(clippy::large_enum_variant)]
 pub enum ApplicationResult {
     Published(PublishedDefinition),
     Task(crate::AcceptedUserTask),
+    AgentExecution(AgentExecutionView),
+    AgentEvents(Vec<AgentTaskEvent>),
     Run(RunView),
     PolicyUpdated { revision: PolicyRevision },
     Events(Vec<RunEvent>),
@@ -294,6 +320,30 @@ impl From<crate::StoreError> for ProtocolError {
                 message: "agent definitions require durable goal lifecycle and runtime authority"
                     .to_owned(),
             },
+            crate::StoreError::AgentTransitionInvalid(_)
+            | crate::StoreError::RuntimeStateInvalid(_) => Self::StableApplication {
+                code: "agent_transition_invalid",
+                message: "agent transition failed validation".to_owned(),
+            },
+            crate::StoreError::TaskRevisionConflict | crate::StoreError::GoalRevisionConflict => {
+                Self::StableApplication {
+                    code: "revision_conflict",
+                    message: "agent revision did not match current state".to_owned(),
+                }
+            }
+            crate::StoreError::GoalAlreadyTerminal
+            | crate::StoreError::AgentTaskAlreadyTerminal => Self::StableApplication {
+                code: "task_transition_invalid",
+                message: "agent task transition is not available".to_owned(),
+            },
+            crate::StoreError::GoalEvidenceIncomplete
+            | crate::StoreError::GoalEvidenceNotFound
+            | crate::StoreError::GoalEvidenceTypeMismatch
+            | crate::StoreError::GoalEvidenceUnauthorized
+            | crate::StoreError::GoalEvidenceStale => Self::StableApplication {
+                code: "goal_evidence_invalid",
+                message: "goal evidence failed validation".to_owned(),
+            },
             error => Self::Application(error.to_string()),
         }
     }
@@ -333,6 +383,12 @@ pub(crate) fn command_session(command: &ApplicationCommand) -> Option<&SessionId
         ApplicationCommand::RetryRecovery(request) => Some(&request.session_id),
         ApplicationCommand::SubmitTask(request) => Some(&request.session_id),
         ApplicationCommand::GetTask(request) => Some(&request.session_id),
+        ApplicationCommand::StartAgent(request) => Some(&request.session_id),
+        ApplicationCommand::GetAgentExecution(request) => Some(&request.session_id),
+        ApplicationCommand::PauseTask(request) => Some(&request.session_id),
+        ApplicationCommand::ResumeTask(request) => Some(&request.session_id),
+        ApplicationCommand::CancelTask(request) => Some(&request.session_id),
+        ApplicationCommand::ReplayAgentEvents(request) => Some(&request.session_id),
         ApplicationCommand::NewSession(_)
         | ApplicationCommand::ListSessions
         | ApplicationCommand::Publish(_)
@@ -388,6 +444,17 @@ fn encode_application_result_with_kind(
             "revision": task.revision,
             "createdAt": task.created_at.to_string(),
         }),
+        ApplicationResult::AgentExecution(execution) => encode_agent_execution(execution),
+        ApplicationResult::AgentEvents(events) => json!({
+            "events": events.into_iter().map(|event| json!({
+                "sequence": event.sequence,
+                "kind": event.kind.as_str(),
+                "metadata": event.metadata,
+                "taskRevision": event.task_revision,
+                "goalRevision": event.goal_revision,
+                "createdAt": event.created_at.to_string(),
+            })).collect::<Vec<_>>()
+        }),
         ApplicationResult::PolicyUpdated { revision } => {
             json!({ "revision": revision.get() })
         }
@@ -414,6 +481,47 @@ fn encode_application_result_with_kind(
                 "extension result".to_owned(),
             ));
         }
+    })
+}
+
+fn encode_agent_execution(execution: AgentExecutionView) -> Value {
+    let task = execution.task;
+    json!({
+        "id": task.id.as_uuid(),
+        "sessionId": task.session_id.as_uuid(),
+        "principal": task.principal.as_str(),
+        "agent": {
+            "id": task.definition.id,
+            "kind": task.definition.kind,
+            "name": task.definition.name,
+            "version": task.definition.version,
+            "definitionHash": task.definition.definition_hash,
+        },
+        "target": task.target,
+        "preferences": task.preferences,
+        "lifecycle": execution.lifecycle,
+        "operationalStatus": execution.operational_status,
+        "taskRevision": execution.task_revision,
+        "goal": {
+            "contract": task.goal,
+            "contractDigest": task.goal_digest,
+            "phase": execution.goal_phase,
+            "revision": execution.goal_revision,
+            "blocker": execution.blocker.map(|blocker| json!({
+                "blockedWhenIndex": blocker.blocked_when_index,
+                "reasonCode": blocker.reason_code,
+                "explanation": blocker.explanation,
+                "unlockConditions": blocker.unlock_conditions,
+                "goalRevision": blocker.goal_revision,
+            })),
+        },
+        "runtime": execution.runtime.map(|runtime| json!({
+            "schemaVersion": runtime.schema_version,
+            "runtimeId": runtime.runtime_id,
+            "disposition": runtime.disposition,
+            "snapshotDigest": runtime.snapshot_digest,
+        })),
+        "createdAt": task.created_at.to_string(),
     })
 }
 

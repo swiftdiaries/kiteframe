@@ -1,9 +1,10 @@
 # Agent runtime and goal lifecycle reference
 
 This reference freezes the Slice 2 Rust contract between an agent runtime and
-the authoritative Kiteframe kernel. It defines data and validation boundaries;
-it does not select a runtime implementation or let a harness mutate durable
-task or goal state.
+the authoritative Kiteframe kernel. Slice 2 implements the pure built-in
+`KiteAgentRuntime` (`kite.v1`) and a bounded direct-loop harness executor. The
+kernel remains the only durable task, goal, snapshot, command, policy, and
+evidence authority; a harness cannot mutate those aggregates directly.
 
 ## Authoritative state
 
@@ -165,9 +166,12 @@ is a closed snake-case tagged union:
 | `BlockGoal` | `blockedWhenIndex`, `reasonCode`, `explanation`, `evidenceIds`, `unlockConditions` |
 | `FailTask` | `code`, `message` |
 
-`GoalProjection` contains objective, ordered `{id,evidenceType}` success
-criteria, and constraints only. `GoalProjection::from_contract` does not expose
-criterion prose or blocked conditions. `HarnessStructuralLimits` contains
+`GoalProjection` contains the full durable semantic goal: objective; every
+ordered success criterion's id, human statement, and evidence type; all
+constraints; and all blocked conditions. `GoalProjection::from_contract`
+copies those immutable fields into every persisted `InvokeHarness`, so repeated
+or recovered invocations receive the same goal rather than an abbreviated
+objective label. `HarnessStructuralLimits` contains
 `modelTurnsRemaining`, `toolCallsPerResponse`, `responseItemBytes`, and
 `activeExecutionMillisRemaining`. A `HarnessTool` carries `qualifiedName`,
 `descriptorDigest`, and the immutable descriptor. Projected history items
@@ -265,3 +269,68 @@ It cannot complete a goal. Only a validated `CompleteGoal` command whose
 assertions cover the immutable goal contract can change the phase to
 `complete`. Only a validated `BlockGoal` can establish the durable blocker and
 change the phase to `blocked`.
+
+## Direct-loop execution and recovery
+
+The process constructs one `AgentKernel`, runs startup recovery through it,
+and derives one `AgentCommandDispatcher` with a
+`DirectLoopHarnessExecutor`. The application lifecycle methods and the process
+scheduler share that same kernel. The scheduler processes legacy workflow work
+and persisted agent commands, retains the configured batch size and 50 ms idle
+delay, continues after bounded failures, and is cancellable during shutdown.
+
+The direct-loop executor receives only a persisted `InvokeHarness`. It builds
+one bounded model request from the frozen semantic role, input, full goal
+projection, projected history, exact result schema, tool descriptors, and
+structural limits. Its closed `complete_task` function validates one declared
+outcome and that outcome's exact fields. `complete_task` completes only the
+bounded harness invocation and returns command-bound
+`harness.invocation_result` evidence; it does not mean task success and cannot
+construct `CompleteGoal` or `BlockGoal`. Those two authority commands remain
+Rust-runtime output validated by the kernel.
+
+Only `InvokeHarness` is dispatched by the built-in direct loop. Unsupported
+downstream commands and tool calls fail closed through durable command/task
+state. `RequestContext` and `WaitForEvent` remain defensive dispatcher cases:
+no valid Slice 2 runtime state can emit them because canonical context/event
+wait and resolution semantics belong to later slices.
+
+If a harness result, model failure, or unavailable-command failure arrives
+after cancellation or another terminal race, the kernel retains it as bounded,
+idempotent audit metadata on the already-terminal command. That late audit may
+advance only command metadata/revision; it cannot advance task, goal, snapshot,
+evidence, action, or event state. Exact replay is a no-op and conflicting late
+content fails closed.
+
+## Private lifecycle/read model
+
+ACP v1, gated ACP v2, NDJSON, and WebSocket expose the same private methods:
+
+```text
+_kiteframe/agent/start
+_kiteframe/agent/get
+_kiteframe/task/pause
+_kiteframe/task/resume
+_kiteframe/task/cancel
+_kiteframe/task/events
+```
+
+The authenticated connection owns both principal and session authorization;
+wire payloads cannot supply a principal or select another connection's
+session. Start/pause/resume/cancel require the task owner, exact task and goal
+revisions, and idempotency. Get and ordered event replay are session scoped.
+Event cursors reject negative `after` values and limits outside 1-1,000.
+
+The execution read model keeps task lifecycle, operational status, and goal
+phase distinct. It exposes the immutable accepted task and goal contract,
+their digests and revisions, a redacted blocker, and only runtime envelope
+identity/disposition/digest. Opaque runtime payload/history, evidence ids and
+sources, assertion ids, and blocker evidence stay behind the authorization
+boundary. Stable failures use fixed coarse transport codes/messages. Transport
+request logs contain only the allowlisted method, coarse error code, transport,
+and expected task revision when present; they do not record request content.
+
+This is not a public plugin/provider protocol. External runtime transports,
+registration and capability negotiation, connectors, semantic channels,
+workers/leases, budgets/profiles, secrets, Codex integration, and editor
+integrations remain later-slice work.

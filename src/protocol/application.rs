@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use sqlx::Row;
 
-use crate::{CreateSession, Engine, McpManager, McpServerConfig, PostgresStore, SessionId};
+use crate::{
+    AgentKernel, CreateSession, Engine, KiteAgentRuntime, McpManager, McpServerConfig,
+    PostgresStore, SessionId, TaskOwnerAuthorizer,
+};
 
 use super::{
     ApplicationCommand, ApplicationContext, ApplicationResult, ApplicationSession, ProtocolError,
@@ -12,6 +15,7 @@ use super::{
 pub struct Application {
     store: Arc<PostgresStore>,
     engine: Arc<Engine>,
+    agent_kernel: Arc<AgentKernel>,
     mcp: Option<Arc<McpManager>>,
     session_retention: time::Duration,
     definition_limits: crate::dsl::Limits,
@@ -20,9 +24,13 @@ pub struct Application {
 impl Application {
     #[must_use]
     pub fn new(store: Arc<PostgresStore>, engine: Arc<Engine>) -> Self {
+        let runtime = Arc::new(KiteAgentRuntime::new(*store.agent_runtime_ceilings()));
+        let authorizer = Arc::new(TaskOwnerAuthorizer::new(store.clone()));
+        let agent_kernel = Arc::new(AgentKernel::new(store.clone(), runtime, authorizer));
         Self {
             store,
             engine,
+            agent_kernel,
             mcp: None,
             session_retention: time::Duration::days(30),
             definition_limits: crate::dsl::Limits::default(),
@@ -39,6 +47,17 @@ impl Application {
     pub fn with_mcp_manager(mut self, mcp: Arc<McpManager>) -> Self {
         self.mcp = Some(mcp);
         self
+    }
+
+    #[must_use]
+    pub fn with_agent_kernel(mut self, agent_kernel: Arc<AgentKernel>) -> Self {
+        self.agent_kernel = agent_kernel;
+        self
+    }
+
+    #[must_use]
+    pub fn agent_kernel(&self) -> Arc<AgentKernel> {
+        self.agent_kernel.clone()
     }
 
     pub async fn dispatch(
@@ -197,6 +216,73 @@ impl Application {
                 .await
                 .map(ApplicationResult::Task)
                 .map_err(ProtocolError::from_task_store),
+            ApplicationCommand::StartAgent(request) => self
+                .agent_kernel
+                .start_agent(&context.connection_principal, request)
+                .await
+                .map(ApplicationResult::AgentExecution)
+                .map_err(ProtocolError::from),
+            ApplicationCommand::GetAgentExecution(request) => self
+                .store
+                .get_agent_execution(request.session_id, request.task_id)
+                .await
+                .map(ApplicationResult::AgentExecution)
+                .map_err(ProtocolError::from),
+            ApplicationCommand::PauseTask(request) => self
+                .agent_kernel
+                .pause_task(&context.connection_principal, request)
+                .await
+                .map(ApplicationResult::AgentExecution)
+                .map_err(ProtocolError::from),
+            ApplicationCommand::ResumeTask(request) => self
+                .agent_kernel
+                .resume_task(&context.connection_principal, request)
+                .await
+                .map(ApplicationResult::AgentExecution)
+                .map_err(ProtocolError::from),
+            ApplicationCommand::CancelTask(request) => self
+                .agent_kernel
+                .cancel_task(&context.connection_principal, request)
+                .await
+                .map(ApplicationResult::AgentExecution)
+                .map_err(ProtocolError::from),
+            ApplicationCommand::ReplayAgentEvents(cursor) => {
+                let mut after = u64::try_from(cursor.after).map_err(|_| {
+                    ProtocolError::InvalidPayload(
+                        "agent event cursor must not be negative".to_owned(),
+                    )
+                })?;
+                if !(1..=1_000).contains(&cursor.limit) {
+                    return Err(ProtocolError::InvalidPayload(
+                        "agent event limit must be between 1 and 1000".to_owned(),
+                    ));
+                }
+                let mut remaining = cursor.limit;
+                let mut events = Vec::with_capacity(cursor.limit as usize);
+                while remaining > 0 {
+                    let batch_limit = remaining.min(256);
+                    let batch = self
+                        .store
+                        .agent_task_events_after(
+                            cursor.session_id.clone(),
+                            cursor.task_id.clone(),
+                            after,
+                            batch_limit,
+                        )
+                        .await
+                        .map_err(ProtocolError::from)?;
+                    let count = u32::try_from(batch.len()).expect("event batch is bounded");
+                    if let Some(last) = batch.last() {
+                        after = last.sequence;
+                    }
+                    events.extend(batch);
+                    remaining -= count;
+                    if count < batch_limit {
+                        break;
+                    }
+                }
+                Ok(ApplicationResult::AgentEvents(events))
+            }
             ApplicationCommand::UpdatePolicy(request) => {
                 let catalog = self.store.current_catalog(session_id.clone()).await?;
                 let revision = self

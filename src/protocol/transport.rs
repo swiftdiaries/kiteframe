@@ -1011,24 +1011,35 @@ impl HandleDispatchFrom<Client> for SemanticHandler {
         match dispatch {
             Dispatch::Request(request, responder) => {
                 let method = request.method.clone();
-                let result = if connection_accepting(&self.accepting, &self.healthy) {
-                    dispatch_application(
+                let task_revision = logged_task_revision(&method, &request.params);
+                let (result, error_code) = if connection_accepting(&self.accepting, &self.healthy) {
+                    let dispatched = dispatch_application(
                         &self.application,
                         &self.connection,
                         method.as_str(),
                         request.params,
                     )
-                    .await
-                    .map_err(protocol_sdk_error)
+                    .await;
+                    let error_code = dispatched
+                        .as_ref()
+                        .err()
+                        .map_or("none", logged_protocol_error);
+                    (dispatched.map_err(protocol_sdk_error), error_code)
                 } else {
-                    Err(agent_client_protocol::Error::request_cancelled()
-                        .data("service is shutting down"))
+                    (
+                        Err(agent_client_protocol::Error::request_cancelled()
+                            .data("service is shutting down")),
+                        "request_cancelled",
+                    )
                 };
                 let succeeded = result.is_ok();
                 tracing::info!(
                     method = logged_method(&method),
                     transport = ?self.connection.authenticated.transport,
                     success = result.is_ok(),
+                    error_code,
+                    task_revision = task_revision.unwrap_or_default(),
+                    task_revision_known = task_revision.is_some(),
                     "ACP request handled"
                 );
                 responder.respond_with_result(result.map(|outcome| outcome.value))?;
@@ -1038,18 +1049,28 @@ impl HandleDispatchFrom<Client> for SemanticHandler {
                 Ok(Handled::Yes)
             }
             Dispatch::Notification(notification) => {
-                if connection_accepting(&self.accepting, &self.healthy) {
-                    let _ = dispatch_application(
+                let task_revision =
+                    logged_task_revision(&notification.method, &notification.params);
+                let error_code = if connection_accepting(&self.accepting, &self.healthy) {
+                    dispatch_application(
                         &self.application,
                         &self.connection,
                         notification.method.as_str(),
                         notification.params,
                     )
-                    .await;
-                }
+                    .await
+                    .as_ref()
+                    .err()
+                    .map_or("none", logged_protocol_error)
+                } else {
+                    "request_cancelled"
+                };
                 tracing::info!(
                     method = logged_method(&notification.method),
                     transport = ?self.connection.authenticated.transport,
+                    error_code,
+                    task_revision = task_revision.unwrap_or_default(),
+                    task_revision_known = task_revision.is_some(),
                     "ACP notification handled"
                 );
                 Ok(Handled::Yes)
@@ -1063,6 +1084,38 @@ impl HandleDispatchFrom<Client> for SemanticHandler {
 
     fn describe_chain(&self) -> impl fmt::Debug {
         "kiteframe semantic dispatcher"
+    }
+}
+
+fn logged_task_revision(method: &str, params: &Value) -> Option<u64> {
+    match method {
+        "_kiteframe/agent/start"
+        | "_kiteframe/task/pause"
+        | "_kiteframe/task/resume"
+        | "_kiteframe/task/cancel" => params.get("expectedTaskRevision")?.as_u64(),
+        _ => None,
+    }
+}
+
+fn logged_protocol_error(error: &crate::ProtocolError) -> &'static str {
+    match error {
+        crate::ProtocolError::StableApplication { code, .. } => code,
+        crate::ProtocolError::InvalidPayload(_)
+        | crate::ProtocolError::UnsupportedVersion(_)
+        | crate::ProtocolError::V2Disabled
+        | crate::ProtocolError::McpUnavailable => "invalid_params",
+        crate::ProtocolError::UnsupportedMethod(_) => "method_not_found",
+        crate::ProtocolError::MissingSession => "missing_session",
+        crate::ProtocolError::SessionMismatch => "session_mismatch",
+        crate::ProtocolError::AlreadyNegotiated => "already_negotiated",
+        crate::ProtocolError::NotNegotiated => "not_negotiated",
+        crate::ProtocolError::PermissionCancelled => "permission_cancelled",
+        crate::ProtocolError::SessionExpired => "session_expired",
+        crate::ProtocolError::WorkingDirectoryMismatch => "working_directory_mismatch",
+        crate::ProtocolError::McpConfigurationRequired => "mcp_configuration_required",
+        crate::ProtocolError::Application(_) | crate::ProtocolError::UnexpectedResult(_) => {
+            "application_failure"
+        }
     }
 }
 
@@ -1085,6 +1138,12 @@ fn logged_method(method: &str) -> &'static str {
         "_kiteframe/run/event" => "_kiteframe/run/event",
         "_kiteframe/task/submit" => "_kiteframe/task/submit",
         "_kiteframe/task/get" => "_kiteframe/task/get",
+        "_kiteframe/agent/start" => "_kiteframe/agent/start",
+        "_kiteframe/agent/get" => "_kiteframe/agent/get",
+        "_kiteframe/task/pause" => "_kiteframe/task/pause",
+        "_kiteframe/task/resume" => "_kiteframe/task/resume",
+        "_kiteframe/task/cancel" => "_kiteframe/task/cancel",
+        "_kiteframe/task/events" => "_kiteframe/task/events",
         _ => "unknown",
     }
 }
@@ -1859,7 +1918,8 @@ impl From<crate::ProtocolError> for RpcError {
             },
             crate::ProtocolError::InvalidPayload(_)
             | crate::ProtocolError::UnsupportedVersion(_)
-            | crate::ProtocolError::V2Disabled => Self {
+            | crate::ProtocolError::V2Disabled
+            | crate::ProtocolError::McpUnavailable => Self {
                 code: -32602,
                 message: "Invalid params".to_owned(),
                 data: None,
@@ -1874,14 +1934,9 @@ impl From<crate::ProtocolError> for RpcError {
                 message: "application request failed".to_owned(),
                 data: Some(serde_json::json!({"kiteframe_code": code})),
             },
-            crate::ProtocolError::MissingSession | crate::ProtocolError::SessionMismatch => Self {
+            _ => Self {
                 code: -32000,
                 message: "application request failed".to_owned(),
-                data: None,
-            },
-            error => Self {
-                code: -32000,
-                message: error.to_string(),
                 data: None,
             },
         }

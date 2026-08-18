@@ -11,10 +11,10 @@ pub use transport::{
     StaticBearerAuthenticator, TransportKind, serve_ndjson,
 };
 pub use types::{
-    AGENT_RUNTIME_UNAVAILABLE, ApplicationCommand, ApplicationContext, ApplicationResult,
-    ApplicationSession, CloseSession, EventCursor, GetRun, GetUserTask, NegotiatedProtocol,
-    NewSession, PermissionResponseContext, ProtocolAdapter, ProtocolError, ProtocolNegotiation,
-    PublishDefinition, ResumeSession, UpdateSessionPolicy,
+    AGENT_RUNTIME_UNAVAILABLE, AgentEventCursor, ApplicationCommand, ApplicationContext,
+    ApplicationResult, ApplicationSession, CloseSession, EventCursor, GetAgentExecution, GetRun,
+    GetUserTask, NegotiatedProtocol, NewSession, PermissionResponseContext, ProtocolAdapter,
+    ProtocolError, ProtocolNegotiation, PublishDefinition, ResumeSession, UpdateSessionPolicy,
 };
 pub(crate) use types::{command_session, encode_application_result};
 pub use v1::V1Adapter;

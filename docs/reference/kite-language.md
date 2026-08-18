@@ -180,14 +180,31 @@ source-size, token, identifier, and type-nesting limits remain in force.
 
 Compiled definition identity includes definition kind, normalized agent
 metadata, exact source, and immutable tool descriptors. Compiled agents are
-available to authoring, compile-time tooling, and publication in this slice;
-legacy workflows remain publishable and executable.
+available to authoring, compile-time tooling, immutable publication, and the
+separate `StartAgent` execution path; legacy workflows remain publishable and
+executable with unchanged bytes and runtime semantics.
 
 The reviewed [babysit PR example](../../examples/babysit_pr.kite) remains an
-authoring and compiler example. This reference freezes the Slice 2 language
-and runtime interface only; persistence, plugins, channels, workers, budgets,
-connectors, Codex, Cursor, and VS Code integration land in later tasks.
+authoring/compiler/runtime fixture. The built-in runtime, revisioned durable
+state and command journal, evidence-backed goal authority, principal lifecycle
+actions, restart recovery, and private lifecycle/read methods are implemented
+in Slice 2. The direct harness receives the complete immutable semantic goal:
+objective; criterion id, statement, and evidence type; constraints; and
+blocked conditions. Its `complete_task` operation completes only one bounded
+harness invocation and yields `harness.invocation_result` evidence. It cannot
+complete or block the durable goal; only the Rust runtime can emit
+`CompleteGoal` or `BlockGoal` for kernel validation.
+
+The example's GitHub-typed completion criteria cannot be satisfied end to end
+by Slice 2's harness-only evidence. Canonical context/event resolution,
+plugins, external runtime/provider transports, semantic channels, workers and
+leases, budgets/profiles, connectors, secrets, Codex, Cursor, and VS Code
+integration remain later-slice work. The example therefore does not claim an
+operational GitHub product loop.
 
 Generic definition publication currently uses the private Kiteframe ACP
 extension method `_kiteframe/definition/publish`. It is an application method,
-not a stable plugin protocol.
+not a stable plugin protocol. Agent execution and control likewise use the
+private `_kiteframe/agent/start`, `_kiteframe/agent/get`,
+`_kiteframe/task/pause`, `_kiteframe/task/resume`,
+`_kiteframe/task/cancel`, and `_kiteframe/task/events` methods.

@@ -1839,6 +1839,357 @@ async fn exercise_agent_publication_boundary<P: RpcPeer + Send>(
     })
 }
 
+async fn exercise_agent_lifecycle<P: RpcPeer + Send>(
+    peer: &mut P,
+    store: &PostgresStore,
+    protocol_version: u16,
+    expected_principal: &PrincipalId,
+) -> Value {
+    let initialize = if protocol_version == 1 {
+        json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {"name": "agent-lifecycle", "version": "1.0.0"}
+        })
+    } else {
+        json!({
+            "protocolVersion": 2,
+            "capabilities": {},
+            "info": {"name": "agent-lifecycle", "version": "1.0.0"}
+        })
+    };
+    success(peer.request("initialize", initialize).await);
+    let new_session = if protocol_version == 1 {
+        json!({"cwd": "/tmp/kiteframe-agent-lifecycle", "mcpServers": []})
+    } else {
+        json!({"cwd": "/tmp/kiteframe-agent-lifecycle"})
+    };
+    let session = success(peer.request("session/new", new_session).await);
+    let agent_name = format!("lifecycle_agent_{}", Uuid::now_v7().simple());
+    let source = format!(
+        r#"agent {agent_name}(repository: string, pull_request: integer) -> string {{
+  entry inspect(repository = repository, pull_request = pull_request)
+  limits {{ steps: 5 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect(repository: string, pull_request: integer) -> string {{
+    model reasoning
+    prompt """Inspect one bounded pull request."""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let published = success(
+        peer.request("_kiteframe/definition/publish", json!({"source": source}))
+            .await,
+    );
+    let mut submission: Value =
+        serde_json::from_str(include_str!("fixtures/task/babysit_pr.submit.json")).unwrap();
+    submission["sessionId"] = session["sessionId"].clone();
+    submission["agent"] = json!({"name": agent_name, "version": published["version"]});
+    submission["goal"] = json!({
+        "version": 1,
+        "objective": "Inspect the pull request safely.",
+        "success": [{
+            "id": "inspection_complete",
+            "statement": "The bounded inspection succeeded.",
+            "evidence": "harness.invocation_result"
+        }],
+        "constraints": ["Do not mutate repository state."],
+        "blockedWhen": ["Required context is unavailable."]
+    });
+    submission["idempotencyKey"] = json!(format!("submit-{agent_name}"));
+    let accepted = success(peer.request("_kiteframe/task/submit", submission).await);
+    assert_eq!(accepted["principal"], expected_principal.as_str());
+
+    let start_payload = json!({
+        "sessionId": session["sessionId"],
+        "taskId": accepted["id"],
+        "expectedTaskRevision": 0,
+        "expectedGoalRevision": 0,
+        "idempotencyKey": "start-agent-lifecycle"
+    });
+    let started = success(
+        peer.request("_kiteframe/agent/start", start_payload.clone())
+            .await,
+    );
+    let replay = success(
+        peer.request("_kiteframe/agent/start", start_payload.clone())
+            .await,
+    );
+    assert_eq!(started, replay);
+    let task_id = Uuid::parse_str(accepted["id"].as_str().unwrap()).unwrap();
+    let snapshots: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_runtime_snapshots WHERE task_id = $1")
+            .bind(task_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(snapshots, 1);
+
+    let fetched = success(
+        peer.request(
+            "_kiteframe/agent/get",
+            json!({"sessionId": session["sessionId"], "taskId": accepted["id"]}),
+        )
+        .await,
+    );
+    assert_eq!(fetched, started);
+
+    let stale = peer
+        .request(
+            "_kiteframe/task/pause",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "expectedTaskRevision": 0, "expectedGoalRevision": 0,
+                "reason": "User paused work.", "idempotencyKey": "stale-pause"
+            }),
+        )
+        .await;
+    assert_eq!(
+        stale["error"]["data"]["kiteframe_code"],
+        "revision_conflict"
+    );
+    let stale_goal = peer
+        .request(
+            "_kiteframe/task/pause",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "expectedTaskRevision": 1, "expectedGoalRevision": 99,
+                "reason": "User paused work.", "idempotencyKey": "stale-goal-pause"
+            }),
+        )
+        .await;
+    assert_eq!(
+        stale_goal["error"]["data"]["kiteframe_code"],
+        "revision_conflict"
+    );
+
+    let pause_payload = json!({
+        "sessionId": session["sessionId"], "taskId": accepted["id"],
+        "expectedTaskRevision": 1, "expectedGoalRevision": 0,
+        "reason": "User paused work.", "idempotencyKey": "pause-agent-lifecycle"
+    });
+    let paused = success(
+        peer.request("_kiteframe/task/pause", pause_payload.clone())
+            .await,
+    );
+    assert_eq!(
+        paused,
+        success(peer.request("_kiteframe/task/pause", pause_payload).await)
+    );
+    let resumed = success(
+        peer.request(
+            "_kiteframe/task/resume",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "expectedTaskRevision": 2, "expectedGoalRevision": 1,
+                "idempotencyKey": "resume-agent-lifecycle"
+            }),
+        )
+        .await,
+    );
+    let cancelled = success(
+        peer.request(
+            "_kiteframe/task/cancel",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "expectedTaskRevision": 3, "expectedGoalRevision": 2,
+                "reason": "No longer needed.", "idempotencyKey": "cancel-agent-lifecycle"
+            }),
+        )
+        .await,
+    );
+    assert_eq!(resumed["goal"]["phase"], "active");
+    assert_eq!(cancelled["lifecycle"], "cancelled");
+    assert_eq!(cancelled["goal"]["phase"], "active");
+
+    let events_payload = json!({
+        "sessionId": session["sessionId"], "taskId": accepted["id"],
+        "after": 0, "limit": 1000
+    });
+    let events = success(
+        peer.request("_kiteframe/task/events", events_payload.clone())
+            .await,
+    );
+    assert_eq!(
+        events,
+        success(peer.request("_kiteframe/task/events", events_payload).await)
+    );
+    let kinds = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].clone())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&json!("agent.started")));
+    assert!(kinds.contains(&json!("task.paused")));
+    assert!(kinds.contains(&json!("task.resumed")));
+    assert!(kinds.contains(&json!("task.cancelled")));
+
+    let mut changed_start_payload = start_payload;
+    changed_start_payload["expectedTaskRevision"] = json!(99);
+    let changed_replay = peer
+        .request("_kiteframe/agent/start", changed_start_payload)
+        .await;
+    let invalid_cursor = peer
+        .request(
+            "_kiteframe/task/events",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "after": -1, "limit": 1
+            }),
+        )
+        .await;
+    let zero_limit = peer
+        .request(
+            "_kiteframe/task/events",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "after": 0, "limit": 0
+            }),
+        )
+        .await;
+    let over_limit = peer
+        .request(
+            "_kiteframe/task/events",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "after": 0, "limit": 1001
+            }),
+        )
+        .await;
+    let unknown = peer
+        .request(
+            "_kiteframe/agent/get",
+            json!({
+                "sessionId": session["sessionId"], "taskId": accepted["id"],
+                "unknown": true
+            }),
+        )
+        .await;
+    for response in [&invalid_cursor, &zero_limit, &over_limit, &unknown] {
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(response["error"]["message"], "Invalid params");
+    }
+    assert_eq!(changed_replay["error"]["code"], -32000);
+    assert_eq!(
+        changed_replay["error"]["message"],
+        "application request failed"
+    );
+    let missing = peer
+        .request(
+            "_kiteframe/agent/get",
+            json!({"sessionId": session["sessionId"], "taskId": Uuid::now_v7()}),
+        )
+        .await;
+    assert_eq!(missing["error"]["code"], -32000);
+    assert_eq!(missing["error"]["message"], "application request failed");
+
+    let session_id =
+        SessionId::new(Uuid::parse_str(session["sessionId"].as_str().unwrap()).unwrap());
+    store
+        .close_session_and_cancel_work(session_id, expected_principal)
+        .await
+        .unwrap();
+    let closed = peer
+        .request(
+            "_kiteframe/agent/get",
+            json!({"sessionId": session["sessionId"], "taskId": accepted["id"]}),
+        )
+        .await;
+    assert_eq!(closed["error"]["code"], -32000);
+    assert_eq!(closed["error"]["message"], "application request failed");
+
+    json!({
+        "start": {
+            "lifecycle": started["lifecycle"],
+            "operationalStatus": started["operationalStatus"],
+            "goalPhase": started["goal"]["phase"],
+            "runtimeId": started["runtime"]["runtimeId"],
+            "runtimeHasPayload": started["runtime"].get("payload").is_some(),
+        },
+        "pause": {
+            "lifecycle": paused["lifecycle"],
+            "operationalStatus": paused["operationalStatus"],
+            "goalPhase": paused["goal"]["phase"],
+        },
+        "resume": {
+            "lifecycle": resumed["lifecycle"],
+            "operationalStatus": resumed["operationalStatus"],
+            "goalPhase": resumed["goal"]["phase"],
+        },
+        "cancel": {
+            "lifecycle": cancelled["lifecycle"],
+            "operationalStatus": cancelled["operationalStatus"],
+            "goalPhase": cancelled["goal"]["phase"],
+        },
+        "events": kinds,
+        "stale": stale["error"],
+        "staleGoal": stale_goal["error"],
+        "changedReplay": changed_replay["error"],
+        "invalidCursor": invalid_cursor["error"],
+        "zeroLimit": zero_limit["error"],
+        "overLimit": over_limit["error"],
+        "unknown": unknown["error"],
+        "missing": missing["error"],
+        "closed": closed["error"],
+    })
+}
+
+#[tokio::test]
+async fn private_agent_lifecycle_matches_across_acp_v1_v2_ndjson_and_websocket() {
+    let (application, store) = application().await;
+    let websocket_principal = principal("lifecycle-websocket");
+    let authenticator = Arc::new(
+        BearerAuthenticator::new([(
+            Secret::new("lifecycle-websocket-secret"),
+            websocket_principal.clone(),
+        )])
+        .unwrap(),
+    );
+    let remote = RemoteService::with_v2(
+        application.clone(),
+        authenticator,
+        store.clone(),
+        ready_model(),
+        true,
+    );
+    remote.mark_ready();
+    let server = TestServer::start(&remote).await;
+
+    let v1_principal = principal("lifecycle-v1");
+    let mut v1 = StdioPeer::new(application.clone(), store.clone(), v1_principal.clone());
+    let v1_result = exercise_agent_lifecycle(&mut v1, &store, 1, &v1_principal).await;
+    v1.close().await;
+
+    let v2_principal = principal("lifecycle-v2");
+    let mut v2 = StdioPeer::with_v2(
+        application.clone(),
+        store.clone(),
+        v2_principal.clone(),
+        true,
+    );
+    let v2_result = exercise_agent_lifecycle(&mut v2, &store, 2, &v2_principal).await;
+    v2.close().await;
+
+    let ndjson_principal = principal("lifecycle-ndjson");
+    let mut ndjson = NdjsonPeer::new(application.clone(), ndjson_principal.clone());
+    let ndjson_result = exercise_agent_lifecycle(&mut ndjson, &store, 1, &ndjson_principal).await;
+    ndjson.close().await;
+
+    let mut websocket = WebSocketPeer::connect(server.address, "lifecycle-websocket-secret").await;
+    let websocket_result =
+        exercise_agent_lifecycle(&mut websocket, &store, 1, &websocket_principal).await;
+    websocket.close().await;
+
+    assert_eq!(v2_result, v1_result);
+    assert_eq!(ndjson_result, v1_result);
+    assert_eq!(websocket_result, v1_result);
+
+    remote.begin_shutdown();
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn agent_publication_and_runtime_errors_match_across_all_adapters() {
     let (application, store) = application().await;
@@ -2659,6 +3010,112 @@ async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures
         )
         .await,
     );
+    let agent_name = format!("redaction_agent_{}", Uuid::now_v7().simple());
+    let agent_source = format!(
+        r#"agent {agent_name}(repository: string, pull_request: integer) -> string {{
+  entry inspect(repository = repository, pull_request = pull_request)
+  limits {{ steps: 2 active_execution_seconds: 10 elapsed_seconds: 20 }}
+  task inspect(repository: string, pull_request: integer) -> string {{
+    model reasoning
+    prompt """sentinel-agent-prompt"""
+    tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let published_agent = success(
+        peer.request(
+            "_kiteframe/definition/publish",
+            json!({"source": agent_source}),
+        )
+        .await,
+    );
+    let accepted_agent_task = success(
+        peer.request(
+            "_kiteframe/task/submit",
+            json!({
+                "sessionId": created["sessionId"],
+                "agent": {"name": agent_name, "version": published_agent["version"]},
+                "target": {
+                    "type": "github_pull_request",
+                    "repository": "sentinel-owner/sentinel-repository",
+                    "number": 142
+                },
+                "preferences": {"harnessRole": "reasoning"},
+                "goal": {
+                    "version": 1,
+                    "objective": "sentinel-agent-objective",
+                    "success": [{
+                        "id": "inspection_complete",
+                        "statement": "sentinel-criterion-statement",
+                        "evidence": "harness.invocation_result"
+                    }],
+                    "constraints": ["sentinel-agent-constraint"],
+                    "blockedWhen": ["sentinel-blocked-condition"]
+                },
+                "idempotencyKey": "sentinel-submit-key"
+            }),
+        )
+        .await,
+    );
+    success(
+        peer.request(
+            "_kiteframe/agent/start",
+            json!({
+                "sessionId": created["sessionId"],
+                "taskId": accepted_agent_task["id"],
+                "expectedTaskRevision": 0,
+                "expectedGoalRevision": 0,
+                "idempotencyKey": "sentinel-start-key"
+            }),
+        )
+        .await,
+    );
+    let stale_pause = peer
+        .request(
+            "_kiteframe/task/pause",
+            json!({
+                "sessionId": created["sessionId"],
+                "taskId": accepted_agent_task["id"],
+                "expectedTaskRevision": 0,
+                "expectedGoalRevision": 0,
+                "reason": "sentinel-stale-pause-reason",
+                "idempotencyKey": "sentinel-stale-pause-key"
+            }),
+        )
+        .await;
+    assert_eq!(
+        stale_pause["error"]["data"]["kiteframe_code"],
+        "revision_conflict"
+    );
+    success(
+        peer.request(
+            "_kiteframe/task/pause",
+            json!({
+                "sessionId": created["sessionId"],
+                "taskId": accepted_agent_task["id"],
+                "expectedTaskRevision": 1,
+                "expectedGoalRevision": 0,
+                "reason": "sentinel-pause-reason",
+                "idempotencyKey": "sentinel-pause-key"
+            }),
+        )
+        .await,
+    );
+    success(
+        peer.request(
+            "_kiteframe/task/cancel",
+            json!({
+                "sessionId": created["sessionId"],
+                "taskId": accepted_agent_task["id"],
+                "expectedTaskRevision": 2,
+                "expectedGoalRevision": 1,
+                "reason": "sentinel-cancel-reason",
+                "idempotencyKey": "sentinel-cancel-key"
+            }),
+        )
+        .await,
+    );
     peer.close().await;
 
     let mut draining_websocket =
@@ -2711,10 +3168,28 @@ async fn remote_surface_separates_auth_upgrade_protocol_and_application_failures
     assert!(logs.contains("ACP request handled"));
     assert!(logs.contains("_kiteframe/task/submit"));
     assert!(logs.contains("_kiteframe/task/get"));
+    assert!(logs.contains("_kiteframe/agent/start"));
+    assert!(logs.contains("_kiteframe/task/pause"));
+    assert!(logs.contains("_kiteframe/task/cancel"));
+    assert!(logs.contains("\"error_code\":\"revision_conflict\""));
+    assert!(logs.contains("\"task_revision\":1"));
+    assert!(logs.contains("\"task_revision\":2"));
     assert!(!logs.contains("sentinel-bearer-secret"));
     assert!(!logs.contains("sentinel-private-content"));
     for secret in [
         "Address actionable review feedback",
+        "sentinel-agent-prompt",
+        "sentinel-agent-objective",
+        "sentinel-criterion-statement",
+        "sentinel-agent-constraint",
+        "sentinel-blocked-condition",
+        "sentinel-owner/sentinel-repository",
+        "sentinel-stale-pause-reason",
+        "sentinel-stale-pause-key",
+        "sentinel-pause-reason",
+        "sentinel-pause-key",
+        "sentinel-cancel-reason",
+        "sentinel-cancel-key",
         "acme/payments",
         "Never merge the pull request",
         "submit-babysit-pr-142",
