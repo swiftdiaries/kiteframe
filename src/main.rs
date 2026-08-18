@@ -467,10 +467,12 @@ mod tests {
     use async_trait::async_trait;
     use kiteframe::dsl::{Limits, compile};
     use kiteframe::{
-        AgentSelector, CancelUserTask, ClaimAgentCommand, CreateSession, GoalContract,
-        IdempotencyKey, ModelError, ModelResponse, PrincipalId, StartAgent, SubmitUserTask,
-        SuccessCriterion, TaskPreferences, TaskTarget, ToolCatalogSnapshot,
+        AgentKernel, AgentSelector, CancelUserTask, ClaimAgentCommand, CreateSession, GoalContract,
+        IdempotencyKey, KiteAgentRuntime, ModelError, ModelResponse, PrincipalId, RuntimeCeilings,
+        SessionId, StartAgent, SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer,
+        TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
     };
+    use sqlx::postgres::PgPoolOptions;
     use time::{Duration as TimeDuration, OffsetDateTime};
     use tokio::sync::oneshot;
     use uuid::Uuid;
@@ -553,17 +555,42 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn scheduler_dispatches_recovered_builtin_claim_and_cancels_active_work_on_shutdown() {
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
-            return;
-        };
-        let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    async fn scheduler_agent_fingerprint(
+        store: &PostgresStore,
+        task_id: &UserTaskId,
+    ) -> serde_json::Value {
+        sqlx::query_scalar(
+            "SELECT jsonb_build_object( \
+                 'task', (SELECT to_jsonb(t) FROM user_tasks t WHERE t.id = $1), \
+                 'goal', (SELECT to_jsonb(g) FROM goal_states g WHERE g.task_id = $1), \
+                 'commands', (SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY c.id), '[]'::jsonb) \
+                     FROM agent_commands c WHERE c.task_id = $1), \
+                 'events', (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY e.sequence), '[]'::jsonb) \
+                     FROM agent_task_events e WHERE e.task_id = $1))",
+        )
+        .bind(task_id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .expect("fingerprint scheduler agent state")
+    }
+
+    struct AcceptedSchedulerAgent {
+        principal: PrincipalId,
+        session_id: SessionId,
+        task_id: UserTaskId,
+    }
+
+    async fn accept_scheduler_agent(
+        store: &PostgresStore,
+        objective: &str,
+        repository: &str,
+        number: u64,
+    ) -> AcceptedSchedulerAgent {
         let principal = PrincipalId::new(format!("scheduler-owner-{}", Uuid::now_v7())).unwrap();
         let session = store
             .create_session(CreateSession {
                 principal: principal.clone(),
-                working_directory: "/scheduler-active-work".to_owned(),
+                working_directory: format!("/scheduler-active-work/{number}"),
                 retention_until: OffsetDateTime::now_utc() + TimeDuration::days(1),
             })
             .await
@@ -598,21 +625,21 @@ mod tests {
                         version: Some(published.version),
                     },
                     target: TaskTarget::GithubPullRequest {
-                        repository: "acme/scheduler".to_owned(),
-                        number: 142,
+                        repository: repository.to_owned(),
+                        number,
                     },
                     preferences: TaskPreferences { harness_role: None },
                     goal: GoalContract {
                         version: 1,
-                        objective: "Prove recovered scheduler shutdown cancellation.".to_owned(),
+                        objective: objective.to_owned(),
                         success: vec![SuccessCriterion {
-                            id: "scheduler_cancelled".to_owned(),
-                            statement: "Active scheduler work was cancelled on shutdown."
+                            id: "scheduler_test".to_owned(),
+                            statement: "The scheduler test preserves its bounded invariant."
                                 .to_owned(),
                             evidence: "harness.invocation_result".to_owned(),
                         }],
                         constraints: vec!["Do not wait without a timeout.".to_owned()],
-                        blocked_when: vec!["The model gate is never entered.".to_owned()],
+                        blocked_when: vec!["The scheduler invariant cannot be proven.".to_owned()],
                     },
                     idempotency_key: IdempotencyKey::new(format!("submit-{}", Uuid::now_v7()))
                         .unwrap(),
@@ -620,6 +647,120 @@ mod tests {
             )
             .await
             .unwrap();
+        AcceptedSchedulerAgent {
+            principal,
+            session_id: session.id,
+            task_id: accepted.id,
+        }
+    }
+
+    async fn start_scheduler_agent(kernel: &AgentKernel, accepted: &AcceptedSchedulerAgent) {
+        kernel
+            .start_agent(
+                &accepted.principal,
+                StartAgent {
+                    session_id: accepted.session_id.clone(),
+                    task_id: accepted.task_id.clone(),
+                    expected_task_revision: 0,
+                    expected_goal_revision: 0,
+                    idempotency_key: IdempotencyKey::new(format!("start-{}", Uuid::now_v7()))
+                        .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    struct IsolatedSchedulerDatabase {
+        name: String,
+        admin_url: String,
+        url: String,
+    }
+
+    impl IsolatedSchedulerDatabase {
+        async fn create(base_url: &str) -> Self {
+            let mut admin = url::Url::parse(base_url).expect("database URL");
+            admin.set_path("/postgres");
+            let name = format!("kiteframe_scheduler_{}", Uuid::now_v7().simple());
+            let admin_url = admin.to_string();
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&admin_url)
+                .await
+                .expect("connect database administrator");
+            sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+                .execute(&pool)
+                .await
+                .expect("create isolated scheduler database");
+            pool.close().await;
+            let mut database = admin;
+            database.set_path(&format!("/{name}"));
+            Self {
+                name,
+                admin_url,
+                url: database.to_string(),
+            }
+        }
+
+        async fn drop(self) {
+            let pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&self.admin_url)
+                .await
+                .expect("connect database administrator for scheduler cleanup");
+            sqlx::query(&format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name))
+                .execute(&pool)
+                .await
+                .expect("drop isolated scheduler database");
+            pool.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_dispatches_recovered_claim_cancels_active_work_and_preserves_unrelated_work()
+    {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let unrelated_store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+        let unrelated = accept_scheduler_agent(
+            &unrelated_store,
+            "Preserve unrelated scheduler work.",
+            "acme/unrelated",
+            141,
+        )
+        .await;
+        let unrelated_kernel = Arc::new(AgentKernel::new(
+            unrelated_store.clone(),
+            Arc::new(KiteAgentRuntime::new(RuntimeCeilings::default())),
+            Arc::new(TaskOwnerAuthorizer::new(unrelated_store.clone())),
+        ));
+        start_scheduler_agent(&unrelated_kernel, &unrelated).await;
+        assert!(
+            unrelated_store
+                .dispatchable_agent_commands(256)
+                .await
+                .unwrap()
+                .into_iter()
+                .any(|command| command.task_id == unrelated.task_id),
+            "unrelated command must be globally dispatchable before the scheduler runs"
+        );
+        let unrelated_before =
+            scheduler_agent_fingerprint(&unrelated_store, &unrelated.task_id).await;
+
+        let isolated_database = IsolatedSchedulerDatabase::create(&database_url).await;
+        let store = Arc::new(
+            PostgresStore::connect(&isolated_database.url)
+                .await
+                .unwrap(),
+        );
+        let accepted = accept_scheduler_agent(
+            &store,
+            "Prove recovered scheduler shutdown cancellation.",
+            "acme/scheduler",
+            142,
+        )
+        .await;
         let (entered_tx, entered_rx) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let gated = Arc::new(ActiveWorkModel {
@@ -636,31 +777,18 @@ mod tests {
         });
         let application = Application::new(store.clone(), engine.clone());
         let kernel = application.agent_kernel();
-        kernel
-            .start_agent(
-                &principal,
-                StartAgent {
-                    session_id: session.id.clone(),
-                    task_id: accepted.id.clone(),
-                    expected_task_revision: 0,
-                    expected_goal_revision: 0,
-                    idempotency_key: IdempotencyKey::new(format!("start-{}", Uuid::now_v7()))
-                        .unwrap(),
-                },
-            )
-            .await
-            .unwrap();
+        start_scheduler_agent(&kernel, &accepted).await;
         let pending = store
             .dispatchable_agent_commands(engine.config.scheduler_batch_size)
             .await
             .unwrap()
             .into_iter()
-            .find(|command| command.task_id == accepted.id)
+            .find(|command| command.task_id == accepted.task_id)
             .expect("target command is dispatchable");
         let claimed = store
             .claim_agent_command(ClaimAgentCommand {
-                session_id: session.id.clone(),
-                task_id: accepted.id.clone(),
+                session_id: accepted.session_id.clone(),
+                task_id: accepted.task_id.clone(),
                 command_id: pending.id.clone(),
                 expected_command_revision: pending.revision,
                 claimant: "builtin-direct-v1".to_owned(),
@@ -708,12 +836,35 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(after, persisted);
+        assert_eq!(
+            scheduler_agent_fingerprint(&unrelated_store, &unrelated.task_id).await,
+            unrelated_before,
+            "the scheduler test must not mutate unrelated eligible agent work"
+        );
+        unrelated_kernel
+            .cancel_task(
+                &unrelated.principal,
+                CancelUserTask {
+                    session_id: unrelated.session_id,
+                    task_id: unrelated.task_id,
+                    expected_task_revision: 1,
+                    expected_goal_revision: 0,
+                    reason: Some("Unrelated scheduler test cleanup.".to_owned()),
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "cleanup-unrelated-{}",
+                        Uuid::now_v7()
+                    ))
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
         kernel
             .cancel_task(
-                &principal,
+                &accepted.principal,
                 CancelUserTask {
-                    session_id: session.id,
-                    task_id: accepted.id,
+                    session_id: accepted.session_id,
+                    task_id: accepted.task_id,
                     expected_task_revision: 1,
                     expected_goal_revision: 0,
                     reason: Some("Scheduler test cleanup.".to_owned()),
@@ -723,5 +874,7 @@ mod tests {
             )
             .await
             .unwrap();
+        store.pool().close().await;
+        isolated_database.drop().await;
     }
 }
