@@ -203,7 +203,7 @@ pub fn validate_transition(
                 ));
             }
         }
-        RuntimeDisposition::Terminating => {
+        RuntimeDisposition::Terminating
             if !matches!(
                 transition.commands.as_slice(),
                 [KernelCommand {
@@ -211,11 +211,11 @@ pub fn validate_transition(
                         | KernelCommandPayload::FailTask(_),
                     ..
                 }]
-            ) {
-                return Err(AgentRuntimeError::InvalidTransition(
-                    "terminating snapshot requires one authority command".into(),
-                ));
-            }
+            ) =>
+        {
+            return Err(AgentRuntimeError::InvalidTransition(
+                "terminating snapshot requires one authority command".into(),
+            ));
         }
         _ => {}
     }

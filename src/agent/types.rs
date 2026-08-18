@@ -231,6 +231,10 @@ pub struct FailTask {
     content = "payload",
     deny_unknown_fields
 )]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "InvokeHarness is intentionally unboxed to preserve the frozen public and wire contract"
+)]
 pub enum KernelCommandPayload {
     RequestContext(RequestContext),
     WaitForEvent(WaitForEvent),
