@@ -166,9 +166,25 @@ impl<'a> Compiler<'a> {
             return Err(self.diagnostics);
         }
 
+        let events = self
+            .view
+            .events
+            .iter()
+            .map(|event| (*event).to_owned())
+            .collect::<Vec<_>>();
         let tool_bindings = self.all_tool_bindings.into_values().collect::<Vec<_>>();
-        let definition_hash = definition_hash(self.source, self.view.dsl_version, &tool_bindings)
-            .map_err(|error| vec![Diagnostic::new(error, self.ast.span)])?;
+        let definition_hash = match self.view.kind {
+            DefinitionKind::Workflow => {
+                workflow_definition_hash(self.source, self.view.dsl_version, &tool_bindings)
+            }
+            DefinitionKind::Agent => agent_definition_hash(
+                self.source,
+                self.view.dsl_version,
+                &agent_hash_metadata(&events, &entry, &tasks),
+                &tool_bindings,
+            ),
+        }
+        .map_err(|error| vec![Diagnostic::new(error, self.ast.span)])?;
         Ok(CompiledDefinition {
             dsl_version: self.view.dsl_version,
             definition_kind: self.view.kind,
@@ -179,12 +195,7 @@ impl<'a> Compiler<'a> {
             result,
             entry,
             limits: self.view.limits.clone(),
-            events: self
-                .view
-                .events
-                .iter()
-                .map(|event| (*event).to_owned())
-                .collect(),
+            events,
             records: self.records,
             tasks,
             tool_bindings,
@@ -299,7 +310,8 @@ impl<'a> Compiler<'a> {
                 .iter()
                 .filter(|(qualified, _)| {
                     *qualified == declared
-                        || qualified.replace('/', "_") == *declared
+                        || (self.view.kind == DefinitionKind::Agent
+                            && qualified.replace('/', "_") == *declared)
                         || qualified
                             .rsplit_once('/')
                             .is_some_and(|(_, short)| short == declared)
@@ -739,7 +751,7 @@ fn compile_context(context: ContextModeAst) -> ContextMode {
     }
 }
 
-fn definition_hash(
+fn workflow_definition_hash(
     source: &str,
     dsl_version: u8,
     tool_bindings: &[CompiledToolBinding],
@@ -763,6 +775,97 @@ fn definition_hash(
     canonical_sha256(&Identity {
         dsl_version,
         source,
+        descriptors,
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Default)]
+struct AgentHashMetadata {
+    events: Vec<String>,
+    model_roles: BTreeMap<String, ModelRole>,
+    contexts: BTreeMap<String, ContextMode>,
+}
+
+fn agent_hash_metadata(
+    events: &[String],
+    entry: &CompiledCall,
+    tasks: &BTreeMap<String, CompiledTask>,
+) -> AgentHashMetadata {
+    let mut metadata = AgentHashMetadata {
+        events: events.to_vec(),
+        ..AgentHashMetadata::default()
+    };
+    metadata.contexts.insert("entry".to_owned(), entry.context);
+    for (task_name, task) in tasks {
+        if let Some(role) = task.model_role {
+            metadata.model_roles.insert(task_name.clone(), role);
+        }
+        for (outcome_name, outcome) in &task.outcomes {
+            for (statement_index, statement) in outcome.statements.iter().enumerate() {
+                let prefix = format!("{task_name}.{outcome_name}.{statement_index}");
+                match statement {
+                    CompiledStatement::Call { call, .. } => {
+                        metadata
+                            .contexts
+                            .insert(format!("{prefix}.call"), call.context);
+                    }
+                    CompiledStatement::Parallel { calls } => {
+                        for (branch_index, binding) in calls.iter().enumerate() {
+                            metadata.contexts.insert(
+                                format!("{prefix}.parallel.{branch_index}"),
+                                binding.call.context,
+                            );
+                        }
+                    }
+                    CompiledStatement::Goto { call } => {
+                        metadata
+                            .contexts
+                            .insert(format!("{prefix}.goto"), call.context);
+                    }
+                    CompiledStatement::Ask { .. }
+                    | CompiledStatement::Done { .. }
+                    | CompiledStatement::Fail { .. } => {}
+                }
+            }
+        }
+    }
+    metadata
+}
+
+fn agent_definition_hash(
+    source: &str,
+    dsl_version: u8,
+    metadata: &AgentHashMetadata,
+    tool_bindings: &[CompiledToolBinding],
+) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct Identity<'a> {
+        dsl_version: u8,
+        definition_kind: DefinitionKind,
+        source: &'a str,
+        events: &'a [String],
+        model_roles: &'a BTreeMap<String, ModelRole>,
+        contexts: &'a BTreeMap<String, ContextMode>,
+        descriptors: BTreeMap<&'a str, serde_json::Value>,
+    }
+
+    let descriptors = tool_bindings
+        .iter()
+        .map(|binding| {
+            (
+                binding.qualified_name.as_str(),
+                binding.descriptor.normalized_descriptor(),
+            )
+        })
+        .collect();
+    canonical_sha256(&Identity {
+        dsl_version,
+        definition_kind: DefinitionKind::Agent,
+        source,
+        events: &metadata.events,
+        model_roles: &metadata.model_roles,
+        contexts: &metadata.contexts,
         descriptors,
     })
     .map_err(|error| error.to_string())

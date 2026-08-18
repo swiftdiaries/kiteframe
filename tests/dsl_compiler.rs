@@ -138,6 +138,20 @@ task t() -> string { prompt """x""" tools [search] on ok() { done "x" } }
 }
 
 #[test]
+fn workflow_short_tool_name_wins_over_agent_identifier_safe_collision() {
+    let source = r#"
+workflow w() -> string { start t() }
+task t() -> string { prompt """x""" tools [x_y] on ok() { done "x" } }
+"#;
+
+    let compiled = compile(source, &catalog([tool("a/x_y"), tool("x/y")]), &ceilings())
+        .expect("legacy short-name matching ignores agent qualified aliases");
+
+    assert_eq!(compiled.tasks["t"].tools.len(), 1);
+    assert_eq!(compiled.tasks["t"].tools[0].qualified_name, "a/x_y");
+}
+
+#[test]
 fn rejects_invalid_completion_unbound_values_and_type_mismatches() {
     let source = r#"
 workflow w() -> string { start t() }

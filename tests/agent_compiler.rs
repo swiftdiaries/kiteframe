@@ -6,6 +6,7 @@ use kiteframe::dsl::{
 };
 use kiteframe::{
     CatalogTool, ClosedSchema, EffectKind, RecoverySupport, SessionId, ToolCatalogSnapshot,
+    canonical_sha256,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -122,6 +123,64 @@ fn compiles_agent_metadata_and_reuses_graph_safety_checks() {
         serde_json::from_str(include_str!("fixtures/dsl/agent_babysit_pr.compiled.json"))
             .expect("agent golden is valid JSON");
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn agent_identity_binds_normalized_kind_events_roles_and_contexts() {
+    let descriptor = tool("github/context");
+    let compiled = compile_report(BABYSIT, &catalog([descriptor.clone()]), &ceilings())
+        .expect("reviewed agent compiles")
+        .definition;
+    let identity = json!({
+        "dsl_version": 2,
+        "definition_kind": "agent",
+        "source": BABYSIT,
+        "events": [
+            "github.pull_request.changed.v1",
+            "github.review.submitted.v1",
+            "github.required_checks.changed.v1"
+        ],
+        "model_roles": {
+            "inspect_branch": "reasoning",
+            "inspect_pr": "reasoning",
+            "repair_reviews": "coding"
+        },
+        "contexts": {
+            "entry": "isolated",
+            "inspect_pr.compare.0.parallel.0": "isolated",
+            "inspect_pr.compare.0.parallel.1": "isolated",
+            "inspect_pr.refresh.0.goto": "isolated",
+            "inspect_pr.repair.0.call": "kept"
+        },
+        "descriptors": {
+            "github/context": descriptor.normalized_descriptor()
+        }
+    });
+    assert_eq!(
+        compiled.definition_hash,
+        canonical_sha256(&identity).expect("identity is canonical JSON")
+    );
+
+    let mut changed_kind = identity.clone();
+    changed_kind["definition_kind"] = json!("workflow");
+    let mut changed_events = identity.clone();
+    changed_events["events"][0] = json!("github.pull_request.closed.v1");
+    let mut changed_roles = identity.clone();
+    changed_roles["model_roles"]["repair_reviews"] = json!("reasoning");
+    let mut changed_contexts = identity;
+    changed_contexts["contexts"]["inspect_pr.repair.0.call"] = json!("isolated");
+
+    for changed in [
+        changed_kind,
+        changed_events,
+        changed_roles,
+        changed_contexts,
+    ] {
+        assert_ne!(
+            compiled.definition_hash,
+            canonical_sha256(&changed).expect("changed identity is canonical JSON")
+        );
+    }
 }
 
 #[test]
