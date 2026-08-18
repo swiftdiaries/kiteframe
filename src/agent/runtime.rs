@@ -179,6 +179,11 @@ pub fn validate_transition(
         }
     }
 
+    // `commands` is the delta of newly proposed work, not the complete set of
+    // persisted outstanding commands. In particular, consuming one structured
+    // fork result can remain Running with no new commands while another sibling
+    // command remains pending or claimed. Persistence validates that
+    // correspondence atomically before accepting the transition.
     match transition.snapshot.disposition {
         RuntimeDisposition::Returned if !transition.commands.is_empty() => {
             return Err(AgentRuntimeError::InvalidTransition(

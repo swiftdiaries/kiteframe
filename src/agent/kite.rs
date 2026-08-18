@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::dsl::{
-    CompiledCall, CompiledDefinition, CompiledStatement, CompiledToolBinding, CompiledType,
-    CompiledValue, CompletionContract, ContextMode, DefinitionKind,
+    CompiledCall, CompiledDefinition, CompiledStatement, CompiledTask, CompiledToolBinding,
+    CompiledType, CompiledValue, CompletionContract, ContextMode, DefinitionKind,
 };
 use crate::{
     AcceptedUserTask, ClosedSchema, CriterionAssertion, EvidenceId, GoalContract, PrimitiveValue,
@@ -101,7 +101,6 @@ impl KiteAgentRuntime {
             || state.next_frame_id == 0
             || state.frames.len() > self.ceilings.max_frames
             || !state.frames.contains_key(&state.root_frame_id)
-            || state.next_frame_id as usize > self.ceilings.max_frames
             || state.frames.iter().any(|(id, frame)| {
                 id != &frame.id
                     || id.0 >= state.next_frame_id
@@ -169,11 +168,6 @@ impl AgentRuntime for KiteAgentRuntime {
                 "built-in runtime requires a version-2 agent".into(),
             ));
         }
-        if definition.tasks.len() > self.ceilings.max_frames {
-            return Err(AgentRuntimeError::InvalidDefinition(
-                "agent task count exceeds the frame ceiling".into(),
-            ));
-        }
         if definition.entry.context == ContextMode::Legacy
             || !definition.tasks.contains_key(&definition.entry.task)
         {
@@ -181,6 +175,7 @@ impl AgentRuntime for KiteAgentRuntime {
                 "agent entry is invalid".into(),
             ));
         }
+        validate_tools(&definition.tool_bindings)?;
         for task in definition.tasks.values() {
             if task.model_role.is_none() {
                 return Err(AgentRuntimeError::InvalidDefinition(
@@ -193,14 +188,24 @@ impl AgentRuntime for KiteAgentRuntime {
             completion_result_schema(&task.completion, definition)?
                 .validate_definition()
                 .map_err(|error| AgentRuntimeError::InvalidDefinition(error.to_string()))?;
+            validate_completion_contract(task)?;
             validate_tools(&task.tools)?;
+            if task.tools.iter().any(|task_tool| {
+                !definition
+                    .tool_bindings
+                    .iter()
+                    .any(|frozen| same_tool_binding(task_tool, frozen))
+            }) {
+                return Err(AgentRuntimeError::InvalidDefinition(
+                    "task tool does not match a frozen definition binding".into(),
+                ));
+            }
             for outcome in task.outcomes.values() {
                 for statement in &outcome.statements {
                     validate_statement_context(statement)?;
                 }
             }
         }
-        validate_tools(&definition.tool_bindings)?;
         Ok(())
     }
 
@@ -276,6 +281,7 @@ impl AgentRuntime for KiteAgentRuntime {
                 "runtime definition hash does not match".into(),
             ));
         }
+        validate_waiting_command_keys(&state, input.execution.task_revision)?;
         let revisions = RuntimeRevisions {
             task: input.execution.task_revision,
             goal: input.execution.goal_revision,
@@ -348,6 +354,53 @@ enum WaitingKind {
     Harness,
     Approval,
     Any,
+}
+
+fn validate_waiting_command_keys(
+    state: &KiteRuntimeState,
+    current_task_revision: u64,
+) -> Result<(), AgentRuntimeError> {
+    for frame in state.frames.values() {
+        let waiting = match &frame.state {
+            KiteFrameState::WaitingForHarness { command_key } => Some((command_key, "harness")),
+            KiteFrameState::WaitingForApproval { command_key, .. } => {
+                Some((command_key, "approval"))
+            }
+            _ => None,
+        };
+        let Some((command_key, expected_kind)) = waiting else {
+            continue;
+        };
+        let Some((revision, suffix)) = command_key.as_str().strip_prefix('r').and_then(|value| {
+            value.split_once("-f").and_then(|(revision, suffix)| {
+                revision.parse::<u64>().ok().map(|value| (value, suffix))
+            })
+        }) else {
+            return Err(AgentRuntimeError::InvalidState(
+                "waiting command key is not canonical".into(),
+            ));
+        };
+        let Some((encoded_frame, encoded_kind)) = suffix.split_once('-') else {
+            return Err(AgentRuntimeError::InvalidState(
+                "waiting command key is not canonical".into(),
+            ));
+        };
+        let encoded_frame = encoded_frame.parse::<u32>().map_err(|_| {
+            AgentRuntimeError::InvalidState("waiting command key is not canonical".into())
+        })?;
+        let canonical = format!("r{revision}-f{encoded_frame}-{encoded_kind}");
+        if command_key.as_str() != canonical
+            || revision == 0
+            || revision > current_task_revision
+            || encoded_frame != frame.id.0
+            || encoded_kind != expected_kind
+        {
+            return Err(AgentRuntimeError::InvalidState(
+                "waiting command key does not match its frame or task revision".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn find_waiting_frame(
@@ -794,9 +847,7 @@ fn create_child(
     definition: &CompiledDefinition,
     ceilings: &RuntimeCeilings,
 ) -> Result<KiteFrameSnapshot, AgentRuntimeError> {
-    if state.frames.len() >= ceilings.max_frames
-        || state.next_frame_id as usize >= ceilings.max_frames
-    {
+    if state.frames.len() >= ceilings.max_frames {
         return Err(AgentRuntimeError::CeilingExceeded("frames"));
     }
     let parent = state
@@ -1114,6 +1165,42 @@ fn completion_result_schema(
     Ok(ClosedSchema::object("complete_task_result", fields))
 }
 
+fn validate_completion_contract(task: &CompiledTask) -> Result<(), AgentRuntimeError> {
+    if task.completion.outcomes.len() != task.outcomes.len()
+        || task
+            .outcomes
+            .iter()
+            .any(|(name, outcome)| task.completion.outcomes.get(name) != Some(&outcome.fields))
+    {
+        return Err(AgentRuntimeError::InvalidDefinition(
+            "completion contract does not match executable outcomes".into(),
+        ));
+    }
+
+    let mut expected_union = BTreeMap::new();
+    for outcome in task.outcomes.values() {
+        for (name, value) in &outcome.fields {
+            let nullable = match value {
+                CompiledType::Optional(_) => value.clone(),
+                _ => CompiledType::Optional(Box::new(value.clone())),
+            };
+            if let Some(existing) = expected_union.insert(name.clone(), nullable.clone())
+                && existing != nullable
+            {
+                return Err(AgentRuntimeError::InvalidDefinition(
+                    "outcome field union has incompatible types".into(),
+                ));
+            }
+        }
+    }
+    if task.completion.required_nullable_fields != expected_union {
+        return Err(AgentRuntimeError::InvalidDefinition(
+            "completion contract nullable field union does not match outcomes".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_tools(bindings: &[CompiledToolBinding]) -> Result<(), AgentRuntimeError> {
     for binding in bindings {
         binding
@@ -1129,6 +1216,13 @@ fn validate_tools(bindings: &[CompiledToolBinding]) -> Result<(), AgentRuntimeEr
         }
     }
     Ok(())
+}
+
+fn same_tool_binding(left: &CompiledToolBinding, right: &CompiledToolBinding) -> bool {
+    left.qualified_name == right.qualified_name
+        && left.catalog_epoch_id == right.catalog_epoch_id
+        && left.descriptor_digest == right.descriptor_digest
+        && left.descriptor.normalized_descriptor() == right.descriptor.normalized_descriptor()
 }
 
 fn validate_statement_context(statement: &CompiledStatement) -> Result<(), AgentRuntimeError> {

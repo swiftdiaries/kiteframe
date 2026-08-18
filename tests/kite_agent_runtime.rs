@@ -1,12 +1,17 @@
-use kiteframe::dsl::{CompiledDefinition, ContextMode, DefinitionKind, Limits, ModelRole, compile};
+use std::collections::BTreeSet;
+
+use kiteframe::dsl::{
+    CompiledDefinition, CompiledType, ContextMode, DefinitionKind, Limits, ModelRole, compile,
+};
 use kiteframe::{
     AcceptedUserTask, AgentExecutionView, AgentRuntime, AgentRuntimeError, AgentSelector,
-    EvidenceId, GoalContract, GoalPhase, IdempotencyKey, InvokeHarness, KernelCommand,
-    KernelCommandPayload, KiteAgentRuntime, KiteFrameId, KiteFrameState, OperationalStatus,
-    PrincipalId, PublishedDefinition, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition,
-    RuntimeEvent, RuntimeHandle, RuntimeHistoryItem, RuntimeHistoryKind, RuntimeStart,
-    RuntimeStateSnapshot, SessionId, SubmitUserTask, SuccessCriterion, TaskLifecycle,
-    TaskPreferences, TaskTarget, UserTaskId, validate_transition,
+    CatalogTool, ClosedSchema, EffectKind, EvidenceId, GoalContract, GoalPhase, IdempotencyKey,
+    InvokeHarness, KernelCommand, KernelCommandPayload, KiteAgentRuntime, KiteFrameId,
+    KiteFrameState, OperationalStatus, PrincipalId, PublishedDefinition, RecoverySupport,
+    RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeHandle,
+    RuntimeHistoryItem, RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot, SessionId,
+    SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskPreferences, TaskTarget,
+    ToolCatalogSnapshot, UserTaskId, validate_transition,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -43,17 +48,18 @@ impl RuntimeFixture {
     }
 
     fn from_source(source: &str, ceilings: RuntimeCeilings) -> Self {
-        let definition = compile(
-            source,
-            &kiteframe::ToolCatalogSnapshot::new(
-                SessionId::new(Uuid::from_u128(10)),
-                Uuid::from_u128(11),
-                [],
-            )
-            .unwrap(),
-            &Limits::default(),
-        )
-        .unwrap();
+        let catalog =
+            ToolCatalogSnapshot::new(SessionId::new(Uuid::from_u128(10)), Uuid::from_u128(11), [])
+                .unwrap();
+        Self::from_source_and_catalog(source, ceilings, &catalog)
+    }
+
+    fn from_source_and_catalog(
+        source: &str,
+        ceilings: RuntimeCeilings,
+        catalog: &ToolCatalogSnapshot,
+    ) -> Self {
+        let definition = compile(source, catalog, &Limits::default()).unwrap();
         let submission = SubmitUserTask {
             session_id: SessionId::new(Uuid::from_u128(10)),
             agent: AgentSelector {
@@ -111,6 +117,38 @@ impl RuntimeFixture {
             execution,
             definition,
         }
+    }
+
+    fn with_tool() -> Self {
+        let tool = CatalogTool::new(
+            "docs/search",
+            "docs",
+            "Search documents.",
+            ClosedSchema::object("input", Default::default()),
+            ClosedSchema::object("output", Default::default()),
+            BTreeSet::new(),
+            EffectKind::ReadOnly,
+            RecoverySupport::NotRequired,
+        )
+        .unwrap();
+        let catalog = ToolCatalogSnapshot::new(
+            SessionId::new(Uuid::from_u128(10)),
+            Uuid::from_u128(11),
+            [tool],
+        )
+        .unwrap();
+        Self::from_source_and_catalog(
+            r#"agent tool_agent(repository: string, pull_request: integer) -> string {
+  entry inspect(repository = repository, pull_request = pull_request)
+  limits { steps: 20 model_turns_per_task: 5 tool_calls_per_response: 2 parallel_branches: 2 response_item_bytes: 4096 active_execution_seconds: 30 elapsed_seconds: 60 }
+  task inspect(repository: string, pull_request: integer) -> string {
+    model reasoning prompt """Inspect.""" tools [search]
+    on ok(answer: string) { done answer }
+  }
+}"#,
+            RuntimeCeilings::default(),
+            &catalog,
+        )
     }
 
     fn history_graph() -> Self {
@@ -395,6 +433,134 @@ fn call_returns_into_the_parent_and_removes_the_joined_child() {
 }
 
 #[test]
+fn sequential_child_allocations_can_exceed_255_with_two_live_frames() {
+    let mut calls = String::new();
+    for index in 0..260 {
+        let task = if index % 2 == 0 {
+            "even_child"
+        } else {
+            "odd_child"
+        };
+        calls.push_str(&format!(
+            "      result_{index} = call {task}(value = \"value-{index}\") context isolated\n"
+        ));
+    }
+    let source = format!(
+        r#"agent allocation_agent(repository: string, pull_request: integer) -> string {{
+  entry root(repository = repository, pull_request = pull_request)
+  limits {{ steps: 1000 model_turns_per_task: 10 tool_calls_per_response: 4 parallel_branches: 2 response_item_bytes: 16384 active_execution_seconds: 60 elapsed_seconds: 600 }}
+  task root(repository: string, pull_request: integer) -> string {{
+    model reasoning prompt """Allocate sequential children.""" tools []
+    on run() {{
+{calls}      done result_259
+    }}
+  }}
+  task even_child(value: string) -> string {{
+    model reasoning prompt """Return even value.""" tools []
+    on ok(result: string) {{ done result }}
+  }}
+  task odd_child(value: string) -> string {{
+    model reasoning prompt """Return odd value.""" tools []
+    on ok(result: string) {{ done result }}
+  }}
+}}"#
+    );
+    let ceilings = RuntimeCeilings {
+        max_frames: 2,
+        ..RuntimeCeilings::default()
+    };
+    let fixture = RuntimeFixture::from_source(&source, ceilings);
+    let start = fixture.runtime.start(fixture.start_input()).unwrap();
+    let mut transition = fixture
+        .handle_harness_at(
+            start.snapshot,
+            &start.commands[0],
+            "run",
+            json!({}),
+            1,
+            "evt-root-allocation",
+            Uuid::from_u128(1000),
+            Vec::new(),
+        )
+        .unwrap();
+
+    for index in 0..260 {
+        let [command] = transition.commands.as_slice() else {
+            panic!("allocation {index} should propose one child command")
+        };
+        transition = fixture
+            .handle_harness_at(
+                transition.snapshot.clone(),
+                command,
+                "ok",
+                json!({"result": format!("result-{index}")}),
+                index + 2,
+                &format!("evt-child-allocation-{index}"),
+                Uuid::from_u128(1001 + index as u128),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        transition.snapshot.disposition,
+        RuntimeDisposition::Returned
+    );
+    let state = fixture.decode(&transition.snapshot);
+    assert_eq!(state.frames.len(), 1);
+    assert_eq!(state.next_frame_id, 261);
+    assert_eq!(
+        state.frames[&KiteFrameId::new(0)].state,
+        KiteFrameState::Returned {
+            result: json!("result-259")
+        }
+    );
+}
+
+#[test]
+fn max_frames_rejects_a_parallel_live_frame_overflow() {
+    let ceilings = RuntimeCeilings {
+        max_frames: 2,
+        ..RuntimeCeilings::default()
+    };
+    let fixture = RuntimeFixture::from_source(
+        r#"agent parallel_agent(repository: string, pull_request: integer) -> string {
+  entry root(repository = repository, pull_request = pull_request)
+  limits { steps: 20 model_turns_per_task: 5 tool_calls_per_response: 2 parallel_branches: 2 response_item_bytes: 4096 active_execution_seconds: 30 elapsed_seconds: 60 }
+  task root(repository: string, pull_request: integer) -> string {
+    model reasoning prompt """Split.""" tools []
+    on split(left: string, right: string) {
+      fork {
+        first = call branch(value = left) context isolated
+        second = call branch(value = right) context isolated
+      } join
+      done first
+    }
+  }
+  task branch(value: string) -> string {
+    model reasoning prompt """Return.""" tools []
+    on ok(result: string) { done result }
+  }
+}"#,
+        ceilings,
+    );
+    let start = fixture.runtime.start(fixture.start_input()).unwrap();
+    let error = fixture
+        .handle_harness_at(
+            start.snapshot,
+            &start.commands[0],
+            "split",
+            json!({"left":"left", "right":"right"}),
+            1,
+            "evt-live-frame-overflow",
+            Uuid::from_u128(1261),
+            Vec::new(),
+        )
+        .unwrap_err();
+    assert_eq!(error, AgentRuntimeError::CeilingExceeded("frames"));
+}
+
+#[test]
 fn isolated_kept_and_fork_histories_have_exact_boundaries() {
     let fixture = RuntimeFixture::history_graph();
     let start = fixture.runtime.start(fixture.start_input()).unwrap();
@@ -416,11 +582,13 @@ fn isolated_kept_and_fork_histories_have_exact_boundaries() {
     assert_eq!(invocations[1].projected_history, fixture.root_history());
     assert_eq!(after_root.commands[0].key.as_str(), "r2-f1-harness");
     assert_eq!(after_root.commands[1].key.as_str(), "r2-f2-harness");
+    let left_command = after_root.commands[0].clone();
+    let right_command = after_root.commands[1].clone();
 
     let after_left = fixture
         .handle_harness_at(
             after_root.snapshot,
-            &after_root.commands[0],
+            &left_command,
             "ok",
             json!({"result":"left return"}),
             2,
@@ -429,8 +597,30 @@ fn isolated_kept_and_fork_histories_have_exact_boundaries() {
             history(1, "left result"),
         )
         .unwrap();
+    // Commands are newly proposed work only. The right sibling's r2 command is
+    // still persisted and outstanding, so consuming the left result at r2 may
+    // validly produce a Running snapshot with no new command at r3.
     assert!(after_left.commands.is_empty());
-    let right_state = fixture.decode(&after_left.snapshot).frames[&KiteFrameId::new(2)].clone();
+    let partial_state = fixture.decode(&after_left.snapshot);
+    assert_eq!(
+        partial_state.frames[&KiteFrameId::new(0)].state,
+        KiteFrameState::WaitingForChildren {
+            child_ids: vec![KiteFrameId::new(1), KiteFrameId::new(2)]
+        }
+    );
+    assert_eq!(
+        partial_state.frames[&KiteFrameId::new(1)].state,
+        KiteFrameState::Returned {
+            result: json!("left return")
+        }
+    );
+    assert_eq!(
+        partial_state.frames[&KiteFrameId::new(2)].state,
+        KiteFrameState::WaitingForHarness {
+            command_key: right_command.key.clone()
+        }
+    );
+    let right_state = partial_state.frames[&KiteFrameId::new(2)].clone();
     assert_eq!(right_state.history, fixture.root_history());
     assert!(
         !right_state
@@ -447,6 +637,24 @@ fn isolated_kept_and_fork_histories_have_exact_boundaries() {
         validate_transition(&after_left, &execution, &RuntimeCeilings::default()),
         Ok(())
     );
+
+    let after_right = fixture
+        .handle_harness_at(
+            after_left.snapshot,
+            &right_command,
+            "ok",
+            json!({"result":"right return"}),
+            3,
+            "evt-right",
+            Uuid::from_u128(25),
+            history(2, "right result"),
+        )
+        .unwrap();
+    assert_eq!(
+        after_right.snapshot.disposition,
+        RuntimeDisposition::Returned
+    );
+    assert!(after_right.commands.is_empty());
 }
 
 #[test]
@@ -799,6 +1007,84 @@ fn command_failed_for_a_matching_wait_emits_exactly_one_fail_task() {
 }
 
 #[test]
+fn hostile_harness_wait_keys_must_match_frame_kind_and_current_revision() {
+    let fixture = RuntimeFixture::simple("on ok(answer: string) { done answer }");
+    let start = fixture.runtime.start(fixture.start_input()).unwrap();
+
+    for invalid_key in ["r999-f0-harness", "r1-f42-harness", "r1-f0-approval"] {
+        let mut payload = start.snapshot.payload.clone();
+        payload["frames"]["0"]["state"]["command_key"] = json!(invalid_key);
+        let hostile = RuntimeStateSnapshot::new(
+            RuntimeDisposition::Running,
+            payload,
+            &RuntimeCeilings::default(),
+        )
+        .unwrap();
+        let matching_event_command = KernelCommand {
+            schema_version: 1,
+            key: RuntimeCommandKey::new(invalid_key).unwrap(),
+            payload: start.commands[0].payload.clone(),
+        };
+
+        assert!(matches!(
+            fixture.handle_harness_at(
+                hostile,
+                &matching_event_command,
+                "ok",
+                json!({"answer":"forged"}),
+                1,
+                "evt-hostile-harness-wait",
+                Uuid::from_u128(42),
+                history(0, "forged"),
+            ),
+            Err(AgentRuntimeError::InvalidState(_))
+        ));
+    }
+}
+
+#[test]
+fn hostile_approval_wait_key_cannot_claim_a_future_revision_or_wrong_frame() {
+    let fixture = RuntimeFixture::simple(
+        r#"on clarify(question: string) {
+          answer = ask string question
+          done answer
+        }"#,
+    );
+    let start = fixture.runtime.start(fixture.start_input()).unwrap();
+    let waiting = fixture
+        .handle_harness_at(
+            start.snapshot,
+            &start.commands[0],
+            "clarify",
+            json!({"question":"Proceed?"}),
+            1,
+            "evt-hostile-approval-setup",
+            Uuid::from_u128(43),
+            history(0, "asked"),
+        )
+        .unwrap();
+    let invalid_key = RuntimeCommandKey::new("r999-f42-approval").unwrap();
+    let mut payload = waiting.snapshot.payload.clone();
+    payload["frames"]["0"]["state"]["command_key"] = json!(invalid_key.as_str());
+    let hostile = RuntimeStateSnapshot::new(
+        RuntimeDisposition::Running,
+        payload,
+        &RuntimeCeilings::default(),
+    )
+    .unwrap();
+    let event = RuntimeEvent::ApprovalResult {
+        event_id: "evt-hostile-approval".into(),
+        command_key: invalid_key,
+        answer: json!("yes"),
+    };
+
+    assert!(matches!(
+        fixture.handle_event(hostile, 2, OperationalStatus::WaitingForApproval, &event,),
+        Err(AgentRuntimeError::InvalidState(_))
+    ));
+}
+
+#[test]
 fn non_waiting_consumed_and_malformed_harness_results_are_rejected_without_state_change() {
     let fixture = RuntimeFixture::simple("on ok(answer: string) { done answer }");
     let start = fixture.runtime.start(fixture.start_input()).unwrap();
@@ -1111,6 +1397,80 @@ fn validation_rejects_non_agent_missing_role_and_legacy_context_contracts() {
     let mut legacy = fixture.definition.clone();
     legacy.entry.context = ContextMode::Legacy;
     assert!(fixture.runtime.validate_agent(&legacy).is_err());
+}
+
+#[test]
+fn validation_rejects_completion_contracts_that_diverge_from_executable_outcomes() {
+    let fixture = RuntimeFixture::simple("on ok(answer: string) { done answer }");
+
+    let mut extra_outcome = fixture.definition.clone();
+    extra_outcome
+        .tasks
+        .get_mut("inspect")
+        .unwrap()
+        .completion
+        .outcomes
+        .insert("forged".into(), Default::default());
+
+    let mut wrong_fields = fixture.definition.clone();
+    wrong_fields
+        .tasks
+        .get_mut("inspect")
+        .unwrap()
+        .completion
+        .outcomes
+        .get_mut("ok")
+        .unwrap()
+        .insert("answer".into(), CompiledType::Integer);
+
+    let mut wrong_union = fixture.definition.clone();
+    wrong_union
+        .tasks
+        .get_mut("inspect")
+        .unwrap()
+        .completion
+        .required_nullable_fields
+        .clear();
+
+    for hostile in [extra_outcome, wrong_fields, wrong_union] {
+        assert!(matches!(
+            fixture.runtime.validate_agent(&hostile),
+            Err(AgentRuntimeError::InvalidDefinition(_))
+        ));
+    }
+}
+
+#[test]
+fn validation_requires_each_task_tool_to_match_a_frozen_definition_member() {
+    let fixture = RuntimeFixture::with_tool();
+    assert_eq!(fixture.definition.tool_bindings.len(), 1);
+    assert_eq!(fixture.definition.tasks["inspect"].tools.len(), 1);
+
+    let mut absent_from_definition = fixture.definition.clone();
+    absent_from_definition.tool_bindings.clear();
+
+    let replacement = CatalogTool::new(
+        "docs/search",
+        "docs",
+        "A different frozen descriptor.",
+        ClosedSchema::object("input", Default::default()),
+        ClosedSchema::object("output", Default::default()),
+        BTreeSet::new(),
+        EffectKind::ReadOnly,
+        RecoverySupport::NotRequired,
+    )
+    .unwrap();
+    let mut mismatched_member = fixture.definition.clone();
+    mismatched_member.tool_bindings[0].descriptor_digest =
+        replacement.descriptor_digest().to_owned();
+    mismatched_member.tool_bindings[0].descriptor = replacement;
+
+    for hostile in [absent_from_definition, mismatched_member] {
+        assert!(matches!(
+            fixture.runtime.validate_agent(&hostile),
+            Err(AgentRuntimeError::InvalidDefinition(_))
+        ));
+    }
 }
 
 fn fixture_source() -> String {
