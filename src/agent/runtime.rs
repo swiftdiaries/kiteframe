@@ -179,6 +179,24 @@ pub fn validate_transition(
         }
     }
 
+    if transition
+        .commands
+        .iter()
+        .any(|command| matches!(command.payload, KernelCommandPayload::FailTask(_)))
+        && !(transition.snapshot.disposition == RuntimeDisposition::Terminating
+            && matches!(
+                transition.commands.as_slice(),
+                [KernelCommand {
+                    payload: KernelCommandPayload::FailTask(_),
+                    ..
+                }]
+            ))
+    {
+        return Err(AgentRuntimeError::InvalidTransition(
+            "FailTask requires a terminating snapshot and must be the sole command".into(),
+        ));
+    }
+
     // `commands` is the delta of newly proposed work, not the complete set of
     // persisted outstanding commands. In particular, consuming one structured
     // fork result can remain Running with no new commands while another sibling

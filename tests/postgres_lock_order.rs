@@ -5,14 +5,15 @@ use std::time::Duration;
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
-    AgentKernel, AgentRuntime, AgentRuntimeError, AgentSelector, CatalogTool, ClosedSchema,
-    CompleteAgentCommand, CreateSession, EffectKind, EvidenceId, FrameCommand, FrameId,
-    GoalContract, IdempotencyKey, KernelCommand, KernelCommandPayload, KiteAgentRuntime, NewChild,
-    NewPermissionRequest, PermissionRequestId, PolicyRevision, PolicyUpdate, PostgresStore,
-    PrincipalId, RecoverySupport, RequestContext, RunId, RuntimeCeilings, RuntimeCommandKey,
-    RuntimeDisposition, RuntimeEvent, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition,
-    SessionId, StartAgent, StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle,
-    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+    AgentKernel, AgentRuntime, AgentRuntimeError, AgentSelector, CatalogTool, ClaimAgentCommand,
+    ClosedSchema, CompleteAgentCommand, CreateSession, EffectKind, EvidenceId, FrameCommand,
+    FrameId, GoalContract, IdempotencyKey, KernelCommand, KernelCommandPayload, KiteAgentRuntime,
+    NewChild, NewPermissionRequest, PermissionRequestId, PolicyRevision, PolicyUpdate,
+    PostgresStore, PrincipalId, RecoverySupport, RequestContext, RunId, RuntimeCeilings,
+    RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeStart, RuntimeStateSnapshot,
+    RuntimeTransition, SessionId, StartAgent, StartRun, StoreError, SubmitUserTask,
+    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
+    ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -850,7 +851,7 @@ async fn command_completion_and_session_close_share_ordered_command_locks() {
         )
         .await
         .expect("start fork agent");
-    let root = child
+    let pending_root = child
         .store
         .dispatchable_agent_commands(256)
         .await
@@ -858,6 +859,18 @@ async fn command_completion_and_session_close_share_ordered_command_locks() {
         .into_iter()
         .find(|command| command.task_id == task_id)
         .expect("root command");
+    let root = child
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: child.session_id.clone(),
+            task_id: task_id.clone(),
+            command_id: pending_root.id,
+            expected_command_revision: pending_root.revision,
+            claimant: "builtin-direct-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new("claim-lock-root").expect("root claim key"),
+        })
+        .await
+        .expect("claim root command");
     kernel
         .complete_command(
             &child.principal,
@@ -880,7 +893,7 @@ async fn command_completion_and_session_close_share_ordered_command_locks() {
         )
         .await
         .expect("split root");
-    let source = child
+    let pending_source = child
         .store
         .dispatchable_agent_commands(256)
         .await
@@ -889,6 +902,18 @@ async fn command_completion_and_session_close_share_ordered_command_locks() {
         .filter(|command| command.task_id == task_id)
         .max_by_key(|command| *command.id.as_uuid())
         .expect("child command");
+    let source = child
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: child.session_id.clone(),
+            task_id: task_id.clone(),
+            command_id: pending_source.id,
+            expected_command_revision: pending_source.revision,
+            claimant: "builtin-direct-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new("claim-lock-child").expect("child claim key"),
+        })
+        .await
+        .expect("claim child command");
     let command_ids: Vec<Uuid> =
         sqlx::query_scalar("SELECT id FROM agent_commands WHERE task_id = $1 ORDER BY id")
             .bind(task_id.as_uuid())

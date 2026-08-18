@@ -5,14 +5,14 @@ use kiteframe::dsl::{CompiledDefinition, Limits, compile};
 use kiteframe::{
     AgentCommandState, AgentCommandView, AgentExecutionView, AgentKernel, AgentRuntime,
     AgentRuntimeError, AgentSelector, BlockGoal, ClaimAgentCommand, ClosedSchema,
-    CompleteAgentCommand, CompleteGoal, CreateSession, EvidenceId, FailAgentCommand, GoalContract,
-    GoalPhase, IdempotencyKey, KernelCommandPayload, KiteAgentRuntime, KiteFrameId, KiteFrameState,
-    KiteRuntimeState, OperationalStatus, PostgresStore, PrincipalId, RequestApproval,
-    RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeHandle,
-    RuntimeHistoryItem, RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition,
-    SessionId, SessionView, StartAgent, StoreError, SubmitUserTask, SuccessCriterion,
-    TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot,
-    UserTaskId,
+    CompleteAgentCommand, CompleteGoal, CreateSession, EvidenceId, FailAgentCommand, FailTask,
+    GoalContract, GoalPhase, IdempotencyKey, KernelCommand, KernelCommandPayload, KiteAgentRuntime,
+    KiteFrameId, KiteFrameState, KiteRuntimeState, OperationalStatus, PostgresStore, PrincipalId,
+    RequestApproval, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent,
+    RuntimeHandle, RuntimeHistoryItem, RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot,
+    RuntimeTransition, SessionId, SessionView, StartAgent, StoreError, SubmitUserTask,
+    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
+    ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -599,6 +599,7 @@ async fn claim_is_revisioned_idempotent_and_claimed_work_remains_dispatchable() 
         .claim_agent_command(request.clone())
         .await
         .unwrap();
+    let after_claim = fixture.database_fingerprint().await;
     let replay = fixture
         .store
         .claim_agent_command(request.clone())
@@ -607,6 +608,7 @@ async fn claim_is_revisioned_idempotent_and_claimed_work_remains_dispatchable() 
     assert_eq!(claimed.state, AgentCommandState::Claimed);
     assert_eq!(claimed.revision, 1);
     assert_eq!(replay.revision, claimed.revision);
+    assert_eq!(fixture.database_fingerprint().await, after_claim);
     let redelivered = fixture
         .store
         .dispatchable_agent_commands(64)
@@ -631,6 +633,87 @@ async fn claim_is_revisioned_idempotent_and_claimed_work_remains_dispatchable() 
         fixture.store.claim_agent_command(second_key).await,
         Err(StoreError::RevisionConflict)
     ));
+}
+
+#[tokio::test]
+async fn pending_command_cannot_complete_or_fail_and_writes_nothing() {
+    let Some(fixture) = TransitionFixture::started_simple_agent().await else {
+        return;
+    };
+    let pending = fixture
+        .store
+        .dispatchable_agent_commands(64)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|command| command.task_id == fixture.task_id)
+        .unwrap();
+    assert_eq!(pending.state, AgentCommandState::Pending);
+    let before = fixture.database_fingerprint().await;
+    let handle_calls = fixture.runtime_handle_calls();
+    let completion = fixture.completion(
+        &pending,
+        "evt-pending-command",
+        "ok",
+        json!({"answer":"must-not-commit"}),
+    );
+
+    assert!(matches!(
+        fixture
+            .kernel
+            .complete_command(&fixture.principal, completion.clone())
+            .await,
+        Err(StoreError::RevisionConflict)
+    ));
+    assert_eq!(fixture.runtime_handle_calls(), handle_calls);
+
+    let context = fixture
+        .store
+        .load_agent_command_context(
+            fixture.session.id.clone(),
+            fixture.task_id.clone(),
+            pending.id.clone(),
+        )
+        .await
+        .unwrap();
+    let transition = fixture
+        .runtime
+        .handle(RuntimeHandle {
+            execution: &context.execution,
+            definition: &context.definition,
+            event: &completion.event,
+        })
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .commit_agent_command_transition(
+                &fixture.principal,
+                &completion,
+                &transition,
+                None,
+                &fixture.ceilings,
+            )
+            .await,
+        Err(StoreError::RevisionConflict)
+    ));
+
+    let unavailable = FailAgentCommand {
+        session_id: fixture.session.id.clone(),
+        task_id: fixture.task_id.clone(),
+        command_id: pending.id,
+        expected_command_revision: pending.revision,
+        idempotency_key: IdempotencyKey::new("unavailable-pending-command").unwrap(),
+        code: "runtime_command_unavailable".to_owned(),
+    };
+    assert!(matches!(
+        fixture
+            .store
+            .fail_unavailable_agent_command(&fixture.principal, &unavailable)
+            .await,
+        Err(StoreError::RevisionConflict)
+    ));
+    assert_eq!(fixture.database_fingerprint().await, before);
 }
 
 #[tokio::test]
@@ -683,6 +766,148 @@ async fn structured_partial_join_keeps_the_persisted_sibling_without_reproposal(
     assert_eq!(rows.iter().filter(|row| row.1 == "pending").count(), 1);
     assert!(rows.iter().any(|row| row.0 == children[1].key.as_str()));
     assert_eq!(fixture.commands_for_latest_transition().await.len(), 0);
+}
+
+#[tokio::test]
+async fn running_partial_join_cannot_persist_fail_task_and_writes_nothing() {
+    let Some(fixture) = TransitionFixture::started_fork_agent().await else {
+        return;
+    };
+    let root = fixture
+        .claim_first("builtin-direct-v1", "claim-fail-shape-root")
+        .await;
+    fixture
+        .kernel
+        .complete_command(
+            &fixture.principal,
+            fixture.completion(
+                &root,
+                "evt-fail-shape-root",
+                "split",
+                json!({"left":"one", "right":"two"}),
+            ),
+        )
+        .await
+        .unwrap();
+    let children = fixture.commands_for_latest_transition().await;
+    let source = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session.id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: children[0].id.clone(),
+            expected_command_revision: children[0].revision,
+            claimant: "builtin-direct-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new("claim-fail-shape-child").unwrap(),
+        })
+        .await
+        .unwrap();
+    let (completion, mut transition) = fixture
+        .direct_runtime_transition(
+            &source,
+            "evt-fail-shape-child",
+            "ok",
+            json!({"result":"left-result"}),
+        )
+        .await;
+    assert_eq!(transition.snapshot.disposition, RuntimeDisposition::Running);
+    assert!(transition.commands.is_empty());
+    transition.commands.push(KernelCommand {
+        schema_version: 1,
+        key: RuntimeCommandKey::new(format!(
+            "r{}-task-fail",
+            transition.expected_task_revision + 1
+        ))
+        .unwrap(),
+        payload: KernelCommandPayload::FailTask(FailTask {
+            code: "forged_failure".to_owned(),
+            message: "must not persist".to_owned(),
+        }),
+    });
+    let before = fixture.database_fingerprint().await;
+
+    assert!(matches!(
+        fixture
+            .store
+            .commit_agent_command_transition(
+                &fixture.principal,
+                &completion,
+                &transition,
+                None,
+                &fixture.ceilings,
+            )
+            .await,
+        Err(StoreError::AgentTransitionInvalid(_))
+    ));
+    assert_eq!(fixture.database_fingerprint().await, before);
+}
+
+#[tokio::test]
+async fn matching_wait_and_command_with_invalid_revision_are_rejected_without_writes() {
+    for revision in ["0", "999", "02"] {
+        let Some(fixture) = TransitionFixture::started_fork_agent().await else {
+            return;
+        };
+        let source = fixture
+            .claim_first(
+                "builtin-direct-v1",
+                &format!("claim-invalid-wait-{revision}"),
+            )
+            .await;
+        let (completion, mut transition) = fixture
+            .direct_runtime_transition(
+                &source,
+                &format!("evt-invalid-wait-{revision}"),
+                "split",
+                json!({"left":"one", "right":"two"}),
+            )
+            .await;
+        let original_key = transition.commands[0].key.clone();
+        let mut state = fixture
+            .runtime
+            .inner
+            .decode_snapshot(&transition.snapshot)
+            .unwrap();
+        let frame = state
+            .frames
+            .values_mut()
+            .find(|frame| {
+                matches!(
+                    &frame.state,
+                    KiteFrameState::WaitingForHarness { command_key }
+                        if command_key == &original_key
+                )
+            })
+            .unwrap();
+        let invalid_key =
+            RuntimeCommandKey::new(format!("r{revision}-f{}-harness", frame.id.get())).unwrap();
+        frame.state = KiteFrameState::WaitingForHarness {
+            command_key: invalid_key.clone(),
+        };
+        transition.commands[0].key = invalid_key;
+        transition.snapshot = RuntimeStateSnapshot::new(
+            transition.snapshot.disposition,
+            serde_json::to_value(state).unwrap(),
+            &fixture.ceilings,
+        )
+        .unwrap();
+        let before = fixture.database_fingerprint().await;
+
+        assert!(matches!(
+            fixture
+                .store
+                .commit_agent_command_transition(
+                    &fixture.principal,
+                    &completion,
+                    &transition,
+                    None,
+                    &fixture.ceilings,
+                )
+                .await,
+            Err(StoreError::AgentTransitionInvalid(_))
+        ));
+        assert_eq!(fixture.database_fingerprint().await, before, "{revision}");
+    }
 }
 
 #[tokio::test]

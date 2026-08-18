@@ -5,12 +5,12 @@ use kiteframe::dsl::{
 };
 use kiteframe::{
     AcceptedUserTask, AgentExecutionView, AgentRuntime, AgentRuntimeError, AgentSelector,
-    CatalogTool, ClosedSchema, EffectKind, EvidenceId, GoalContract, GoalPhase, IdempotencyKey,
-    InvokeHarness, KernelCommand, KernelCommandPayload, KiteAgentRuntime, KiteFrameId,
-    KiteFrameState, OperationalStatus, PrincipalId, PublishedDefinition, RecoverySupport,
-    RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeHandle,
-    RuntimeHistoryItem, RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot, SessionId,
-    SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskPreferences, TaskTarget,
+    CatalogTool, ClosedSchema, CompleteGoal, EffectKind, EvidenceId, GoalContract, GoalPhase,
+    IdempotencyKey, InvokeHarness, KernelCommand, KernelCommandPayload, KiteAgentRuntime,
+    KiteFrameId, KiteFrameState, OperationalStatus, PrincipalId, PublishedDefinition,
+    RecoverySupport, RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeEvent,
+    RuntimeHandle, RuntimeHistoryItem, RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot,
+    SessionId, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskPreferences, TaskTarget,
     ToolCatalogSnapshot, UserTaskId, validate_transition,
 };
 use serde_json::{Value, json};
@@ -896,6 +896,65 @@ fn fail_emits_fail_task_without_goal_authority() {
     let wire = serde_json::to_string(&transition.commands).unwrap();
     assert!(!wire.contains("complete_goal"));
     assert!(!wire.contains("block_goal"));
+}
+
+#[test]
+fn fail_task_is_valid_only_as_the_sole_terminating_command() {
+    let fixture =
+        RuntimeFixture::simple(r#"on no_path(reason: string) { fail "no_safe_path" reason }"#);
+    let start = fixture.runtime.start(fixture.start_input()).unwrap();
+    let execution = fixture.execution_with_snapshot(
+        start.snapshot.clone(),
+        1,
+        OperationalStatus::WaitingForHarness,
+    );
+    let terminal = fixture
+        .handle_harness_at(
+            start.snapshot,
+            &start.commands[0],
+            "no_path",
+            json!({"reason":"No safe path remains"}),
+            1,
+            "evt-fail-shape",
+            Uuid::from_u128(131),
+            history(0, "failed"),
+        )
+        .unwrap();
+    let ceilings = RuntimeCeilings::default();
+    validate_transition(&terminal, &execution, &ceilings).unwrap();
+
+    for disposition in [
+        RuntimeDisposition::Running,
+        RuntimeDisposition::Returned,
+        RuntimeDisposition::Blocked,
+    ] {
+        let mut hostile = terminal.clone();
+        hostile.snapshot =
+            RuntimeStateSnapshot::new(disposition, hostile.snapshot.payload.clone(), &ceilings)
+                .unwrap();
+        assert!(matches!(
+            validate_transition(&hostile, &execution, &ceilings),
+            Err(AgentRuntimeError::InvalidTransition(_))
+        ));
+    }
+
+    let mut mixed_external = terminal.clone();
+    mixed_external.commands.push(start.commands[0].clone());
+    assert!(matches!(
+        validate_transition(&mixed_external, &execution, &ceilings),
+        Err(AgentRuntimeError::InvalidTransition(_))
+    ));
+
+    let mut mixed_authority = terminal;
+    mixed_authority.commands.push(KernelCommand {
+        schema_version: 1,
+        key: RuntimeCommandKey::new("r2-goal-complete").unwrap(),
+        payload: KernelCommandPayload::CompleteGoal(CompleteGoal { assertions: vec![] }),
+    });
+    assert!(matches!(
+        validate_transition(&mixed_authority, &execution, &ceilings),
+        Err(AgentRuntimeError::InvalidTransition(_))
+    ));
 }
 
 #[test]

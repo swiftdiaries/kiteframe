@@ -618,19 +618,20 @@ impl PostgresStore {
         validate_completion_locked(
             principal, completion, transition, policy, &aggregate, source,
         )?;
+        let next_task_revision = aggregate
+            .task_revision
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidData("user task revision is malformed".to_owned()))?;
         reconcile_transition_commands(
             &current_snapshot,
             &completion.event,
             transition,
             source,
             &commands,
+            aggregate.task_revision,
             ceilings,
         )?;
 
-        let next_task_revision = aggregate
-            .task_revision
-            .checked_add(1)
-            .ok_or_else(|| StoreError::InvalidData("user task revision is malformed".to_owned()))?;
         let next_goal_revision = aggregate.goal_revision;
         let transition_id = uuid::Uuid::now_v7();
         sqlx::query(
@@ -674,7 +675,7 @@ impl PostgresStore {
             "UPDATE agent_commands SET state = 'completed', completion_idempotency_key = $1, \
              completion_request_digest = $2, result = $3, revision = revision + 1, \
              updated_at = CURRENT_TIMESTAMP WHERE task_id = $4 AND id = $5 \
-             AND state IN ('pending', 'claimed') AND revision = $6",
+             AND state = 'claimed' AND revision = $6",
         )
         .bind(completion.idempotency_key.as_str())
         .bind(&completion_digest)
@@ -847,15 +848,13 @@ impl PostgresStore {
         if aggregate.goal_phase != GoalPhase::Active {
             return Err(StoreError::RevisionConflict);
         }
-        if !matches!(
-            source.view.state,
-            AgentCommandState::Pending | AgentCommandState::Claimed
-        ) || source.view.revision != request.expected_command_revision
+        if source.view.state != AgentCommandState::Claimed
+            || source.view.revision != request.expected_command_revision
         {
             return Err(StoreError::RevisionConflict);
         }
         let state = KiteAgentRuntime::new(*self.agent_runtime_ceilings())
-            .decode_snapshot(&current_snapshot)
+            .decode_snapshot_for_task_revision(&current_snapshot, aggregate.task_revision)
             .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
         let waits = runtime_waits(&state)?;
         let source_kind = external_command_kind(&source.view.payload).ok_or_else(|| {
@@ -875,7 +874,7 @@ impl PostgresStore {
             "UPDATE agent_commands SET state = 'failed', completion_idempotency_key = $1, \
              completion_request_digest = $2, failure = $3, revision = revision + 1, \
              updated_at = CURRENT_TIMESTAMP WHERE task_id = $4 AND id = $5 \
-             AND state IN ('pending', 'claimed') AND revision = $6",
+             AND state = 'claimed' AND revision = $6",
         )
         .bind(request.idempotency_key.as_str())
         .bind(&request_digest)
@@ -975,7 +974,7 @@ impl PostgresStore {
             )
             .await?;
             let state = KiteAgentRuntime::new(*self.agent_runtime_ceilings())
-                .decode_snapshot(&snapshot)
+                .decode_snapshot_for_task_revision(&snapshot, task_revision)
                 .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
             let waits = runtime_waits(&state)?;
             let rows = sqlx::query(
@@ -983,7 +982,7 @@ impl PostgresStore {
                         payload_digest, state, revision, claimant, claim_idempotency_key, \
                         claim_request_digest, completion_idempotency_key, \
                         completion_request_digest \
-                 FROM agent_commands WHERE task_id = $1 AND state IN ('pending', 'claimed') \
+                 FROM agent_commands WHERE task_id = $1 \
                  ORDER BY id",
             )
             .bind(task_id.as_uuid())
@@ -1000,22 +999,9 @@ impl PostgresStore {
                         "recovered command belongs to another task".to_owned(),
                     ));
                 }
-                let kind = external_command_kind(&command.view.payload).ok_or_else(|| {
-                    StoreError::RuntimeStateInvalid(
-                        "recovered authority command is not terminal".to_owned(),
-                    )
-                })?;
-                if waits.get(command.view.key.as_str()) != Some(&kind)
-                    || command_waits
-                        .insert(command.view.key.as_str().to_owned(), kind)
-                        .is_some()
-                {
-                    return Err(StoreError::RuntimeStateInvalid(
-                        "recovered command does not match its snapshot wait".to_owned(),
-                    ));
-                }
                 match command.view.state {
                     AgentCommandState::Pending => {
+                        record_recovered_wait(&waits, &mut command_waits, &command)?;
                         report.pending = report.pending.checked_add(1).ok_or_else(|| {
                             StoreError::InvalidData(
                                 "recovery command count is malformed".to_owned(),
@@ -1023,13 +1009,16 @@ impl PostgresStore {
                         })?;
                     }
                     AgentCommandState::Claimed => {
+                        record_recovered_wait(&waits, &mut command_waits, &command)?;
                         report.claimed = report.claimed.checked_add(1).ok_or_else(|| {
                             StoreError::InvalidData(
                                 "recovery command count is malformed".to_owned(),
                             )
                         })?;
                     }
-                    _ => unreachable!("recovery query selects outstanding commands"),
+                    AgentCommandState::Completed
+                    | AgentCommandState::Failed
+                    | AgentCommandState::Cancelled => {}
                 }
             }
             if waits != command_waits {
@@ -1414,10 +1403,8 @@ fn validate_completion_locked(
     {
         return Err(StoreError::RevisionConflict);
     }
-    if !matches!(
-        source.view.state,
-        AgentCommandState::Pending | AgentCommandState::Claimed
-    ) || source.view.revision != completion.expected_command_revision
+    if source.view.state != AgentCommandState::Claimed
+        || source.view.revision != completion.expected_command_revision
     {
         return Err(StoreError::RevisionConflict);
     }
@@ -1448,6 +1435,33 @@ fn validate_completion_locked(
             "goal authority is not enabled until Task 6".to_owned(),
         ));
     }
+    validate_task5_authority_shape(transition)?;
+    Ok(())
+}
+
+fn validate_task5_authority_shape(transition: &RuntimeTransition) -> Result<(), StoreError> {
+    let sole_fail_task = matches!(
+        transition.commands.as_slice(),
+        [KernelCommand {
+            payload: KernelCommandPayload::FailTask(_),
+            ..
+        }]
+    );
+    if transition.snapshot.disposition == RuntimeDisposition::Terminating {
+        if !sole_fail_task {
+            return Err(StoreError::AgentTransitionInvalid(
+                "terminating transition must propose exactly one FailTask".to_owned(),
+            ));
+        }
+    } else if transition
+        .commands
+        .iter()
+        .any(|command| matches!(command.payload, KernelCommandPayload::FailTask(_)))
+    {
+        return Err(StoreError::AgentTransitionInvalid(
+            "FailTask requires a terminating snapshot and must be the sole command".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -1457,13 +1471,17 @@ fn reconcile_transition_commands(
     transition: &RuntimeTransition,
     source: &LockedAgentCommand,
     persisted: &[LockedAgentCommand],
+    current_task_revision: u64,
     ceilings: &RuntimeCeilings,
 ) -> Result<(), StoreError> {
+    let replacement_task_revision = current_task_revision
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidData("user task revision is malformed".to_owned()))?;
     let current_state = KiteAgentRuntime::new(*ceilings)
-        .decode_snapshot(current_snapshot)
+        .decode_snapshot_for_task_revision(current_snapshot, current_task_revision)
         .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
     let replacement_state = KiteAgentRuntime::new(*ceilings)
-        .decode_snapshot(&transition.snapshot)
+        .decode_snapshot_for_task_revision(&transition.snapshot, replacement_task_revision)
         .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
     let current_waits = runtime_waits(&current_state)?;
     let replacement_waits = runtime_waits(&replacement_state)?;
@@ -1596,6 +1614,28 @@ fn runtime_waits(state: &KiteRuntimeState) -> Result<BTreeMap<String, &'static s
         }
     }
     Ok(waits)
+}
+
+fn record_recovered_wait(
+    waits: &BTreeMap<String, &'static str>,
+    command_waits: &mut BTreeMap<String, &'static str>,
+    command: &LockedAgentCommand,
+) -> Result<(), StoreError> {
+    let kind = external_command_kind(&command.view.payload).ok_or_else(|| {
+        StoreError::RuntimeStateInvalid(
+            "recovered outstanding command is not external work".to_owned(),
+        )
+    })?;
+    if waits.get(command.view.key.as_str()) != Some(&kind)
+        || command_waits
+            .insert(command.view.key.as_str().to_owned(), kind)
+            .is_some()
+    {
+        return Err(StoreError::RuntimeStateInvalid(
+            "recovered command does not match its snapshot wait".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn structured_partial_join(

@@ -4,9 +4,10 @@ use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     AgentCommandContext, AgentCommandId, AgentKernel, AgentRecoveryReport, AgentSelector,
     ClaimAgentCommand, CompleteAgentCommand, CreateSession, EvidenceId, GoalContract,
-    IdempotencyKey, KiteAgentRuntime, PostgresStore, PrincipalId, RuntimeCeilings, RuntimeEvent,
-    SessionView, StartAgent, StoreError, SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer,
-    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+    IdempotencyKey, KiteAgentRuntime, KiteFrameState, PostgresStore, PrincipalId, RuntimeCeilings,
+    RuntimeCommandKey, RuntimeEvent, RuntimeStateSnapshot, SessionView, StartAgent, StoreError,
+    SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
+    ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -182,13 +183,25 @@ impl RestartAgentFixture {
     }
 
     async fn complete_root_into_two_pending_children(&mut self) {
-        let root = self
+        let pending = self
             .store
             .dispatchable_agent_commands(64)
             .await
             .unwrap()
             .into_iter()
             .find(|command| command.task_id == self.task_id)
+            .unwrap();
+        let root = self
+            .store
+            .claim_agent_command(ClaimAgentCommand {
+                session_id: self.session.id.clone(),
+                task_id: self.task_id.clone(),
+                command_id: pending.id,
+                expected_command_revision: pending.revision,
+                claimant: "builtin-direct-v1".to_owned(),
+                idempotency_key: IdempotencyKey::new("claim-restart-root").unwrap(),
+            })
+            .await
             .unwrap();
         self.kernel
             .complete_command(
@@ -278,6 +291,52 @@ impl RestartAgentFixture {
             .await
             .unwrap()
     }
+
+    async fn corrupt_matching_wait_revision(&self, revision: &str) {
+        let context = self.first_pending_context().await;
+        let snapshot = context.execution.runtime.unwrap();
+        let runtime = KiteAgentRuntime::new(RuntimeCeilings::default());
+        let mut state = runtime.decode_snapshot(&snapshot).unwrap();
+        let frame = state
+            .frames
+            .values_mut()
+            .find(|frame| {
+                matches!(
+                    &frame.state,
+                    KiteFrameState::WaitingForHarness { command_key }
+                        if command_key == &context.command.key
+                )
+            })
+            .unwrap();
+        let invalid_key =
+            RuntimeCommandKey::new(format!("r{revision}-f{}-harness", frame.id.get())).unwrap();
+        frame.state = KiteFrameState::WaitingForHarness {
+            command_key: invalid_key.clone(),
+        };
+        let corrupted = RuntimeStateSnapshot::new(
+            snapshot.disposition,
+            serde_json::to_value(state).unwrap(),
+            &RuntimeCeilings::default(),
+        )
+        .unwrap();
+        sqlx::query("UPDATE agent_commands SET runtime_key = $1 WHERE id = $2")
+            .bind(invalid_key.as_str())
+            .bind(context.command.id.as_uuid())
+            .execute(self.store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE agent_runtime_snapshots SET payload = $1, canonical_bytes = $2, \
+             snapshot_digest = $3 WHERE task_id = $4",
+        )
+        .bind(&corrupted.payload)
+        .bind(i32::try_from(corrupted.canonical_byte_count).unwrap())
+        .bind(&corrupted.snapshot_digest)
+        .bind(self.task_id.as_uuid())
+        .execute(self.store.pool())
+        .await
+        .unwrap();
+    }
 }
 
 #[tokio::test]
@@ -309,7 +368,7 @@ async fn restart_restores_snapshot_and_pending_commands_without_replay() {
     );
     assert_eq!(after, before);
     assert_eq!(after.transition_count, 2);
-    assert_eq!(after.event_count, 2);
+    assert_eq!(after.event_count, 3);
     let command_id = AgentCommandId::new(
         Uuid::parse_str(after.command_rows[1]["id"].as_str().unwrap()).unwrap(),
     );
@@ -365,7 +424,15 @@ async fn restart_preserves_claim_and_excludes_completed_commands() {
 #[tokio::test]
 async fn recovery_rejects_corrupt_snapshot_command_and_wait_mismatch_without_repair() {
     let _guard = RESTART_TEST_LOCK.lock().await;
-    for corruption in ["snapshot", "command_digest", "wait_mismatch"] {
+    for corruption in [
+        "snapshot",
+        "command_digest",
+        "completed_command_digest",
+        "wait_mismatch",
+        "wait_revision_zero",
+        "wait_revision_future",
+        "wait_revision_noncanonical",
+    ] {
         let Some(mut fixture) = RestartAgentFixture::started_fork().await else {
             return;
         };
@@ -392,6 +459,16 @@ async fn recovery_rejects_corrupt_snapshot_command_and_wait_mismatch_without_rep
                 .await
                 .unwrap();
             }
+            "completed_command_digest" => {
+                sqlx::query(
+                    "UPDATE agent_commands SET payload_digest = 'sha256:corrupt' \
+                     WHERE task_id = $1 AND state = 'completed'",
+                )
+                .bind(fixture.task_id.as_uuid())
+                .execute(fixture.store.pool())
+                .await
+                .unwrap();
+            }
             "wait_mismatch" => {
                 sqlx::query(
                     "UPDATE agent_commands SET runtime_key = runtime_key || '-mismatch' \
@@ -403,6 +480,9 @@ async fn recovery_rejects_corrupt_snapshot_command_and_wait_mismatch_without_rep
                 .await
                 .unwrap();
             }
+            "wait_revision_zero" => fixture.corrupt_matching_wait_revision("0").await,
+            "wait_revision_future" => fixture.corrupt_matching_wait_revision("999").await,
+            "wait_revision_noncanonical" => fixture.corrupt_matching_wait_revision("02").await,
             _ => unreachable!(),
         }
         let corrupted = fixture.authority_snapshot().await;

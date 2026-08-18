@@ -158,6 +158,16 @@ impl KiteAgentRuntime {
         }
         Ok(state)
     }
+
+    pub fn decode_snapshot_for_task_revision(
+        &self,
+        snapshot: &RuntimeStateSnapshot,
+        current_task_revision: u64,
+    ) -> Result<KiteRuntimeState, AgentRuntimeError> {
+        let state = self.decode_snapshot(snapshot)?;
+        validate_waiting_command_keys(&state, current_task_revision)?;
+        Ok(state)
+    }
 }
 
 impl AgentRuntime for KiteAgentRuntime {
@@ -273,7 +283,8 @@ impl AgentRuntime for KiteAgentRuntime {
             input.execution.runtime.as_ref().ok_or_else(|| {
                 AgentRuntimeError::InvalidState("runtime snapshot is absent".into())
             })?;
-        let mut state = self.decode_snapshot(snapshot)?;
+        let mut state =
+            self.decode_snapshot_for_task_revision(snapshot, input.execution.task_revision)?;
         if state.definition_hash != input.definition.definition_hash
             || input.execution.task.definition.definition_hash != input.definition.definition_hash
         {
@@ -281,7 +292,6 @@ impl AgentRuntime for KiteAgentRuntime {
                 "runtime definition hash does not match".into(),
             ));
         }
-        validate_waiting_command_keys(&state, input.execution.task_revision)?;
         let revisions = RuntimeRevisions {
             task: input.execution.task_revision,
             goal: input.execution.goal_revision,

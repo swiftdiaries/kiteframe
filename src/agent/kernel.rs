@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
-    AcceptedUserTask, AgentExecutionView, AgentRecoveryReport, AgentRuntime, CompleteAgentCommand,
-    FailAgentCommand, KernelCommand, KernelCommandPayload, PolicyRevision, PostgresStore,
-    PrincipalId, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart, StartAgent,
-    StoreError, validate_transition,
+    AcceptedUserTask, AgentCommandState, AgentExecutionView, AgentRecoveryReport, AgentRuntime,
+    CompleteAgentCommand, FailAgentCommand, KernelCommand, KernelCommandPayload, PolicyRevision,
+    PostgresStore, PrincipalId, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart,
+    StartAgent, StoreError, validate_transition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +201,9 @@ impl AgentKernel {
                 request.command_id.clone(),
             )
             .await?;
+        if context.command.state != AgentCommandState::Claimed {
+            return Err(StoreError::RevisionConflict);
+        }
         if request.event.command_key() != Some(&context.command.key) {
             return Err(StoreError::AgentTransitionInvalid(
                 "event command key does not match persisted command".to_owned(),
