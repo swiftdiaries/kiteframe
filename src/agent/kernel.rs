@@ -66,6 +66,8 @@ pub struct AgentKernel {
     runtime: Arc<dyn AgentRuntime>,
     authorizer: Arc<dyn AgentLifecycleAuthorizer>,
     ceilings: RuntimeCeilings,
+    #[cfg(feature = "test-support")]
+    completion_probe_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl AgentKernel {
@@ -81,7 +83,20 @@ impl AgentKernel {
             runtime,
             authorizer,
             ceilings,
+            #[cfg(feature = "test-support")]
+            completion_probe_hook: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    // This hook exists only for deterministic concurrency tests. Production
+    // builds do not compile the field, setter, or call site.
+    #[doc(hidden)]
+    pub fn set_completion_probe_hook<F>(&mut self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.completion_probe_hook = Some(Arc::new(hook));
     }
 
     pub(crate) fn store(&self) -> &PostgresStore {
@@ -199,6 +214,10 @@ impl AgentKernel {
             .await?
         {
             return Ok(replay);
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(hook) = &self.completion_probe_hook {
+            hook();
         }
         let context = self
             .store

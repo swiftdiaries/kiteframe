@@ -1,5 +1,7 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "test-support")]
+use std::sync::{Condvar, Mutex};
 
 use kiteframe::dsl::{CompiledDefinition, Limits, compile};
 use kiteframe::{
@@ -17,47 +19,71 @@ use kiteframe::{
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
+#[cfg(feature = "test-support")]
 use tokio::sync::Notify;
-use tracing::Subscriber;
-use tracing::field::{Field, Visit};
-use tracing::instrument::WithSubscriber;
-use tracing_subscriber::layer::Context;
-use tracing_subscriber::{Layer, prelude::*};
 use uuid::Uuid;
 
-#[derive(Clone)]
-struct EmptyCompletionProbeGate {
-    armed: Arc<AtomicBool>,
+#[cfg(feature = "test-support")]
+struct CompletionProbeGate {
     reached: Arc<Notify>,
-    release: Arc<Barrier>,
+    state: Mutex<CompletionProbeState>,
+    changed: Condvar,
 }
 
-impl<S> Layer<S> for EmptyCompletionProbeGate
-where
-    S: Subscriber,
-{
-    fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
-        #[derive(Default)]
-        struct EventFields(String);
+#[cfg(feature = "test-support")]
+struct CompletionProbeState {
+    armed: bool,
+    released: bool,
+}
 
-        impl Visit for EventFields {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                use std::fmt::Write;
-                write!(&mut self.0, " {}={value:?}", field.name()).unwrap();
+#[cfg(feature = "test-support")]
+impl CompletionProbeGate {
+    fn new(reached: Arc<Notify>) -> Self {
+        Self {
+            reached,
+            state: Mutex::new(CompletionProbeState {
+                armed: true,
+                released: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn block_once(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        state.armed = false;
+        self.reached.notify_one();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let (next_state, wait_result) = self.changed.wait_timeout(state, remaining).unwrap();
+            state = next_state;
+            if wait_result.timed_out() {
+                break;
             }
         }
+    }
 
-        let mut fields = EventFields::default();
-        event.record(&mut fields);
-        if event.metadata().target() == "sqlx::query"
-            && fields
-                .0
-                .contains("SELECT completion_idempotency_key, completion_request_digest")
-            && self.armed.swap(false, Ordering::SeqCst)
-        {
-            self.reached.notify_one();
-            self.release.wait();
-        }
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(feature = "test-support")]
+struct CompletionProbeReleaseOnDrop(Arc<CompletionProbeGate>);
+
+#[cfg(feature = "test-support")]
+impl Drop for CompletionProbeReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
     }
 }
 
@@ -616,8 +642,9 @@ async fn concurrent_completion_races_commit_exactly_one_transition() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "test-support")]
 async fn exact_completion_replays_when_winner_commits_after_empty_probe() {
-    let Some(fixture) = TransitionFixture::started_simple_agent().await else {
+    let Some(mut fixture) = TransitionFixture::started_simple_agent().await else {
         return;
     };
     let command = fixture
@@ -630,12 +657,11 @@ async fn exact_completion_replays_when_winner_commits_after_empty_probe() {
         json!({"answer":"x"}),
     );
     let reached = Arc::new(Notify::new());
-    let release = Arc::new(Barrier::new(2));
-    let subscriber = tracing_subscriber::registry().with(EmptyCompletionProbeGate {
-        armed: Arc::new(AtomicBool::new(true)),
-        reached: Arc::clone(&reached),
-        release: Arc::clone(&release),
-    });
+    let gate = Arc::new(CompletionProbeGate::new(Arc::clone(&reached)));
+    let gate_for_hook = Arc::clone(&gate);
+    Arc::get_mut(&mut fixture.kernel)
+        .expect("fixture kernel has no other owners")
+        .set_completion_probe_hook(move || gate_for_hook.block_once());
     let losing_kernel = Arc::clone(&fixture.kernel);
     let losing_principal = fixture.principal.clone();
     let losing_request = request.clone();
@@ -644,26 +670,36 @@ async fn exact_completion_replays_when_winner_commits_after_empty_probe() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(
-                async move {
-                    losing_kernel
-                        .complete_command(&losing_principal, losing_request)
-                        .await
-                }
-                .with_subscriber(subscriber),
-            )
+            .block_on(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    losing_kernel.complete_command(&losing_principal, losing_request),
+                )
+                .await
+            })
     });
 
-    reached.notified().await;
+    if tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .is_err()
+    {
+        gate.release();
+        let _ = tokio::task::spawn_blocking(move || loser.join())
+            .await
+            .expect("loser join task completed");
+        panic!("completion probe hook was not reached within the timeout");
+    }
+    let _release_on_drop = CompletionProbeReleaseOnDrop(Arc::clone(&gate));
     let winner = fixture
         .kernel
         .complete_command(&fixture.principal, request)
         .await
         .unwrap();
-    release.wait();
+    gate.release();
     let replay = tokio::task::spawn_blocking(move || loser.join().unwrap())
         .await
         .unwrap()
+        .expect("loser completion finished before its timeout")
         .unwrap();
 
     assert_eq!(replay.task_revision, winner.task_revision);
