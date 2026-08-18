@@ -17,7 +17,7 @@ fn limits() -> ParseLimits {
 }
 
 #[test]
-fn reviewed_agent_grammar_and_fixture_are_checked_in() {
+fn reviewed_agent_language_contract_is_checked_in() {
     let reference =
         fs::read_to_string("docs/reference/kite-language.md").expect("language reference exists");
     let fixture = fs::read_to_string("tests/fixtures/dsl/agent_babysit_pr.kite")
@@ -25,7 +25,13 @@ fn reviewed_agent_grammar_and_fixture_are_checked_in() {
 
     assert!(reference.contains("agent-definition"));
     assert!(reference.contains("workflow-definition (deprecated)"));
+    assert!(reference.contains(
+        "Agents are immutable and publishable in consolidated Slice 1, but not executable."
+    ));
+    assert!(reference.contains("`StartRun` rejects agents with `agent_runtime_unavailable`"));
+    assert!(!reference.contains("Publication must reject them before persistence"));
     assert!(fixture.starts_with("agent babysit_pr("));
+    assert!(fixture.ends_with("}\n"));
 }
 
 #[test]
@@ -88,38 +94,49 @@ fn rejects_agent_declaration_cardinality_and_definition_separation_violations() 
             "duplicate_agent_event",
         ),
         (
+            format!("agent a() -> string {{ entry t() events [\"github.pull_request.changed\"] {agent_task} }}"),
+            "invalid_agent_event",
+        ),
+        (
             format!("agent a() -> string {{ entry t() events [] {agent_task} }}"),
             "empty_agent_events",
         ),
-        ("agent a() -> string { entry t() }".to_owned(), "agent_task_required"),
+        ("agent a() -> string { entry t() }".to_owned(), "missing_agent_task"),
         (
             format!("agent a() -> string {{ entry t() agent nested() -> string {{ entry t() {agent_task} }} {agent_task} }}"),
-            "nested_agent_definition",
+            "nested_agent_not_allowed",
         ),
         (
             format!("agent a() -> string {{ entry t() {agent_task} }} task outside() -> string {{ prompt \"\"\"x\"\"\" tools [] on ok() {{ done \"x\" }} }}"),
-            "top_level_task_with_agent",
+            "unexpected_top_level_task",
         ),
         (
             "agent a() -> string { entry t() task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }".to_owned(),
-            "missing_agent_task_model",
+            "missing_model_role",
         ),
         (
             "agent a() -> string { entry t() task t() -> string { model reasoning model coding prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } } }".to_owned(),
             "duplicate_agent_task_model",
         ),
         (
-            "workflow w() -> string { start t() } task t() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }".to_owned(),
-            "workflow_task_model_unsupported",
-        ),
-        (
-            "workflow w() -> string { start t() limits { elapsed_seconds: 1 } } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }".to_owned(),
-            "unsupported_workflow_limit",
+            "task t() -> string { model reasoning prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }".to_owned(),
+            "model_role_requires_agent",
         ),
     ] {
         let diagnostics = parse_report(&source, limits()).expect_err("invalid declaration rejected");
-        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == expected_code), "{source}");
+        assert_eq!(diagnostics[0].code, expected_code, "{source}");
+        assert!(diagnostics.len() <= limits().max_diagnostics, "{source}");
     }
+}
+
+#[test]
+fn rejects_agent_only_elapsed_limit_on_workflows_with_an_exact_code() {
+    let source = "workflow w() -> string { start t() limits { elapsed_seconds: 1 } } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { done \"x\" } }";
+    let diagnostics = parse_report(source, limits()).expect_err("agent-only limit rejected");
+
+    assert_eq!(diagnostics[0].code, "deprecated_workflow");
+    assert_eq!(diagnostics[1].code, "elapsed_seconds_requires_agent");
+    assert!(diagnostics.len() <= limits().max_diagnostics);
 }
 
 #[test]
@@ -129,15 +146,30 @@ fn rejects_invalid_agent_traversal_syntax_and_legacy_separation_violations() {
             "agent a() -> string {{ entry t() task t() -> string {{ model reasoning prompt \"\"\"x\"\"\" tools [] on ok() {{ {body} }} }} }}"
         )
     };
-    for source in [
-        task("fork { branch = call t() } done \"x\""),
-        task("fork { } join done \"x\""),
-        task("fork { call t() } join done \"x\""),
-        task("answer = call t() context summarized done answer"),
-        task("goto t()"),
-        "workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { return t() } }".to_owned(),
+    for (source, expected_code) in [
+        (
+            task("fork { branch = call t() } done \"x\""),
+            "missing_fork_join",
+        ),
+        (task("fork { } join done \"x\""), "empty_fork"),
+        (
+            task("fork { call t() } join done \"x\""),
+            "fork_call_requires_binding",
+        ),
+        (
+            task("answer = call t() context summarized done answer"),
+            "invalid_context_mode",
+        ),
+        (task("goto t()"), "goto_requires_workflow"),
+        (
+            "task t() -> string { prompt \"\"\"x\"\"\" tools [] on ok() { return t() } }"
+                .to_owned(),
+            "return_requires_agent",
+        ),
     ] {
-        assert!(parse_report(&source, limits()).is_err(), "invalid source was accepted: {source}");
+        let diagnostics = parse_report(&source, limits()).expect_err("invalid source rejected");
+        assert_eq!(diagnostics[0].code, expected_code, "{source}");
+        assert!(diagnostics.len() <= limits().max_diagnostics, "{source}");
     }
 }
 

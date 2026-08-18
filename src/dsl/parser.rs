@@ -161,7 +161,7 @@ impl Parser {
             DefinitionAst::Agent(agent) => {
                 if !workflow_tasks.is_empty() {
                     self.error(
-                        "top_level_task_with_agent",
+                        "unexpected_top_level_task",
                         "top-level tasks are only allowed with workflow definitions",
                         workflow_tasks[0].span,
                     );
@@ -235,7 +235,13 @@ impl Parser {
                     let key = self.identifier()?;
                     self.expect_colon();
                     let (value, span) = self.number()?;
-                    if !matches!(
+                    if key == "elapsed_seconds" {
+                        self.error(
+                            "elapsed_seconds_requires_agent",
+                            "unsupported workflow limit",
+                            span,
+                        );
+                    } else if !matches!(
                         key.as_str(),
                         "steps"
                             | "model_turns_per_task"
@@ -349,7 +355,7 @@ impl Parser {
                 }
             } else if self.keyword("agent") {
                 self.error(
-                    "nested_agent_definition",
+                    "nested_agent_not_allowed",
                     "agent definitions cannot be nested",
                     self.previous_span(),
                 );
@@ -378,7 +384,7 @@ impl Parser {
         };
         if tasks.is_empty() {
             self.error(
-                "agent_task_required",
+                "missing_agent_task",
                 "agent requires at least one task",
                 span,
             );
@@ -420,7 +426,7 @@ impl Parser {
                     }
                 } else {
                     self.error(
-                        "workflow_task_model_unsupported",
+                        "model_role_requires_agent",
                         "workflow tasks do not accept model declarations",
                         role_span,
                     );
@@ -502,7 +508,7 @@ impl Parser {
         }
         if is_agent && model_role.is_none() {
             self.error(
-                "missing_agent_task_model",
+                "missing_model_role",
                 "agent task requires a model declaration",
                 span,
             );
@@ -582,7 +588,7 @@ impl Parser {
         if self.keyword("goto") {
             if syntax == DefinitionSyntax::Agent {
                 self.error(
-                    "agent_goto_unsupported",
+                    "goto_requires_workflow",
                     "agent outcomes use return instead of goto",
                     self.previous_span(),
                 );
@@ -609,7 +615,7 @@ impl Parser {
         if self.keyword("return") {
             if syntax == DefinitionSyntax::Workflow {
                 self.error(
-                    "workflow_return_unsupported",
+                    "return_requires_agent",
                     "workflow outcomes use goto instead of return",
                     self.previous_span(),
                 );
@@ -685,7 +691,7 @@ impl Parser {
         while !self.at_rbrace() && !self.at_eof() {
             if self.keyword("call") {
                 self.error(
-                    "fork_call_binding_required",
+                    "fork_call_requires_binding",
                     "fork calls require a result binding",
                     self.previous_span(),
                 );
@@ -707,7 +713,7 @@ impl Parser {
         self.expect_rbrace();
         if calls.is_empty() {
             self.error(
-                "empty_fork_block",
+                "empty_fork",
                 "fork block must not be empty",
                 self.previous_span(),
             );
@@ -776,7 +782,7 @@ impl Parser {
                         "kept" => ContextModeAst::Kept,
                         _ => {
                             self.error(
-                                "invalid_agent_context_mode",
+                                "invalid_context_mode",
                                 "agent context mode must be isolated or kept",
                                 span,
                             );
@@ -810,7 +816,7 @@ impl Parser {
             self.advance();
             if !valid_event_type(&event_type) {
                 self.error(
-                    "invalid_agent_event_name",
+                    "invalid_agent_event",
                     "event name must be a versioned semantic event string",
                     span,
                 );

@@ -1,0 +1,41 @@
+{
+  "sessionId": "018f0f47-5d8b-7d5a-9cb1-3a09d0d4c902",
+  "agent": { "name": "babysit_pr", "version": 1 },
+  "target": {
+    "type": "github_pull_request",
+    "repository": "acme/payments",
+    "number": 142
+  },
+  "preferences": { "harnessRole": "coding" },
+  "goal": {
+    "version": 1,
+    "objective": "Address actionable review feedback and see the PR through merge.",
+    "success": [
+      {
+        "id": "reviews_resolved",
+        "statement": "All actionable review threads are resolved.",
+        "evidence": "github.unresolved_reviews"
+      },
+      {
+        "id": "checks_passed",
+        "statement": "Required GitHub Actions checks pass.",
+        "evidence": "github.required_checks"
+      },
+      {
+        "id": "pull_request_merged",
+        "statement": "The pull request reaches merged state.",
+        "evidence": "github.pull_request_state"
+      }
+    ],
+    "constraints": [
+      "Never merge the pull request.",
+      "Never bypass required checks.",
+      "Repository mutation requires approval."
+    ],
+    "blockedWhen": [
+      "Required user or reviewer action remains unavailable.",
+      "No policy-permitted repair path remains."
+    ]
+  },
+  "idempotencyKey": "submit-babysit-pr-142"
+}

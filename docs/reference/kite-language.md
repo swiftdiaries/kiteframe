@@ -2,7 +2,7 @@
 
 This reference freezes the concrete Slice 1 source spelling for authoring
 tools and the parser. It is a grammar and compile-time contract; it does not
-make an `agent` publishable or executable.
+make an `agent` executable.
 
 ## Definitions
 
@@ -99,15 +99,13 @@ retain their existing outcome semantics in both definition kinds.
 Diagnostics use stable snake-case codes and include a source span. A valid
 legacy workflow produces the bounded warning code `deprecated_workflow`.
 Both definition kinds compile in Slice 1: a workflow has `dsl_version = 1` and
-an agent has `dsl_version = 2`. Agent publication remains fail-closed with
-`agent_runtime_unavailable` because durable agent goals and runtime authority
-are not yet available.
+an agent has `dsl_version = 2`. Agents are immutable and publishable in consolidated Slice 1, but not executable. `StartRun` rejects agents with `agent_runtime_unavailable` before creating any execution state. Goal lifecycle
+and agent runtime authority begin in Slice 2.
 
 Warnings and errors consume the same configured diagnostic budget. Existing
 source-size, token, identifier, and type-nesting limits remain in force.
 
 Compiled definition identity includes definition kind, normalized agent
 metadata, exact source, and immutable tool descriptors. Compiled agents are
-available only to authoring and compile-time tooling in this slice. Publication
-must reject them before persistence; legacy workflows remain publishable and
-executable.
+available to authoring, compile-time tooling, and publication in this slice;
+legacy workflows remain publishable and executable.
