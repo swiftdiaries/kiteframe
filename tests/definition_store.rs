@@ -50,7 +50,7 @@ task triage(ticket: string) -> string {
     )
 }
 
-async fn migrated_store_through_0011() -> Option<(PostgresStore, sqlx::PgPool)> {
+async fn migrated_store_through_0011() -> Option<(String, sqlx::PgPool)> {
     let database_url = std::env::var("DATABASE_URL").ok()?;
     let mut admin_url = url::Url::parse(&database_url).expect("database URL");
     admin_url.set_path("/postgres");
@@ -95,16 +95,17 @@ async fn migrated_store_through_0011() -> Option<(PostgresStore, sqlx::PgPool)> 
     .await
     .expect("seed historical definition");
 
-    Some((PostgresStore::from_migrated_pool(pool.clone()), pool))
+    Some((database_url.to_string(), pool))
 }
 
 #[tokio::test]
 async fn migrated_definitions_are_tagged_without_changing_versions() {
-    let Some((store, pool)) = migrated_store_through_0011().await else {
+    let Some((database_url, pool)) = migrated_store_through_0011().await else {
         eprintln!("skipping definition migration test: DATABASE_URL is not configured");
         return;
     };
     MIGRATOR.run(&pool).await.unwrap();
+    let store = PostgresStore::connect(&database_url).await.unwrap();
 
     let old_rows: Vec<(String, i32, String)> = sqlx::query_as(
         "SELECT name, version, definition_kind FROM workflow_definitions \

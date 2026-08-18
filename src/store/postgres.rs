@@ -18,16 +18,6 @@ pub struct PostgresStore {
 }
 
 impl PostgresStore {
-    /// Builds a store around a pool whose migration lifecycle is managed by the caller.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn from_migrated_pool(pool: PgPool) -> Self {
-        Self {
-            pool,
-            limits: super::StoreLimits::default(),
-        }
-    }
-
     pub async fn connect(database_url: &str) -> Result<Self, StoreError> {
         Self::connect_with_limits(database_url, super::StoreLimits::default()).await
     }
@@ -2294,10 +2284,11 @@ async fn get_user_task_in_tx(
                 t.state AS task_state, t.revision, t.created_at, \
                 d.id AS definition_id, d.definition_kind, d.name AS definition_name, \
                 d.version AS definition_version, d.definition_hash, \
-                g.contract_version, g.objective, g.success_criteria, g.constraints, \
+                g.task_id AS goal_task_id, g.contract_version, g.objective, \
+                g.success_criteria, g.constraints, \
                 g.blocked_when, g.contract_digest \
          FROM user_tasks t \
-         JOIN goal_contracts g ON g.task_id = t.id \
+         LEFT JOIN goal_contracts g ON g.task_id = t.id \
          JOIN workflow_definitions d ON d.id = t.definition_id \
          WHERE t.session_id = $1 AND t.id = $2",
     )
@@ -2329,6 +2320,14 @@ fn accepted_user_task_from_row(
             .map_err(|_| stored_data("definition version is malformed"))?,
         definition_hash: row.get("definition_hash"),
     };
+    if definition.kind != DefinitionKind::Agent {
+        return Err(stored_data(
+            "user task definition is not an agent definition",
+        ));
+    }
+    if row.get::<Option<uuid::Uuid>, _>("goal_task_id").is_none() {
+        return Err(stored_data("user task goal contract is missing"));
+    }
     let target: TaskTarget = serde_json::from_value(row.get("target"))
         .map_err(|error| StoreError::InvalidData(error.to_string()))?;
     let preferences: TaskPreferences = serde_json::from_value(row.get("preferences"))
