@@ -19,13 +19,14 @@ pub mod tools;
 
 pub use agent::{
     AgentCommandId, AgentKernel, AgentLifecycleAction, AgentLifecycleAuthorizer,
-    AgentPolicyDecision, AgentRuntime, AgentRuntimeError, BlockGoal, CompleteGoal, FailTask,
-    GoalCriterionProjection, GoalProjection, HarnessStructuralLimits, HarnessTool, InvokeHarness,
-    KernelCommand, KernelCommandPayload, KiteAgentRuntime, KiteFrameId, KiteFrameSnapshot,
-    KiteFrameState, KiteRuntimeState, RequestApproval, RequestContext, RuntimeCeilings,
-    RuntimeCommandKey, RuntimeDisposition, RuntimeEvent, RuntimeHandle, RuntimeHistoryItem,
-    RuntimeHistoryKind, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition, TaskOwnerAuthorizer,
-    WaitForEvent, validate_transition,
+    AgentPolicyDecision, AgentRuntime, AgentRuntimeError, BlockGoal, ClaimAgentCommand,
+    CompleteAgentCommand, CompleteGoal, FailAgentCommand, FailTask, GoalCriterionProjection,
+    GoalProjection, HarnessStructuralLimits, HarnessTool, InvokeHarness, KernelCommand,
+    KernelCommandPayload, KiteAgentRuntime, KiteFrameId, KiteFrameSnapshot, KiteFrameState,
+    KiteRuntimeState, RequestApproval, RequestContext, RuntimeCeilings, RuntimeCommandKey,
+    RuntimeDisposition, RuntimeEvent, RuntimeHandle, RuntimeHistoryItem, RuntimeHistoryKind,
+    RuntimeStart, RuntimeStateSnapshot, RuntimeTransition, TaskOwnerAuthorizer, WaitForEvent,
+    validate_transition,
 };
 pub use config::{ConfigError, HarnessConfig, HarnessMode};
 pub use domain::{
@@ -66,12 +67,12 @@ pub use protocol::{
 };
 pub use schema::{ClosedSchema, PrimitiveValue, SchemaError};
 pub use store::{
-    AcceptedUserTask, AgentCommandState, AgentCommandView, AgentStartCommit, AgentStartSeed,
-    AgentTaskEvent, AgentTaskEventKind, Bindings, CreateSession, FrameCommand, ModelAttempt,
-    NewChild, NewPermissionRequest, PendingPermission, PolicyUpdate, PostgresStore,
-    PublishedDefinition, Question, RecoverableToolCall, RunEvent, RunState, RunToolBinding,
-    RunView, RunnableFrame, SessionView, StartRun, StoreError, StoreLimits, SuspensionFrame,
-    ToolCallIntent,
+    AcceptedUserTask, AgentCommandContext, AgentCommandState, AgentCommandView,
+    AgentRecoveryReport, AgentStartCommit, AgentStartSeed, AgentTaskEvent, AgentTaskEventKind,
+    Bindings, CreateSession, FrameCommand, ModelAttempt, NewChild, NewPermissionRequest,
+    PendingPermission, PolicyUpdate, PostgresStore, PublishedDefinition, Question,
+    RecoverableToolCall, RunEvent, RunState, RunToolBinding, RunView, RunnableFrame, SessionView,
+    StartRun, StoreError, StoreLimits, SuspensionFrame, ToolCallIntent,
 };
 pub use task::{
     AgentExecutionView, AgentSelector, CancelUserTask, HarnessRole, OperationalStatus,

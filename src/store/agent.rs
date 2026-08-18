@@ -1,18 +1,20 @@
 use serde_json::{Value, json};
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::dsl::{CompiledDefinition, CompiledToolBinding, DefinitionKind};
 use crate::{
-    AgentExecutionView, AgentStartCommit, CatalogEpochId, CatalogTool, EvidenceId, GoalBlocker,
-    GoalPhase, KernelCommand, KernelCommandPayload, OperationalStatus, PolicyRevision, PrincipalId,
-    RuntimeCeilings, RuntimeDisposition, RuntimeStateSnapshot, SessionId, StartAgent,
-    TaskLifecycle, UserTaskId, canonical_sha256,
+    AgentCommandId, AgentExecutionView, AgentStartCommit, CatalogEpochId, CatalogTool,
+    ClaimAgentCommand, CompleteAgentCommand, EvidenceId, FailAgentCommand, GoalBlocker, GoalPhase,
+    KernelCommand, KernelCommandPayload, KiteAgentRuntime, KiteFrameState, KiteRuntimeState,
+    OperationalStatus, PolicyRevision, PrincipalId, RuntimeCeilings, RuntimeCommandKey,
+    RuntimeDisposition, RuntimeEvent, RuntimeStateSnapshot, RuntimeTransition, SessionId,
+    StartAgent, TaskLifecycle, UserTaskId, canonical_sha256, validate_transition,
 };
 
 use super::{
-    AgentStartSeed, AgentTaskEvent, AgentTaskEventKind, PostgresStore, StoreError,
-    postgres::user_task_from_row,
+    AgentCommandContext, AgentCommandState, AgentCommandView, AgentRecoveryReport, AgentStartSeed,
+    AgentTaskEvent, AgentTaskEventKind, PostgresStore, StoreError, postgres::user_task_from_row,
 };
 
 const SNAPSHOT_INTEGRITY_ERROR: &str = "stored snapshot integrity check failed";
@@ -38,6 +40,14 @@ struct AgentActionReplay {
     request_digest: String,
     result_task_revision: u64,
     result_goal_revision: u64,
+}
+
+struct LockedAgentCommand {
+    view: AgentCommandView,
+    claim_idempotency_key: Option<String>,
+    claim_request_digest: Option<String>,
+    completion_idempotency_key: Option<String>,
+    completion_request_digest: Option<String>,
 }
 
 impl AgentActionReplay {
@@ -376,6 +386,662 @@ impl PostgresStore {
         .await
     }
 
+    pub async fn dispatchable_agent_commands(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<AgentCommandView>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.task_id, c.runtime_key, c.ordinal, c.schema_version, \
+                    c.command_kind, c.payload, c.payload_digest, c.state, c.revision, \
+                    c.claimant, c.claim_idempotency_key, c.claim_request_digest, \
+                    c.completion_idempotency_key, c.completion_request_digest \
+             FROM agent_commands c \
+             JOIN user_tasks t ON t.id = c.task_id \
+             JOIN sessions s ON s.id = t.session_id \
+             WHERE c.state IN ('pending', 'claimed') AND t.state = 'running' \
+               AND s.state = 'active' \
+             ORDER BY c.created_at, c.id LIMIT $1",
+        )
+        .bind(limit.clamp(1, 256))
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(locked_agent_command_from_row)
+            .map(|result| result.map(|command| command.view))
+            .collect()
+    }
+
+    pub async fn claim_agent_command(
+        &self,
+        request: ClaimAgentCommand,
+    ) -> Result<AgentCommandView, StoreError> {
+        if !(1..=128).contains(&request.claimant.len())
+            || !request.claimant.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "command claimant is invalid".to_owned(),
+            ));
+        }
+        let request_digest = claim_request_digest(&request)?;
+        let mut tx = self.pool().begin().await?;
+        lock_agent_aggregate(&mut tx, &request.session_id, &request.task_id).await?;
+        let row =
+            select_agent_command_for_update(&mut tx, &request.task_id, &request.command_id).await?;
+        let command = locked_agent_command_from_row(&row)?;
+        if command.claim_idempotency_key.as_deref() == Some(request.idempotency_key.as_str()) {
+            if command.claim_request_digest.as_deref() != Some(request_digest.as_str()) {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            tx.commit().await?;
+            return Ok(command.view);
+        }
+        if command.view.state != AgentCommandState::Pending
+            || command.view.revision != request.expected_command_revision
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        let row = sqlx::query(
+            "UPDATE agent_commands SET state = 'claimed', claimant = $1, \
+             claim_idempotency_key = $2, claim_request_digest = $3, \
+             revision = revision + 1, updated_at = CURRENT_TIMESTAMP \
+             WHERE id = $4 AND task_id = $5 AND state = 'pending' AND revision = $6 \
+             RETURNING id, task_id, runtime_key, ordinal, schema_version, command_kind, \
+                       payload, payload_digest, state, revision, claimant, \
+                       claim_idempotency_key, claim_request_digest, \
+                       completion_idempotency_key, completion_request_digest",
+        )
+        .bind(&request.claimant)
+        .bind(request.idempotency_key.as_str())
+        .bind(&request_digest)
+        .bind(request.command_id.as_uuid())
+        .bind(request.task_id.as_uuid())
+        .bind(to_i64(
+            request.expected_command_revision,
+            "command revision is malformed",
+        )?)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::RevisionConflict)?;
+        let claimed = locked_agent_command_from_row(&row)?.view;
+        let aggregate = locked_agent_aggregate_snapshot(&mut tx, &request.task_id).await?;
+        append_agent_task_event(
+            &mut tx,
+            &request.task_id,
+            AgentTaskEventKind::CommandClaimed,
+            json!({
+                "command_id": request.command_id,
+                "command_key": claimed.key,
+                "claimant": request.claimant,
+                "command_revision": claimed.revision,
+            }),
+            aggregate.0,
+            aggregate.1,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    pub async fn load_agent_command_context(
+        &self,
+        session_id: SessionId,
+        task_id: UserTaskId,
+        command_id: AgentCommandId,
+    ) -> Result<AgentCommandContext, StoreError> {
+        let row = self.agent_row(&session_id, &task_id).await?;
+        let command = sqlx::query(
+            "SELECT id, task_id, runtime_key, ordinal, schema_version, command_kind, \
+                    payload, payload_digest, state, revision, claimant, \
+                    claim_idempotency_key, claim_request_digest, \
+                    completion_idempotency_key, completion_request_digest \
+             FROM agent_commands WHERE task_id = $1 AND id = $2",
+        )
+        .bind(task_id.as_uuid())
+        .bind(command_id.as_uuid())
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or(StoreError::RevisionConflict)?;
+        Ok(AgentCommandContext {
+            execution: agent_execution_from_row(&row, self.agent_runtime_ceilings())?,
+            definition: definition_from_agent_row(&row)?,
+            command: locked_agent_command_from_row(&command)?.view,
+        })
+    }
+
+    pub async fn replay_agent_command_completion(
+        &self,
+        principal: &PrincipalId,
+        completion: &CompleteAgentCommand,
+    ) -> Result<Option<AgentExecutionView>, StoreError> {
+        authenticate_agent_owner(self, principal, &completion.session_id, &completion.task_id)
+            .await?;
+        let request_digest = completion_request_digest(completion)?;
+        let row = sqlx::query(
+            "SELECT completion_idempotency_key, completion_request_digest \
+             FROM agent_commands WHERE task_id = $1 AND id = $2",
+        )
+        .bind(completion.task_id.as_uuid())
+        .bind(completion.command_id.as_uuid())
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or(StoreError::RevisionConflict)?;
+        if row
+            .get::<Option<String>, _>("completion_idempotency_key")
+            .as_deref()
+            != Some(completion.idempotency_key.as_str())
+        {
+            return Ok(None);
+        }
+        if row
+            .get::<Option<String>, _>("completion_request_digest")
+            .as_deref()
+            != Some(request_digest.as_str())
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        self.get_agent_execution(completion.session_id.clone(), completion.task_id.clone())
+            .await
+            .map(Some)
+    }
+
+    pub async fn commit_agent_command_transition(
+        &self,
+        principal: &PrincipalId,
+        completion: &CompleteAgentCommand,
+        transition: &RuntimeTransition,
+        policy: Option<&crate::AgentPolicyDecision>,
+        ceilings: &RuntimeCeilings,
+    ) -> Result<AgentExecutionView, StoreError> {
+        if ceilings != self.agent_runtime_ceilings() {
+            return Err(StoreError::AgentTransitionInvalid(
+                "runtime ceilings do not match deployment configuration".to_owned(),
+            ));
+        }
+        let mut shape_execution = self
+            .get_agent_execution(completion.session_id.clone(), completion.task_id.clone())
+            .await?;
+        // Validate the proposal envelope without treating this unlocked read as
+        // revision authority. The locked aggregate below resolves a concurrent
+        // completion receipt before it performs the authoritative CAS checks.
+        shape_execution.task_revision = transition.expected_task_revision;
+        shape_execution.goal_revision = transition.expected_goal_revision;
+        validate_transition(transition, &shape_execution, ceilings)
+            .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        let event_value = serde_json::to_value(&completion.event).map_err(invalid_data)?;
+        crate::canonical_json(&event_value)
+            .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        let completion_digest = completion_request_digest(completion)?;
+        let transition_digest = transition_request_digest(transition)?;
+        let snapshot_bytes = transition
+            .snapshot
+            .canonical_bytes(ceilings)
+            .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
+        let snapshot_digest = transition
+            .snapshot
+            .digest(ceilings)
+            .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
+        let prepared_commands = prepare_commands(&transition.commands, ceilings)?;
+
+        let mut tx = self.pool().begin().await?;
+        let aggregate =
+            lock_agent_aggregate(&mut tx, &completion.session_id, &completion.task_id).await?;
+        if aggregate.task_principal != principal.as_str() {
+            return Err(StoreError::PrincipalMismatch);
+        }
+        let current_snapshot = lock_runtime_snapshot(
+            &mut tx,
+            &completion.task_id,
+            aggregate.task_revision,
+            ceilings,
+        )
+        .await?;
+        let rows = lock_agent_commands(&mut tx, &completion.task_id).await?;
+        let commands = rows
+            .iter()
+            .map(locked_agent_command_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let source = commands
+            .iter()
+            .find(|command| command.view.id == completion.command_id)
+            .ok_or(StoreError::RevisionConflict)?;
+
+        if source.completion_idempotency_key.as_deref() == Some(completion.idempotency_key.as_str())
+        {
+            if source.completion_request_digest.as_deref() != Some(completion_digest.as_str()) {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            tx.commit().await?;
+            return self
+                .get_agent_execution(completion.session_id.clone(), completion.task_id.clone())
+                .await;
+        }
+        validate_completion_locked(
+            principal, completion, transition, policy, &aggregate, source,
+        )?;
+        reconcile_transition_commands(
+            &current_snapshot,
+            &completion.event,
+            transition,
+            source,
+            &commands,
+            ceilings,
+        )?;
+
+        let next_task_revision = aggregate
+            .task_revision
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidData("user task revision is malformed".to_owned()))?;
+        let next_goal_revision = aggregate.goal_revision;
+        let transition_id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO agent_transitions \
+             (id, task_id, idempotency_key, request_digest, source_event_id, \
+              expected_task_revision, expected_goal_revision, committed_task_revision, \
+              committed_goal_revision, snapshot_digest, command_digests) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(transition_id)
+        .bind(completion.task_id.as_uuid())
+        .bind(&transition.idempotency_key)
+        .bind(&transition_digest)
+        .bind(completion.event.event_id())
+        .bind(to_i64(
+            transition.expected_task_revision,
+            "user task revision is malformed",
+        )?)
+        .bind(to_i64(
+            transition.expected_goal_revision,
+            "goal revision is malformed",
+        )?)
+        .bind(to_i64(
+            next_task_revision,
+            "user task revision is malformed",
+        )?)
+        .bind(to_i64(next_goal_revision, "goal revision is malformed")?)
+        .bind(&snapshot_digest)
+        .bind(
+            serde_json::to_value(
+                prepared_commands
+                    .iter()
+                    .map(|command| &command.command_digest)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(invalid_data)?,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE agent_commands SET state = 'completed', completion_idempotency_key = $1, \
+             completion_request_digest = $2, result = $3, revision = revision + 1, \
+             updated_at = CURRENT_TIMESTAMP WHERE task_id = $4 AND id = $5 \
+             AND state IN ('pending', 'claimed') AND revision = $6",
+        )
+        .bind(completion.idempotency_key.as_str())
+        .bind(&completion_digest)
+        .bind(&event_value)
+        .bind(completion.task_id.as_uuid())
+        .bind(completion.command_id.as_uuid())
+        .bind(to_i64(
+            completion.expected_command_revision,
+            "command revision is malformed",
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE agent_runtime_snapshots SET task_revision = $1, schema_version = $2, \
+             runtime_id = $3, disposition = $4, payload = $5, ceiling_bytes = $6, \
+             canonical_bytes = $7, snapshot_digest = $8, updated_at = CURRENT_TIMESTAMP \
+             WHERE task_id = $9",
+        )
+        .bind(to_i64(
+            next_task_revision,
+            "user task revision is malformed",
+        )?)
+        .bind(i32::from(transition.snapshot.schema_version))
+        .bind(&transition.snapshot.runtime_id)
+        .bind(runtime_disposition_name(transition.snapshot.disposition))
+        .bind(&transition.snapshot.payload)
+        .bind(
+            i32::try_from(transition.snapshot.ceiling_bytes).map_err(|_| {
+                StoreError::RuntimeStateInvalid("snapshot ceiling is malformed".to_owned())
+            })?,
+        )
+        .bind(i32::try_from(snapshot_bytes.len()).map_err(|_| {
+            StoreError::RuntimeStateInvalid("snapshot byte count is malformed".to_owned())
+        })?)
+        .bind(&snapshot_digest)
+        .bind(completion.task_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+
+        let terminal_failure = matches!(
+            transition.commands.as_slice(),
+            [KernelCommand {
+                payload: KernelCommandPayload::FailTask(_),
+                ..
+            }]
+        );
+        for (ordinal, prepared) in prepared_commands.iter().enumerate() {
+            let completed = terminal_failure
+                && matches!(prepared.command.payload, KernelCommandPayload::FailTask(_));
+            sqlx::query(
+                "INSERT INTO agent_commands \
+                 (id, task_id, transition_id, ordinal, schema_version, runtime_key, \
+                  command_kind, payload, payload_digest, state, revision, result) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(completion.task_id.as_uuid())
+            .bind(transition_id)
+            .bind(i32::try_from(ordinal).map_err(|_| {
+                StoreError::AgentTransitionInvalid("command ordinal is invalid".to_owned())
+            })?)
+            .bind(i32::from(prepared.command.schema_version))
+            .bind(prepared.command.key.as_str())
+            .bind(command_kind(&prepared.command.payload))
+            .bind(&prepared.payload)
+            .bind(&prepared.payload_digest)
+            .bind(if completed { "completed" } else { "pending" })
+            .bind(if completed { 1_i64 } else { 0_i64 })
+            .bind(completed.then_some(&prepared.payload))
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let (task_state, status, failure) = transition_task_state(transition, ceilings)?;
+        if task_state != "running" {
+            sqlx::query(
+                "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1, \
+                 updated_at = CURRENT_TIMESTAMP WHERE task_id = $1 AND id <> $2 \
+                 AND state IN ('pending', 'claimed')",
+            )
+            .bind(completion.task_id.as_uuid())
+            .bind(completion.command_id.as_uuid())
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE user_tasks SET state = $1, operational_status = $2, revision = $3, \
+             failure = $4, finished_at = CASE WHEN $1 = 'running' THEN NULL \
+                 ELSE CURRENT_TIMESTAMP END, updated_at = CURRENT_TIMESTAMP WHERE id = $5",
+        )
+        .bind(task_state)
+        .bind(operational_status_name(status))
+        .bind(to_i64(
+            next_task_revision,
+            "user task revision is malformed",
+        )?)
+        .bind(failure)
+        .bind(completion.task_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        append_agent_task_event(
+            &mut tx,
+            &completion.task_id,
+            AgentTaskEventKind::RuntimeTransitionCommitted,
+            json!({
+                "transition_id": transition_id,
+                "source_event_id": completion.event.event_id(),
+                "source_command_id": completion.command_id,
+                "snapshot_digest": snapshot_digest,
+                "command_count": transition.commands.len(),
+            }),
+            next_task_revision,
+            next_goal_revision,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_agent_execution(completion.session_id.clone(), completion.task_id.clone())
+            .await
+    }
+
+    pub async fn fail_unavailable_agent_command(
+        &self,
+        principal: &PrincipalId,
+        request: &FailAgentCommand,
+    ) -> Result<AgentExecutionView, StoreError> {
+        if request.code != "runtime_command_unavailable" {
+            return Err(StoreError::AgentTransitionInvalid(
+                "unavailable command failure code is invalid".to_owned(),
+            ));
+        }
+        let request_digest = unavailable_request_digest(request)?;
+        let failure = json!({"code": "runtime_command_unavailable"});
+        let mut tx = self.pool().begin().await?;
+        let aggregate =
+            lock_agent_aggregate(&mut tx, &request.session_id, &request.task_id).await?;
+        if aggregate.task_principal != principal.as_str() {
+            return Err(StoreError::PrincipalMismatch);
+        }
+        let current_snapshot = lock_runtime_snapshot(
+            &mut tx,
+            &request.task_id,
+            aggregate.task_revision,
+            self.agent_runtime_ceilings(),
+        )
+        .await?;
+        let rows = lock_agent_commands(&mut tx, &request.task_id).await?;
+        let commands = rows
+            .iter()
+            .map(locked_agent_command_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let source = commands
+            .iter()
+            .find(|command| command.view.id == request.command_id)
+            .ok_or(StoreError::RevisionConflict)?;
+
+        if source.completion_idempotency_key.as_deref() == Some(request.idempotency_key.as_str()) {
+            if source.completion_request_digest.as_deref() != Some(request_digest.as_str()) {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            tx.commit().await?;
+            return self
+                .get_agent_execution(request.session_id.clone(), request.task_id.clone())
+                .await;
+        }
+        if aggregate.task_lifecycle != TaskLifecycle::Running
+            || aggregate.operational_status == OperationalStatus::Finished
+        {
+            return Err(StoreError::AgentTaskAlreadyTerminal);
+        }
+        if aggregate.goal_phase != GoalPhase::Active {
+            return Err(StoreError::RevisionConflict);
+        }
+        if !matches!(
+            source.view.state,
+            AgentCommandState::Pending | AgentCommandState::Claimed
+        ) || source.view.revision != request.expected_command_revision
+        {
+            return Err(StoreError::RevisionConflict);
+        }
+        let state = KiteAgentRuntime::new(*self.agent_runtime_ceilings())
+            .decode_snapshot(&current_snapshot)
+            .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
+        let waits = runtime_waits(&state)?;
+        let source_kind = external_command_kind(&source.view.payload).ok_or_else(|| {
+            StoreError::AgentTransitionInvalid("source command is not external work".to_owned())
+        })?;
+        if waits.get(source.view.key.as_str()) != Some(&source_kind) {
+            return Err(StoreError::AgentTransitionInvalid(
+                "source command does not match the current snapshot wait".to_owned(),
+            ));
+        }
+
+        let next_task_revision = aggregate
+            .task_revision
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidData("user task revision is malformed".to_owned()))?;
+        let updated = sqlx::query(
+            "UPDATE agent_commands SET state = 'failed', completion_idempotency_key = $1, \
+             completion_request_digest = $2, failure = $3, revision = revision + 1, \
+             updated_at = CURRENT_TIMESTAMP WHERE task_id = $4 AND id = $5 \
+             AND state IN ('pending', 'claimed') AND revision = $6",
+        )
+        .bind(request.idempotency_key.as_str())
+        .bind(&request_digest)
+        .bind(&failure)
+        .bind(request.task_id.as_uuid())
+        .bind(request.command_id.as_uuid())
+        .bind(to_i64(
+            request.expected_command_revision,
+            "command revision is malformed",
+        )?)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::RevisionConflict);
+        }
+        sqlx::query(
+            "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1, \
+             updated_at = CURRENT_TIMESTAMP WHERE task_id = $1 AND id <> $2 \
+             AND state IN ('pending', 'claimed')",
+        )
+        .bind(request.task_id.as_uuid())
+        .bind(request.command_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE agent_runtime_snapshots SET task_revision = $1, \
+             updated_at = CURRENT_TIMESTAMP WHERE task_id = $2",
+        )
+        .bind(to_i64(
+            next_task_revision,
+            "user task revision is malformed",
+        )?)
+        .bind(request.task_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE user_tasks SET state = 'failed', operational_status = 'finished', \
+             revision = $1, failure = $2, finished_at = CURRENT_TIMESTAMP, \
+             updated_at = CURRENT_TIMESTAMP WHERE id = $3",
+        )
+        .bind(to_i64(
+            next_task_revision,
+            "user task revision is malformed",
+        )?)
+        .bind(&failure)
+        .bind(request.task_id.as_uuid())
+        .execute(&mut *tx)
+        .await?;
+        append_agent_task_event(
+            &mut tx,
+            &request.task_id,
+            AgentTaskEventKind::RuntimeCommandUnavailable,
+            json!({
+                "command_id": request.command_id,
+                "command_key": source.view.key,
+                "code": "runtime_command_unavailable",
+            }),
+            next_task_revision,
+            aggregate.goal_revision,
+        )
+        .await?;
+        tx.commit().await?;
+        self.get_agent_execution(request.session_id.clone(), request.task_id.clone())
+            .await
+    }
+
+    pub async fn recover_agent_commands(
+        &self,
+        limit: i64,
+    ) -> Result<AgentRecoveryReport, StoreError> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let tasks = sqlx::query(
+            "SELECT DISTINCT t.id, t.revision \
+             FROM user_tasks t JOIN agent_commands c ON c.task_id = t.id \
+             WHERE t.state = 'running' AND c.state IN ('pending', 'claimed') \
+             ORDER BY t.id LIMIT $1",
+        )
+        .bind(limit.clamp(1, 256))
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut report = AgentRecoveryReport {
+            pending: 0,
+            claimed: 0,
+        };
+        for task in tasks {
+            let task_id = UserTaskId::new(task.get("id"));
+            let task_revision =
+                nonnegative(task.get("revision"), "user task revision is malformed")?;
+            let snapshot = read_runtime_snapshot(
+                &mut tx,
+                &task_id,
+                task_revision,
+                self.agent_runtime_ceilings(),
+            )
+            .await?;
+            let state = KiteAgentRuntime::new(*self.agent_runtime_ceilings())
+                .decode_snapshot(&snapshot)
+                .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
+            let waits = runtime_waits(&state)?;
+            let rows = sqlx::query(
+                "SELECT id, task_id, runtime_key, ordinal, schema_version, command_kind, payload, \
+                        payload_digest, state, revision, claimant, claim_idempotency_key, \
+                        claim_request_digest, completion_idempotency_key, \
+                        completion_request_digest \
+                 FROM agent_commands WHERE task_id = $1 AND state IN ('pending', 'claimed') \
+                 ORDER BY id",
+            )
+            .bind(task_id.as_uuid())
+            .fetch_all(&mut *tx)
+            .await?;
+            let commands = rows
+                .iter()
+                .map(locked_agent_command_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut command_waits = BTreeMap::new();
+            for command in commands {
+                if command.view.task_id != task_id {
+                    return Err(StoreError::RuntimeStateInvalid(
+                        "recovered command belongs to another task".to_owned(),
+                    ));
+                }
+                let kind = external_command_kind(&command.view.payload).ok_or_else(|| {
+                    StoreError::RuntimeStateInvalid(
+                        "recovered authority command is not terminal".to_owned(),
+                    )
+                })?;
+                if waits.get(command.view.key.as_str()) != Some(&kind)
+                    || command_waits
+                        .insert(command.view.key.as_str().to_owned(), kind)
+                        .is_some()
+                {
+                    return Err(StoreError::RuntimeStateInvalid(
+                        "recovered command does not match its snapshot wait".to_owned(),
+                    ));
+                }
+                match command.view.state {
+                    AgentCommandState::Pending => {
+                        report.pending = report.pending.checked_add(1).ok_or_else(|| {
+                            StoreError::InvalidData(
+                                "recovery command count is malformed".to_owned(),
+                            )
+                        })?;
+                    }
+                    AgentCommandState::Claimed => {
+                        report.claimed = report.claimed.checked_add(1).ok_or_else(|| {
+                            StoreError::InvalidData(
+                                "recovery command count is malformed".to_owned(),
+                            )
+                        })?;
+                    }
+                    _ => unreachable!("recovery query selects outstanding commands"),
+                }
+            }
+            if waits != command_waits {
+                return Err(StoreError::RuntimeStateInvalid(
+                    "recovered snapshot wait has no outstanding command".to_owned(),
+                ));
+            }
+        }
+        tx.commit().await?;
+        Ok(report)
+    }
+
     pub async fn agent_task_events_after(
         &self,
         session_id: SessionId,
@@ -440,6 +1106,622 @@ impl PostgresStore {
         .await?
         .ok_or(StoreError::UserTaskNotFound)
     }
+}
+
+struct PreparedCommand<'a> {
+    command: &'a KernelCommand,
+    payload: Value,
+    payload_digest: String,
+    command_digest: String,
+}
+
+async fn authenticate_agent_owner(
+    store: &PostgresStore,
+    principal: &PrincipalId,
+    session_id: &SessionId,
+    task_id: &UserTaskId,
+) -> Result<(), StoreError> {
+    let row = sqlx::query(
+        "SELECT s.principal AS session_principal, s.state AS session_state, \
+                t.principal AS task_principal \
+         FROM sessions s JOIN user_tasks t ON t.session_id = s.id \
+         WHERE s.id = $1 AND t.id = $2",
+    )
+    .bind(session_id.as_uuid())
+    .bind(task_id.as_uuid())
+    .fetch_optional(store.pool())
+    .await?
+    .ok_or(StoreError::UserTaskNotFound)?;
+    if row.get::<String, _>("session_principal") != principal.as_str()
+        || row.get::<String, _>("task_principal") != principal.as_str()
+    {
+        return Err(StoreError::PrincipalMismatch);
+    }
+    if row.get::<String, _>("session_state") != "active" {
+        return Err(StoreError::SessionClosed);
+    }
+    Ok(())
+}
+
+async fn select_agent_command_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &UserTaskId,
+    command_id: &AgentCommandId,
+) -> Result<PgRow, StoreError> {
+    sqlx::query(
+        "SELECT id, task_id, runtime_key, ordinal, schema_version, command_kind, payload, \
+                payload_digest, state, revision, claimant, claim_idempotency_key, \
+                claim_request_digest, completion_idempotency_key, completion_request_digest \
+         FROM agent_commands WHERE task_id = $1 AND id = $2 FOR UPDATE",
+    )
+    .bind(task_id.as_uuid())
+    .bind(command_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(StoreError::RevisionConflict)
+}
+
+async fn lock_agent_commands(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &UserTaskId,
+) -> Result<Vec<PgRow>, StoreError> {
+    Ok(sqlx::query(
+        "SELECT id, task_id, runtime_key, ordinal, schema_version, command_kind, payload, \
+                payload_digest, state, revision, claimant, claim_idempotency_key, \
+                claim_request_digest, completion_idempotency_key, completion_request_digest \
+         FROM agent_commands WHERE task_id = $1 ORDER BY id FOR UPDATE",
+    )
+    .bind(task_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?)
+}
+
+async fn locked_agent_aggregate_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &UserTaskId,
+) -> Result<(u64, u64), StoreError> {
+    let row = sqlx::query(
+        "SELECT t.revision AS task_revision, g.revision AS goal_revision \
+         FROM user_tasks t JOIN goal_states g ON g.task_id = t.id WHERE t.id = $1",
+    )
+    .bind(task_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((
+        nonnegative(row.get("task_revision"), "user task revision is malformed")?,
+        nonnegative(row.get("goal_revision"), "goal revision is malformed")?,
+    ))
+}
+
+async fn lock_runtime_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &UserTaskId,
+    task_revision: u64,
+    ceilings: &RuntimeCeilings,
+) -> Result<RuntimeStateSnapshot, StoreError> {
+    let row = sqlx::query(
+        "SELECT task_revision, schema_version, runtime_id, disposition, payload, \
+                ceiling_bytes, canonical_bytes, snapshot_digest \
+         FROM agent_runtime_snapshots WHERE task_id = $1 FOR UPDATE",
+    )
+    .bind(task_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(snapshot_integrity_error)?;
+    runtime_snapshot_from_locked_row(&row, task_revision, ceilings)
+}
+
+async fn read_runtime_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &UserTaskId,
+    task_revision: u64,
+    ceilings: &RuntimeCeilings,
+) -> Result<RuntimeStateSnapshot, StoreError> {
+    let row = sqlx::query(
+        "SELECT task_revision, schema_version, runtime_id, disposition, payload, \
+                ceiling_bytes, canonical_bytes, snapshot_digest \
+         FROM agent_runtime_snapshots WHERE task_id = $1",
+    )
+    .bind(task_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(snapshot_integrity_error)?;
+    runtime_snapshot_from_locked_row(&row, task_revision, ceilings)
+}
+
+fn runtime_snapshot_from_locked_row(
+    row: &PgRow,
+    task_revision: u64,
+    ceilings: &RuntimeCeilings,
+) -> Result<RuntimeStateSnapshot, StoreError> {
+    if nonnegative_runtime(row.get("task_revision"))? != task_revision {
+        return Err(snapshot_integrity_error());
+    }
+    let snapshot = RuntimeStateSnapshot {
+        schema_version: u16::try_from(row.get::<i32, _>("schema_version"))
+            .map_err(|_| snapshot_integrity_error())?,
+        runtime_id: row.get("runtime_id"),
+        disposition: runtime_disposition(&row.get::<String, _>("disposition"))?,
+        payload: row.get("payload"),
+        ceiling_bytes: u32::try_from(row.get::<i32, _>("ceiling_bytes"))
+            .map_err(|_| snapshot_integrity_error())?,
+        canonical_byte_count: u32::try_from(row.get::<i32, _>("canonical_bytes"))
+            .map_err(|_| snapshot_integrity_error())?,
+        snapshot_digest: row.get("snapshot_digest"),
+    };
+    snapshot
+        .canonical_bytes(ceilings)
+        .map_err(|_| snapshot_integrity_error())?;
+    Ok(snapshot)
+}
+
+fn locked_agent_command_from_row(row: &PgRow) -> Result<LockedAgentCommand, StoreError> {
+    let payload: Value = row.get("payload");
+    let payload_digest: String = row.get("payload_digest");
+    if canonical_sha256(&payload).map_err(|_| command_integrity_error())? != payload_digest {
+        return Err(command_integrity_error());
+    }
+    let kind: String = row.get("command_kind");
+    let payload = parse_command_payload(&kind, payload)?;
+    let schema_version = u16::try_from(row.get::<i32, _>("schema_version"))
+        .map_err(|_| command_integrity_error())?;
+    if schema_version != 1 {
+        return Err(command_integrity_error());
+    }
+    let key = RuntimeCommandKey::new(row.get::<String, _>("runtime_key"))
+        .map_err(|_| command_integrity_error())?;
+    Ok(LockedAgentCommand {
+        view: AgentCommandView {
+            id: AgentCommandId::new(row.get("id")),
+            task_id: UserTaskId::new(row.get("task_id")),
+            key,
+            ordinal: u16::try_from(row.get::<i32, _>("ordinal"))
+                .map_err(|_| command_integrity_error())?,
+            schema_version,
+            payload,
+            payload_digest,
+            state: agent_command_state(&row.get::<String, _>("state"))?,
+            revision: nonnegative(row.get("revision"), "command revision is malformed")?,
+            claimant: row.get("claimant"),
+        },
+        claim_idempotency_key: row.get("claim_idempotency_key"),
+        claim_request_digest: row.get("claim_request_digest"),
+        completion_idempotency_key: row.get("completion_idempotency_key"),
+        completion_request_digest: row.get("completion_request_digest"),
+    })
+}
+
+fn parse_command_payload(kind: &str, value: Value) -> Result<KernelCommandPayload, StoreError> {
+    let parsed = match kind {
+        "request_context" => {
+            serde_json::from_value(value).map(KernelCommandPayload::RequestContext)
+        }
+        "wait_for_event" => serde_json::from_value(value).map(KernelCommandPayload::WaitForEvent),
+        "invoke_harness" => serde_json::from_value(value).map(KernelCommandPayload::InvokeHarness),
+        "request_approval" => {
+            serde_json::from_value(value).map(KernelCommandPayload::RequestApproval)
+        }
+        "complete_goal" => serde_json::from_value(value).map(KernelCommandPayload::CompleteGoal),
+        "block_goal" => serde_json::from_value(value).map(KernelCommandPayload::BlockGoal),
+        "fail_task" => serde_json::from_value(value).map(KernelCommandPayload::FailTask),
+        _ => return Err(command_integrity_error()),
+    };
+    parsed.map_err(|_| command_integrity_error())
+}
+
+fn agent_command_state(value: &str) -> Result<AgentCommandState, StoreError> {
+    match value {
+        "pending" => Ok(AgentCommandState::Pending),
+        "claimed" => Ok(AgentCommandState::Claimed),
+        "completed" => Ok(AgentCommandState::Completed),
+        "failed" => Ok(AgentCommandState::Failed),
+        "cancelled" => Ok(AgentCommandState::Cancelled),
+        _ => Err(command_integrity_error()),
+    }
+}
+
+fn claim_request_digest(request: &ClaimAgentCommand) -> Result<String, StoreError> {
+    canonical_sha256(&json!({
+        "sessionId": &request.session_id,
+        "taskId": &request.task_id,
+        "commandId": &request.command_id,
+        "expectedCommandRevision": request.expected_command_revision,
+        "claimant": &request.claimant,
+    }))
+    .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))
+}
+
+fn completion_request_digest(request: &CompleteAgentCommand) -> Result<String, StoreError> {
+    canonical_sha256(&json!({
+        "sessionId": &request.session_id,
+        "taskId": &request.task_id,
+        "commandId": &request.command_id,
+        "expectedCommandRevision": request.expected_command_revision,
+        "event": &request.event,
+    }))
+    .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))
+}
+
+fn unavailable_request_digest(request: &FailAgentCommand) -> Result<String, StoreError> {
+    canonical_sha256(&json!({
+        "sessionId": &request.session_id,
+        "taskId": &request.task_id,
+        "commandId": &request.command_id,
+        "expectedCommandRevision": request.expected_command_revision,
+        "code": &request.code,
+    }))
+    .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))
+}
+
+fn transition_request_digest(transition: &RuntimeTransition) -> Result<String, StoreError> {
+    canonical_sha256(&json!({
+        "expectedTaskRevision": transition.expected_task_revision,
+        "expectedGoalRevision": transition.expected_goal_revision,
+        "snapshot": &transition.snapshot,
+        "commands": &transition.commands,
+    }))
+    .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))
+}
+
+fn prepare_commands<'a>(
+    commands: &'a [KernelCommand],
+    ceilings: &RuntimeCeilings,
+) -> Result<Vec<PreparedCommand<'a>>, StoreError> {
+    commands
+        .iter()
+        .map(|command| {
+            let bytes = crate::canonical_json(command)
+                .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+            if bytes.len() > ceilings.max_command_bytes {
+                return Err(StoreError::AgentTransitionInvalid(
+                    "runtime command ceiling exceeded".to_owned(),
+                ));
+            }
+            let payload = command_payload(&command.payload)?;
+            Ok(PreparedCommand {
+                command,
+                payload_digest: canonical_sha256(&payload)
+                    .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?,
+                command_digest: canonical_sha256(command)
+                    .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?,
+                payload,
+            })
+        })
+        .collect()
+}
+
+fn validate_completion_locked(
+    principal: &PrincipalId,
+    completion: &CompleteAgentCommand,
+    transition: &RuntimeTransition,
+    policy: Option<&crate::AgentPolicyDecision>,
+    aggregate: &LockedAgentAggregate,
+    source: &LockedAgentCommand,
+) -> Result<(), StoreError> {
+    if aggregate.task_principal != principal.as_str() {
+        return Err(StoreError::PrincipalMismatch);
+    }
+    if aggregate.task_lifecycle != TaskLifecycle::Running
+        || aggregate.operational_status == OperationalStatus::Finished
+    {
+        return Err(StoreError::AgentTaskAlreadyTerminal);
+    }
+    if aggregate.goal_phase != GoalPhase::Active {
+        return Err(StoreError::RevisionConflict);
+    }
+    if transition.expected_task_revision != aggregate.task_revision
+        || transition.expected_goal_revision != aggregate.goal_revision
+    {
+        return Err(StoreError::RevisionConflict);
+    }
+    if !matches!(
+        source.view.state,
+        AgentCommandState::Pending | AgentCommandState::Claimed
+    ) || source.view.revision != completion.expected_command_revision
+    {
+        return Err(StoreError::RevisionConflict);
+    }
+    if completion.event.command_key() != Some(&source.view.key)
+        || transition.idempotency_key != format!("event:{}", completion.event.event_id())
+    {
+        return Err(StoreError::AgentTransitionInvalid(
+            "completion event does not match its source command".to_owned(),
+        ));
+    }
+    if let Some(policy) = policy {
+        if !policy.allowed {
+            return Err(StoreError::AgentTransitionInvalid(
+                "current policy denied agent transition".to_owned(),
+            ));
+        }
+        if policy.policy_revision != aggregate.session_policy_revision {
+            return Err(StoreError::PolicyRevisionConflict);
+        }
+    }
+    if transition.commands.iter().any(|command| {
+        matches!(
+            command.payload,
+            KernelCommandPayload::CompleteGoal(_) | KernelCommandPayload::BlockGoal(_)
+        )
+    }) {
+        return Err(StoreError::AgentTransitionInvalid(
+            "goal authority is not enabled until Task 6".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn reconcile_transition_commands(
+    current_snapshot: &RuntimeStateSnapshot,
+    event: &RuntimeEvent,
+    transition: &RuntimeTransition,
+    source: &LockedAgentCommand,
+    persisted: &[LockedAgentCommand],
+    ceilings: &RuntimeCeilings,
+) -> Result<(), StoreError> {
+    let current_state = KiteAgentRuntime::new(*ceilings)
+        .decode_snapshot(current_snapshot)
+        .map_err(|error| StoreError::RuntimeStateInvalid(error.to_string()))?;
+    let replacement_state = KiteAgentRuntime::new(*ceilings)
+        .decode_snapshot(&transition.snapshot)
+        .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+    let current_waits = runtime_waits(&current_state)?;
+    let replacement_waits = runtime_waits(&replacement_state)?;
+    let source_kind = external_command_kind(&source.view.payload).ok_or_else(|| {
+        StoreError::AgentTransitionInvalid("source command is not external work".to_owned())
+    })?;
+    if current_waits.get(source.view.key.as_str()) != Some(&source_kind) {
+        return Err(StoreError::AgentTransitionInvalid(
+            "source command does not match the current snapshot wait".to_owned(),
+        ));
+    }
+    let event_kind = event_command_kind(event, source_kind)?;
+    if event_kind != source_kind {
+        return Err(StoreError::AgentTransitionInvalid(
+            "event kind does not match persisted command".to_owned(),
+        ));
+    }
+    if replacement_waits.contains_key(source.view.key.as_str()) {
+        return Err(StoreError::AgentTransitionInvalid(
+            "consumed source wait remains in replacement snapshot".to_owned(),
+        ));
+    }
+
+    let mut new_keys = BTreeSet::new();
+    let mut new_external = BTreeMap::new();
+    for command in &transition.commands {
+        if persisted
+            .iter()
+            .any(|stored| stored.view.key == command.key)
+            || !new_keys.insert(command.key.as_str())
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "new command runtime key is duplicated".to_owned(),
+            ));
+        }
+        if let Some(kind) = external_command_kind(&command.payload) {
+            new_external.insert(command.key.as_str(), kind);
+            if replacement_waits.get(command.key.as_str()) != Some(&kind) {
+                return Err(StoreError::AgentTransitionInvalid(
+                    "new command does not have exactly one matching snapshot wait".to_owned(),
+                ));
+            }
+        }
+    }
+    let outstanding = persisted
+        .iter()
+        .filter(|stored| stored.view.id != source.view.id)
+        .filter(|stored| {
+            matches!(
+                stored.view.state,
+                AgentCommandState::Pending | AgentCommandState::Claimed
+            )
+        })
+        .map(|stored| {
+            external_command_kind(&stored.view.payload)
+                .map(|kind| (stored.view.key.as_str(), kind))
+                .ok_or_else(|| {
+                    StoreError::AgentTransitionInvalid(
+                        "outstanding authority command cannot be dispatched".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    for (key, kind) in &replacement_waits {
+        let matches_new = new_external.get(key.as_str()) == Some(kind);
+        let matches_persisted = outstanding.get(key.as_str()) == Some(kind);
+        if matches_new == matches_persisted {
+            return Err(StoreError::AgentTransitionInvalid(
+                "replacement snapshot wait does not match exactly one command".to_owned(),
+            ));
+        }
+    }
+    for (key, kind) in &outstanding {
+        if replacement_waits.get(*key) != Some(kind) {
+            return Err(StoreError::AgentTransitionInvalid(
+                "outstanding command is absent from replacement snapshot".to_owned(),
+            ));
+        }
+    }
+    if transition.snapshot.disposition == RuntimeDisposition::Running
+        && transition.commands.is_empty()
+        && !structured_partial_join(
+            &current_state,
+            &replacement_state,
+            &source.view.key,
+            &outstanding,
+        )
+    {
+        return Err(StoreError::AgentTransitionInvalid(
+            "running transition without new commands is not a structured partial join".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn event_command_kind(
+    event: &RuntimeEvent,
+    source_kind: &'static str,
+) -> Result<&'static str, StoreError> {
+    match event {
+        RuntimeEvent::HarnessResult { .. } => Ok("invoke_harness"),
+        RuntimeEvent::ContextResolved { .. } => Ok("request_context"),
+        RuntimeEvent::SemanticEvent { .. } => Ok("wait_for_event"),
+        RuntimeEvent::ApprovalResult { .. } => Ok("request_approval"),
+        RuntimeEvent::CommandFailed { .. } => Ok(source_kind),
+        RuntimeEvent::PrincipalResumed { .. } => Err(StoreError::AgentTransitionInvalid(
+            "event kind does not name an external command".to_owned(),
+        )),
+    }
+}
+
+fn runtime_waits(state: &KiteRuntimeState) -> Result<BTreeMap<String, &'static str>, StoreError> {
+    let mut waits = BTreeMap::new();
+    for frame in state.frames.values() {
+        let waiting = match &frame.state {
+            KiteFrameState::WaitingForHarness { command_key } => {
+                Some((command_key, "invoke_harness"))
+            }
+            KiteFrameState::WaitingForApproval { command_key, .. } => {
+                Some((command_key, "request_approval"))
+            }
+            _ => None,
+        };
+        if let Some((key, kind)) = waiting
+            && waits.insert(key.as_str().to_owned(), kind).is_some()
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "snapshot wait key is duplicated".to_owned(),
+            ));
+        }
+    }
+    Ok(waits)
+}
+
+fn structured_partial_join(
+    before: &KiteRuntimeState,
+    after: &KiteRuntimeState,
+    source_key: &RuntimeCommandKey,
+    outstanding: &BTreeMap<&str, &'static str>,
+) -> bool {
+    let source = before.frames.values().find(|frame| {
+        matches!(
+            &frame.state,
+            KiteFrameState::WaitingForHarness { command_key }
+                | KiteFrameState::WaitingForApproval { command_key, .. }
+                if command_key == source_key
+        )
+    });
+    let Some(source) = source else {
+        return false;
+    };
+    let Some(parent_id) = source.parent_id else {
+        return false;
+    };
+    let Some(parent) = before.frames.get(&parent_id) else {
+        return false;
+    };
+    let KiteFrameState::WaitingForChildren { child_ids } = &parent.state else {
+        return false;
+    };
+    if child_ids.len() < 2 || !child_ids.contains(&source.id) {
+        return false;
+    }
+    if !matches!(
+        after.frames.get(&source.id).map(|frame| &frame.state),
+        Some(KiteFrameState::Returned { .. })
+    ) || !matches!(
+        after.frames.get(&parent_id).map(|frame| &frame.state),
+        Some(KiteFrameState::WaitingForChildren { .. })
+    ) {
+        return false;
+    }
+    child_ids.iter().filter(|id| **id != source.id).any(|id| {
+        after
+            .frames
+            .get(id)
+            .is_some_and(|frame| match &frame.state {
+                KiteFrameState::WaitingForHarness { command_key }
+                | KiteFrameState::WaitingForApproval { command_key, .. } => {
+                    outstanding.contains_key(command_key.as_str())
+                }
+                _ => false,
+            })
+    })
+}
+
+fn external_command_kind(payload: &KernelCommandPayload) -> Option<&'static str> {
+    match payload {
+        KernelCommandPayload::RequestContext(_) => Some("request_context"),
+        KernelCommandPayload::WaitForEvent(_) => Some("wait_for_event"),
+        KernelCommandPayload::InvokeHarness(_) => Some("invoke_harness"),
+        KernelCommandPayload::RequestApproval(_) => Some("request_approval"),
+        KernelCommandPayload::CompleteGoal(_)
+        | KernelCommandPayload::BlockGoal(_)
+        | KernelCommandPayload::FailTask(_) => None,
+    }
+}
+
+fn transition_task_state(
+    transition: &RuntimeTransition,
+    ceilings: &RuntimeCeilings,
+) -> Result<(&'static str, OperationalStatus, Option<Value>), StoreError> {
+    match transition.snapshot.disposition {
+        RuntimeDisposition::Running => {
+            let state = KiteAgentRuntime::new(*ceilings)
+                .decode_snapshot(&transition.snapshot)
+                .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+            let waits = runtime_waits(&state)?;
+            let mut kinds = waits.values();
+            let first = kinds.next().ok_or_else(|| {
+                StoreError::AgentTransitionInvalid("running snapshot has no wait".to_owned())
+            })?;
+            if kinds.any(|kind| kind != first) {
+                return Err(StoreError::AgentTransitionInvalid(
+                    "running snapshot has mixed external command kinds".to_owned(),
+                ));
+            }
+            let status = match *first {
+                "invoke_harness" => OperationalStatus::WaitingForHarness,
+                "request_approval" => OperationalStatus::WaitingForApproval,
+                "request_context" => OperationalStatus::WaitingForContext,
+                "wait_for_event" => OperationalStatus::WaitingForEvent,
+                _ => unreachable!("runtime_waits returns closed command kinds"),
+            };
+            Ok(("running", status, None))
+        }
+        RuntimeDisposition::Returned if transition.commands.is_empty() => {
+            Ok(("succeeded", OperationalStatus::Finished, None))
+        }
+        RuntimeDisposition::Terminating => {
+            let [
+                KernelCommand {
+                    payload: KernelCommandPayload::FailTask(failure),
+                    ..
+                },
+            ] = transition.commands.as_slice()
+            else {
+                return Err(StoreError::AgentTransitionInvalid(
+                    "terminating transition must fail the task".to_owned(),
+                ));
+            };
+            Ok((
+                "failed",
+                OperationalStatus::Finished,
+                Some(json!({"code": failure.code, "message": failure.message})),
+            ))
+        }
+        RuntimeDisposition::Blocked => Err(StoreError::AgentTransitionInvalid(
+            "goal authority is not enabled until Task 6".to_owned(),
+        )),
+        _ => Err(StoreError::AgentTransitionInvalid(
+            "runtime transition disposition is invalid".to_owned(),
+        )),
+    }
+}
+
+fn command_integrity_error() -> StoreError {
+    StoreError::RuntimeStateInvalid("stored command integrity check failed".to_owned())
 }
 
 async fn load_action_replay(

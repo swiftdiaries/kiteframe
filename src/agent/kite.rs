@@ -312,7 +312,8 @@ impl AgentRuntime for KiteAgentRuntime {
             RuntimeEvent::CommandFailed {
                 command_key, code, ..
             } => {
-                find_waiting_frame(&state, command_key, WaitingKind::Any)?;
+                let frame_id = find_waiting_frame(&state, command_key, WaitingKind::Any)?;
+                state.frames.get_mut(&frame_id).unwrap().state = KiteFrameState::Ready;
                 return transition(
                     state,
                     RuntimeDisposition::Terminating,

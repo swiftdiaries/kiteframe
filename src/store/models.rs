@@ -61,6 +61,19 @@ pub struct AgentCommandView {
     pub claimant: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentCommandContext {
+    pub execution: AgentExecutionView,
+    pub definition: CompiledDefinition,
+    pub command: AgentCommandView,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRecoveryReport {
+    pub pending: u64,
+    pub claimed: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentTaskEventKind {
     AgentStarted,

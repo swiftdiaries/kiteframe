@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
-    AcceptedUserTask, AgentExecutionView, AgentRuntime, PolicyRevision, PostgresStore, PrincipalId,
-    RuntimeCeilings, RuntimeStart, StartAgent, StoreError, validate_transition,
+    AcceptedUserTask, AgentExecutionView, AgentRecoveryReport, AgentRuntime, CompleteAgentCommand,
+    FailAgentCommand, KernelCommand, KernelCommandPayload, PolicyRevision, PostgresStore,
+    PrincipalId, RuntimeCeilings, RuntimeEvent, RuntimeHandle, RuntimeStart, StartAgent,
+    StoreError, validate_transition,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,5 +131,110 @@ impl AgentKernel {
                 ceilings: &self.ceilings,
             })
             .await
+    }
+
+    pub async fn complete_command(
+        &self,
+        principal: &PrincipalId,
+        request: CompleteAgentCommand,
+    ) -> Result<AgentExecutionView, StoreError> {
+        self.complete_command_with_shape(principal, request, false)
+            .await
+    }
+
+    pub async fn fail_command(
+        &self,
+        principal: &PrincipalId,
+        request: FailAgentCommand,
+    ) -> Result<AgentExecutionView, StoreError> {
+        if request.code.is_empty() || request.code.len() > 128 {
+            return Err(StoreError::AgentTransitionInvalid(
+                "command failure code is invalid".to_owned(),
+            ));
+        }
+        let context = self
+            .store
+            .load_agent_command_context(
+                request.session_id.clone(),
+                request.task_id.clone(),
+                request.command_id.clone(),
+            )
+            .await?;
+        let completion = CompleteAgentCommand {
+            session_id: request.session_id,
+            task_id: request.task_id,
+            command_id: request.command_id.clone(),
+            expected_command_revision: request.expected_command_revision,
+            idempotency_key: request.idempotency_key.clone(),
+            event: RuntimeEvent::CommandFailed {
+                event_id: format!(
+                    "command-failed:{}:{}",
+                    request.command_id.as_uuid(),
+                    request.idempotency_key.as_str()
+                ),
+                command_key: context.command.key,
+                code: request.code,
+            },
+        };
+        self.complete_command_with_shape(principal, completion, true)
+            .await
+    }
+
+    async fn complete_command_with_shape(
+        &self,
+        principal: &PrincipalId,
+        request: CompleteAgentCommand,
+        require_fail_task: bool,
+    ) -> Result<AgentExecutionView, StoreError> {
+        if let Some(replay) = self
+            .store
+            .replay_agent_command_completion(principal, &request)
+            .await?
+        {
+            return Ok(replay);
+        }
+        let context = self
+            .store
+            .load_agent_command_context(
+                request.session_id.clone(),
+                request.task_id.clone(),
+                request.command_id.clone(),
+            )
+            .await?;
+        if request.event.command_key() != Some(&context.command.key) {
+            return Err(StoreError::AgentTransitionInvalid(
+                "event command key does not match persisted command".to_owned(),
+            ));
+        }
+        let transition = self
+            .runtime
+            .handle(RuntimeHandle {
+                execution: &context.execution,
+                definition: &context.definition,
+                event: &request.event,
+            })
+            .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        validate_transition(&transition, &context.execution, &self.ceilings)
+            .map_err(|error| StoreError::AgentTransitionInvalid(error.to_string()))?;
+        if require_fail_task
+            && !matches!(
+                transition.commands.as_slice(),
+                [KernelCommand {
+                    payload: KernelCommandPayload::FailTask(_),
+                    ..
+                }]
+            )
+        {
+            return Err(StoreError::AgentTransitionInvalid(
+                "command failure must produce exactly one FailTask".to_owned(),
+            ));
+        }
+        self.store
+            .commit_agent_command_transition(principal, &request, &transition, None, &self.ceilings)
+            .await
+    }
+
+    pub async fn recover(&self, limit: i64) -> Result<AgentRecoveryReport, StoreError> {
+        self.store.recover_agent_commands(limit).await
     }
 }

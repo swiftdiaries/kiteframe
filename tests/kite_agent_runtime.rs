@@ -1001,6 +1001,11 @@ fn command_failed_for_a_matching_wait_emits_exactly_one_fail_task() {
     };
     assert_eq!(command.code, "provider_unavailable");
     assert!(!command.message.is_empty());
+    let state = fixture.decode(&transition.snapshot);
+    assert_eq!(
+        state.frames[&KiteFrameId::new(0)].state,
+        KiteFrameState::Ready
+    );
     let wire = serde_json::to_string(&transition.commands).unwrap();
     assert!(!wire.contains("complete_goal"));
     assert!(!wire.contains("block_goal"));

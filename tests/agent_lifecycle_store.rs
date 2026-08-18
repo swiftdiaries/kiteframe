@@ -147,16 +147,18 @@ impl AgentStoreFixture {
         .execute(&fixture.pool)
         .await
         .unwrap();
+        let command_payload = json!({"evidenceType": "github.review_thread", "subject": {}});
         sqlx::query(
             "INSERT INTO agent_commands \
              (id, task_id, transition_id, ordinal, schema_version, runtime_key, \
               command_kind, payload, payload_digest) \
-             VALUES ($1, $2, $3, 0, 1, 'context-1', 'request_context', $4, 'sha256:command')",
+             VALUES ($1, $2, $3, 0, 1, 'context-1', 'request_context', $4, $5)",
         )
         .bind(command_id)
         .bind(fixture.task.id.as_uuid())
         .bind(transition_id)
-        .bind(json!({"evidenceType": "github.review_thread", "subject": {}}))
+        .bind(&command_payload)
+        .bind(kiteframe::canonical_sha256(&command_payload).unwrap())
         .execute(&fixture.pool)
         .await
         .unwrap();

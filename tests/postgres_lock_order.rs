@@ -6,13 +6,13 @@ use std::time::Duration;
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::{
     AgentKernel, AgentRuntime, AgentRuntimeError, AgentSelector, CatalogTool, ClosedSchema,
-    CreateSession, EffectKind, FrameCommand, FrameId, GoalContract, IdempotencyKey, KernelCommand,
-    KernelCommandPayload, NewChild, NewPermissionRequest, PermissionRequestId, PolicyRevision,
-    PolicyUpdate, PostgresStore, PrincipalId, RecoverySupport, RequestContext, RunId,
-    RuntimeCeilings, RuntimeCommandKey, RuntimeDisposition, RuntimeStart, RuntimeStateSnapshot,
-    RuntimeTransition, SessionId, StartAgent, StartRun, StoreError, SubmitUserTask,
-    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
-    ToolCatalogSnapshot, UserTaskId,
+    CompleteAgentCommand, CreateSession, EffectKind, EvidenceId, FrameCommand, FrameId,
+    GoalContract, IdempotencyKey, KernelCommand, KernelCommandPayload, KiteAgentRuntime, NewChild,
+    NewPermissionRequest, PermissionRequestId, PolicyRevision, PolicyUpdate, PostgresStore,
+    PrincipalId, RecoverySupport, RequestContext, RunId, RuntimeCeilings, RuntimeCommandKey,
+    RuntimeDisposition, RuntimeEvent, RuntimeStart, RuntimeStateSnapshot, RuntimeTransition,
+    SessionId, StartAgent, StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle,
+    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -207,6 +207,75 @@ async fn accepted_agent_task(child: &ChildRun) -> UserTaskId {
         .id
 }
 
+async fn accepted_fork_agent_task(child: &ChildRun) -> UserTaskId {
+    let name = format!("lock_fork_agent_{}", Uuid::now_v7().simple());
+    let source = format!(
+        r#"agent {name}(repository: string, pull_request: integer) -> string {{
+  entry root(repository = repository, pull_request = pull_request)
+  limits {{ steps: 100 model_turns_per_task: 10 tool_calls_per_response: 4 parallel_branches: 4 response_item_bytes: 16384 active_execution_seconds: 60 elapsed_seconds: 600 }}
+  task root(repository: string, pull_request: integer) -> string {{
+    model reasoning prompt """Split.""" tools []
+    on split(left: string, right: string) {{
+      fork {{
+        first = call branch(value = left) context isolated
+        second = call branch(value = right) context kept
+      }} join
+      done first
+    }}
+  }}
+  task branch(value: string) -> string {{
+    model reasoning prompt """Return.""" tools []
+    on finished(summary: string) {{ done summary }}
+  }}
+}}"#
+    );
+    let catalog = ToolCatalogSnapshot::new(
+        child.session_id.clone(),
+        Uuid::now_v7(),
+        std::iter::empty::<CatalogTool>(),
+    )
+    .expect("empty fork-agent catalog");
+    let agent = compile(&source, &catalog, &Limits::default()).expect("compile fork lock agent");
+    let definition = child
+        .store
+        .publish(child.session_id.clone(), &agent, &source)
+        .await
+        .expect("publish fork lock agent");
+    child
+        .store
+        .submit_user_task(
+            &child.principal,
+            SubmitUserTask {
+                session_id: child.session_id.clone(),
+                agent: AgentSelector {
+                    name: definition.name,
+                    version: Some(definition.version),
+                },
+                target: TaskTarget::GithubPullRequest {
+                    repository: "acme/widgets".to_owned(),
+                    number: 142,
+                },
+                preferences: TaskPreferences { harness_role: None },
+                goal: GoalContract {
+                    version: 1,
+                    objective: "Keep the pull request mergeable".to_owned(),
+                    success: vec![SuccessCriterion {
+                        id: "reviews_resolved".to_owned(),
+                        statement: "All actionable reviews are resolved".to_owned(),
+                        evidence: "github.review_thread".to_owned(),
+                    }],
+                    constraints: vec![],
+                    blocked_when: vec![],
+                },
+                idempotency_key: IdempotencyKey::new(format!("submit-fork-{}", Uuid::now_v7()))
+                    .expect("fork task idempotency key"),
+            },
+        )
+        .await
+        .expect("submit fork lock agent task")
+        .id
+}
+
 struct LockStartRuntime;
 
 impl AgentRuntime for LockStartRuntime {
@@ -250,6 +319,14 @@ fn agent_kernel(child: &ChildRun) -> Arc<AgentKernel> {
     Arc::new(AgentKernel::new(
         Arc::clone(&child.store),
         Arc::new(LockStartRuntime),
+        Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&child.store))),
+    ))
+}
+
+fn kite_agent_kernel(child: &ChildRun) -> Arc<AgentKernel> {
+    Arc::new(AgentKernel::new(
+        Arc::clone(&child.store),
+        Arc::new(KiteAgentRuntime::new(RuntimeCeilings::default())),
         Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&child.store))),
     ))
 }
@@ -758,6 +835,149 @@ async fn session_close_locks_multiple_agent_commands_in_id_order() {
             "cancelled".to_owned(),
         ],
     );
+}
+
+#[tokio::test]
+async fn command_completion_and_session_close_share_ordered_command_locks() {
+    let application_name = format!("kf-complete-close-lock-{}", Uuid::now_v7());
+    let child = child_run(&application_name).await;
+    let task_id = accepted_fork_agent_task(&child).await;
+    let kernel = kite_agent_kernel(&child);
+    kernel
+        .start_agent(
+            &child.principal,
+            start_agent_request(&child, task_id.clone(), "start-completion-lock"),
+        )
+        .await
+        .expect("start fork agent");
+    let root = child
+        .store
+        .dispatchable_agent_commands(256)
+        .await
+        .expect("dispatch root")
+        .into_iter()
+        .find(|command| command.task_id == task_id)
+        .expect("root command");
+    kernel
+        .complete_command(
+            &child.principal,
+            CompleteAgentCommand {
+                session_id: child.session_id.clone(),
+                task_id: task_id.clone(),
+                command_id: root.id,
+                expected_command_revision: root.revision,
+                idempotency_key: IdempotencyKey::new("complete-lock-root")
+                    .expect("root completion key"),
+                event: RuntimeEvent::HarnessResult {
+                    event_id: "evt-lock-root".to_owned(),
+                    command_key: root.key,
+                    outcome: "split".to_owned(),
+                    fields: json!({"left":"one", "right":"two"}),
+                    evidence_id: EvidenceId::new(Uuid::now_v7()),
+                    history: vec![],
+                },
+            },
+        )
+        .await
+        .expect("split root");
+    let source = child
+        .store
+        .dispatchable_agent_commands(256)
+        .await
+        .expect("dispatch children")
+        .into_iter()
+        .filter(|command| command.task_id == task_id)
+        .max_by_key(|command| *command.id.as_uuid())
+        .expect("child command");
+    let command_ids: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM agent_commands WHERE task_id = $1 ORDER BY id")
+            .bind(task_id.as_uuid())
+            .fetch_all(child.store.pool())
+            .await
+            .expect("ordered command ids");
+    assert!(command_ids.len() >= 3);
+    let lowest = command_ids[0];
+    let later = command_ids[1..].to_vec();
+
+    let mut command_gate = child.store.pool().begin().await.expect("command gate");
+    sqlx::query("SELECT id FROM agent_commands WHERE id = $1 FOR UPDATE")
+        .bind(lowest)
+        .execute(&mut *command_gate)
+        .await
+        .expect("lock lowest command");
+
+    let completion_kernel = Arc::clone(&kernel);
+    let completion_principal = child.principal.clone();
+    let completion_session = child.session_id.clone();
+    let completion_task = task_id.clone();
+    let mut completion = tokio::spawn(async move {
+        completion_kernel
+            .complete_command(
+                &completion_principal,
+                CompleteAgentCommand {
+                    session_id: completion_session,
+                    task_id: completion_task,
+                    command_id: source.id,
+                    expected_command_revision: source.revision,
+                    idempotency_key: IdempotencyKey::new("complete-lock-child")
+                        .expect("child completion key"),
+                    event: RuntimeEvent::HarnessResult {
+                        event_id: "evt-lock-child".to_owned(),
+                        command_key: source.key,
+                        outcome: "finished".to_owned(),
+                        fields: json!({"summary":"one"}),
+                        evidence_id: EvidenceId::new(Uuid::now_v7()),
+                        history: vec![],
+                    },
+                },
+            )
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+    let mut later_probe = child.store.pool().begin().await.expect("later probe");
+    let later_result = sqlx::query(
+        "SELECT id FROM agent_commands WHERE id = ANY($1) ORDER BY id FOR UPDATE NOWAIT",
+    )
+    .bind(&later)
+    .fetch_all(&mut *later_probe)
+    .await;
+    assert!(
+        later_result.is_ok(),
+        "completion locked a later command before the lowest command: {later_result:?}",
+    );
+    later_probe.rollback().await.expect("release later probe");
+
+    let close_store = Arc::clone(&child.store);
+    let close_session = child.session_id.clone();
+    let close_principal = child.principal.clone();
+    let mut close = tokio::spawn(async move {
+        close_store
+            .close_session_and_cancel_work(close_session, &close_principal)
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 2).await;
+    command_gate.commit().await.expect("release command gate");
+
+    let (completion_result, close_result) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut completion, &mut close)
+    })
+    .await
+    .expect("completion and close must terminate without deadlock");
+    completion_result
+        .expect("completion task")
+        .expect("completion result");
+    close_result.expect("close task").expect("close result");
+    assert_eq!(
+        child
+            .store
+            .get_agent_execution(child.session_id.clone(), task_id)
+            .await
+            .expect("cancelled agent task")
+            .lifecycle,
+        TaskLifecycle::Cancelled,
+    );
+    assert_cancelled(&child, "closed").await;
 }
 
 #[tokio::test]

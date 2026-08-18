@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dsl::ModelRole;
-use crate::{ClosedSchema, CriterionAssertion, EvidenceId, GoalContract};
+use crate::{
+    ClosedSchema, CriterionAssertion, EvidenceId, GoalContract, IdempotencyKey, SessionId,
+    UserTaskId,
+};
 
 use super::AgentRuntimeError;
 
@@ -17,6 +20,39 @@ impl AgentCommandId {
     pub const fn as_uuid(&self) -> &uuid::Uuid {
         &self.0
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimAgentCommand {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub command_id: AgentCommandId,
+    pub expected_command_revision: u64,
+    pub claimant: String,
+    pub idempotency_key: IdempotencyKey,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CompleteAgentCommand {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub command_id: AgentCommandId,
+    pub expected_command_revision: u64,
+    pub idempotency_key: IdempotencyKey,
+    pub event: RuntimeEvent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FailAgentCommand {
+    pub session_id: SessionId,
+    pub task_id: UserTaskId,
+    pub command_id: AgentCommandId,
+    pub expected_command_revision: u64,
+    pub idempotency_key: IdempotencyKey,
+    pub code: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
