@@ -443,6 +443,117 @@ async fn session_close_locks_session_before_ordered_task_and_goal_rows() {
 }
 
 #[tokio::test]
+async fn session_close_locks_multiple_agent_commands_in_id_order() {
+    let application_name = format!("kf-agent-command-lock-{}", Uuid::now_v7());
+    let child = child_run(&application_name).await;
+    let task_id = accepted_agent_task(&child).await;
+    let transition_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO agent_transitions \
+         (id, task_id, idempotency_key, request_digest, expected_task_revision, \
+          expected_goal_revision, committed_task_revision, committed_goal_revision, \
+          snapshot_digest, command_digests) \
+         VALUES ($1, $2, $3, 'sha256:request', 0, 0, 1, 0, \
+                 'sha256:snapshot', '[]'::jsonb)",
+    )
+    .bind(transition_id)
+    .bind(task_id.as_uuid())
+    .bind(format!("transition-{}", Uuid::now_v7()))
+    .execute(child.store.pool())
+    .await
+    .expect("insert transition");
+
+    let low = Uuid::now_v7();
+    let middle = Uuid::now_v7();
+    let high = Uuid::now_v7();
+    assert!(
+        low < middle && middle < high,
+        "UUIDs must define lock order"
+    );
+    for (ordinal, id, key, state) in [
+        (0_i32, high, "command-high", "pending"),
+        (1_i32, middle, "command-middle", "claimed"),
+        (2_i32, low, "command-low", "pending"),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_commands \
+             (id, task_id, transition_id, ordinal, schema_version, runtime_key, \
+              command_kind, payload, payload_digest, state) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'request_context', '{}'::jsonb, $6, $7)",
+        )
+        .bind(id)
+        .bind(task_id.as_uuid())
+        .bind(transition_id)
+        .bind(ordinal)
+        .bind(key)
+        .bind(format!("sha256:{key}"))
+        .bind(state)
+        .execute(child.store.pool())
+        .await
+        .expect("insert command");
+    }
+
+    let mut low_gate = child.store.pool().begin().await.expect("low command gate");
+    sqlx::query("SELECT id FROM agent_commands WHERE id = $1 FOR UPDATE")
+        .bind(low)
+        .execute(&mut *low_gate)
+        .await
+        .expect("lock lowest command");
+
+    let close_store = Arc::clone(&child.store);
+    let close_session = child.session_id.clone();
+    let close_principal = child.principal.clone();
+    let mut close = tokio::spawn(async move {
+        close_store
+            .close_session_and_cancel_work(close_session, &close_principal)
+            .await
+    });
+    wait_for_blocked_connections(&child.store, &application_name, 1).await;
+
+    let mut later_probe = child
+        .store
+        .pool()
+        .begin()
+        .await
+        .expect("later command probe");
+    let later_result = sqlx::query(
+        "SELECT id FROM agent_commands WHERE id = ANY($1) ORDER BY id FOR UPDATE NOWAIT",
+    )
+    .bind(vec![middle, high])
+    .fetch_all(&mut *later_probe)
+    .await;
+    assert!(
+        later_result.is_ok(),
+        "session close locked a later command before the lowest command: {later_result:?}",
+    );
+    later_probe
+        .rollback()
+        .await
+        .expect("release later command probe");
+    low_gate.commit().await.expect("release low command gate");
+
+    tokio::time::timeout(Duration::from_secs(5), &mut close)
+        .await
+        .expect("session close must terminate")
+        .expect("session close task")
+        .expect("session close result");
+    let command_states: Vec<String> =
+        sqlx::query_scalar("SELECT state FROM agent_commands WHERE task_id = $1 ORDER BY id")
+            .bind(task_id.as_uuid())
+            .fetch_all(child.store.pool())
+            .await
+            .expect("command states");
+    assert_eq!(
+        command_states,
+        vec![
+            "cancelled".to_owned(),
+            "cancelled".to_owned(),
+            "cancelled".to_owned(),
+        ],
+    );
+}
+
+#[tokio::test]
 async fn child_completion_and_run_cancel_use_the_same_frame_lock_order() {
     let application_name = format!("kf-cancel-lock-{}", Uuid::now_v7());
     let child = child_run(&application_name).await;

@@ -88,6 +88,14 @@ impl PostgresStore {
             .execute(&mut *tx)
             .await?;
             sqlx::query(
+                "SELECT id FROM agent_commands \
+                 WHERE task_id = $1 AND state IN ('pending', 'claimed') \
+                 ORDER BY id FOR UPDATE",
+            )
+            .bind(task_uuid)
+            .fetch_all(&mut *tx)
+            .await?;
+            sqlx::query(
                 "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1, \
                  updated_at = CURRENT_TIMESTAMP \
                  WHERE task_id = $1 AND state IN ('pending', 'claimed')",
