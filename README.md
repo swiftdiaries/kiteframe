@@ -1,15 +1,28 @@
 # Kiteframe
 
 Kiteframe is a durable Rust workflow and declarative-agent harness. The single
-`kiteframe-harness` process compiles author-authored `.kite` workflows, stores
-workflow state in PostgreSQL, evaluates typed Cedar policy, discovers MCP
-tools, and serves the Agent Client Protocol (ACP).
+`kiteframe-harness` process compiles author-authored `.kite` definitions,
+persists authority in PostgreSQL, evaluates typed Cedar policy, discovers MCP
+tools, and serves the Agent Client Protocol (ACP). Python and TypeScript are
+thin clients: the compiler, scheduler, policy evaluator, and durable state all
+remain in the Rust kernel.
 
-The engine persists runs, frames, questions, permission requests, model
-attempts, tool calls, and run events. It schedules model turns, durable tool
-calls, child tasks, parallel joins, questions, cancellation, and recovery. The
-Python and TypeScript packages are thin clients: they do not carry a workflow
-compiler, scheduler, policy evaluator, or durable state.
+## What works today
+
+Workflow compilation, immutable publication, execution, and restart recovery
+are implemented. Workflows can model typed tasks, model outcomes, MCP tools,
+questions, child calls, parallel work, limits, and terminal results. Start with
+the small [support workflow](examples/support.kite).
+
+Declarative-agent work is complete through the first two V1 slices:
+
+| Completed slice | Available outcome |
+|---|---|
+| 1. Authoring and durable intent | Versioned `agent` definitions, immutable publication, canonical `UserTask` submission, and one frozen immutable `GoalContract` per accepted task. |
+| 2. Authoritative agent lifecycle | Exact-version agent start, the built-in `kite.v1` runtime, revisioned task/goal/snapshot transitions, command journaling, evidence-backed complete/block authority, pause/resume/cancel, recovery, and the bounded direct-loop harness executor. |
+
+For a practical overview, read the [developer guide](docs/guides/building-on-kiteframe.md).
+For feature work, use the [testing guide](docs/guides/testing-kiteframe.md).
 
 ## Local stdio
 
@@ -44,14 +57,6 @@ cargo run --bin kiteframe-harness
 
 The optional ACP v2 adapter is compile-time gated and must also be enabled at
 runtime with `KITEFRAME_ENABLE_ACP_V2=true`.
-
-## Workflow authoring
-
-Workflows declare typed tasks, model outcomes, MCP tools, transitions,
-questions, child calls, parallel work, limits, and terminal results. See the
-[support workflow example](examples/support.kite) for a small end-to-end
-workflow. Workflow compilation, immutable publication, execution, and restart
-recovery are implemented.
 
 ## Declarative agents
 
@@ -102,6 +107,23 @@ budget/profile system, provider connector, Codex integration, editor worker,
 or Cursor/VS Code extension is implemented. The example is a reviewed
 language/runtime fixture, not a claim that the product vertical is operational.
 
+## Planned V1 slices
+
+The remaining slices are product intent, not currently available integration
+surfaces:
+
+| Slice | Intended outcome |
+|---|---|
+| 3. Replaceable harness and plugin boundary | A built-in harness behind a versioned, out-of-process plugin protocol. |
+| 4. Context and event ingress | Provenance-bearing context, semantic events, bindings, deduplication, correlation, and durable waits. |
+| 5. Guarded local work delivery | Work items, approvals, IDE worker offers, leases, fencing, and uncertain-outcome recovery. |
+| 6. Governed connector control plane | Connector identity, secret references, data classification, profiles, and budget enforcement. |
+| 7. GitHub, Codex, and editor path | GitHub connectors, Codex-verified ACP, and VS Code with a thin Cursor adapter. |
+| 8. `babysit_pr` release | An end-to-end, auditable review-and-repair loop through pull-request merge. |
+
+The [developer guide](docs/guides/building-on-kiteframe.md) explains how to
+build against the completed boundary without depending on these future seams.
+
 ## Design and plan
 
 - [Minimal workflow engine design](docs/superpowers/specs/2026-08-11-kiteframe-minimal-workflow-engine-design.md)
@@ -109,6 +131,8 @@ language/runtime fixture, not a claim that the product vertical is operational.
 - [Declarative agents and plugin runtime design](docs/superpowers/specs/2026-08-17-kiteframe-declarative-agents-and-plugin-runtime-design.md)
 - [Declarative-agent foundation plan](docs/superpowers/plans/2026-08-17-kiteframe-declarative-agents-slice-1.md)
 - [Declarative-agent lifecycle plan](docs/superpowers/plans/2026-08-17-kiteframe-declarative-agents-slice-2.md)
+- [Developer guide](docs/guides/building-on-kiteframe.md)
+- [Feature-work testing guide](docs/guides/testing-kiteframe.md)
 
 ## Development verification
 
