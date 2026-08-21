@@ -163,6 +163,11 @@ impl HarnessInvocationEventRecord {
     }
 
     pub fn validate_digest(&self) -> Result<(), StoreError> {
+        if (self.sequence == 0) != matches!(self.event, HarnessInvocationEvent::Started) {
+            return Err(StoreError::InvalidData(
+                "harness event sequence zero must be Started".to_owned(),
+            ));
+        }
         let digest = canonical_sha256(&HarnessEventDigestInput {
             protocol_version: HARNESS_PROTOCOL_VERSION,
             invocation_id: &self.invocation_id,
@@ -170,28 +175,13 @@ impl HarnessInvocationEventRecord {
             event: &self.event,
         })
         .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        let legacy_digest = canonical_sha256(&self.event)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        if self.event_digest == digest || self.event_digest == legacy_digest {
+        if self.event_digest == digest {
             Ok(())
         } else {
             Err(StoreError::InvalidData(
                 "harness invocation event digest is malformed".to_owned(),
             ))
         }
-    }
-
-    pub fn is_compatible_replay_of(&self, incoming: &Self) -> Result<bool, StoreError> {
-        self.validate_digest()?;
-        incoming.validate_digest()?;
-        if self.invocation_id != incoming.invocation_id || self.sequence != incoming.sequence {
-            return Ok(false);
-        }
-        let stored_event = canonical_sha256(&self.event)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        let incoming_event = canonical_sha256(&incoming.event)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        Ok(stored_event == incoming_event)
     }
 }
 

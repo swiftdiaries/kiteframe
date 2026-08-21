@@ -8,10 +8,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{PostgresStore, canonical_sha256};
 
 use super::{
-    HARNESS_PROTOCOL_VERSION, HarnessApprovalDecision, HarnessApprovalRequest, HarnessCancellation,
-    HarnessEventSender, HarnessFailure, HarnessInvocationEvent, HarnessInvocationId,
-    HarnessInvocationRequest, HarnessPendingEvent, HarnessProfile, HarnessProfileId,
-    HarnessTerminal,
+    HARNESS_PROTOCOL_VERSION, HarnessAcceptanceBarrier, HarnessApprovalDecision,
+    HarnessApprovalRequest, HarnessCancellation, HarnessEventSender, HarnessFailure,
+    HarnessInvocationEvent, HarnessInvocationId, HarnessInvocationRequest, HarnessPendingEvent,
+    HarnessProfile, HarnessProfileId, HarnessTerminal,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -191,6 +191,11 @@ impl HarnessApprovalBroker for DenyAllHarnessApprovals {
 
 #[async_trait]
 pub trait HarnessEventSink: Send + Sync {
+    fn acceptance_barrier(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Arc<dyn HarnessAcceptanceBarrier>;
+
     async fn next_sequence(
         &self,
         _invocation_id: &HarnessInvocationId,
@@ -238,16 +243,48 @@ pub async fn emit_and_wait(
 #[derive(Clone)]
 pub struct PostgresHarnessEventSink {
     store: Arc<PostgresStore>,
+    expected_attempt: u64,
 }
 
 impl PostgresHarnessEventSink {
-    pub fn new(store: Arc<PostgresStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<PostgresStore>, expected_attempt: u64) -> Self {
+        Self {
+            store,
+            expected_attempt,
+        }
+    }
+}
+
+struct PostgresHarnessAcceptanceBarrier {
+    store: Arc<PostgresStore>,
+    invocation_id: HarnessInvocationId,
+    expected_attempt: u64,
+}
+
+#[async_trait]
+impl HarnessAcceptanceBarrier for PostgresHarnessAcceptanceBarrier {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        self.store
+            .mark_harness_prompt_accepted(&self.invocation_id, self.expected_attempt)
+            .await
+            .map(|_| ())
+            .map_err(|error| HarnessFailure::new("harness_outcome_unknown", error.to_string()))
     }
 }
 
 #[async_trait]
 impl HarnessEventSink for PostgresHarnessEventSink {
+    fn acceptance_barrier(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Arc<dyn HarnessAcceptanceBarrier> {
+        Arc::new(PostgresHarnessAcceptanceBarrier {
+            store: self.store.clone(),
+            invocation_id: invocation_id.clone(),
+            expected_attempt: self.expected_attempt,
+        })
+    }
+
     async fn next_sequence(
         &self,
         invocation_id: &HarnessInvocationId,

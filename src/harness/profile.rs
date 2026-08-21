@@ -52,10 +52,11 @@ impl HarnessProfile {
         }
         if raw.source_revision.len() != 40
             || !raw.source_revision.bytes().all(|b| b.is_ascii_hexdigit())
+            || raw.source_revision.bytes().all(|b| b == b'0')
         {
             return Err(HarnessFailure::new(
                 "harness_profile_unavailable",
-                "source revision must be a full commit hash",
+                "source revision must be a nonzero full commit hash",
             ));
         }
         let expected_revision = match id.as_str() {

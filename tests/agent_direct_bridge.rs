@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessCapability, HarnessInvocationId, HarnessProfile,
-    HarnessProfileId, HarnessRegistry, HarnessTransport,
+    DenyAllHarnessApprovals, HarnessInvocationId, HarnessProfile, HarnessRegistry,
+    builtin_harness_profile,
 };
 use kiteframe::store::{
     HarnessInvocationState, HarnessPluginRegistration, PrepareHarnessInvocation,
@@ -33,23 +33,7 @@ type ModelHandler = dyn Fn(ModelRequest) -> ModelFuture + Send + Sync;
 static BRIDGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn builtin_profile() -> HarnessProfile {
-    HarnessProfile {
-        id: HarnessProfileId::new("builtin-v1").unwrap(),
-        transport: HarnessTransport::Builtin,
-        source_repository: "https://github.com/swiftdiaries/kiteframe".to_owned(),
-        source_revision: "0000000000000000000000000000000000000000".to_owned(),
-        program: "kiteframe-builtin".to_owned(),
-        args: vec![],
-        required: BTreeSet::from([
-            HarnessCapability::FreshSession,
-            HarnessCapability::TextPrompt,
-            HarnessCapability::PermissionOnce,
-            HarnessCapability::Cancel,
-            HarnessCapability::CommittedOutput,
-        ]),
-        optional: BTreeSet::new(),
-        fresh_sessions_only: true,
-    }
+    builtin_harness_profile("0123456789abcdef0123456789abcdef01234567").unwrap()
 }
 
 async fn non_command_fingerprint(pool: &PgPool, task_id: &UserTaskId) -> Value {
@@ -955,7 +939,7 @@ async fn declared_model_tool_fails_closed_without_legacy_or_goal_authority() {
     assert_eq!(view.lifecycle, TaskLifecycle::Failed);
     assert_eq!(view.operational_status, OperationalStatus::Finished);
     assert_eq!(view.goal_phase, GoalPhase::Active);
-    assert_eq!(fixture.command_state(&command.id).await, "completed");
+    assert_eq!(fixture.command_state(&command.id).await, "failed");
     let requests = fixture.model.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].tools.len(), 2);
@@ -976,7 +960,13 @@ async fn declared_model_tool_fails_closed_without_legacy_or_goal_authority() {
         .fetch_one(&fixture.pool)
         .await
         .unwrap();
-    assert_eq!(failure["code"], "harness_capability_unsupported");
+    assert_eq!(failure["code"], "runtime_command_unavailable");
+    assert!(
+        fixture
+            .event_kinds()
+            .await
+            .contains(&"runtime.command_unavailable".to_owned())
+    );
     assert_eq!(fixture.legacy_run_count().await, 0);
     assert_eq!(fixture.legacy_frame_count().await, 0);
 }

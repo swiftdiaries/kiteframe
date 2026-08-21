@@ -102,7 +102,7 @@ impl PostgresStore {
         .await?
         {
             let view = harness_invocation_from_row(&row)?;
-            validate_prepare_replay(&view, &request)?;
+            validate_invocation_identity_replay(&view, &request)?;
             tx.commit().await?;
             return Ok(view);
         }
@@ -137,7 +137,7 @@ impl PostgresStore {
         .fetch_one(&mut *tx)
         .await?;
         let view = harness_invocation_from_row(&row)?;
-        validate_prepare_replay(&view, &request)?;
+        validate_command_revision_replay(&view, &request)?;
         tx.commit().await?;
         Ok(view)
     }
@@ -287,7 +287,7 @@ impl PostgresStore {
         .await?
         {
             let stored = harness_event_record_from_row(&existing)?;
-            if stored.event_digest == event.event_digest || stored.is_compatible_replay_of(event)? {
+            if stored.event_digest == event.event_digest {
                 tx.commit().await?;
                 return Ok(());
             }
@@ -326,7 +326,7 @@ impl PostgresStore {
         .fetch_one(&mut *tx)
         .await?;
         let stored = harness_event_record_from_row(&stored)?;
-        if stored.event_digest != event.event_digest && !stored.is_compatible_replay_of(event)? {
+        if stored.event_digest != event.event_digest {
             return Err(StoreError::IdempotencyConflict);
         }
         tx.commit().await?;
@@ -513,12 +513,21 @@ fn harness_event_record_from_row(row: &PgRow) -> Result<HarnessInvocationEventRe
     Ok(record)
 }
 
-fn validate_prepare_replay(
+fn validate_invocation_identity_replay(
     view: &HarnessInvocationView,
     request: &PrepareHarnessInvocation<'_>,
 ) -> Result<(), StoreError> {
-    if view.invocation_id != *request.invocation_id
-        || view.command_id != *request.command_id
+    if view.invocation_id != *request.invocation_id {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    validate_command_revision_replay(view, request)
+}
+
+fn validate_command_revision_replay(
+    view: &HarnessInvocationView,
+    request: &PrepareHarnessInvocation<'_>,
+) -> Result<(), StoreError> {
+    if view.command_id != *request.command_id
         || view.command_revision != request.command_revision
         || view.profile_id != *request.profile_id
         || view.profile_digest != request.profile_digest
@@ -583,4 +592,59 @@ fn is_harness_invocation_identity_conflict(error: &sqlx::Error) -> bool {
         database_error.code().as_deref() == Some("23505")
             && database_error.constraint() == Some("harness_invocations_pkey")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_command_revision_replay, validate_invocation_identity_replay};
+    use crate::harness::{HarnessInvocationId, HarnessProfileId};
+    use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
+    use crate::{AgentCommandId, StoreError};
+
+    fn stored_invocation() -> HarnessInvocationView {
+        HarnessInvocationView {
+            invocation_id: HarnessInvocationId::new(uuid::Uuid::now_v7()),
+            command_id: AgentCommandId::new(uuid::Uuid::now_v7()),
+            command_revision: 7,
+            profile_id: HarnessProfileId::new("builtin-v1").unwrap(),
+            profile_digest: "profile-digest".to_owned(),
+            payload_digest: "payload-digest".to_owned(),
+            state: HarnessInvocationState::Completed,
+            attempt: 0,
+            prompt_accepted: true,
+            terminal: true,
+            terminal_request_digest: Some("terminal-key".to_owned()),
+            terminal_payload: Some(serde_json::json!({"type":"completed"})),
+        }
+    }
+
+    #[test]
+    fn command_revision_replay_discards_a_fresh_candidate_but_uuid_reuse_checks_command_identity() {
+        let stored = stored_invocation();
+        let fresh_candidate = HarnessInvocationId::new(uuid::Uuid::now_v7());
+        let replay = PrepareHarnessInvocation {
+            invocation_id: &fresh_candidate,
+            command_id: &stored.command_id,
+            command_revision: stored.command_revision,
+            profile_id: &stored.profile_id,
+            profile_digest: &stored.profile_digest,
+            payload_digest: &stored.payload_digest,
+        };
+        validate_command_revision_replay(&stored, &replay)
+            .expect("command-bound replay ignores its disposable candidate UUID");
+
+        let different_command = AgentCommandId::new(uuid::Uuid::now_v7());
+        let reused_uuid = PrepareHarnessInvocation {
+            invocation_id: &stored.invocation_id,
+            command_id: &different_command,
+            command_revision: stored.command_revision,
+            profile_id: &stored.profile_id,
+            profile_digest: &stored.profile_digest,
+            payload_digest: &stored.payload_digest,
+        };
+        assert!(matches!(
+            validate_invocation_identity_replay(&stored, &reused_uuid),
+            Err(StoreError::IdempotencyConflict)
+        ));
+    }
 }

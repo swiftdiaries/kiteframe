@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,35 @@ use super::{
 
 const DURABLE_GOAL_DIRECTIVE: &str = "Treat the complete structured goal in the first input item as durable across this invocation and every repeated or recovered invocation. Preserve its objective, criterion ids, human success statements, required evidence types, constraints, and blocked conditions. The complete_task function completes only this bounded harness task and yields invocation evidence; it never completes or blocks the enclosing Kiteframe goal. Only the Rust kernel's CompleteGoal and BlockGoal authority may complete or block that goal.";
 const BUILTIN_PERMISSION_REQUEST_TOOL: &str = "kiteframe/request_permission";
+
+pub fn builtin_harness_profile(source_revision: &str) -> Result<HarnessProfile, HarnessFailure> {
+    if source_revision.len() != 40
+        || !source_revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || source_revision.bytes().all(|byte| byte == b'0')
+    {
+        return Err(HarnessFailure::new(
+            "harness_profile_unavailable",
+            "built-in harness source revision must be a nonzero full 40-hex commit",
+        ));
+    }
+    Ok(HarnessProfile {
+        id: super::HarnessProfileId::new("builtin-v1")?,
+        transport: super::HarnessTransport::Builtin,
+        source_repository: "https://github.com/swiftdiaries/kiteframe".to_owned(),
+        source_revision: source_revision.to_owned(),
+        program: "kiteframe-builtin".to_owned(),
+        args: vec![],
+        required: BTreeSet::from([
+            super::HarnessCapability::FreshSession,
+            super::HarnessCapability::TextPrompt,
+            super::HarnessCapability::PermissionOnce,
+            super::HarnessCapability::Cancel,
+            super::HarnessCapability::CommittedOutput,
+        ]),
+        optional: BTreeSet::new(),
+        fresh_sessions_only: true,
+    })
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HarnessExecutionResult {
@@ -202,6 +232,12 @@ impl HarnessPlugin for BuiltinHarnessPlugin {
                     "built-in permission request was rejected",
                 ));
             }
+        }
+        if cancellation.is_cancelled() {
+            return HarnessTerminal::Cancelled;
+        }
+        if let Err(error) = events.commit_acceptance().await {
+            return HarnessTerminal::OutcomeUnknown(error);
         }
         tokio::select! {
             _ = cancellation.cancelled() => HarnessTerminal::Cancelled,

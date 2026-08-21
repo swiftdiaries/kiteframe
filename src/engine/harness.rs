@@ -205,11 +205,6 @@ impl AgentCommandDispatcher {
                     | HarnessInvocationState::Failed
                     | HarnessInvocationState::OutcomeUnknown => return Ok(()),
                 };
-                let prepared = self
-                    .kernel
-                    .store()
-                    .mark_harness_prompt_accepted(&prepared.invocation_id, prepared.attempt)
-                    .await?;
                 let workspace: String =
                     sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
                         .bind(execution.task.session_id.as_uuid())
@@ -229,7 +224,10 @@ impl AgentCommandDispatcher {
                     .invoke(
                         request,
                         self.approvals.clone(),
-                        Arc::new(PostgresHarnessEventSink::new(self.kernel.store_arc())),
+                        Arc::new(PostgresHarnessEventSink::new(
+                            self.kernel.store_arc(),
+                            prepared.attempt,
+                        )),
                     )
                     .await;
                 self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
@@ -326,8 +324,19 @@ impl AgentCommandDispatcher {
                         &terminal_payload,
                     )
                     .await?;
-                let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
-                failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+                if is_builtin_command_unavailable(&invocation.profile_id, &failure) {
+                    let failure = failure_request(
+                        execution,
+                        claimed,
+                        &terminal_key,
+                        "runtime_command_unavailable",
+                    )?;
+                    unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                        .await
+                } else {
+                    let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
+                    failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+                }
             }
             HarnessTerminal::OutcomeUnknown(_) => {
                 self.settle_outcome_unknown(
@@ -363,6 +372,10 @@ impl AgentCommandDispatcher {
             failure_request(execution, claimed, &terminal_key, "harness_outcome_unknown")?;
         failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
     }
+}
+
+fn is_builtin_command_unavailable(profile_id: &HarnessProfileId, failure: &HarnessFailure) -> bool {
+    profile_id.as_str() == "builtin-v1" && failure.code == "harness_capability_unsupported"
 }
 
 struct PreparedHarnessTerminalJournal<'a> {
@@ -636,8 +649,11 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
-    use super::{ActiveDispatchGuard, DispatchRoute, dispatch_route, terminal_from_record};
-    use crate::harness::{HarnessInvocationId, HarnessProfileId, HarnessTerminal};
+    use super::{
+        ActiveDispatchGuard, DispatchRoute, dispatch_route, is_builtin_command_unavailable,
+        terminal_from_record,
+    };
+    use crate::harness::{HarnessFailure, HarnessInvocationId, HarnessProfileId, HarnessTerminal};
     use crate::store::{HarnessInvocationState, HarnessInvocationView};
     use crate::{AgentCommandId, KernelCommandPayload, RequestContext, WaitForEvent};
     use serde_json::json;
@@ -656,6 +672,23 @@ mod tests {
         ] {
             assert_eq!(dispatch_route(&payload), DispatchRoute::Unavailable);
         }
+    }
+
+    #[test]
+    fn only_builtin_capability_failure_restores_the_slice_two_unavailable_command_contract() {
+        let unsupported = HarnessFailure::new("harness_capability_unsupported", "model_tool_calls");
+        assert!(is_builtin_command_unavailable(
+            &HarnessProfileId::new("builtin-v1").unwrap(),
+            &unsupported,
+        ));
+        assert!(!is_builtin_command_unavailable(
+            &HarnessProfileId::new("codex-acp-v1").unwrap(),
+            &unsupported,
+        ));
+        assert!(!is_builtin_command_unavailable(
+            &HarnessProfileId::new("builtin-v1").unwrap(),
+            &HarnessFailure::new("harness_failed", "definitive failure"),
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use kiteframe::{
-    AgentCommandId, CreateSession, PostgresStore, PrincipalId, StoreError, canonical_sha256,
+    AgentCommandId, CreateSession, PostgresStore, PrincipalId, StoreError,
     harness::{
         HarnessApprovalDecision, HarnessEventEnvelope, HarnessInvocationEvent, HarnessInvocationId,
         HarnessProfileId, HarnessTransport,
@@ -186,6 +186,13 @@ impl HarnessStoreFixture {
             .append_harness_invocation_event(&self.event(
                 invocation_id,
                 0,
+                HarnessInvocationEvent::Started,
+            ))
+            .await?;
+        self.store
+            .append_harness_invocation_event(&self.event(
+                invocation_id,
+                1,
                 HarnessInvocationEvent::ApprovalRequested {
                     request_id: request_id.to_owned(),
                     title: "Need permission".to_owned(),
@@ -195,7 +202,7 @@ impl HarnessStoreFixture {
         self.store
             .append_harness_invocation_event(&self.event(
                 invocation_id,
-                1,
+                2,
                 HarnessInvocationEvent::ApprovalResolved {
                     request_id: request_id.to_owned(),
                     decision,
@@ -249,6 +256,25 @@ fn terminal_replay_payload_is_immutable_journal_data() {
     );
 }
 
+#[test]
+fn gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation() {
+    let sql = std::fs::read_to_string("migrations/0016_harness_gate_a.sql")
+        .expect("Gate A migration exists");
+    for required in [
+        "harness_event_envelope_digest_v1",
+        "protocolVersion",
+        "invocationId",
+        "sequence zero must be Started",
+        "harness event sequence gap",
+        "harness event replay differs from the durable event",
+        "0000000000000000000000000000000000000000",
+        "zero-revision builtin registration has durable invocations",
+        "harness_plugin_registrations_nonzero_revision_check",
+    ] {
+        assert!(sql.contains(required), "missing Gate A guard: {required}");
+    }
+}
+
 #[tokio::test]
 async fn prepare_is_idempotent_for_one_command_revision_and_rejects_drift() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
@@ -276,14 +302,38 @@ async fn prepare_is_idempotent_for_one_command_revision_and_rejects_drift() {
             "sha256:payload-a",
         )
         .await
-        .unwrap_err();
-    assert!(matches!(identity_drift, StoreError::IdempotencyConflict));
+        .unwrap();
+    assert_eq!(identity_drift.invocation_id, prepared.invocation_id);
     let second_command = fixture.additional_command().await;
     let command_drift = fixture
         .prepare_for(&second_command, &invocation_id, "sha256:payload-a")
         .await
         .unwrap_err();
     assert!(matches!(command_drift, StoreError::IdempotencyConflict));
+}
+
+#[tokio::test]
+async fn terminal_prepare_replay_discards_a_fresh_candidate_and_returns_the_stored_invocation() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    fixture
+        .store
+        .settle_harness_invocation(
+            &invocation.invocation_id,
+            0,
+            HarnessInvocationState::Cancelled,
+            "sha256:terminal-a",
+            &json!({"type":"cancelled"}),
+        )
+        .await
+        .unwrap();
+
+    let replay = fixture.prepare("sha256:payload-a").await.unwrap();
+    assert_eq!(replay.invocation_id, invocation.invocation_id);
+    assert_eq!(replay.state, HarnessInvocationState::Cancelled);
+    assert!(replay.terminal);
 }
 
 #[tokio::test]
@@ -398,41 +448,180 @@ async fn event_sequence_replay_is_idempotent_and_digest_drift_conflicts() {
 }
 
 #[tokio::test]
-async fn legacy_event_digest_replays_a_versioned_envelope_when_content_is_identical() {
+async fn event_sequence_gap_after_started_is_rejected_while_exact_replay_succeeds() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
     };
     let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
-    let envelope = HarnessEventEnvelope::new(
-        invocation.invocation_id.clone(),
+    let started = fixture.event(
+        &invocation.invocation_id,
         0,
         HarnessInvocationEvent::Started,
     );
-    let legacy_digest = canonical_sha256(&envelope.event).unwrap();
-    sqlx::query(
+    fixture
+        .store
+        .append_harness_invocation_event(&started)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .append_harness_invocation_event(&started)
+        .await
+        .expect("exact replay remains idempotent");
+    let gap = fixture.event(
+        &invocation.invocation_id,
+        2,
+        HarnessInvocationEvent::Progress {
+            message: "skipped sequence one".to_owned(),
+        },
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .append_harness_invocation_event(&gap)
+            .await
+            .unwrap_err(),
+        StoreError::RevisionConflict
+    ));
+}
+
+#[tokio::test]
+async fn event_only_digest_is_rejected_by_the_exported_store_boundary() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let mut record = fixture.event(
+        &invocation.invocation_id,
+        0,
+        HarnessInvocationEvent::Started,
+    );
+    record.event_digest = kiteframe::canonical_sha256(&record.event).unwrap();
+
+    assert!(matches!(
+        fixture
+            .store
+            .append_harness_invocation_event(&record)
+            .await
+            .unwrap_err(),
+        StoreError::InvalidData(_)
+    ));
+}
+
+#[tokio::test]
+async fn database_digest_matches_rust_v1_envelopes_for_every_event_shape() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let events = [
+        HarnessInvocationEvent::Started,
+        HarnessInvocationEvent::Progress {
+            message: "working".to_owned(),
+        },
+        HarnessInvocationEvent::ApprovalRequested {
+            request_id: "permission-7".to_owned(),
+            title: "Need permission".to_owned(),
+        },
+        HarnessInvocationEvent::ApprovalResolved {
+            request_id: "permission-7".to_owned(),
+            decision: HarnessApprovalDecision::AllowOnce,
+        },
+        HarnessInvocationEvent::AssistantMessage {
+            text: "committed".to_owned(),
+        },
+        HarnessInvocationEvent::Cancelled,
+    ];
+    for (sequence, event) in events.into_iter().enumerate() {
+        let envelope = HarnessEventEnvelope::new(
+            invocation.invocation_id.clone(),
+            sequence as u64,
+            event.clone(),
+        );
+        let database_digest: String =
+            sqlx::query_scalar("SELECT harness_event_envelope_digest_v1($1, $2, $3)")
+                .bind(invocation.invocation_id.as_uuid())
+                .bind(sequence as i64)
+                .bind(serde_json::to_value(event).unwrap())
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(database_digest, envelope.event_digest);
+    }
+}
+
+#[tokio::test]
+async fn database_rejects_sequence_zero_that_is_not_started() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let invalid = HarnessEventEnvelope::new(
+        invocation.invocation_id.clone(),
+        0,
+        HarnessInvocationEvent::ApprovalRequested {
+            request_id: "permission-7".to_owned(),
+            title: "Need permission".to_owned(),
+        },
+    );
+    let error = sqlx::query(
         "INSERT INTO harness_invocation_events (invocation_id, sequence, event_digest, event) \
          VALUES ($1, $2, $3, $4)",
     )
     .bind(invocation.invocation_id.as_uuid())
     .bind(0_i64)
-    .bind(&legacy_digest)
-    .bind(serde_json::to_value(&envelope.event).unwrap())
+    .bind(&invalid.event_digest)
+    .bind(serde_json::to_value(&invalid.event).unwrap())
     .execute(&fixture.pool)
     .await
-    .unwrap();
+    .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55000")
+    );
+}
 
+#[tokio::test]
+async fn database_on_conflict_accepts_only_an_exact_event_replay() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let started = fixture.event(
+        &invocation.invocation_id,
+        0,
+        HarnessInvocationEvent::Started,
+    );
     fixture
         .store
-        .append_harness_event_envelope(&envelope)
-        .await
-        .expect("identical legacy event replays successfully");
-    let stored = fixture
-        .store
-        .harness_invocation_events(&invocation.invocation_id)
+        .append_harness_invocation_event(&started)
         .await
         .unwrap();
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].event_digest, legacy_digest);
+
+    let insert = "INSERT INTO harness_invocation_events \
+        (invocation_id, sequence, event_digest, event) VALUES ($1, $2, $3, $4) \
+        ON CONFLICT (invocation_id, sequence) DO NOTHING";
+    sqlx::query(insert)
+        .bind(invocation.invocation_id.as_uuid())
+        .bind(0_i64)
+        .bind(&started.event_digest)
+        .bind(serde_json::to_value(&started.event).unwrap())
+        .execute(&fixture.pool)
+        .await
+        .expect("an exact event replay remains idempotent at the database boundary");
+
+    let error = sqlx::query(insert)
+        .bind(invocation.invocation_id.as_uuid())
+        .bind(0_i64)
+        .bind("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+        .bind(serde_json::to_value(&started.event).unwrap())
+        .execute(&fixture.pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55000")
+    );
 }
 
 #[tokio::test]
@@ -455,11 +644,11 @@ async fn approval_request_and_one_shot_decision_are_durable_events() {
         .await
         .unwrap();
     assert!(matches!(
-        events[0].event,
+        events[1].event,
         HarnessInvocationEvent::ApprovalRequested { .. }
     ));
     assert!(matches!(
-        events[1].event,
+        events[2].event,
         HarnessInvocationEvent::ApprovalResolved {
             decision: HarnessApprovalDecision::RejectOnce,
             ..

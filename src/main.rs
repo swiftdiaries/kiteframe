@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     ffi::OsStr,
     io,
     sync::{
@@ -11,8 +10,7 @@ use std::{
 
 use agent_client_protocol::{ConnectTo, Stdio};
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessCapability, HarnessProfile, HarnessProfileId, HarnessRegistry,
-    HarnessTransport,
+    DenyAllHarnessApprovals, HarnessProfile, HarnessRegistry, builtin_harness_profile,
 };
 use kiteframe::protocol::transport::{AcpService, BearerAuthenticator, RemoteService};
 use kiteframe::store::HarnessPluginRegistration;
@@ -28,31 +26,24 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 
-fn builtin_profile() -> HarnessProfile {
-    HarnessProfile {
-        id: HarnessProfileId::new("builtin-v1").expect("the built-in profile id is valid"),
-        transport: HarnessTransport::Builtin,
-        source_repository: "https://github.com/swiftdiaries/kiteframe".to_owned(),
-        source_revision: "0000000000000000000000000000000000000000".to_owned(),
-        program: "kiteframe-builtin".to_owned(),
-        args: vec![],
-        required: BTreeSet::from([
-            HarnessCapability::FreshSession,
-            HarnessCapability::TextPrompt,
-            HarnessCapability::PermissionOnce,
-            HarnessCapability::Cancel,
-            HarnessCapability::CommittedOutput,
-        ]),
-        optional: BTreeSet::new(),
-        fresh_sessions_only: true,
-    }
+fn builtin_profile_from_attestation(
+    source_revision: Option<&str>,
+) -> Result<HarnessProfile, io::Error> {
+    let source_revision = source_revision.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "KITEFRAME_SOURCE_REVISION must be set to the exact 40-hex Kiteframe commit at compile time",
+        )
+    })?;
+    builtin_harness_profile(source_revision)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
 }
 
 async fn configured_builtin_registry(
     store: Arc<PostgresStore>,
     model: Arc<dyn ModelClient>,
+    profile: HarnessProfile,
 ) -> Result<Arc<HarnessRegistry>, Box<dyn std::error::Error>> {
-    let profile = builtin_profile();
     let plugin = Arc::new(BuiltinHarnessPlugin::new(profile.clone(), model));
     let mut registry = HarnessRegistry::new();
     registry.register(plugin).await?;
@@ -77,6 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     init_logging();
     let config = HarnessConfig::from_env()?;
+    let builtin_profile =
+        builtin_profile_from_attestation(option_env!("KITEFRAME_SOURCE_REVISION"))?;
     let store = Arc::new(
         PostgresStore::connect_with_limits(&config.database_url, config.store_limits).await?,
     );
@@ -110,7 +103,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             claimed = agent_recovery.claimed,
             "agent command recovery complete"
         );
-        let harness_registry = configured_builtin_registry(store.clone(), model.clone()).await?;
+        let harness_registry =
+            configured_builtin_registry(store.clone(), model.clone(), builtin_profile).await?;
         let agent_dispatcher = Arc::new(
             application
                 .agent_kernel()
@@ -538,6 +532,19 @@ mod tests {
         assert_eq!(standalone_version(["kiteframe-harness"].into_iter()), None);
     }
 
+    #[test]
+    fn builtin_startup_attestation_is_required_and_validated() {
+        assert!(builtin_profile_from_attestation(None).is_err());
+        assert!(builtin_profile_from_attestation(Some("invalid")).is_err());
+        let profile =
+            builtin_profile_from_attestation(Some("0123456789abcdef0123456789abcdef01234567"))
+                .unwrap();
+        assert_eq!(
+            profile.source_revision,
+            "0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
     struct RecoveringModel(AtomicUsize);
 
     #[async_trait]
@@ -848,9 +855,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let harness_registry = configured_builtin_registry(store.clone(), model)
-            .await
-            .unwrap();
+        let harness_registry = configured_builtin_registry(
+            store.clone(),
+            model,
+            builtin_harness_profile("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        )
+        .await
+        .unwrap();
         let dispatcher = Arc::new(
             kernel
                 .clone()

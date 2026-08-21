@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessApprovalBroker, HarnessApprovalDecision,
-    HarnessApprovalRequest, HarnessCapabilities, HarnessCapability, HarnessEventEnvelope,
-    HarnessEventSender, HarnessEventSink, HarnessFailure, HarnessInvocationEvent,
-    HarnessInvocationId, HarnessInvocationOutput, HarnessInvocationRequest, HarnessPlugin,
-    HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessRequestEnvelope, HarnessTerminal,
-    HarnessTransport, emit_and_wait,
+    DenyAllHarnessApprovals, HarnessAcceptanceBarrier, HarnessApprovalBroker,
+    HarnessApprovalDecision, HarnessApprovalRequest, HarnessCapabilities, HarnessCapability,
+    HarnessEventEnvelope, HarnessEventSender, HarnessEventSink, HarnessFailure,
+    HarnessInvocationEvent, HarnessInvocationId, HarnessInvocationOutput, HarnessInvocationRequest,
+    HarnessPlugin, HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessRequestEnvelope,
+    HarnessTerminal, HarnessTransport, emit_and_wait,
 };
 use kiteframe::store::HarnessInvocationEventRecord;
 use kiteframe::{
@@ -75,6 +75,19 @@ fn request() -> HarnessInvocationRequest {
 #[derive(Default)]
 struct RecordingHarnessEventSink(Mutex<Vec<HarnessEventEnvelope>>);
 
+struct ImmediateAcceptanceBarrier;
+
+#[async_trait]
+impl HarnessAcceptanceBarrier for ImmediateAcceptanceBarrier {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        Ok(())
+    }
+}
+
+fn immediate_acceptance_barrier() -> Arc<dyn HarnessAcceptanceBarrier> {
+    Arc::new(ImmediateAcceptanceBarrier)
+}
+
 impl RecordingHarnessEventSink {
     fn sequences(&self) -> Vec<u64> {
         self.0
@@ -88,6 +101,13 @@ impl RecordingHarnessEventSink {
 
 #[async_trait]
 impl HarnessEventSink for RecordingHarnessEventSink {
+    fn acceptance_barrier(
+        &self,
+        _invocation_id: &HarnessInvocationId,
+    ) -> Arc<dyn HarnessAcceptanceBarrier> {
+        immediate_acceptance_barrier()
+    }
+
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         self.0.lock().unwrap().push(event);
         Ok(())
@@ -98,6 +118,13 @@ struct FailingHarnessEventSink;
 
 #[async_trait]
 impl HarnessEventSink for FailingHarnessEventSink {
+    fn acceptance_barrier(
+        &self,
+        _invocation_id: &HarnessInvocationId,
+    ) -> Arc<dyn HarnessAcceptanceBarrier> {
+        immediate_acceptance_barrier()
+    }
+
     async fn append(&self, _event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         Err(HarnessFailure::new(
             "harness_event_persistence_failed",
@@ -110,6 +137,13 @@ struct FailAfterOneHarnessEventSink(Mutex<usize>);
 
 #[async_trait]
 impl HarnessEventSink for FailAfterOneHarnessEventSink {
+    fn acceptance_barrier(
+        &self,
+        _invocation_id: &HarnessInvocationId,
+    ) -> Arc<dyn HarnessAcceptanceBarrier> {
+        immediate_acceptance_barrier()
+    }
+
     async fn append(&self, _event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         let mut calls = self.0.lock().unwrap();
         *calls += 1;
@@ -128,6 +162,7 @@ enum FakeMode {
     Events(Vec<HarnessInvocationEvent>),
     WaitForCancel,
     Retryable(HarnessFailure),
+    RetryableAfterAcceptance(HarnessFailure),
     Failed(HarnessFailure),
     OutcomeUnknown(HarnessFailure),
 }
@@ -261,7 +296,12 @@ impl HarnessPlugin for FakePlugin {
         match &self.mode {
             FakeMode::Events(events_to_emit) => {
                 for event in events_to_emit.clone() {
-                    emit_and_wait(&events, event).await.unwrap();
+                    if let Err(error) = emit_and_wait(&events, event).await {
+                        return HarnessTerminal::OutcomeUnknown(error);
+                    }
+                }
+                if let Err(error) = events.commit_acceptance().await {
+                    return HarnessTerminal::OutcomeUnknown(error);
                 }
                 HarnessTerminal::Completed(HarnessInvocationOutput {
                     outcome: "ok".to_owned(),
@@ -274,6 +314,13 @@ impl HarnessPlugin for FakePlugin {
                 HarnessTerminal::Cancelled
             }
             FakeMode::Retryable(error) => HarnessTerminal::Retryable(error.clone()),
+            FakeMode::RetryableAfterAcceptance(error) => {
+                emit_and_wait(&events, HarnessInvocationEvent::Started)
+                    .await
+                    .unwrap();
+                events.commit_acceptance().await.unwrap();
+                HarnessTerminal::Retryable(error.clone())
+            }
             FakeMode::Failed(error) => HarnessTerminal::Failed(error.clone()),
             FakeMode::OutcomeUnknown(error) => HarnessTerminal::OutcomeUnknown(error.clone()),
         }
@@ -331,6 +378,9 @@ impl HarnessPlugin for BurstPlugin {
                 let _ = reports.send(result);
             }
         });
+        if let Err(error) = events.commit_acceptance().await {
+            return HarnessTerminal::OutcomeUnknown(error);
+        }
         HarnessTerminal::Completed(HarnessInvocationOutput {
             outcome: "ok".to_owned(),
             fields: json!({}),
@@ -364,6 +414,9 @@ impl HarnessPlugin for LateEmitterPlugin {
         emit_and_wait(&events, HarnessInvocationEvent::Started)
             .await
             .unwrap();
+        if let Err(error) = events.commit_acceptance().await {
+            return HarnessTerminal::OutcomeUnknown(error);
+        }
         let release = self.release.clone();
         let reports = self.reports.clone();
         tokio::spawn(async move {
@@ -679,27 +732,52 @@ fn journal_record_preserves_the_validated_envelope_digest() {
 }
 
 #[test]
-fn legacy_event_digest_replays_only_when_the_canonical_event_is_identical() {
+fn event_only_digest_is_rejected_even_when_the_event_content_is_identical() {
     let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
-    let versioned = HarnessInvocationEventRecord::new(
+    let mut record = HarnessInvocationEventRecord::new(
         invocation_id.clone(),
         0,
         HarnessInvocationEvent::Started,
     )
     .unwrap();
-    let mut legacy = versioned.clone();
-    legacy.event_digest = kiteframe::canonical_sha256(&legacy.event).unwrap();
-    assert!(legacy.is_compatible_replay_of(&versioned).unwrap());
+    record.event_digest = kiteframe::canonical_sha256(&record.event).unwrap();
+    assert!(record.validate_digest().is_err());
+}
 
-    let drift = HarnessInvocationEventRecord::new(
-        invocation_id,
-        0,
-        HarnessInvocationEvent::Progress {
-            message: "different event".to_owned(),
-        },
+#[tokio::test]
+async fn retryable_failure_is_retryable_before_acceptance_and_uncertain_after_acceptance() {
+    let before = registry_with(Arc::new(FakePlugin::with_terminal(FakeMode::Retryable(
+        HarnessFailure::new("harness_failed", "workspace was unavailable"),
+    ))))
+    .await
+    .invoke(
+        request(),
+        Arc::new(DenyAllHarnessApprovals),
+        Arc::new(RecordingHarnessEventSink::default()),
     )
-    .unwrap();
-    assert!(!legacy.is_compatible_replay_of(&drift).unwrap());
+    .await;
+    assert!(matches!(before, HarnessTerminal::Retryable(_)));
+
+    let after = registry_with(Arc::new(FakePlugin::with_terminal(
+        FakeMode::RetryableAfterAcceptance(HarnessFailure::new(
+            "harness_failed",
+            "transport failed after model dispatch",
+        )),
+    )))
+    .await
+    .invoke(
+        request(),
+        Arc::new(DenyAllHarnessApprovals),
+        Arc::new(RecordingHarnessEventSink::default()),
+    )
+    .await;
+    assert!(matches!(
+        after,
+        HarnessTerminal::OutcomeUnknown(HarnessFailure {
+            code: "harness_outcome_unknown",
+            ..
+        })
+    ));
 }
 
 #[tokio::test]

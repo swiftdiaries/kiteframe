@@ -27,9 +27,13 @@ For feature work, use the [testing guide](docs/guides/testing-kiteframe.md).
 ## Local stdio
 
 The local harness requires PostgreSQL, an authenticated local principal, and a
-Responses-compatible model configuration:
+Responses-compatible model configuration. Builds must also receive
+`KITEFRAME_SOURCE_REVISION` as the exact full 40-hex commit represented by a
+clean source tree; startup rejects missing, malformed, or placeholder
+provenance, including the former all-zero development revision:
 
 ```console
+export KITEFRAME_SOURCE_REVISION="$(git rev-parse HEAD)"
 export KITEFRAME_DATABASE_URL=postgres://postgres:postgres@localhost/kiteframe
 export KITEFRAME_PRINCIPAL=local-user
 export KITEFRAME_RESPONSES_BASE_URL=https://api.example.com/v1

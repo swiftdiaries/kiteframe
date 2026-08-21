@@ -7,10 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kiteframe::harness::{
-    BuiltinHarnessPlugin, DenyAllHarnessApprovals, HarnessCapability, HarnessEventEnvelope,
-    HarnessEventSink, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
-    HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessTerminal, HarnessTransport,
-    dispatch_with_terminal_journal,
+    BuiltinHarnessPlugin, DenyAllHarnessApprovals, HarnessAcceptanceBarrier, HarnessCapability,
+    HarnessEventEnvelope, HarnessEventSink, HarnessFailure, HarnessInvocationId,
+    HarnessInvocationRequest, HarnessProfile, HarnessRegistry, HarnessTerminal,
+    builtin_harness_profile, dispatch_with_terminal_journal,
 };
 use kiteframe::{
     AgentCommandId, AgentKernel, ClosedSchema, GoalPhase, GoalProjection, HarnessPlugin,
@@ -27,12 +27,62 @@ use harness_conformance::{
 
 struct BuiltinConformanceDriver;
 
+const TEST_SOURCE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
+
 struct RecordingSink(Mutex<Vec<HarnessEventEnvelope>>);
+
+struct ImmediateAcceptanceBarrier;
+
+struct ObservedAcceptanceBarrier(Arc<AtomicUsize>);
+
+struct ObservedAcceptanceSink {
+    events: Mutex<Vec<HarnessEventEnvelope>>,
+    commits: Arc<AtomicUsize>,
+}
+
+struct AcceptanceAssertingModel(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl HarnessAcceptanceBarrier for ImmediateAcceptanceBarrier {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessAcceptanceBarrier for ObservedAcceptanceBarrier {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
 
 #[async_trait::async_trait]
 impl HarnessEventSink for RecordingSink {
+    fn acceptance_barrier(
+        &self,
+        _invocation_id: &HarnessInvocationId,
+    ) -> Arc<dyn HarnessAcceptanceBarrier> {
+        Arc::new(ImmediateAcceptanceBarrier)
+    }
+
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         self.0.lock().await.push(event);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessEventSink for ObservedAcceptanceSink {
+    fn acceptance_barrier(
+        &self,
+        _invocation_id: &HarnessInvocationId,
+    ) -> Arc<dyn HarnessAcceptanceBarrier> {
+        Arc::new(ObservedAcceptanceBarrier(self.commits.clone()))
+    }
+
+    async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
+        self.events.lock().await.push(event);
         Ok(())
     }
 }
@@ -67,6 +117,27 @@ impl ModelClient for CountingTestModel {
 }
 
 #[async_trait::async_trait]
+impl ModelClient for AcceptanceAssertingModel {
+    async fn respond(
+        &self,
+        _request: kiteframe::ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        assert_eq!(
+            self.0.load(Ordering::SeqCst),
+            1,
+            "the durable acceptance barrier commits immediately before model dispatch"
+        );
+        Ok(ModelResponse {
+            items: vec![json!({
+                "type":"function_call",
+                "name":"complete_task",
+                "arguments":{"outcome":"ok","fields":{"answer":"done"}}
+            })],
+        })
+    }
+}
+
+#[async_trait::async_trait]
 impl ModelClient for TestModel {
     async fn respond(
         &self,
@@ -88,23 +159,7 @@ impl BuiltinConformanceDriver {
 }
 
 fn profile() -> HarnessProfile {
-    HarnessProfile {
-        id: HarnessProfileId::new("builtin-v1").unwrap(),
-        transport: HarnessTransport::Builtin,
-        source_repository: "https://github.com/swiftdiaries/kiteframe".to_owned(),
-        source_revision: "0000000000000000000000000000000000000000".to_owned(),
-        program: "kiteframe-builtin".to_owned(),
-        args: vec![],
-        required: BTreeSet::from([
-            HarnessCapability::FreshSession,
-            HarnessCapability::TextPrompt,
-            HarnessCapability::PermissionOnce,
-            HarnessCapability::Cancel,
-            HarnessCapability::CommittedOutput,
-        ]),
-        optional: BTreeSet::new(),
-        fresh_sessions_only: true,
-    }
+    builtin_harness_profile(TEST_SOURCE_REVISION).unwrap()
 }
 
 #[tokio::test]
@@ -129,12 +184,35 @@ async fn builtin_profile_advertises_and_uses_permission_once() {
 }
 
 #[test]
-fn builtin_v1_registration_digest_remains_upgrade_compatible() {
-    assert_eq!(
-        profile().digest().unwrap(),
-        "c5f8f5116ca8e338fc5e764e89e72aee0f657da519eb3e8f97395bc0a6373e5b",
-        "builtin-v1 registration must replay with its pre-fix profile digest"
-    );
+fn builtin_registration_requires_exact_nonzero_source_attestation() {
+    assert!(builtin_harness_profile("0000000000000000000000000000000000000000").is_err());
+    assert!(builtin_harness_profile("not-a-full-source-revision").is_err());
+    let first = profile();
+    let second = builtin_harness_profile("1123456789abcdef0123456789abcdef01234567").unwrap();
+    assert_eq!(first.source_revision, TEST_SOURCE_REVISION);
+    assert_ne!(first.digest().unwrap(), second.digest().unwrap());
+}
+
+#[tokio::test]
+async fn builtin_commits_the_injected_acceptance_barrier_before_model_dispatch() {
+    let commits = Arc::new(AtomicUsize::new(0));
+    let plugin = Arc::new(BuiltinHarnessPlugin::new(
+        profile(),
+        Arc::new(AcceptanceAssertingModel(commits.clone())),
+    ));
+    let mut registry = HarnessRegistry::new();
+    registry.register(plugin).await.unwrap();
+    let sink = Arc::new(ObservedAcceptanceSink {
+        events: Mutex::new(vec![]),
+        commits: commits.clone(),
+    });
+
+    let terminal = registry
+        .invoke(request(), Arc::new(DenyAllHarnessApprovals), sink)
+        .await;
+
+    assert!(matches!(terminal, HarnessTerminal::Completed(_)));
+    assert_eq!(commits.load(Ordering::SeqCst), 1);
 }
 
 fn permission_request() -> HarnessInvocationRequest {

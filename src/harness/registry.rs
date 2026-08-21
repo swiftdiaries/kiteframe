@@ -222,7 +222,8 @@ impl HarnessRegistry {
             Err(error) => return HarnessTerminal::OutcomeUnknown(error),
         };
         let (raw_events_tx, mut events_rx) = mpsc::channel(64);
-        let events_tx = HarnessEventSender::new(raw_events_tx);
+        let acceptance_barrier = sink.acceptance_barrier(&request.invocation_id);
+        let events_tx = HarnessEventSender::new(raw_events_tx, acceptance_barrier);
         let invocation = plugin.start_invocation(envelope, events_tx.clone(), approvals, token);
         tokio::pin!(invocation);
         let mut sequence = sequence;
@@ -281,6 +282,18 @@ impl HarnessRegistry {
             return HarnessTerminal::Failed(HarnessFailure::new(
                 "harness_protocol_incompatible",
                 "harness invocation completed without a durable Started event",
+            ));
+        }
+        if matches!(terminal, HarnessTerminal::Completed(_)) && !events_tx.acceptance_committed() {
+            return HarnessTerminal::Failed(HarnessFailure::new(
+                "harness_protocol_incompatible",
+                "harness invocation completed without committing acceptance",
+            ));
+        }
+        if matches!(terminal, HarnessTerminal::Retryable(_)) && events_tx.acceptance_committed() {
+            return HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+                "harness_outcome_unknown",
+                "harness returned a retryable failure after accepting external work",
             ));
         }
         terminal

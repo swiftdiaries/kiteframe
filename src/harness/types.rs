@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,11 @@ impl std::fmt::Display for HarnessFailure {
 }
 impl std::error::Error for HarnessFailure {}
 
+#[async_trait::async_trait]
+pub trait HarnessAcceptanceBarrier: Send + Sync {
+    async fn commit(&self) -> Result<(), HarnessFailure>;
+}
+
 #[derive(Clone, Debug)]
 pub struct HarnessRouteTable {
     pub reasoning: HarnessProfileId,
@@ -241,18 +247,36 @@ impl HarnessRouteTable {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HarnessEventSender {
     sender: mpsc::Sender<HarnessPendingEvent>,
     admission_open: std::sync::Arc<std::sync::Mutex<bool>>,
+    acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
+    acceptance_result: Arc<tokio::sync::OnceCell<Result<(), HarnessFailure>>>,
 }
 
 impl HarnessEventSender {
-    pub(crate) fn new(sender: mpsc::Sender<HarnessPendingEvent>) -> Self {
+    pub(crate) fn new(
+        sender: mpsc::Sender<HarnessPendingEvent>,
+        acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
+    ) -> Self {
         Self {
             sender,
             admission_open: std::sync::Arc::new(std::sync::Mutex::new(true)),
+            acceptance_barrier,
+            acceptance_result: Arc::new(tokio::sync::OnceCell::new()),
         }
+    }
+
+    pub async fn commit_acceptance(&self) -> Result<(), HarnessFailure> {
+        self.acceptance_result
+            .get_or_init(|| self.acceptance_barrier.commit())
+            .await
+            .clone()
+    }
+
+    pub(crate) fn acceptance_committed(&self) -> bool {
+        matches!(self.acceptance_result.get(), Some(Ok(())))
     }
 
     pub async fn send(
@@ -274,6 +298,15 @@ impl HarnessEventSender {
             .admission_open
             .lock()
             .expect("harness event admission lock is not poisoned") = false;
+    }
+}
+
+impl std::fmt::Debug for HarnessEventSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HarnessEventSender")
+            .field("acceptance_committed", &self.acceptance_committed())
+            .finish_non_exhaustive()
     }
 }
 
