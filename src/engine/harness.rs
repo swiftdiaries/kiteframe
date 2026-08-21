@@ -31,12 +31,17 @@ pub enum HarnessDispatcherError {
         dispatch: StoreError,
         reconciliation: StoreError,
     },
+    #[error("owned harness lifecycle audit failed after bounded shutdown: {audit}")]
+    LifecycleAuditFailed { audit: StoreError },
 }
 
 impl HarnessDispatcherError {
     #[must_use]
     pub fn is_fatal(&self) -> bool {
-        matches!(self, Self::ReconciliationFailed { .. })
+        matches!(
+            self,
+            Self::ReconciliationFailed { .. } | Self::LifecycleAuditFailed { .. }
+        )
     }
 }
 
@@ -70,6 +75,8 @@ pub enum HarnessDispatcherTestFaultPoint {
     EventPersistence,
     RegistryBoundary,
     CancellationPoll,
+    TerminalSettlement,
+    LifecycleAudit,
     Reconciliation,
 }
 
@@ -682,6 +689,7 @@ impl AgentCommandDispatcher {
                     .await;
                 }
                 let mut reconciliation_attempted = false;
+                let mut lifecycle_audit = None;
                 let owned_result: Result<(), StoreError> = async {
                     if prepared.terminal {
                         return self
@@ -757,33 +765,31 @@ impl AgentCommandDispatcher {
                     tokio::pin!(lifecycle);
                     let cancellation = self.wait_for_command_cancellation(&claimed.id);
                     tokio::pin!(cancellation);
-                    let lifecycle = tokio::select! {
+                    let (lifecycle, cancellation_error) = tokio::select! {
                         biased;
-                        lifecycle = &mut lifecycle => lifecycle,
+                        lifecycle = &mut lifecycle => (lifecycle, None),
                         cancelled = &mut cancellation => {
                             let _ = self.registry.cancel(&prepared.invocation_id).await;
                             let lifecycle = lifecycle.await;
-                            if let Err(error) = cancelled {
-                                let _ = lifecycle.finish().await;
-                                return Err(error);
-                            }
-                            lifecycle
+                            (lifecycle, cancelled.err())
                         }
                     };
                     let terminal = lifecycle.terminal().clone();
-                    if matches!(terminal, HarnessTerminal::OutcomeUnknown(_)) {
+                    let persistence = if let Some(error) = cancellation_error {
+                        Err(error)
+                    } else if matches!(terminal, HarnessTerminal::OutcomeUnknown(_)) {
                         reconciliation_attempted = true;
-                        match self
+                        let reconciliation = self
                             .reconcile_owned_reservation(
                                 execution,
                                 &claimed,
                                 &prepared.invocation_id,
                             )
-                            .await
-                        {
-                            Ok(()) => reconciliation_attempted = false,
-                            Err(error) => return Err(error),
+                            .await;
+                        if reconciliation.is_ok() {
+                            reconciliation_attempted = false;
                         }
+                        reconciliation
                     } else {
                         self.settle_harness_terminal(
                             execution,
@@ -791,22 +797,16 @@ impl AgentCommandDispatcher {
                             &prepared,
                             terminal.clone(),
                         )
-                        .await?;
-                    }
+                        .await
+                    };
                     let lifecycle_terminal = lifecycle.finish().await;
                     if lifecycle_terminal != terminal {
-                        self.kernel
-                            .store()
-                            .record_harness_lifecycle_failure(
-                                &prepared.invocation_id,
-                                lifecycle_failure(&lifecycle_terminal),
-                            )
-                            .await?;
+                        lifecycle_audit = Some(lifecycle_failure(&lifecycle_terminal).clone());
                     }
-                    Ok(())
+                    persistence
                 }
                 .await;
-                match owned_result {
+                let reconciled = match owned_result {
                     Ok(()) => Ok(()),
                     Err(reconciliation) if reconciliation_attempted => {
                         Err(HarnessDispatcherError::ReconciliationFailed {
@@ -826,7 +826,19 @@ impl AgentCommandDispatcher {
                         )
                         .await
                     }
+                };
+                reconciled?;
+                if let Some(failure) = lifecycle_audit {
+                    #[cfg(feature = "test-support")]
+                    self.fail_test_fault(HarnessDispatcherTestFaultPoint::LifecycleAudit)
+                        .map_err(|audit| HarnessDispatcherError::LifecycleAuditFailed { audit })?;
+                    self.kernel
+                        .store()
+                        .record_harness_lifecycle_failure(&prepared.invocation_id, &failure)
+                        .await
+                        .map_err(|audit| HarnessDispatcherError::LifecycleAuditFailed { audit })?;
                 }
+                Ok(())
             },
         )
         .await
@@ -958,6 +970,8 @@ impl AgentCommandDispatcher {
         invocation: &crate::store::HarnessInvocationView,
         terminal: HarnessTerminal,
     ) -> Result<(), StoreError> {
+        #[cfg(feature = "test-support")]
+        self.fail_test_fault(HarnessDispatcherTestFaultPoint::TerminalSettlement)?;
         if self.command_is_cancelled(&claimed.id).await? {
             return self
                 .settle_late_terminal_after_cancel(execution, claimed, invocation, terminal)

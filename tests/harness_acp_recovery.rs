@@ -756,10 +756,11 @@ mod integrated_postgres_fake_restart {
     use kiteframe::store::{HarnessInvocationState, HarnessPluginRegistration};
     use kiteframe::{
         AgentCommandDispatcher, AgentCommandId, AgentKernel, AgentSelector, CreateSession,
-        GoalContract, GoalPhase, HarnessDispatcherTestBarrier, HarnessDispatcherTestBarrierPoint,
-        HarnessDispatcherTestFault, HarnessDispatcherTestFaultPoint, IdempotencyKey, PrincipalId,
-        RuntimeCeilings, StartAgent, SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer,
-        TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+        GoalContract, GoalPhase, HarnessDispatcherError, HarnessDispatcherTestBarrier,
+        HarnessDispatcherTestBarrierPoint, HarnessDispatcherTestFault,
+        HarnessDispatcherTestFaultPoint, IdempotencyKey, PrincipalId, RuntimeCeilings, StartAgent,
+        SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
+        ToolCatalogSnapshot, UserTaskId,
     };
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
@@ -2625,6 +2626,160 @@ mod integrated_postgres_fake_restart {
         let observation: Value =
             serde_json::from_slice(&std::fs::read(observation).unwrap()).unwrap();
         assert_eq!(observation["scriptComplete"], true);
+        recovery.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn completed_acp_settlement_error_finishes_and_reaps_before_reconciliation() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let process_log = recovery
+            .workspace
+            .join("settlement-error-owned-shutdown.jsonl");
+        let barrier = Arc::new(AcpTestBarrier::new_disarmed(
+            "adapter/shutdown",
+            AcpTestBarrierPoint::BeforeAdapterShutdown,
+        ));
+        barrier.arm();
+        let fault = Arc::new(HarnessDispatcherTestFault::new([
+            HarnessDispatcherTestFaultPoint::TerminalSettlement,
+        ]));
+        let (dispatcher, observation) = recovery
+            .dispatcher_with_fault(
+                "core-success.json",
+                Some("shutdown-nonzero.json"),
+                barrier.clone(),
+                fault.clone(),
+                &process_log,
+            )
+            .await;
+        let tick = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            async move { dispatcher.tick_agent_commands(8).await }
+        });
+        barrier.wait_until_entered().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !fault.fired(HarnessDispatcherTestFaultPoint::TerminalSettlement) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal settlement fault fires after the real ACP completion");
+
+        let accepted = recovery.invocation().await.unwrap();
+        assert_eq!(accepted.state, HarnessInvocationState::Accepted);
+        assert_eq!(
+            recovery.pending_or_owned_command().await.state,
+            kiteframe::AgentCommandState::Claimed
+        );
+        assert_eq!(recovery.authority().await, (GoalPhase::Active, 0));
+        assert!(
+            !tick.is_finished(),
+            "settlement failure cannot drop the managed ACP shutdown owner"
+        );
+
+        barrier.release();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), tick)
+                .await
+                .expect("owned ACP shutdown and reconciliation stay bounded")
+                .expect("dispatcher task joins")
+                .unwrap(),
+            1
+        );
+        let terminal = recovery.invocation().await.unwrap();
+        let command = recovery.pending_or_owned_command().await;
+        let lifecycle_audit = sqlx::query(
+            "SELECT stage, code, detail FROM harness_invocation_lifecycle_audits \
+             WHERE invocation_id = $1",
+        )
+        .bind(terminal.invocation_id.as_uuid())
+        .fetch_one(recovery.store.pool())
+        .await
+        .unwrap();
+        let observation: Value =
+            serde_json::from_slice(&std::fs::read(&observation).unwrap()).unwrap();
+
+        assert_eq!(terminal.state, HarnessInvocationState::OutcomeUnknown);
+        assert_eq!(command.state, kiteframe::AgentCommandState::Completed);
+        assert_eq!(recovery.authority().await, (GoalPhase::Active, 0));
+        assert_eq!(
+            sqlx::Row::get::<String, _>(&lifecycle_audit, "stage"),
+            "shutdown"
+        );
+        assert_eq!(
+            sqlx::Row::get::<String, _>(&lifecycle_audit, "code"),
+            "harness_outcome_unknown"
+        );
+        assert!(
+            sqlx::Row::get::<String, _>(&lifecycle_audit, "detail")
+                .starts_with("ACP process connection lost:")
+        );
+        assert_eq!(process_log_counts(&process_log), (1, 1));
+        assert_eq!(observation["scriptComplete"], false);
+        assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+        assert_eq!(recovery.authority().await, (GoalPhase::Active, 0));
+        recovery.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_audit_write_failure_is_explicitly_fatal_after_child_reap() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let process_log = recovery.workspace.join("lifecycle-audit-failure.jsonl");
+        let fault = Arc::new(HarnessDispatcherTestFault::new([
+            HarnessDispatcherTestFaultPoint::LifecycleAudit,
+        ]));
+        let (dispatcher, observation) = recovery
+            .dispatcher_with_fault(
+                "core-success.json",
+                Some("shutdown-nonzero.json"),
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                fault.clone(),
+                &process_log,
+            )
+            .await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatcher.tick_agent_commands(8),
+        )
+        .await
+        .expect("failed lifecycle audit is classified after bounded child reap")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            HarnessDispatcherError::LifecycleAuditFailed { .. }
+        ));
+        assert!(error.is_fatal());
+        assert!(fault.fired(HarnessDispatcherTestFaultPoint::LifecycleAudit));
+
+        let invocation = recovery.invocation().await.unwrap();
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM harness_invocation_lifecycle_audits WHERE invocation_id = $1",
+        )
+        .bind(invocation.invocation_id.as_uuid())
+        .fetch_one(recovery.store.pool())
+        .await
+        .unwrap();
+        assert_eq!(invocation.state, HarnessInvocationState::Completed);
+        assert_eq!(
+            recovery.pending_or_owned_command().await.state,
+            kiteframe::AgentCommandState::Completed
+        );
+        assert_eq!(recovery.authority().await, (GoalPhase::Active, 1));
+        assert_eq!(audit_count, 0);
+        assert_eq!(process_log_counts(&process_log), (1, 1));
+        assert_eq!(prompt_count(&observation), 1);
+        assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+        assert_eq!(recovery.authority().await, (GoalPhase::Active, 1));
         recovery.cleanup().await;
     }
 
