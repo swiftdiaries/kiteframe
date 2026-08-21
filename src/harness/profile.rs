@@ -118,12 +118,15 @@ impl HarnessProfile {
     }
 
     pub fn require(&self, capability: HarnessCapability) -> Result<(), HarnessFailure> {
-        if self.required.contains(&capability) || self.optional.contains(&capability) {
+        if self.required.contains(&capability) {
             Ok(())
         } else {
             Err(HarnessFailure::new(
                 "harness_capability_unsupported",
-                format!("capability {:?} is not declared by profile", capability),
+                format!(
+                    "capability {:?} requires observed handshake support",
+                    capability
+                ),
             ))
         }
     }
@@ -134,7 +137,12 @@ impl HarnessProfile {
         capability: HarnessCapability,
         observed: &HarnessCapabilities,
     ) -> Result<(), HarnessFailure> {
-        self.require(capability)?;
+        if !self.required.contains(&capability) && !self.optional.contains(&capability) {
+            return Err(HarnessFailure::new(
+                "harness_capability_unsupported",
+                format!("capability {:?} is not declared by profile", capability),
+            ));
+        }
         if observed.protocol_version != HARNESS_PROTOCOL_VERSION {
             return Err(HarnessFailure::new(
                 "harness_protocol_incompatible",

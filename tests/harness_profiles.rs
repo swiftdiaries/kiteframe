@@ -81,6 +81,29 @@ fn optional_capability_absent_from_handshake_fails_closed() {
 }
 
 #[test]
+fn optional_capability_requires_observed_handshake_state() {
+    let codex = profile("config/harness-profiles/codex-acp-v1.json");
+    assert_eq!(
+        codex
+            .require(HarnessCapability::SessionLoad)
+            .unwrap_err()
+            .code,
+        "harness_capability_unsupported"
+    );
+    let mut supported = codex.required.clone();
+    supported.insert(HarnessCapability::SessionLoad);
+    let observed = kiteframe::harness::HarnessCapabilities {
+        protocol_version: 1,
+        implementation_name: "codex-acp".into(),
+        implementation_version: "test".into(),
+        supported,
+    };
+    codex
+        .require_observed(HarnessCapability::SessionLoad, &observed)
+        .expect("observed optional capability is supported");
+}
+
+#[test]
 fn malformed_profiles_fail_closed_with_stable_error_code() {
     let source =
         fs::read_to_string("config/harness-profiles/deepseek-harness-acp-v1.json").unwrap();
