@@ -93,6 +93,13 @@ impl HarnessStoreFixture {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "UPDATE agent_commands SET state = 'claimed', claimant = 'harness-store-test' WHERE id = $1",
+        )
+        .bind(command_id.as_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
         let profile_id = HarnessProfileId::new(format!("test-harness-{}", Uuid::now_v7())).unwrap();
         let profile_digest = "sha256:profile-a".to_owned();
         store
@@ -161,6 +168,13 @@ impl HarnessStoreFixture {
         .bind(self.transition_id)
         .bind(json!({"type": "invoke_harness", "payload": {}}))
         .bind(self.command_id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE agent_commands SET state = 'claimed', claimant = 'harness-store-test' WHERE id = $1",
+        )
+        .bind(command_id.as_uuid())
         .execute(&self.pool)
         .await
         .unwrap();
@@ -441,7 +455,7 @@ async fn accepted_process_death_is_recovered_as_outcome_unknown() {
 }
 
 #[tokio::test]
-async fn recovery_settles_all_accepted_rows_before_limiting_retryable_work() {
+async fn recovery_limit_is_total_and_exclusion_makes_bounded_scans_progress() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
     };
@@ -467,13 +481,162 @@ async fn recovery_settles_all_accepted_rows_before_limiting_retryable_work() {
         .await
         .unwrap();
 
-    let recovered = fixture.store.recover_harness_invocations(1).await.unwrap();
-    assert!(recovered.iter().any(|view| {
-        view.invocation_id == accepted_id && view.state == HarnessInvocationState::OutcomeUnknown
-    }));
-    assert!(recovered.iter().any(|view| {
-        view.invocation_id == retryable_id && view.state == HarnessInvocationState::Prepared
-    }));
+    let first = fixture
+        .store
+        .recover_harness_invocations_excluding(1, &[])
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1, "limit is a total row bound");
+    assert_eq!(first[0].invocation_id, accepted_id);
+    assert_eq!(first[0].state, HarnessInvocationState::OutcomeUnknown);
+
+    let second = fixture
+        .store
+        .recover_harness_invocations_excluding(1, &[accepted_id])
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].invocation_id, retryable_id);
+    assert_eq!(second[0].state, HarnessInvocationState::Prepared);
+
+    let drained = fixture
+        .store
+        .recover_harness_invocations_excluding(1, &[first[0].invocation_id.clone(), retryable_id])
+        .await
+        .unwrap();
+    assert!(drained.is_empty());
+}
+
+#[tokio::test]
+async fn cancelled_command_atomically_settles_pre_accept_and_late_terminals_as_cancelled() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let prepared = fixture.prepare("sha256:payload-cancelled").await.unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&prepared.invocation_id, 0)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    let retry = fixture
+        .store
+        .record_harness_retryable_failure(
+            &prepared.invocation_id,
+            0,
+            3,
+            "sha256:retry-after-cancel",
+            &json!({"type":"failed","code":"harness_failed","detail":"late retry"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry.state, HarnessInvocationState::Cancelled);
+    assert_eq!(retry.attempt, 0);
+    assert_eq!(retry.terminal_payload, Some(json!({"type":"cancelled"})));
+
+    let late = fixture
+        .store
+        .settle_harness_invocation(
+            &prepared.invocation_id,
+            0,
+            HarnessInvocationState::Completed,
+            "sha256:late-completion",
+            &json!({"type":"completed","outcome":"ok","fields":{},"history":[]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(late.state, HarnessInvocationState::Cancelled);
+    assert_eq!(late.terminal_payload, Some(json!({"type":"cancelled"})));
+}
+
+#[tokio::test]
+async fn command_cancellation_lock_winner_forces_a_waiting_late_success_to_cancelled() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-cancel-race").await.unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation.invocation_id, 0)
+        .await
+        .unwrap();
+
+    let mut cancellation = fixture.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM agent_commands WHERE id = $1 FOR UPDATE")
+        .bind(fixture.command_id.as_uuid())
+        .execute(&mut *cancellation)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&mut *cancellation)
+    .await
+    .unwrap();
+
+    let store = fixture.store.clone();
+    let invocation_id = invocation.invocation_id.clone();
+    let late_success = tokio::spawn(async move {
+        store
+            .settle_harness_invocation(
+                &invocation_id,
+                0,
+                HarnessInvocationState::Completed,
+                "sha256:late-success-race",
+                &json!({"type":"completed","outcome":"ok","fields":{},"history":[]}),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !late_success.is_finished(),
+        "terminal settlement waits for the authoritative command lock"
+    );
+    cancellation.commit().await.unwrap();
+
+    let settled = late_success.await.unwrap().unwrap();
+    assert_eq!(settled.state, HarnessInvocationState::Cancelled);
+    assert_eq!(settled.attempt, 0);
+    assert_eq!(settled.terminal_payload, Some(json!({"type":"cancelled"})));
+}
+
+#[tokio::test]
+async fn recovery_settles_cancelled_command_rows_instead_of_reselecting_them_as_retryable() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture
+        .prepare("sha256:payload-cancelled-recovery")
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    let recovered = fixture
+        .store
+        .recover_harness_invocations_excluding(1, &[])
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].invocation_id, invocation.invocation_id);
+    assert_eq!(recovered[0].state, HarnessInvocationState::Cancelled);
+    assert_eq!(
+        recovered[0].terminal_payload,
+        Some(json!({"type":"cancelled"}))
+    );
 }
 
 #[tokio::test]

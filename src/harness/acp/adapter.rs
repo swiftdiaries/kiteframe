@@ -294,7 +294,11 @@ impl AcpHarnessPlugin {
         };
         if let Err(error) = events.commit_acceptance().await {
             let _ = client.shutdown().await;
-            return HarnessTerminal::OutcomeUnknown(error);
+            return if error.code == "harness_cancelled" {
+                HarnessTerminal::Cancelled
+            } else {
+                HarnessTerminal::OutcomeUnknown(error)
+            };
         }
 
         let cancel_once = Arc::new(CancelOnce::default());
@@ -473,6 +477,10 @@ impl AcpHarnessPlugin {
                 }
             }
         };
+        #[cfg(feature = "test-support")]
+        if let Some(barrier) = &self.test_barrier {
+            barrier.pause_before_adapter_shutdown().await;
+        }
         let shutdown = client.shutdown().await;
         match (terminal, shutdown) {
             (HarnessTerminal::Completed(_), Err(error)) => post_accept_error(error),

@@ -35,6 +35,7 @@ pub enum AcpTestBarrierPoint {
     BeforeWrite,
     BeforeAcknowledgement,
     EofBeforeShutdownClaim,
+    BeforeAdapterShutdown,
 }
 
 #[cfg(feature = "test-support")]
@@ -146,6 +147,14 @@ impl AcpTestBarrier {
         while !self.released.load(Ordering::Acquire) {
             self.release_notify.notified().await;
         }
+    }
+
+    pub(crate) async fn pause_before_adapter_shutdown(&self) {
+        self.pause(
+            "adapter/shutdown",
+            AcpTestBarrierPoint::BeforeAdapterShutdown,
+        )
+        .await;
     }
 }
 

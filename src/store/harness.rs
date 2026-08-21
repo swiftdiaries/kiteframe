@@ -1,11 +1,11 @@
 use serde_json::Value;
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 
-use crate::AgentCommandId;
 use crate::harness::{
     HarnessEventEnvelope, HarnessInvocationId, HarnessProfileId, HarnessTransport,
     canonical_outcome_unknown_terminal_payload, terminal_idempotency_key,
 };
+use crate::{AgentCommandId, UserTaskId};
 
 use super::{
     HarnessInvocationEventRecord, HarnessInvocationState, HarnessInvocationView,
@@ -124,6 +124,14 @@ impl PostgresStore {
             "harness command revision is malformed",
         )?;
         let mut tx = self.pool().begin().await?;
+        let command_state: String = sqlx::query_scalar(
+            "SELECT state FROM agent_commands WHERE id = $1 AND revision = $2 FOR UPDATE",
+        )
+        .bind(request.command_id.as_uuid())
+        .bind(command_revision)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::RevisionConflict)?;
         let registration = sqlx::query(
             "SELECT profile_digest, enabled FROM harness_plugin_registrations \
              WHERE profile_id = $1 FOR UPDATE",
@@ -152,6 +160,9 @@ impl PostgresStore {
             validate_invocation_identity_replay(&view, &request)?;
             tx.commit().await?;
             return Ok(view);
+        }
+        if command_state != "claimed" {
+            return Err(StoreError::RevisionConflict);
         }
         let insert = sqlx::query(
             "INSERT INTO harness_invocations \
@@ -195,7 +206,13 @@ impl PostgresStore {
         expected_attempt: u64,
     ) -> Result<HarnessInvocationView, StoreError> {
         let mut tx = self.pool().begin().await?;
-        let view = lock_harness_invocation(&mut tx, invocation_id).await?;
+        let (command_state, view) =
+            lock_harness_invocation_with_command(&mut tx, invocation_id).await?;
+        if command_state == "cancelled" {
+            let view = settle_harness_cancelled(&mut tx, &view).await?;
+            tx.commit().await?;
+            return Ok(view);
+        }
         if view.state == HarnessInvocationState::Started && view.attempt == expected_attempt {
             tx.commit().await?;
             return Ok(view);
@@ -232,7 +249,13 @@ impl PostgresStore {
             ));
         }
         let mut tx = self.pool().begin().await?;
-        let view = lock_harness_invocation(&mut tx, invocation_id).await?;
+        let (command_state, view) =
+            lock_harness_invocation_with_command(&mut tx, invocation_id).await?;
+        if command_state == "cancelled" {
+            let view = settle_harness_cancelled(&mut tx, &view).await?;
+            tx.commit().await?;
+            return Ok(view);
+        }
         if view.state == HarnessInvocationState::Failed && view.attempt == expected_attempt {
             if view.terminal_request_digest.as_deref() == Some(request_digest)
                 && view.terminal_payload.as_ref() == Some(terminal_payload)
@@ -288,7 +311,13 @@ impl PostgresStore {
         expected_attempt: u64,
     ) -> Result<HarnessInvocationView, StoreError> {
         let mut tx = self.pool().begin().await?;
-        let view = lock_harness_invocation(&mut tx, invocation_id).await?;
+        let (command_state, view) =
+            lock_harness_invocation_with_command(&mut tx, invocation_id).await?;
+        if command_state == "cancelled" {
+            let view = settle_harness_cancelled(&mut tx, &view).await?;
+            tx.commit().await?;
+            return Ok(view);
+        }
         if view.state == HarnessInvocationState::Accepted && view.attempt == expected_attempt {
             tx.commit().await?;
             return Ok(view);
@@ -408,7 +437,13 @@ impl PostgresStore {
             ));
         }
         let mut tx = self.pool().begin().await?;
-        let view = lock_harness_invocation(&mut tx, invocation_id).await?;
+        let (command_state, view) =
+            lock_harness_invocation_with_command(&mut tx, invocation_id).await?;
+        if command_state == "cancelled" {
+            let view = settle_harness_cancelled(&mut tx, &view).await?;
+            tx.commit().await?;
+            return Ok(view);
+        }
         if view.terminal {
             if view.state == state
                 && view.terminal_request_digest.as_deref() == Some(request_digest)
@@ -441,50 +476,72 @@ impl PostgresStore {
         &self,
         limit: i64,
     ) -> Result<Vec<HarnessInvocationView>, StoreError> {
+        self.recover_harness_invocations_excluding(limit, &[]).await
+    }
+
+    pub async fn recover_harness_invocations_excluding(
+        &self,
+        limit: i64,
+        excluded: &[HarnessInvocationId],
+    ) -> Result<Vec<HarnessInvocationView>, StoreError> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
         let mut tx = self.pool().begin().await?;
-        let work_rows = sqlx::query(
+        let excluded = excluded
+            .iter()
+            .map(HarnessInvocationId::as_uuid)
+            .collect::<Vec<_>>();
+        let rows = sqlx::query(
             "SELECT invocations.invocation_id, invocations.command_id, invocations.command_revision, \
                     invocations.profile_id, invocations.profile_digest, invocations.payload_digest, \
                     invocations.state, invocations.attempt, invocations.prompt_accepted, \
-                    invocations.terminal, invocations.terminal_request_digest, invocations.terminal_payload \
+                    invocations.terminal, invocations.terminal_request_digest, invocations.terminal_payload, \
+                    commands.state AS command_state \
              FROM harness_invocations invocations \
              JOIN agent_commands commands ON commands.id = invocations.command_id \
-             WHERE invocations.state = 'prepared' \
-                OR (invocations.state = 'started' AND invocations.prompt_accepted = FALSE) \
-                OR (invocations.terminal = TRUE AND commands.completion_idempotency_key IS NULL) \
-             ORDER BY invocations.created_at, invocations.invocation_id LIMIT $1 \
-             FOR UPDATE OF invocations",
+             WHERE NOT (invocations.invocation_id = ANY($2)) AND ( \
+                    (invocations.terminal = FALSE AND commands.state = 'cancelled') \
+                 OR (invocations.state = 'accepted' AND commands.state = 'claimed') \
+                 OR (invocations.terminal = TRUE AND commands.completion_idempotency_key IS NULL) \
+                 OR (commands.state = 'claimed' AND (invocations.state = 'prepared' \
+                     OR (invocations.state = 'started' AND invocations.prompt_accepted = FALSE))) \
+             ) \
+             ORDER BY CASE \
+                    WHEN invocations.terminal = FALSE AND commands.state = 'cancelled' THEN 0 \
+                    WHEN invocations.state = 'accepted' THEN 1 \
+                    WHEN invocations.terminal = TRUE THEN 2 \
+                    ELSE 3 END, \
+                    invocations.created_at, invocations.invocation_id \
+             LIMIT $1 FOR UPDATE OF commands, invocations",
         )
-        .bind(limit.clamp(1, 256))
+        .bind(limit.min(256))
+        .bind(excluded)
         .fetch_all(&mut *tx)
         .await?;
-        let accepted_rows = sqlx::query(
-            "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
-             FROM harness_invocations \
-             WHERE state = 'accepted' ORDER BY created_at, invocation_id FOR UPDATE",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
-        let mut recovered = Vec::with_capacity(accepted_rows.len() + work_rows.len());
-        for row in accepted_rows {
+        let mut recovered = Vec::with_capacity(rows.len());
+        for row in rows {
             let view = harness_invocation_from_row(&row)?;
-            recovered.push(
-                update_invocation_state(
-                    &mut tx,
-                    &view.invocation_id,
-                    HarnessInvocationState::OutcomeUnknown,
-                    view.attempt,
-                    true,
-                    true,
-                    Some(&terminal_idempotency_key(&view.invocation_id)),
-                    Some(&canonical_outcome_unknown_terminal_payload()),
-                )
-                .await?,
-            );
-        }
-        for row in work_rows {
-            recovered.push(harness_invocation_from_row(&row)?);
+            let command_state: String = row.get("command_state");
+            if command_state == "cancelled" && !view.terminal {
+                recovered.push(settle_harness_cancelled(&mut tx, &view).await?);
+            } else if view.state == HarnessInvocationState::Accepted {
+                recovered.push(
+                    update_invocation_state(
+                        &mut tx,
+                        &view.invocation_id,
+                        HarnessInvocationState::OutcomeUnknown,
+                        view.attempt,
+                        true,
+                        true,
+                        Some(&terminal_idempotency_key(&view.invocation_id)),
+                        Some(&canonical_outcome_unknown_terminal_payload()),
+                    )
+                    .await?,
+                );
+            } else {
+                recovered.push(view);
+            }
         }
         tx.commit().await?;
         Ok(recovered)
@@ -605,6 +662,70 @@ async fn lock_harness_invocation(
     .await?
     .ok_or_else(|| StoreError::InvalidData("harness invocation is absent".to_owned()))?;
     harness_invocation_from_row(&row)
+}
+
+async fn lock_harness_invocation_with_command(
+    tx: &mut Transaction<'_, Postgres>,
+    invocation_id: &HarnessInvocationId,
+) -> Result<(String, HarnessInvocationView), StoreError> {
+    let command_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT command_id FROM harness_invocations WHERE invocation_id = $1")
+            .bind(invocation_id.as_uuid())
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(|| StoreError::InvalidData("harness invocation is absent".to_owned()))?;
+    let command_state: String =
+        sqlx::query_scalar("SELECT state FROM agent_commands WHERE id = $1 FOR UPDATE")
+            .bind(command_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let invocation = lock_harness_invocation(tx, invocation_id).await?;
+    Ok((command_state, invocation))
+}
+
+async fn settle_harness_cancelled(
+    tx: &mut Transaction<'_, Postgres>,
+    view: &HarnessInvocationView,
+) -> Result<HarnessInvocationView, StoreError> {
+    if view.terminal {
+        return Ok(view.clone());
+    }
+    let payload = serde_json::json!({"type": "cancelled"});
+    update_invocation_state(
+        tx,
+        &view.invocation_id,
+        HarnessInvocationState::Cancelled,
+        view.attempt,
+        view.prompt_accepted,
+        true,
+        Some(&terminal_idempotency_key(&view.invocation_id)),
+        Some(&payload),
+    )
+    .await
+}
+
+pub(super) async fn cancel_harness_invocations_for_task(
+    tx: &mut Transaction<'_, Postgres>,
+    task_id: &UserTaskId,
+) -> Result<(), StoreError> {
+    let rows = sqlx::query(
+        "SELECT invocations.invocation_id, invocations.command_id, invocations.command_revision, \
+                invocations.profile_id, invocations.profile_digest, invocations.payload_digest, \
+                invocations.state, invocations.attempt, invocations.prompt_accepted, \
+                invocations.terminal, invocations.terminal_request_digest, invocations.terminal_payload \
+         FROM harness_invocations invocations \
+         JOIN agent_commands commands ON commands.id = invocations.command_id \
+         WHERE commands.task_id = $1 AND invocations.terminal = FALSE \
+         ORDER BY commands.id, invocations.invocation_id FOR UPDATE OF invocations",
+    )
+    .bind(task_id.as_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    for row in rows {
+        let view = harness_invocation_from_row(&row)?;
+        settle_harness_cancelled(tx, &view).await?;
+    }
+    Ok(())
 }
 
 async fn update_invocation_state(

@@ -248,11 +248,18 @@ struct PostgresHarnessAcceptanceBarrier {
 #[async_trait]
 impl HarnessAcceptanceBarrier for PostgresHarnessAcceptanceBarrier {
     async fn commit(&self) -> Result<(), HarnessFailure> {
-        self.store
+        let invocation = self
+            .store
             .mark_harness_prompt_accepted(&self.invocation_id, self.expected_attempt)
             .await
-            .map(|_| ())
-            .map_err(|error| HarnessFailure::new("harness_outcome_unknown", error.to_string()))
+            .map_err(|error| HarnessFailure::new("harness_outcome_unknown", error.to_string()))?;
+        if invocation.state == crate::store::HarnessInvocationState::Cancelled {
+            return Err(HarnessFailure::new(
+                "harness_cancelled",
+                "harness command was cancelled before prompt acceptance",
+            ));
+        }
+        Ok(())
     }
 }
 

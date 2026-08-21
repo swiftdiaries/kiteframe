@@ -1532,6 +1532,7 @@ impl PostgresStore {
         )
         .await?;
         let _commands = lock_agent_commands(&mut tx, &request.task_id).await?;
+        super::harness::cancel_harness_invocations_for_task(&mut tx, &request.task_id).await?;
         let next_task_revision = next_revision(aggregate.task_revision, "user task revision")?;
         sqlx::query(
             "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1, \

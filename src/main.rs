@@ -259,9 +259,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(DenyAllHarnessApprovals),
             harness_routes,
         ));
-        let harness_recovery = agent_dispatcher
-            .recover_harness_invocations(engine.config.scheduler_batch_size)
-            .await?;
+        let recovery_limit = engine.config.scheduler_batch_size.clamp(1, 256);
+        let mut harness_recovery = kiteframe::HarnessRecoveryReport::default();
+        loop {
+            let page = agent_dispatcher
+                .recover_harness_invocations(recovery_limit)
+                .await?;
+            let page_count = page.retryable_pre_accept + page.outcome_unknown + page.terminal;
+            harness_recovery.retryable_pre_accept += page.retryable_pre_accept;
+            harness_recovery.outcome_unknown += page.outcome_unknown;
+            harness_recovery.terminal += page.terminal;
+            if page_count < u64::try_from(recovery_limit).expect("positive recovery limit") {
+                break;
+            }
+        }
         tracing::info!(
             retryable_pre_accept = harness_recovery.retryable_pre_accept,
             outcome_unknown = harness_recovery.outcome_unknown,
