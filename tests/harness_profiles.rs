@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 
 use kiteframe::harness::{HarnessCapability, HarnessProfile, HarnessRouteTable};
-use kiteframe::{HarnessConfig, HarnessRole, ModelRole};
+use kiteframe::{ConfigError, HarnessConfig, HarnessRole, ModelRole};
 use serde_json::Value;
 
 fn profile(path: &str) -> HarnessProfile {
@@ -160,13 +160,13 @@ fn command_overrides_are_json_arrays_without_shell_interpolation() {
         ),
         (
             "KITEFRAME_DSH_ACP_COMMAND_JSON",
-            r#"["pnpm","--dir","/opt/deepseek-harness","run","demo:acp"]"#,
+            r#"["echo","--dir","/opt/deepseek-harness","run","demo:acp"]"#,
         ),
         (
             "KITEFRAME_DSH_ACP_SOURCE_REVISION",
             "141eb6fef83422698aef7a981029e843e8161534",
         ),
-        ("KITEFRAME_DSH_ACP_ENV_JSON", r#"{"PATH":"/opt/bin"}"#),
+        ("KITEFRAME_DSH_ACP_ENV_JSON", r#"{"PATH":"/bin"}"#),
     ])
     .unwrap();
 
@@ -175,7 +175,7 @@ fn command_overrides_are_json_arrays_without_shell_interpolation() {
         commands.codex.unwrap().program.to_string_lossy(),
         "/opt/codex-acp/bin/codex-acp"
     );
-    assert_eq!(commands.deepseek.unwrap().program.to_string_lossy(), "pnpm");
+    assert_eq!(commands.deepseek.unwrap().program.to_string_lossy(), "echo");
 }
 
 #[test]
@@ -305,9 +305,23 @@ fn literal_arguments_allow_metacharacters_but_reject_shell_and_precise_secret_fo
 
     for command in [
         r#"["/bin/sh","-c","echo"]"#,
+        r#"["/bin/dash","-c","echo"]"#,
+        r#"["/bin/ksh","-c","echo"]"#,
+        r#"["/bin/csh","-c","echo"]"#,
+        r#"["/bin/tcsh","-c","echo"]"#,
+        r#"["/bin/fish","-c","echo"]"#,
+        r#"["/bin/busybox","sh","-c","echo"]"#,
         r#"["/usr/bin/env","bash","-c","echo"]"#,
+        r#"["/usr/bin/env","printenv"]"#,
+        r#"["/usr/bin/command","dash","-c","echo"]"#,
         r#"["curl","--header","Authorization: Bearer value"]"#,
+        r#"["curl","--header=Authorization: Bearer value"]"#,
+        r#"["curl","-HAuthorization: Bearer value"]"#,
+        r#"["curl","--user=person:password"]"#,
+        r#"["curl","-uperson:password"]"#,
+        r#"["curl","--token:value"]"#,
         r#"["curl","https://secret@example.test/acp"]"#,
+        r#"["curl","https://example.test/acp?api_key=secret"]"#,
     ] {
         assert!(
             HarnessConfig::from_test_values([
@@ -320,4 +334,75 @@ fn literal_arguments_allow_metacharacters_but_reject_shell_and_precise_secret_fo
             .is_err()
         );
     }
+
+    let benign = HarnessConfig::from_test_values([
+        (
+            "KITEFRAME_CODEX_ACP_COMMAND_JSON",
+            r#"["/opt/codex-acp","--tokenizer=enabled","https://example.test/acp?topic=ok"]"#,
+        ),
+        (
+            "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+            "296069e841634cd4bb9bc4515602d836e49231ec",
+        ),
+    ]);
+    assert!(benign.is_ok());
+}
+
+#[test]
+fn required_environment_values_and_json_keys_are_unique_and_nonempty() {
+    for environment in [
+        r#"{"CODEX_TOKEN":""}"#,
+        r#"{"CODEX_TOKEN":"   "}"#,
+        r#"{"CODEX_TOKEN":"one","CODEX_TOKEN":"two"}"#,
+    ] {
+        assert!(
+            HarnessConfig::from_test_values([
+                ("KITEFRAME_CODEX_ACP_COMMAND_JSON", r#"["/opt/codex-acp"]"#),
+                (
+                    "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    "296069e841634cd4bb9bc4515602d836e49231ec",
+                ),
+                ("KITEFRAME_CODEX_ACP_ENV_JSON", environment),
+                (
+                    "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON",
+                    r#"["CODEX_TOKEN"]"#
+                ),
+            ])
+            .is_err()
+        );
+    }
+    for path in ["", "   "] {
+        let empty_path = HarnessConfig::from_test_values([
+            ("KITEFRAME_DSH_ACP_COMMAND_JSON", r#"["pnpm","run","demo"]"#),
+            (
+                "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+                "141eb6fef83422698aef7a981029e843e8161534",
+            ),
+            (
+                "KITEFRAME_DSH_ACP_ENV_JSON",
+                if path.is_empty() {
+                    r#"{"PATH":""}"#
+                } else {
+                    r#"{"PATH":"   "}"#
+                },
+            ),
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            empty_path,
+            ConfigError::BareExternalHarnessCommandRequiresPath { .. }
+        ));
+    }
+    assert!(
+        HarnessConfig::from_test_values([
+            ("KITEFRAME_DSH_ACP_COMMAND_JSON", r#"["/opt/dsh"]"#),
+            (
+                "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+                "141eb6fef83422698aef7a981029e843e8161534",
+            ),
+            ("KITEFRAME_DSH_ACP_ENV_JSON", r#"{"AUTH":"ok"}"#),
+            ("KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON", r#"["AUTH","AUTH"]"#),
+        ])
+        .is_err()
+    );
 }

@@ -2,9 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fmt,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
+
+use serde::de::{Error as _, MapAccess, Visitor};
 
 use crate::{
     PrincipalId, ResponsesConfig, RuntimeCeilings, Secret, StoreLimits,
@@ -389,17 +391,15 @@ fn parse_external_harness(
             let (program, args) = command
                 .split_first()
                 .ok_or(ConfigError::InvalidExternalHarnessCommand { command_name })?;
-            if !valid_program(program) || !valid_literal_arguments(program, args) {
-                return Err(ConfigError::InvalidExternalHarnessCommand { command_name });
-            }
             let environment =
                 parse_child_environment(environment, required_environment, command_name)?;
-            if is_bare_program(program)
-                && !environment
-                    .as_ref()
-                    .is_some_and(|environment| environment.contains_key("PATH"))
-            {
+            if is_bare_program(program) && !environment.as_ref().is_some_and(has_nonempty_path) {
                 return Err(ConfigError::BareExternalHarnessCommandRequiresPath { command_name });
+            }
+            if !valid_program(program, args, environment.as_ref())
+                || !valid_literal_arguments(program, args)
+            {
+                return Err(ConfigError::InvalidExternalHarnessCommand { command_name });
             }
             Ok((
                 Some(AcpCommand {
@@ -424,13 +424,15 @@ fn parse_child_environment(
         }
         return Ok(None);
     };
-    let values: BTreeMap<String, String> = serde_json::from_str(&environment)
+    let values = parse_environment_object(&environment)
         .map_err(|_| ConfigError::InvalidExternalHarnessEnvironment { command_name })?;
     let required: Vec<String> = required_environment
-        .map(|required| serde_json::from_str(&required))
+        .as_deref()
+        .map(serde_json::from_str)
         .transpose()
         .map_err(|_| ConfigError::InvalidExternalHarnessEnvironment { command_name })?
         .unwrap_or_default();
+    let required_count = required.len();
     let values = values
         .into_iter()
         .map(|(key, value)| {
@@ -442,13 +444,46 @@ fn parse_child_environment(
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let required = required.into_iter().collect::<BTreeSet<_>>();
     if required.iter().any(|key| !valid_environment_key(key))
-        || required
-            .iter()
-            .any(|key| !values.contains_key(&OsString::from(key)))
+        || required.len() != required_count
+        || required.iter().any(|key| {
+            !values.get(&OsString::from(key)).is_some_and(|value| {
+                !value.is_empty() && !value.to_string_lossy().trim().is_empty()
+            })
+        })
     {
         return Err(ConfigError::InvalidExternalHarnessEnvironment { command_name });
     }
     Ok(Some(AcpChildEnvironment { values, required }))
+}
+
+fn parse_environment_object(value: &str) -> Result<BTreeMap<String, String>, serde_json::Error> {
+    struct NoDuplicateObject;
+
+    impl<'de> Visitor<'de> for NoDuplicateObject {
+        type Value = BTreeMap<String, String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a JSON object with unique string keys and string values")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut values = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, String>()? {
+                if values.insert(key.clone(), value).is_some() {
+                    return Err(A::Error::custom("duplicate environment key"));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    serde::de::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_str(value),
+        NoDuplicateObject,
+    )
 }
 
 fn valid_environment_key(value: &str) -> bool {
@@ -464,29 +499,88 @@ fn is_full_revision(value: &str) -> bool {
         && !value.bytes().all(|byte| byte == b'0')
 }
 
-fn valid_program(value: &str) -> bool {
-    if !valid_literal(value) || is_shell_executable(value) {
+fn valid_program(
+    value: &str,
+    arguments: &[String],
+    environment: Option<&AcpChildEnvironment>,
+) -> bool {
+    if !valid_literal(value) {
         return false;
     }
     let path = Path::new(value);
-    if path.is_absolute() {
-        return true;
-    }
-    if path.components().count() != 1 {
+    let resolved = if path.is_absolute() {
+        canonical_or_original(path)
+    } else {
+        let Some(environment) = environment else {
+            return false;
+        };
+        let Some(path) = resolve_bare_program(value, environment) else {
+            return false;
+        };
+        path
+    };
+    if !resolved.is_absolute() || (!path.is_absolute() && path.components().count() != 1) {
         return false;
     }
-    true
+    !is_recognized_shell(&resolved, arguments)
 }
 
 fn is_bare_program(value: &str) -> bool {
     !Path::new(value).is_absolute()
 }
 
-fn is_shell_executable(value: &str) -> bool {
+fn canonical_or_original(value: &Path) -> PathBuf {
+    std::fs::canonicalize(value).unwrap_or_else(|_| value.to_path_buf())
+}
+
+fn resolve_bare_program(value: &str, environment: &AcpChildEnvironment) -> Option<PathBuf> {
+    let path = environment.values.get(&OsString::from("PATH"))?;
+    std::env::split_paths(path)
+        .map(|directory| directory.join(value))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| canonical_or_original(&candidate))
+}
+
+fn has_nonempty_path(environment: &AcpChildEnvironment) -> bool {
+    environment
+        .values
+        .get(&OsString::from("PATH"))
+        .is_some_and(|value| !value.is_empty() && !value.to_string_lossy().trim().is_empty())
+}
+
+fn is_shell_executable(value: &Path) -> bool {
     matches!(
-        Path::new(value).file_name().and_then(|name| name.to_str()),
-        Some("sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell" | "pwsh")
+        value.file_name().and_then(|name| name.to_str()),
+        Some(
+            "sh" | "bash"
+                | "zsh"
+                | "fish"
+                | "dash"
+                | "ksh"
+                | "csh"
+                | "tcsh"
+                | "cmd"
+                | "powershell"
+                | "pwsh"
+        )
     )
+}
+
+/// This blocks recognized shell and wrapper basenames only. Deployment controls direct argv and
+/// source attestation; a renamed or shebang interpreter is not inferred from arbitrary programs.
+fn is_recognized_shell(program: &Path, arguments: &[String]) -> bool {
+    if is_shell_executable(program) {
+        return true;
+    }
+    let basename = program.file_name().and_then(|name| name.to_str());
+    match basename {
+        // These launch another executable. Do not try to infer the wrapped command or source.
+        Some("env" | "command") => true,
+        Some("busybox") => arguments
+            .first()
+            .is_some_and(|argument| is_shell_executable(Path::new(argument)) || argument == "sh"),
+        _ => false,
+    }
 }
 
 fn valid_literal_arguments(program: &str, arguments: &[String]) -> bool {
@@ -504,15 +598,6 @@ fn valid_literal_arguments(program: &str, arguments: &[String]) -> bool {
                 return false;
             }
         }
-        if matches!(
-            Path::new(program)
-                .file_name()
-                .and_then(|name| name.to_str()),
-            Some("env" | "command")
-        ) && is_shell_executable(argument)
-        {
-            return false;
-        }
         if matches!(argument.as_str(), "-H" | "--header")
             && arguments
                 .get(index + 1)
@@ -520,8 +605,15 @@ fn valid_literal_arguments(program: &str, arguments: &[String]) -> bool {
         {
             return false;
         }
+        if argument == "-u"
+            && arguments
+                .get(index + 1)
+                .is_some_and(|value| value.contains(':'))
+        {
+            return false;
+        }
     }
-    !workspace_override
+    !workspace_override && !is_recognized_shell(Path::new(program), arguments)
 }
 
 fn valid_literal(value: &str) -> bool {
@@ -537,11 +629,20 @@ fn contains_secret_argument(value: &str) -> bool {
         "api-key",
         "api_key",
         "authorization",
+        "key",
+        "user",
     ]
     .iter()
-    .any(|name| normalized == format!("--{name}") || normalized.starts_with(&format!("--{name}=")))
+    .any(|name| {
+        normalized == format!("--{name}")
+            || normalized.starts_with(&format!("--{name}="))
+            || normalized.starts_with(&format!("--{name}:"))
+    }) || normalized.starts_with("-u") && normalized.len() > 2
+        || normalized.starts_with("-hauthorization:")
+        || normalized.starts_with("--header=authorization:")
         || is_secret_header(value)
         || has_url_userinfo(value)
+        || has_secret_query_name(value)
 }
 
 fn is_secret_header(value: &str) -> bool {
@@ -555,6 +656,26 @@ fn has_url_userinfo(value: &str) -> bool {
             .split_once('/')
             .map_or(&value[scheme + 3..], |(authority, _)| authority);
         authority.contains('@')
+    })
+}
+
+fn has_secret_query_name(value: &str) -> bool {
+    let Some((_, query)) = value.split_once('?') else {
+        return false;
+    };
+    query.split('&').any(|pair| {
+        let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "token"
+                | "key"
+                | "api_key"
+                | "apikey"
+                | "password"
+                | "secret"
+                | "auth"
+                | "authorization"
+        )
     })
 }
 

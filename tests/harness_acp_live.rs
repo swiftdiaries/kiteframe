@@ -80,13 +80,6 @@ impl LiveTarget {
         }
     }
 
-    async fn enabled() -> Vec<Self> {
-        [Self::Codex, Self::DeepSeek]
-            .into_iter()
-            .filter(|target| std::env::var_os(target.command_name()).is_some())
-            .collect()
-    }
-
     async fn driver_if_enabled(self) -> Option<LiveAcpDriver> {
         if std::env::var_os(self.command_name()).is_none() {
             eprintln!("{}", self.skip_line());
@@ -378,12 +371,6 @@ fn request(
             },
         },
     }
-}
-
-#[tokio::test]
-async fn live_codex_and_deepseek_use_the_same_normative_cases() {
-    let targets = LiveTarget::enabled().await;
-    assert!(targets.len() <= 2, "each live target is enumerated once");
 }
 
 #[tokio::test]
