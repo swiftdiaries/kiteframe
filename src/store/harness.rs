@@ -93,7 +93,7 @@ impl PostgresStore {
         }
         if let Some(row) = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
              FROM harness_invocations WHERE invocation_id = $1 FOR UPDATE",
         )
         .bind(request.invocation_id.as_uuid())
@@ -128,7 +128,7 @@ impl PostgresStore {
         }
         let row = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
              FROM harness_invocations WHERE command_id = $1 AND command_revision = $2 FOR UPDATE",
         )
         .bind(request.command_id.as_uuid())
@@ -163,6 +163,7 @@ impl PostgresStore {
             false,
             false,
             None,
+            None,
         )
         .await?;
         tx.commit().await?;
@@ -175,8 +176,9 @@ impl PostgresStore {
         expected_attempt: u64,
         max_pre_accept_attempts: u64,
         request_digest: &str,
+        terminal_payload: &Value,
     ) -> Result<HarnessInvocationView, StoreError> {
-        if request_digest.is_empty() {
+        if request_digest.is_empty() || !terminal_payload.is_object() {
             return Err(StoreError::InvalidData(
                 "harness retryable failure request is malformed".to_owned(),
             ));
@@ -222,6 +224,7 @@ impl PostgresStore {
             false,
             terminal,
             request_digest,
+            terminal.then_some(terminal_payload),
         )
         .await?;
         tx.commit().await?;
@@ -253,6 +256,7 @@ impl PostgresStore {
             expected_attempt,
             true,
             false,
+            None,
             None,
         )
         .await?;
@@ -346,8 +350,9 @@ impl PostgresStore {
         expected_attempt: u64,
         state: HarnessInvocationState,
         request_digest: &str,
+        terminal_payload: &Value,
     ) -> Result<HarnessInvocationView, StoreError> {
-        if !state.is_terminal() || request_digest.is_empty() {
+        if !state.is_terminal() || request_digest.is_empty() || !terminal_payload.is_object() {
             return Err(StoreError::InvalidData(
                 "harness terminal settlement is malformed".to_owned(),
             ));
@@ -357,6 +362,7 @@ impl PostgresStore {
         if view.terminal {
             if view.state == state
                 && view.terminal_request_digest.as_deref() == Some(request_digest)
+                && view.terminal_payload.as_ref() == Some(terminal_payload)
             {
                 tx.commit().await?;
                 return Ok(view);
@@ -374,6 +380,7 @@ impl PostgresStore {
             view.prompt_accepted,
             true,
             Some(request_digest),
+            Some(terminal_payload),
         )
         .await?;
         tx.commit().await?;
@@ -387,7 +394,7 @@ impl PostgresStore {
         let mut tx = self.pool().begin().await?;
         let accepted_rows = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
              FROM harness_invocations \
              WHERE state = 'accepted' ORDER BY created_at, invocation_id FOR UPDATE",
         )
@@ -405,13 +412,18 @@ impl PostgresStore {
                     true,
                     true,
                     Some("harness-recovery-outcome-unknown"),
+                    Some(&serde_json::json!({
+                        "type":"outcome_unknown",
+                        "code":"harness_outcome_unknown",
+                        "detail":"harness recovery observed accepted work",
+                    })),
                 )
                 .await?,
             );
         }
         let retryable_rows = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
              FROM harness_invocations \
              WHERE state = 'prepared' OR (state = 'started' AND prompt_accepted = FALSE) \
              ORDER BY created_at, invocation_id LIMIT $1 FOR UPDATE",
@@ -460,9 +472,10 @@ fn harness_invocation_from_row(row: &PgRow) -> Result<HarnessInvocationView, Sto
     let state = HarnessInvocationState::parse(row.get("state"))?;
     let terminal: bool = row.get("terminal");
     let terminal_request_digest: Option<String> = row.get("terminal_request_digest");
+    let terminal_payload: Option<Value> = row.get("terminal_payload");
     if terminal != state.is_terminal()
-        || (terminal && terminal_request_digest.is_none())
-        || (!terminal && terminal_request_digest.is_some())
+        || (terminal && (terminal_request_digest.is_none() || terminal_payload.is_none()))
+        || (!terminal && (terminal_request_digest.is_some() || terminal_payload.is_some()))
     {
         return Err(StoreError::InvalidData(
             "harness invocation terminal state is malformed".to_owned(),
@@ -484,6 +497,7 @@ fn harness_invocation_from_row(row: &PgRow) -> Result<HarnessInvocationView, Sto
         prompt_accepted: row.get("prompt_accepted"),
         terminal,
         terminal_request_digest,
+        terminal_payload,
     })
 }
 
@@ -522,7 +536,7 @@ async fn lock_harness_invocation(
 ) -> Result<HarnessInvocationView, StoreError> {
     let row = sqlx::query(
         "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                state, attempt, prompt_accepted, terminal, terminal_request_digest \
+                state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
          FROM harness_invocations WHERE invocation_id = $1 FOR UPDATE",
     )
     .bind(invocation_id.as_uuid())
@@ -540,19 +554,21 @@ async fn update_invocation_state(
     prompt_accepted: bool,
     terminal: bool,
     terminal_request_digest: Option<&str>,
+    terminal_payload: Option<&Value>,
 ) -> Result<HarnessInvocationView, StoreError> {
     let row = sqlx::query(
         "UPDATE harness_invocations SET state = $1, attempt = $2, prompt_accepted = $3, terminal = $4, \
-                terminal_request_digest = $5, updated_at = CURRENT_TIMESTAMP \
-         WHERE invocation_id = $6 \
+                terminal_request_digest = $5, terminal_payload = $6, updated_at = CURRENT_TIMESTAMP \
+         WHERE invocation_id = $7 \
          RETURNING invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                   state, attempt, prompt_accepted, terminal, terminal_request_digest",
+                   state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload",
     )
     .bind(state.as_str())
     .bind(harness_i64(attempt, "harness attempt is malformed")?)
     .bind(prompt_accepted)
     .bind(terminal)
     .bind(terminal_request_digest)
+    .bind(terminal_payload)
     .bind(invocation_id.as_uuid())
     .fetch_one(&mut **tx)
     .await?;

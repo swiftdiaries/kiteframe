@@ -1,9 +1,11 @@
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::harness::{
-    HarnessApprovalBroker, HarnessInvocationId, HarnessInvocationRequest, HarnessProfileId,
-    HarnessRegistry, HarnessRouteTable, HarnessTerminal, PostgresHarnessEventSink,
+    HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
+    HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal,
+    PostgresHarnessEventSink,
 };
 use crate::store::{HarnessInvocationState, PrepareHarnessInvocation};
 use crate::{
@@ -20,6 +22,7 @@ pub struct AgentCommandDispatcher {
     registry: Arc<HarnessRegistry>,
     approvals: Arc<dyn HarnessApprovalBroker>,
     routes: HarnessRouteTable,
+    active: Arc<Mutex<BTreeSet<HarnessInvocationId>>>,
 }
 
 impl AgentKernel {
@@ -36,6 +39,7 @@ impl AgentKernel {
             registry,
             approvals,
             routes: HarnessRouteTable::new(builtin.clone(), builtin),
+            active: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 }
@@ -120,7 +124,7 @@ impl AgentCommandDispatcher {
                 let failure = failure_request(
                     execution,
                     &claimed,
-                    "harness-unavailable",
+                    &format!("harness-unavailable:{}", claimed.id.as_uuid()),
                     "runtime_command_unavailable",
                 )?;
                 unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
@@ -161,8 +165,20 @@ impl AgentCommandDispatcher {
             })
             .await?;
         if prepared.terminal {
-            return Ok(());
+            return self
+                .settle_harness_terminal(
+                    execution,
+                    &claimed,
+                    &prepared,
+                    terminal_from_record(&prepared)?,
+                )
+                .await;
         }
+        let Some(_active) =
+            ActiveDispatchGuard::reserve(self.active.clone(), &prepared.invocation_id)
+        else {
+            return Ok(());
+        };
         let prepared = match prepared.state {
             HarnessInvocationState::Prepared => {
                 self.kernel
@@ -186,6 +202,11 @@ impl AgentCommandDispatcher {
             | HarnessInvocationState::Failed
             | HarnessInvocationState::OutcomeUnknown => return Ok(()),
         };
+        let prepared = self
+            .kernel
+            .store()
+            .mark_harness_prompt_accepted(&prepared.invocation_id, prepared.attempt)
+            .await?;
         let workspace: String =
             sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
                 .bind(execution.task.session_id.as_uuid())
@@ -220,6 +241,7 @@ impl AgentCommandDispatcher {
         terminal: HarnessTerminal,
     ) -> Result<(), StoreError> {
         let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+        let terminal_payload = terminal_payload(&terminal);
         match terminal {
             HarnessTerminal::Completed(output) => {
                 self.kernel
@@ -229,6 +251,7 @@ impl AgentCommandDispatcher {
                         invocation.attempt,
                         HarnessInvocationState::Completed,
                         &terminal_key,
+                        &terminal_payload,
                     )
                     .await?;
                 let completion = CompleteAgentCommand {
@@ -259,6 +282,7 @@ impl AgentCommandDispatcher {
                         invocation.attempt,
                         HarnessInvocationState::Cancelled,
                         &terminal_key,
+                        &terminal_payload,
                     )
                     .await?;
                 let failure =
@@ -274,6 +298,7 @@ impl AgentCommandDispatcher {
                         invocation.attempt,
                         MAX_PRE_ACCEPT_ATTEMPTS,
                         &terminal_key,
+                        &terminal_payload,
                     )
                     .await?;
                 if retry.terminal {
@@ -292,6 +317,7 @@ impl AgentCommandDispatcher {
                         invocation.attempt,
                         HarnessInvocationState::Failed,
                         &terminal_key,
+                        &terminal_payload,
                     )
                     .await?;
                 let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
@@ -324,12 +350,152 @@ impl AgentCommandDispatcher {
                 attempt,
                 HarnessInvocationState::OutcomeUnknown,
                 &terminal_key,
+                &serde_json::json!({
+                    "type":"outcome_unknown",
+                    "code":"harness_outcome_unknown",
+                    "detail":"harness terminal outcome is unknown",
+                }),
             )
             .await?;
         let failure =
             failure_request(execution, claimed, &terminal_key, "harness_outcome_unknown")?;
         failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
     }
+}
+
+struct ActiveDispatchGuard {
+    active: Arc<Mutex<BTreeSet<HarnessInvocationId>>>,
+    invocation_id: HarnessInvocationId,
+}
+
+impl ActiveDispatchGuard {
+    fn reserve(
+        active: Arc<Mutex<BTreeSet<HarnessInvocationId>>>,
+        invocation_id: &HarnessInvocationId,
+    ) -> Option<Self> {
+        let mut entries = active
+            .lock()
+            .expect("dispatcher active lock is not poisoned");
+        if !entries.insert(invocation_id.clone()) {
+            return None;
+        }
+        drop(entries);
+        Some(Self {
+            active,
+            invocation_id: invocation_id.clone(),
+        })
+    }
+}
+
+impl Drop for ActiveDispatchGuard {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .expect("dispatcher active lock is not poisoned")
+            .remove(&self.invocation_id);
+    }
+}
+
+fn terminal_payload(terminal: &HarnessTerminal) -> serde_json::Value {
+    match terminal {
+        HarnessTerminal::Completed(output) => serde_json::json!({
+            "type": "completed",
+            "outcome": output.outcome,
+            "fields": output.fields,
+            "history": output.history,
+        }),
+        HarnessTerminal::Cancelled => serde_json::json!({"type": "cancelled"}),
+        HarnessTerminal::Retryable(failure) | HarnessTerminal::Failed(failure) => {
+            serde_json::json!({"type": "failed", "code": failure.code, "detail": failure.detail})
+        }
+        HarnessTerminal::OutcomeUnknown(failure) => serde_json::json!({
+            "type": "outcome_unknown",
+            "code": failure.code,
+            "detail": failure.detail,
+        }),
+    }
+}
+
+fn terminal_from_record(
+    invocation: &crate::store::HarnessInvocationView,
+) -> Result<HarnessTerminal, StoreError> {
+    let payload = invocation.terminal_payload.as_ref().ok_or_else(|| {
+        StoreError::InvalidData("terminal harness invocation payload is absent".to_owned())
+    })?;
+    let kind = payload
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            StoreError::InvalidData("terminal harness invocation payload is malformed".to_owned())
+        })?;
+    match kind {
+        "completed" if invocation.state == HarnessInvocationState::Completed => Ok(
+            HarnessTerminal::Completed(crate::harness::HarnessInvocationOutput {
+                outcome: payload
+                    .get("outcome")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        StoreError::InvalidData(
+                            "terminal completed outcome is malformed".to_owned(),
+                        )
+                    })?
+                    .to_owned(),
+                fields: payload.get("fields").cloned().ok_or_else(|| {
+                    StoreError::InvalidData("terminal completed fields are malformed".to_owned())
+                })?,
+                history: serde_json::from_value(payload.get("history").cloned().ok_or_else(
+                    || {
+                        StoreError::InvalidData(
+                            "terminal completed history is malformed".to_owned(),
+                        )
+                    },
+                )?)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+            }),
+        ),
+        "cancelled" if invocation.state == HarnessInvocationState::Cancelled => {
+            Ok(HarnessTerminal::Cancelled)
+        }
+        "failed" if invocation.state == HarnessInvocationState::Failed => {
+            Ok(HarnessTerminal::Failed(HarnessFailure::new(
+                terminal_code(payload)?,
+                terminal_detail(payload)?,
+            )))
+        }
+        "outcome_unknown" if invocation.state == HarnessInvocationState::OutcomeUnknown => {
+            Ok(HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+                terminal_code(payload)?,
+                terminal_detail(payload)?,
+            )))
+        }
+        _ => Err(StoreError::InvalidData(
+            "terminal harness invocation payload conflicts with its state".to_owned(),
+        )),
+    }
+}
+
+fn terminal_code(payload: &serde_json::Value) -> Result<&'static str, StoreError> {
+    match payload.get("code").and_then(serde_json::Value::as_str) {
+        Some("harness_profile_unavailable") => Ok("harness_profile_unavailable"),
+        Some("harness_protocol_incompatible") => Ok("harness_protocol_incompatible"),
+        Some("harness_capability_unsupported") => Ok("harness_capability_unsupported"),
+        Some("harness_permission_rejected") => Ok("harness_permission_rejected"),
+        Some("harness_cancelled") => Ok("harness_cancelled"),
+        Some("harness_failed") => Ok("harness_failed"),
+        Some("harness_outcome_unknown") => Ok("harness_outcome_unknown"),
+        _ => Err(StoreError::InvalidData(
+            "terminal harness failure code is malformed".to_owned(),
+        )),
+    }
+}
+
+fn terminal_detail(payload: &serde_json::Value) -> Result<&str, StoreError> {
+    payload
+        .get("detail")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            StoreError::InvalidData("terminal harness failure detail is malformed".to_owned())
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,7 +528,7 @@ fn failure_request(
         task_id: claimed.task_id.clone(),
         command_id: claimed.id.clone(),
         expected_command_revision: claimed.revision,
-        idempotency_key: idempotency_key(format!("{prefix}:{}", claimed.id.as_uuid()))?,
+        idempotency_key: idempotency_key(prefix.to_owned())?,
         code: code.to_owned(),
     })
 }

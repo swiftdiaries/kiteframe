@@ -112,6 +112,7 @@ pub struct HarnessInvocationView {
     pub prompt_accepted: bool,
     pub terminal: bool,
     pub terminal_request_digest: Option<String>,
+    pub terminal_payload: Option<serde_json::Value>,
 }
 
 pub struct PrepareHarnessInvocation<'a> {

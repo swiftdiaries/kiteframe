@@ -191,6 +191,13 @@ impl HarnessApprovalBroker for DenyAllHarnessApprovals {
 
 #[async_trait]
 pub trait HarnessEventSink: Send + Sync {
+    async fn next_sequence(
+        &self,
+        _invocation_id: &HarnessInvocationId,
+    ) -> Result<u64, HarnessFailure> {
+        Ok(0)
+    }
+
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure>;
 }
 
@@ -241,6 +248,25 @@ impl PostgresHarnessEventSink {
 
 #[async_trait]
 impl HarnessEventSink for PostgresHarnessEventSink {
+    async fn next_sequence(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<u64, HarnessFailure> {
+        let next: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM harness_invocation_events WHERE invocation_id = $1",
+        )
+        .bind(invocation_id.as_uuid())
+        .fetch_one(self.store.pool())
+        .await
+        .map_err(|error| HarnessFailure::new("harness_outcome_unknown", error.to_string()))?;
+        u64::try_from(next).map_err(|_| {
+            HarnessFailure::new(
+                "harness_outcome_unknown",
+                "harness event sequence is malformed",
+            )
+        })
+    }
+
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         self.store
             .append_harness_event_envelope(&event)

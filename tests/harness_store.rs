@@ -223,6 +223,22 @@ fn harness_migration_has_closed_state_and_identity_guards() {
     }
 }
 
+#[test]
+fn terminal_replay_payload_is_immutable_journal_data() {
+    let sql = std::fs::read_to_string("migrations/0015_harness_terminal_replay.sql")
+        .expect("Task 4 terminal replay migration exists");
+    for required in [
+        "terminal_payload JSONB",
+        "terminal_payload IS NOT NULL",
+        "terminal harness invocation is immutable",
+    ] {
+        assert!(
+            sql.contains(required),
+            "missing terminal replay guard: {required}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn prepare_is_idempotent_for_one_command_revision_and_rejects_drift() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
@@ -440,27 +456,51 @@ async fn retryable_failure_retries_only_before_prompt_acceptance_and_then_fails(
         .unwrap();
     let retry = fixture
         .store
-        .record_harness_retryable_failure(&invocation.invocation_id, 0, 1, "sha256:retry-a")
+        .record_harness_retryable_failure(
+            &invocation.invocation_id,
+            0,
+            1,
+            "sha256:retry-a",
+            &json!({"type":"failed","code":"harness_failed","detail":"retry"}),
+        )
         .await
         .unwrap();
     assert_eq!(retry.state, HarnessInvocationState::Started);
     assert_eq!(retry.attempt, 1);
     let failed = fixture
         .store
-        .record_harness_retryable_failure(&invocation.invocation_id, 1, 1, "sha256:retry-b")
+        .record_harness_retryable_failure(
+            &invocation.invocation_id,
+            1,
+            1,
+            "sha256:retry-b",
+            &json!({"type":"failed","code":"harness_failed","detail":"retry"}),
+        )
         .await
         .unwrap();
     assert_eq!(failed.state, HarnessInvocationState::Failed);
     assert!(failed.terminal);
     fixture
         .store
-        .record_harness_retryable_failure(&invocation.invocation_id, 1, 1, "sha256:retry-b")
+        .record_harness_retryable_failure(
+            &invocation.invocation_id,
+            1,
+            1,
+            "sha256:retry-b",
+            &json!({"type":"failed","code":"harness_failed","detail":"retry"}),
+        )
         .await
         .unwrap();
     assert!(matches!(
         fixture
             .store
-            .record_harness_retryable_failure(&invocation.invocation_id, 1, 1, "sha256:retry-c")
+            .record_harness_retryable_failure(
+                &invocation.invocation_id,
+                1,
+                1,
+                "sha256:retry-c",
+                &json!({"type":"failed","code":"harness_failed","detail":"retry"})
+            )
             .await
             .unwrap_err(),
         StoreError::IdempotencyConflict,
@@ -504,6 +544,7 @@ async fn registration_replay_and_terminal_replay_require_the_same_digests() {
             0,
             HarnessInvocationState::Cancelled,
             "sha256:terminal-a",
+            &json!({"type":"cancelled"}),
         )
         .await
         .unwrap();
@@ -514,6 +555,7 @@ async fn registration_replay_and_terminal_replay_require_the_same_digests() {
             0,
             HarnessInvocationState::Cancelled,
             "sha256:terminal-a",
+            &json!({"type":"cancelled"}),
         )
         .await
         .unwrap();
@@ -524,7 +566,8 @@ async fn registration_replay_and_terminal_replay_require_the_same_digests() {
                 &invocation.invocation_id,
                 0,
                 HarnessInvocationState::Cancelled,
-                "sha256:terminal-b"
+                "sha256:terminal-b",
+                &json!({"type":"cancelled"}),
             )
             .await
             .unwrap_err(),

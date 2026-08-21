@@ -41,7 +41,6 @@ fn builtin_profile() -> HarnessProfile {
         required: BTreeSet::from([
             HarnessCapability::FreshSession,
             HarnessCapability::TextPrompt,
-            HarnessCapability::PermissionOnce,
             HarnessCapability::Cancel,
             HarnessCapability::CommittedOutput,
         ]),
@@ -587,7 +586,7 @@ async fn invocation_is_persisted_and_claimed_before_model_call() {
                 .await
                 .unwrap();
                 assert_eq!(invocation.0, "builtin-v1");
-                assert_eq!(invocation.1, "started");
+                assert_eq!(invocation.1, "accepted");
                 assert!(!invocation.2.is_empty());
                 assert!(invocation.3.is_none());
                 Ok(ModelResponse {
@@ -604,6 +603,24 @@ async fn invocation_is_persisted_and_claimed_before_model_call() {
 
     assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
     assert_eq!(fixture.current().await.lifecycle, TaskLifecycle::Succeeded);
+    let invocation: (Uuid, String, String) = sqlx::query_as(
+        "SELECT invocation_id, state, terminal_request_digest \
+         FROM harness_invocations WHERE command_id = $1",
+    )
+    .bind(command_id)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(invocation.1, "completed");
+    assert_eq!(invocation.2, format!("harness-terminal:{}", invocation.0));
+    let source_event_id: String = sqlx::query_scalar(
+        "SELECT source_event_id FROM agent_transitions WHERE task_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(fixture.task_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(source_event_id, format!("harness-result:{}", invocation.0));
 }
 
 #[tokio::test]

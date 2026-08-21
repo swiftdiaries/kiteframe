@@ -176,12 +176,16 @@ impl HarnessRegistry {
                 "harness invocation id is already active",
             ));
         };
+        let sequence = match sink.next_sequence(&request.invocation_id).await {
+            Ok(sequence) => sequence,
+            Err(error) => return HarnessTerminal::OutcomeUnknown(error),
+        };
         let (raw_events_tx, mut events_rx) = mpsc::channel(64);
         let events_tx = HarnessEventSender::new(raw_events_tx);
         let invocation = plugin.start_invocation(envelope, events_tx.clone(), approvals, token);
         tokio::pin!(invocation);
-        let mut sequence = 0;
-        let mut started = false;
+        let mut sequence = sequence;
+        let mut started = sequence > 0;
         let mut terminal = None;
         let mut persistence_failure = None;
 
@@ -303,6 +307,10 @@ async fn append_pending(
     started: &mut bool,
     pending: super::HarnessPendingEvent,
 ) -> Result<(), HarnessFailure> {
+    if *started && matches!(pending.event, super::HarnessInvocationEvent::Started) {
+        let _ = pending.persisted.send(Ok(()));
+        return Ok(());
+    }
     let envelope = HarnessEventEnvelope::new(invocation_id.clone(), *sequence, pending.event);
     if let Err(error) = envelope.validate() {
         let _ = pending.persisted.send(Err(error.clone()));
