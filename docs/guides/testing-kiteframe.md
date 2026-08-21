@@ -138,8 +138,8 @@ cargo test --test harness_store --test postgres_lock_order
 cargo test --all-features --test agent_runtime_contract --test agent_lifecycle_store --test agent_start --test kite_agent_runtime --test agent_transition_store --test agent_goal_authority --test agent_direct_bridge --test agent_protocol --test e2e_agent_restart --test acp_conformance --test transports
 cargo test --all-features
 cargo check --no-default-features --lib --bin kiteframe-harness
-python -m pytest clients/python/tests
+uv run --directory clients/python pytest
 bun --cwd clients/typescript test
-bun --cwd clients/typescript run typecheck
+bun run --cwd clients/typescript typecheck
 git diff --check
 ```
