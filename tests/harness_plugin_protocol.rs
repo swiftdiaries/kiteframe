@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessApprovalBroker, HarnessApprovalDecision,
-    HarnessApprovalRequest, HarnessCapabilities, HarnessCapability, HarnessEventEnvelope,
-    HarnessEventSender, HarnessEventSink, HarnessFailure, HarnessInvocationEvent,
-    HarnessInvocationId, HarnessInvocationOutput, HarnessInvocationRequest, HarnessPlugin,
-    HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessRequestEnvelope, HarnessTerminal,
-    HarnessTransport, PostgresHarnessEventSink, emit_and_wait,
+    DenyAllHarnessApprovals, HarnessAcceptanceBarrier, HarnessApprovalBroker,
+    HarnessApprovalDecision, HarnessApprovalRequest, HarnessCapabilities, HarnessCapability,
+    HarnessEventEnvelope, HarnessEventSender, HarnessEventSink, HarnessFailure,
+    HarnessInvocationEvent, HarnessInvocationId, HarnessInvocationOutput, HarnessInvocationRequest,
+    HarnessPlugin, HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessRequestEnvelope,
+    HarnessTerminal, HarnessTransport, PostgresHarnessEventSink, emit_and_wait,
 };
 use kiteframe::store::HarnessInvocationEventRecord;
 use kiteframe::{
@@ -77,6 +77,43 @@ fn request() -> HarnessInvocationRequest {
 struct RecordingHarnessEventSink(Mutex<Vec<HarnessEventEnvelope>>);
 
 struct AppendOnlyHarnessEventSink;
+
+struct TestAcceptanceBarrier;
+
+#[async_trait]
+impl HarnessAcceptanceBarrier for TestAcceptanceBarrier {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+trait HarnessRegistryTestExt {
+    async fn invoke_with_test_barrier(
+        &self,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+    ) -> HarnessTerminal;
+}
+
+#[async_trait]
+impl HarnessRegistryTestExt for HarnessRegistry {
+    async fn invoke_with_test_barrier(
+        &self,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+    ) -> HarnessTerminal {
+        self.invoke_with_acceptance_barrier(
+            request,
+            approvals,
+            sink,
+            Arc::new(TestAcceptanceBarrier),
+        )
+        .await
+    }
+}
 
 #[async_trait]
 impl HarnessEventSink for AppendOnlyHarnessEventSink {
@@ -466,7 +503,7 @@ async fn cancel_targets_only_the_exact_active_invocation() {
         let registry = registry.clone();
         async move {
             registry
-                .invoke(invocation, Arc::new(DenyAllHarnessApprovals), sink)
+                .invoke_with_test_barrier(invocation, Arc::new(DenyAllHarnessApprovals), sink)
                 .await
         }
     });
@@ -494,7 +531,7 @@ async fn registry_drains_and_sequences_events_before_returning_terminal() {
     let sink = Arc::new(RecordingHarnessEventSink::default());
     let terminal = registry_with(plugin)
         .await
-        .invoke(request(), Arc::new(DenyAllHarnessApprovals), sink.clone())
+        .invoke_with_test_barrier(request(), Arc::new(DenyAllHarnessApprovals), sink.clone())
         .await;
     assert!(matches!(terminal, HarnessTerminal::Completed(_)));
     assert_eq!(sink.sequences(), vec![0, 1, 2]);
@@ -530,6 +567,22 @@ fn versioned_envelopes_reject_drift_and_preserve_the_canonical_digest() {
     );
 }
 
+#[test]
+fn v1_approval_event_wire_fields_are_camel_case_and_closed() {
+    let event = HarnessInvocationEvent::ApprovalRequested {
+        request_id: "permission-7".to_owned(),
+        title: "Need permission".to_owned(),
+    };
+    assert_eq!(
+        serde_json::to_value(event).unwrap(),
+        json!({
+            "type": "approval_requested",
+            "requestId": "permission-7",
+            "title": "Need permission",
+        })
+    );
+}
+
 #[tokio::test]
 async fn sink_failure_after_the_plugin_starts_is_outcome_unknown() {
     let plugin = Arc::new(FakePlugin::events_then_success(vec![
@@ -537,7 +590,7 @@ async fn sink_failure_after_the_plugin_starts_is_outcome_unknown() {
     ]));
     let terminal = registry_with(plugin)
         .await
-        .invoke(
+        .invoke_with_test_barrier(
             request(),
             Arc::new(DenyAllHarnessApprovals),
             Arc::new(FailingHarnessEventSink),
@@ -567,7 +620,7 @@ async fn duplicate_active_invocation_is_rejected_without_replacing_cancellation_
         let registry = registry.clone();
         async move {
             registry
-                .invoke(
+                .invoke_with_test_barrier(
                     invocation,
                     Arc::new(DenyAllHarnessApprovals),
                     Arc::new(RecordingHarnessEventSink::default()),
@@ -578,7 +631,7 @@ async fn duplicate_active_invocation_is_rejected_without_replacing_cancellation_
     tokio::task::yield_now().await;
     let duplicate = tokio::time::timeout(
         Duration::from_millis(100),
-        registry.invoke(
+        registry.invoke_with_test_barrier(
             HarnessInvocationRequest {
                 invocation_id: invocation_id.clone(),
                 ..request()
@@ -606,7 +659,7 @@ async fn aborting_an_invocation_removes_its_exact_active_entry() {
         let registry = registry.clone();
         async move {
             registry
-                .invoke(
+                .invoke_with_test_barrier(
                     request(),
                     Arc::new(DenyAllHarnessApprovals),
                     Arc::new(RecordingHarnessEventSink::default()),
@@ -625,7 +678,7 @@ async fn aborting_an_invocation_removes_its_exact_active_entry() {
 async fn completed_plugin_without_started_event_fails_closed() {
     let terminal = registry_with(Arc::new(FakePlugin::events_then_success(vec![])))
         .await
-        .invoke(
+        .invoke_with_test_barrier(
             request(),
             Arc::new(DenyAllHarnessApprovals),
             Arc::new(RecordingHarnessEventSink::default()),
@@ -645,7 +698,7 @@ async fn sink_failure_acknowledges_every_accepted_pending_event() {
     let (plugin, mut reports) = BurstPlugin::new();
     let terminal = registry_with(plugin)
         .await
-        .invoke(
+        .invoke_with_test_barrier(
             request(),
             Arc::new(DenyAllHarnessApprovals),
             Arc::new(FailAfterOneHarnessEventSink(Mutex::new(0))),
@@ -679,7 +732,7 @@ async fn cloned_sender_cannot_admit_events_after_terminal_drain() {
     let sink = Arc::new(RecordingHarnessEventSink::default());
     let terminal = registry_with(plugin)
         .await
-        .invoke(request(), Arc::new(DenyAllHarnessApprovals), sink.clone())
+        .invoke_with_test_barrier(request(), Arc::new(DenyAllHarnessApprovals), sink.clone())
         .await;
     assert!(matches!(terminal, HarnessTerminal::Completed(_)));
     release.notify_one();
@@ -733,7 +786,7 @@ async fn retryable_failure_is_retryable_before_acceptance_and_uncertain_after_ac
         HarnessFailure::new("harness_failed", "workspace was unavailable"),
     ))))
     .await
-    .invoke(
+    .invoke_with_test_barrier(
         request(),
         Arc::new(DenyAllHarnessApprovals),
         Arc::new(RecordingHarnessEventSink::default()),
@@ -748,7 +801,7 @@ async fn retryable_failure_is_retryable_before_acceptance_and_uncertain_after_ac
         )),
     )))
     .await
-    .invoke(
+    .invoke_with_test_barrier(
         request(),
         Arc::new(DenyAllHarnessApprovals),
         Arc::new(RecordingHarnessEventSink::default()),
@@ -781,7 +834,7 @@ async fn surfaced_harness_failure_codes_are_closed() {
         let registry = registry.clone();
         async move {
             registry
-                .invoke(
+                .invoke_with_test_barrier(
                     invocation,
                     Arc::new(DenyAllHarnessApprovals),
                     Arc::new(RecordingHarnessEventSink::default()),
@@ -791,7 +844,7 @@ async fn surfaced_harness_failure_codes_are_closed() {
     });
     tokio::task::yield_now().await;
     let duplicate = registry
-        .invoke(
+        .invoke_with_test_barrier(
             HarnessInvocationRequest {
                 invocation_id: invocation_id.clone(),
                 ..request()
@@ -811,7 +864,7 @@ async fn surfaced_harness_failure_codes_are_closed() {
         HarnessInvocationEvent::Started,
     ])))
     .await
-    .invoke(
+    .invoke_with_test_barrier(
         request(),
         Arc::new(DenyAllHarnessApprovals),
         Arc::new(FailingHarnessEventSink),
@@ -854,7 +907,7 @@ async fn plugin_originated_failure_codes_are_normalized_at_registry_boundaries()
     ] {
         let terminal = registry_with(Arc::new(FakePlugin::with_terminal(mode)))
             .await
-            .invoke(
+            .invoke_with_test_barrier(
                 request(),
                 Arc::new(DenyAllHarnessApprovals),
                 Arc::new(RecordingHarnessEventSink::default()),

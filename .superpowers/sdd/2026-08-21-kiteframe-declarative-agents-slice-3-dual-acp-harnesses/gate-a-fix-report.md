@@ -233,3 +233,63 @@ Changed paths are limited to migration 0016, the harness plugin/registry/types/b
 - Confirmed migration lock acquisition cannot wait on registration after acquiring invocation/event locks.
 - Confirmed `fuzz/` and `site/` remain untouched and untracked.
 - Remaining concern is environmental only: live PostgreSQL migration/store/replay/lock-order execution is still required before final Gate A approval.
+
+---
+
+## Gate A re-review fix wave — round 3
+
+### Outcome
+
+Round 3 closes the remaining default-acceptance and closed-event-shape findings. The frozen registry entry point now fails closed before plugin or model work unless its caller uses the explicit durable-barrier path, and migration 0016 validates the exact canonical v1 event object before computing or accepting a digest. The only remaining verification limitation is live PostgreSQL execution in this environment.
+
+### 1. Default registry invocation fails closed without durable acceptance
+
+- The frozen `HarnessRegistry::invoke(request, approvals, events)` signature remains unchanged, but it now returns stable `harness_profile_unavailable` failure detail `durable harness acceptance barrier is required` without registering active work, starting a plugin, emitting an event, or calling a model.
+- The successful no-op `ImmediateAcceptanceBarrier` was removed. Work-producing deterministic callers use the explicit `invoke_with_acceptance_barrier` path with a real or test barrier.
+- Production remains on its separate PostgreSQL acceptance-barrier path. The built-in plugin still commits that barrier immediately before model dispatch, and pre-accept plugin failures remain retryable while post-accept failures remain outcome-unknown.
+- A real built-in/model regression test proves the default entry point cannot call the model or return `Completed`; the existing observed-barrier test proves explicit injection completes only after the commit.
+
+### 2. Migration 0016 enforces an exact closed v1 event object
+
+- `harness_event_is_closed_v1(JSONB)` first requires a top-level object, then accepts only the six canonical variants and their exact key sets: `Started` and `Cancelled` contain only `type`; `Progress.message`, `AssistantMessage.text`, `ApprovalRequested.requestId/title`, and `ApprovalResolved.requestId/decision` are required JSON strings; no variant admits extra keys.
+- Approval decisions are limited to `allow_once` and `reject_once`. Unknown types, missing/null/coerced fields, and extra keys return false.
+- `harness_event_canonical_v1` raises SQLSTATE `55000` on an invalid event before canonicalization or hashing, and the event table has a durable `harness_invocation_events_v1_event_check` constraint in addition to its envelope-digest check.
+- Rust v1 wire serialization now uses the canonical camel-case `requestId`. The migration converts valid 0014-era approval rows from `request_id` before replacing the old 0014 shape constraint, preserving their provenance while making the new Rust and SQL digest inputs identical.
+- Repository-shape tests require every per-variant exact-key/type guard. Database-gated coverage contains extra-key, numeric-string-field, null, unknown-type, invalid-decision, and missing-key cases, plus Rust/SQL digest equivalence for every event variant and both one-shot approval decisions.
+
+### Round-3 RED evidence
+
+- `cargo test --test harness_builtin_conformance default_registry_invoke_fails_before_builtin_or_model_work_without_a_barrier -- --exact --nocapture` failed because the default entry point completed through the successful immediate barrier.
+- `cargo test --test harness_plugin_protocol v1_approval_event_wire_fields_are_camel_case_and_closed -- --exact --nocapture` failed with Rust `request_id` versus required canonical `requestId`.
+- `cargo test --test harness_store gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation -- --exact --nocapture` failed because `harness_event_is_closed_v1` and its exact-shape guards did not exist.
+
+### Round-3 GREEN evidence
+
+- Focused exact reruns for the three RED tests passed.
+- `cargo test --test harness_store -- --nocapture` — 18 passed; repository-shape tests executed, while database-backed bodies explicitly emitted `SKIP harness_store: DATABASE_URL is not set`.
+- `cargo test --test harness_profiles --test harness_plugin_protocol --test harness_builtin_conformance -- --nocapture` — 7 + 19 + 6 passed.
+- `cargo test --test agent_direct_bridge --test agent_goal_authority --test agent_transition_store -- --nocapture` — 21 + 15 + 16 passed.
+- `cargo test --test sequential_runtime --test structured_runtime --test recovery -- --nocapture` — 9 + 5 + 6 passed.
+- `cargo test --lib -- --nocapture` — 30 passed, including acceptance-barrier concurrency, cached-error, cancellation/retry, dispatcher replay, and frozen Slice 2 unavailable-command regressions.
+- `cargo test --bin kiteframe-harness -- --nocapture` — 4 passed.
+- `cargo check --all-targets --all-features` — passed.
+- `cargo check --no-default-features --lib --bin kiteframe-harness` — passed.
+- `cargo fmt --all -- --check` — passed.
+- `git diff --check` — passed before the report append and is rerun in the final diff check.
+
+### Round-3 PostgreSQL limitation
+
+`cargo test --test postgres_lock_order -- --nocapture` exited 101 with exactly `1 passed; 15 failed`. The repository-shape/global-order test passed; all 15 live cases stopped at the common precondition `DATABASE_URL is required for PostgreSQL lock-order tests: NotPresent`. The malformed-event database cases and valid SQL/Rust digest-equivalence cases likewise compiled but self-skipped in `harness_store`. CI or another environment with PostgreSQL and `DATABASE_URL` remains the authoritative live migration/store/lock-order gate.
+
+### Round-3 files and self-review
+
+Round-3 changes are limited to `migrations/0016_harness_gate_a.sql`, `src/harness/registry.rs`, `src/harness/types.rs`, `tests/harness_builtin_conformance.rs`, `tests/harness_plugin_protocol.rs`, `tests/harness_store.rs`, and this report.
+
+- Confirmed frozen `HarnessRegistry::invoke`, `HarnessPlugin::start_invocation`, append-only `HarnessEventSink`, and one-argument `PostgresHarnessEventSink::new` signatures remain intact.
+- Confirmed no `ImmediateAcceptanceBarrier` or other successful no-op production acceptance path remains.
+- Confirmed the only default `.invoke(...)` harness test is the fail-closed proof; all tests intending actual work select an explicit barrier.
+- Confirmed production dispatch still injects the PostgreSQL barrier and never uses the frozen fail-closed entry point.
+- Confirmed migration validation precedes digest construction, exact event keys and JSON types match Rust canonical serde, and valid 0014 approval events are converted before the old constraint is replaced.
+- Confirmed migration registration/invocation/event lock order and versioned built-in coexistence logic from round 2 remain unchanged.
+- Confirmed `fuzz/` and `site/` remain untouched and untracked.
+- Remaining concern is environmental only: live PostgreSQL migration/store/replay/lock-order execution is still required before final Gate A approval.

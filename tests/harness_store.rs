@@ -262,6 +262,24 @@ fn gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation() {
         .expect("Gate A migration exists");
     for required in [
         "harness_event_envelope_digest_v1",
+        "harness_event_is_closed_v1",
+        "jsonb_typeof(event)",
+        "event = '{\"type\":\"started\"}'::jsonb",
+        "event = '{\"type\":\"cancelled\"}'::jsonb",
+        "jsonb_typeof(event->'message') = 'string'",
+        "event - 'type' - 'message'",
+        "jsonb_typeof(event->'text') = 'string'",
+        "event - 'type' - 'text'",
+        "jsonb_typeof(event->'requestId') = 'string'",
+        "event - 'type' - 'requestId' - 'title'",
+        "jsonb_typeof(event->'decision') = 'string'",
+        "event - 'type' - 'requestId' - 'decision'",
+        "requestId",
+        "allow_once",
+        "reject_once",
+        "harness event is not a closed v1 event",
+        "DROP CONSTRAINT harness_invocation_events_event_check",
+        "harness_invocation_events_v1_event_check",
         "protocolVersion",
         "invocationId",
         "sequence zero must be Started",
@@ -286,6 +304,42 @@ fn gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation() {
         registrations_lock < invocations_lock && invocations_lock < events_lock,
         "migration lock order must be registrations, invocations, then events"
     );
+}
+
+#[tokio::test]
+async fn database_digest_rejects_every_malformed_v1_event_shape() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let invalid_events = [
+        json!({"type":"started", "extra":true}),
+        json!({"type":"progress", "message":7}),
+        json!({"type":"assistant_message", "text":null}),
+        json!({"type":"unknown"}),
+        json!({
+            "type":"approval_resolved",
+            "requestId":"permission-7",
+            "decision":"allow_forever"
+        }),
+        json!({"type":"approval_requested", "title":"Need permission"}),
+    ];
+
+    for event in invalid_events {
+        let error =
+            sqlx::query_scalar::<_, String>("SELECT harness_event_envelope_digest_v1($1, $2, $3)")
+                .bind(invocation.invocation_id.as_uuid())
+                .bind(1_i64)
+                .bind(event.clone())
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("55000"),
+            "malformed event must fail before digest acceptance: {event}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -539,6 +593,10 @@ async fn database_digest_matches_rust_v1_envelopes_for_every_event_shape() {
         HarnessInvocationEvent::ApprovalResolved {
             request_id: "permission-7".to_owned(),
             decision: HarnessApprovalDecision::AllowOnce,
+        },
+        HarnessInvocationEvent::ApprovalResolved {
+            request_id: "permission-8".to_owned(),
+            decision: HarnessApprovalDecision::RejectOnce,
         },
         HarnessInvocationEvent::AssistantMessage {
             text: "committed".to_owned(),

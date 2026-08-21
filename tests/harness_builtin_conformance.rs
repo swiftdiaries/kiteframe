@@ -33,6 +33,8 @@ struct RecordingSink(Mutex<Vec<HarnessEventEnvelope>>);
 
 struct ObservedAcceptanceBarrier(Arc<AtomicUsize>);
 
+struct TestAcceptanceBarrier;
+
 struct AcceptanceAssertingModel(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
@@ -40,6 +42,41 @@ impl HarnessAcceptanceBarrier for ObservedAcceptanceBarrier {
     async fn commit(&self) -> Result<(), HarnessFailure> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessAcceptanceBarrier for TestAcceptanceBarrier {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+trait HarnessRegistryTestExt {
+    async fn invoke_with_test_barrier(
+        &self,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn kiteframe::harness::HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+    ) -> HarnessTerminal;
+}
+
+#[async_trait::async_trait]
+impl HarnessRegistryTestExt for HarnessRegistry {
+    async fn invoke_with_test_barrier(
+        &self,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn kiteframe::harness::HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+    ) -> HarnessTerminal {
+        self.invoke_with_acceptance_barrier(
+            request,
+            approvals,
+            sink,
+            Arc::new(TestAcceptanceBarrier),
+        )
+        .await
     }
 }
 
@@ -227,6 +264,36 @@ async fn builtin_commits_the_injected_acceptance_barrier_before_model_dispatch()
     assert_eq!(commits.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn default_registry_invoke_fails_before_builtin_or_model_work_without_a_barrier() {
+    let model = Arc::new(CountingTestModel {
+        response: json!({
+            "type":"function_call",
+            "name":"complete_task",
+            "arguments":{"outcome":"ok","fields":{"answer":"must not run"}}
+        }),
+        calls: AtomicUsize::new(0),
+    });
+    let plugin = Arc::new(BuiltinHarnessPlugin::new(profile(), model.clone()));
+    let mut registry = HarnessRegistry::new();
+    registry.register(plugin).await.unwrap();
+    let sink = Arc::new(RecordingSink(Mutex::new(vec![])));
+
+    let terminal = registry
+        .invoke(request(), Arc::new(DenyAllHarnessApprovals), sink.clone())
+        .await;
+
+    assert!(matches!(
+        terminal,
+        HarnessTerminal::Failed(HarnessFailure {
+            code: "harness_profile_unavailable",
+            detail,
+        }) if detail == "durable harness acceptance barrier is required"
+    ));
+    assert_eq!(model.calls(), 0);
+    assert!(sink.0.lock().await.is_empty());
+}
+
 fn permission_request() -> HarnessInvocationRequest {
     let mut invocation = request();
     invocation.payload.tools.push(HarnessTool {
@@ -311,7 +378,7 @@ async fn invoke(
     let request = request();
     let sink = Arc::new(RecordingSink(Mutex::new(vec![])));
     let terminal = registry
-        .invoke(
+        .invoke_with_test_barrier(
             request.clone(),
             Arc::new(DenyAllHarnessApprovals),
             sink.clone(),
@@ -347,7 +414,7 @@ impl HarnessConformanceDriver for BuiltinConformanceDriver {
                     |terminal| async move { Ok(terminal) },
                     || async {
                         let terminal = registry
-                            .invoke(
+                            .invoke_with_test_barrier(
                                 request.clone(),
                                 Arc::new(DenyAllHarnessApprovals),
                                 sink.clone(),
@@ -367,7 +434,11 @@ impl HarnessConformanceDriver for BuiltinConformanceDriver {
                     |terminal| async move { Ok(terminal) },
                     || async {
                         let terminal = registry
-                            .invoke(request, Arc::new(DenyAllHarnessApprovals), sink.clone())
+                            .invoke_with_test_barrier(
+                                request,
+                                Arc::new(DenyAllHarnessApprovals),
+                                sink.clone(),
+                            )
                             .await;
                         journal
                             .record(invocation_id.clone(), terminal.clone())
@@ -393,7 +464,7 @@ impl HarnessConformanceDriver for BuiltinConformanceDriver {
                 registry.register(plugin).await.unwrap();
                 let sink = Arc::new(RecordingSink(Mutex::new(vec![])));
                 let terminal = registry
-                    .invoke(
+                    .invoke_with_test_barrier(
                         permission_request(),
                         Arc::new(DenyAllHarnessApprovals),
                         sink.clone(),
@@ -445,7 +516,11 @@ impl HarnessConformanceDriver for BuiltinConformanceDriver {
                     let sink = sink.clone();
                     async move {
                         registry
-                            .invoke(request, Arc::new(DenyAllHarnessApprovals), sink)
+                            .invoke_with_test_barrier(
+                                request,
+                                Arc::new(DenyAllHarnessApprovals),
+                                sink,
+                            )
                             .await
                     }
                 });

@@ -90,15 +90,6 @@ struct ActiveInvocationGuard {
     generation: u64,
 }
 
-struct ImmediateAcceptanceBarrier;
-
-#[async_trait::async_trait]
-impl HarnessAcceptanceBarrier for ImmediateAcceptanceBarrier {
-    async fn commit(&self) -> Result<(), HarnessFailure> {
-        Ok(())
-    }
-}
-
 impl Drop for ActiveInvocationGuard {
     fn drop(&mut self) {
         let mut active = self
@@ -227,18 +218,14 @@ impl HarnessRegistry {
 
     pub async fn invoke(
         &self,
-        request: HarnessInvocationRequest,
-        approvals: Arc<dyn HarnessApprovalBroker>,
-        sink: Arc<dyn HarnessEventSink>,
+        _request: HarnessInvocationRequest,
+        _approvals: Arc<dyn HarnessApprovalBroker>,
+        _sink: Arc<dyn HarnessEventSink>,
     ) -> HarnessTerminal {
-        self.invoke_from_sequence_with_acceptance_barrier(
-            request,
-            approvals,
-            sink,
-            0,
-            Arc::new(ImmediateAcceptanceBarrier),
-        )
-        .await
+        HarnessTerminal::Failed(HarnessFailure::new(
+            "harness_profile_unavailable",
+            "durable harness acceptance barrier is required",
+        ))
     }
 
     pub async fn invoke_with_acceptance_barrier(

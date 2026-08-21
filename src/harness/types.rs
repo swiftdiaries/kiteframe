@@ -165,7 +165,12 @@ pub struct HarnessPendingEvent {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    tag = "type",
+    deny_unknown_fields
+)]
 pub enum HarnessInvocationEvent {
     Started,
     Progress {

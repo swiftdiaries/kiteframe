@@ -1,3 +1,31 @@
+CREATE FUNCTION harness_event_is_closed_v1(event JSONB) RETURNS BOOLEAN AS $$
+BEGIN
+    IF jsonb_typeof(event) IS DISTINCT FROM 'object' THEN
+        RETURN FALSE;
+    END IF;
+    RETURN CASE event->>'type'
+        WHEN 'started' THEN event = '{"type":"started"}'::jsonb
+        WHEN 'cancelled' THEN event = '{"type":"cancelled"}'::jsonb
+        WHEN 'progress' THEN event ? 'message'
+            AND jsonb_typeof(event->'message') = 'string'
+            AND event - 'type' - 'message' = '{}'::jsonb
+        WHEN 'assistant_message' THEN event ? 'text'
+            AND jsonb_typeof(event->'text') = 'string'
+            AND event - 'type' - 'text' = '{}'::jsonb
+        WHEN 'approval_requested' THEN event ? 'requestId' AND event ? 'title'
+            AND jsonb_typeof(event->'requestId') = 'string'
+            AND jsonb_typeof(event->'title') = 'string'
+            AND event - 'type' - 'requestId' - 'title' = '{}'::jsonb
+        WHEN 'approval_resolved' THEN event ? 'requestId' AND event ? 'decision'
+            AND jsonb_typeof(event->'requestId') = 'string'
+            AND jsonb_typeof(event->'decision') = 'string'
+            AND event->>'decision' IN ('allow_once', 'reject_once')
+            AND event - 'type' - 'requestId' - 'decision' = '{}'::jsonb
+        ELSE FALSE
+    END;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 CREATE FUNCTION harness_event_canonical_v1(
     invocation_id UUID,
     sequence BIGINT,
@@ -6,6 +34,9 @@ CREATE FUNCTION harness_event_canonical_v1(
 DECLARE
     canonical_event TEXT;
 BEGIN
+    IF NOT harness_event_is_closed_v1(event) THEN
+        RAISE EXCEPTION 'harness event is not a closed v1 event' USING ERRCODE = '55000';
+    END IF;
     canonical_event := CASE event->>'type'
         WHEN 'started' THEN '{"type":"started"}'
         WHEN 'cancelled' THEN '{"type":"cancelled"}'
@@ -14,12 +45,12 @@ BEGIN
         WHEN 'assistant_message' THEN
             '{"text":' || to_jsonb(event->>'text')::text || ',"type":"assistant_message"}'
         WHEN 'approval_requested' THEN
-            '{"request_id":' || to_jsonb(event->>'request_id')::text
+            '{"requestId":' || to_jsonb(event->>'requestId')::text
                 || ',"title":' || to_jsonb(event->>'title')::text
                 || ',"type":"approval_requested"}'
         WHEN 'approval_resolved' THEN
             '{"decision":' || to_jsonb(event->>'decision')::text
-                || ',"request_id":' || to_jsonb(event->>'request_id')::text
+                || ',"requestId":' || to_jsonb(event->>'requestId')::text
                 || ',"type":"approval_resolved"}'
         ELSE NULL
     END;
@@ -82,7 +113,19 @@ WITH needs_started AS (
 INSERT INTO harness_invocation_events_v1_backfill (invocation_id, sequence, event, created_at)
 SELECT events.invocation_id,
        events.sequence + CASE WHEN needs_started.invocation_id IS NULL THEN 0 ELSE 1 END,
-       events.event,
+       CASE events.event->>'type'
+           WHEN 'approval_requested' THEN jsonb_build_object(
+               'type', 'approval_requested',
+               'requestId', events.event->'request_id',
+               'title', events.event->'title'
+           )
+           WHEN 'approval_resolved' THEN jsonb_build_object(
+               'type', 'approval_resolved',
+               'requestId', events.event->'request_id',
+               'decision', events.event->'decision'
+           )
+           ELSE events.event
+       END,
        events.created_at
 FROM harness_invocation_events events
 LEFT JOIN needs_started USING (invocation_id);
@@ -98,6 +141,9 @@ FROM needs_started;
 
 ALTER TABLE harness_invocation_events
     DISABLE TRIGGER harness_invocation_events_reject_update_delete;
+
+ALTER TABLE harness_invocation_events
+    DROP CONSTRAINT harness_invocation_events_event_check;
 
 DELETE FROM harness_invocation_events;
 
@@ -116,6 +162,9 @@ ALTER TABLE harness_invocation_events
     ENABLE TRIGGER harness_invocation_events_reject_update_delete;
 
 ALTER TABLE harness_invocation_events
+    ADD CONSTRAINT harness_invocation_events_v1_event_check CHECK (
+        harness_event_is_closed_v1(event)
+    ),
     ADD CONSTRAINT harness_invocation_events_started_at_zero_check CHECK (
         (sequence = 0) = (event->>'type' = 'started')
     ),
