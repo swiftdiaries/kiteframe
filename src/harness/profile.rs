@@ -69,6 +69,16 @@ impl HarnessProfile {
                 "source revision does not match the pinned profile",
             ));
         }
+        validate_pinned_profile(
+            id.as_str(),
+            raw.transport,
+            &raw.source_repository,
+            &raw.program,
+            &raw.args,
+            &required,
+            &optional,
+            raw.fresh_sessions_only,
+        )?;
         if raw.program.is_empty() || raw.source_repository.is_empty() {
             return Err(HarnessFailure::new(
                 "harness_profile_unavailable",
@@ -118,6 +128,34 @@ impl HarnessProfile {
         }
     }
 
+    /// Require a declared capability and the same capability in the observed handshake.
+    pub fn require_observed(
+        &self,
+        capability: HarnessCapability,
+        observed: &HarnessCapabilities,
+    ) -> Result<(), HarnessFailure> {
+        self.require(capability)?;
+        if observed.protocol_version != HARNESS_PROTOCOL_VERSION {
+            return Err(HarnessFailure::new(
+                "harness_protocol_incompatible",
+                format!(
+                    "expected {}, observed {}",
+                    HARNESS_PROTOCOL_VERSION, observed.protocol_version
+                ),
+            ));
+        }
+        if !observed.supported.contains(&capability) {
+            return Err(HarnessFailure::new(
+                "harness_capability_unsupported",
+                format!(
+                    "capability {:?} is absent from observed handshake",
+                    capability
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn digest(&self) -> Result<String, HarnessFailure> {
         canonical_sha256(self)
             .map_err(|e| HarnessFailure::new("harness_profile_unavailable", e.to_string()))
@@ -136,6 +174,75 @@ fn unique_capabilities(
         ));
     }
     Ok(set)
+}
+
+fn validate_pinned_profile(
+    id: &str,
+    transport: HarnessTransport,
+    source_repository: &str,
+    program: &str,
+    args: &[String],
+    required: &BTreeSet<HarnessCapability>,
+    optional: &BTreeSet<HarnessCapability>,
+    fresh_sessions_only: bool,
+) -> Result<(), HarnessFailure> {
+    let core = BTreeSet::from([
+        HarnessCapability::FreshSession,
+        HarnessCapability::TextPrompt,
+        HarnessCapability::PermissionOnce,
+        HarnessCapability::Cancel,
+        HarnessCapability::CommittedOutput,
+    ]);
+    let (
+        expected_transport,
+        expected_repo,
+        expected_program,
+        expected_args,
+        expected_optional,
+        expected_fresh,
+    ) = match id {
+        "codex-acp-v1" => (
+            HarnessTransport::AcpStdio,
+            "https://github.com/zed-industries/codex-acp.git",
+            "codex-acp",
+            Vec::<String>::new(),
+            BTreeSet::from([
+                HarnessCapability::SessionLoad,
+                HarnessCapability::EmbeddedContext,
+                HarnessCapability::ImagePrompt,
+                HarnessCapability::McpStdio,
+                HarnessCapability::McpHttp,
+                HarnessCapability::ToolPresentation,
+            ]),
+            false,
+        ),
+        "deepseek-harness-acp-v1" => (
+            HarnessTransport::AcpStdio,
+            "https://github.com/deepseek-ai/deepseek-harness.git",
+            "pnpm",
+            vec!["--dir", "vendor/deepseek-harness", "run", "demo:acp"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            BTreeSet::new(),
+            true,
+        ),
+        _ => return Ok(()),
+    };
+    if transport != expected_transport
+        || source_repository != expected_repo
+        || program != expected_program
+        || args != expected_args
+        || required != &core
+        || optional != &expected_optional
+        || fresh_sessions_only != expected_fresh
+    {
+        return Err(HarnessFailure::new(
+            "harness_profile_unavailable",
+            "profile fields do not match the pinned V1 contract",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
