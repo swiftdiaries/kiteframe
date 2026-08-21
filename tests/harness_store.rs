@@ -19,6 +19,15 @@ use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
+type HarnessInvocationUpgradeRow = (
+    String,
+    bool,
+    Option<String>,
+    Option<serde_json::Value>,
+    String,
+    serde_json::Value,
+);
+
 struct IsolatedMigrationDatabase {
     admin_url: url::Url,
     database_name: String,
@@ -638,7 +647,7 @@ async fn harness_receipt_closure_migrates_fresh_and_upgrades_through_0019() {
             .await
             .unwrap();
     assert_eq!(upgraded_versions, (1..=19).collect::<Vec<_>>());
-    let upgraded_rows: Vec<(String, bool, Option<String>, Option<serde_json::Value>, String, serde_json::Value)> = sqlx::query_as(
+    let upgraded_rows: Vec<HarnessInvocationUpgradeRow> = sqlx::query_as(
         "SELECT state, terminal, terminal_request_digest, terminal_payload, exhaustion_request_digest, exhaustion_payload \
          FROM harness_invocations WHERE invocation_id = ANY($1) ORDER BY state",
     )

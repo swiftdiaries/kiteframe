@@ -123,12 +123,12 @@ fn run() -> Result<(), String> {
                 };
                 response = cancel_response;
             }
-            if let Some(expected) = entry.get("expectResponse") {
-                if let Err(error) = assert_partial(expected, &response, "response") {
-                    observation["mismatchedFrame"] = response;
-                    save_observation(observation_path.as_ref(), &observation)?;
-                    return Err(error);
-                }
+            if let Some(expected) = entry.get("expectResponse")
+                && let Err(error) = assert_partial(expected, &response, "response")
+            {
+                observation["mismatchedFrame"] = response;
+                save_observation(observation_path.as_ref(), &observation)?;
+                return Err(error);
             }
             observation["permissionResponseCount"] =
                 json!(observation["permissionResponseCount"].as_u64().unwrap_or(0) + 1);

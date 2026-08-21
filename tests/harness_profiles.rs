@@ -7,6 +7,8 @@ use kiteframe::{ConfigError, HarnessConfig, HarnessRole, ModelRole};
 use serde_json::Value;
 use uuid::Uuid;
 
+type MalformedProfileCase = (&'static str, fn(&mut Value));
+
 fn profile(path: &str) -> HarnessProfile {
     HarnessProfile::from_json(&fs::read(path).expect("profile file")).expect("valid profile")
 }
@@ -130,7 +132,7 @@ fn optional_capability_requires_observed_handshake_state() {
 fn malformed_profiles_fail_closed_with_stable_error_code() {
     let source =
         fs::read_to_string("config/harness-profiles/deepseek-harness-acp-v1.json").unwrap();
-    let cases: [(&str, fn(&mut Value)); 4] = [
+    let cases: [MalformedProfileCase; 4] = [
         ("unknown field", |value: &mut Value| {
             value["unexpected"] = Value::Bool(true);
         }),

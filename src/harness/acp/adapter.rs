@@ -482,10 +482,10 @@ impl AcpHarnessPlugin {
                 }
             }
         };
-        if matches!(terminal, HarnessTerminal::Completed(_)) {
-            if let Some(reporter) = reporter.take() {
-                reporter.report(terminal.clone());
-            }
+        if matches!(terminal, HarnessTerminal::Completed(_))
+            && let Some(reporter) = reporter.take()
+        {
+            reporter.report(terminal.clone());
         }
         #[cfg(feature = "test-support")]
         if let Some(barrier) = &self.test_barrier {

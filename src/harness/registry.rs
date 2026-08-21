@@ -304,10 +304,10 @@ impl HarnessRegistry {
             .plugins
             .lock()
             .expect("harness registry lock is not poisoned");
-        let mut matching = plugins.values().filter_map(|registered| {
-            (registered.plugin.profile().transport == transport)
-                .then(|| registered.plugin.profile().id.clone())
-        });
+        let mut matching = plugins
+            .values()
+            .filter(|registered| registered.plugin.profile().transport == transport)
+            .map(|registered| registered.plugin.profile().id.clone());
         let profile_id = matching.next().ok_or_else(|| {
             HarnessFailure::new(
                 "harness_profile_unavailable",

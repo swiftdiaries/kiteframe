@@ -269,12 +269,14 @@ impl PostgresStore {
         let view = update_invocation_state(
             &mut tx,
             invocation_id,
-            HarnessInvocationState::Started,
-            expected_attempt,
-            false,
-            false,
-            None,
-            None,
+            HarnessInvocationStateUpdate {
+                state: HarnessInvocationState::Started,
+                attempt: expected_attempt,
+                prompt_accepted: false,
+                terminal: false,
+                terminal_request_digest: None,
+                terminal_payload: None,
+            },
         )
         .await?;
         tx.commit().await?;
@@ -393,12 +395,14 @@ impl PostgresStore {
         let view = update_invocation_state(
             &mut tx,
             invocation_id,
-            HarnessInvocationState::Prepared,
-            next_attempt,
-            false,
-            false,
-            None,
-            None,
+            HarnessInvocationStateUpdate {
+                state: HarnessInvocationState::Prepared,
+                attempt: next_attempt,
+                prompt_accepted: false,
+                terminal: false,
+                terminal_request_digest: None,
+                terminal_payload: None,
+            },
         )
         .await?;
         tx.commit().await?;
@@ -438,12 +442,14 @@ impl PostgresStore {
         let view = update_invocation_state(
             &mut tx,
             invocation_id,
-            HarnessInvocationState::Accepted,
-            expected_attempt,
-            true,
-            false,
-            None,
-            None,
+            HarnessInvocationStateUpdate {
+                state: HarnessInvocationState::Accepted,
+                attempt: expected_attempt,
+                prompt_accepted: true,
+                terminal: false,
+                terminal_request_digest: None,
+                terminal_payload: None,
+            },
         )
         .await?;
         tx.commit().await?;
@@ -688,12 +694,14 @@ impl PostgresStore {
         let view = update_invocation_state(
             &mut tx,
             invocation_id,
-            state,
-            expected_attempt,
-            view.prompt_accepted,
-            true,
-            Some(request_digest),
-            Some(terminal_payload),
+            HarnessInvocationStateUpdate {
+                state,
+                attempt: expected_attempt,
+                prompt_accepted: view.prompt_accepted,
+                terminal: true,
+                terminal_request_digest: Some(request_digest),
+                terminal_payload: Some(terminal_payload),
+            },
         )
         .await?;
         tx.commit().await?;
@@ -799,22 +807,22 @@ impl PostgresStore {
                 update_invocation_state(
                     &mut tx,
                     &view.invocation_id,
-                    state,
-                    view.attempt,
-                    view.prompt_accepted,
-                    true,
-                    Some(&terminal_key),
-                    Some(&payload),
+                    HarnessInvocationStateUpdate {
+                        state,
+                        attempt: view.attempt,
+                        prompt_accepted: view.prompt_accepted,
+                        terminal: true,
+                        terminal_request_digest: Some(&terminal_key),
+                        terminal_payload: Some(&payload),
+                    },
                 )
                 .await?,
             )
-        } else if view.state == HarnessInvocationState::Accepted && command_state == "claimed" {
-            Some(view)
-        } else if view.terminal && command.completion_idempotency_key.is_none() {
-            Some(view)
-        } else if command_state == "claimed"
-            && (view.state == HarnessInvocationState::Prepared
-                || (view.state == HarnessInvocationState::Started && !view.prompt_accepted))
+        } else if (view.state == HarnessInvocationState::Accepted && command_state == "claimed")
+            || (view.terminal && command.completion_idempotency_key.is_none())
+            || (command_state == "claimed"
+                && (view.state == HarnessInvocationState::Prepared
+                    || (view.state == HarnessInvocationState::Started && !view.prompt_accepted)))
         {
             Some(view)
         } else {
@@ -1395,12 +1403,14 @@ async fn settle_harness_cancelled(
     update_invocation_state(
         tx,
         &view.invocation_id,
-        HarnessInvocationState::Cancelled,
-        view.attempt,
-        view.prompt_accepted,
-        true,
-        Some(&terminal_idempotency_key(&view.invocation_id)),
-        Some(&payload),
+        HarnessInvocationStateUpdate {
+            state: HarnessInvocationState::Cancelled,
+            attempt: view.attempt,
+            prompt_accepted: view.prompt_accepted,
+            terminal: true,
+            terminal_request_digest: Some(&terminal_idempotency_key(&view.invocation_id)),
+            terminal_payload: Some(&payload),
+        },
     )
     .await
 }
@@ -1441,12 +1451,14 @@ pub(super) async fn cancel_harness_invocations_for_task(
                 update_invocation_state(
                     tx,
                     &view.invocation_id,
-                    state,
-                    view.attempt,
-                    view.prompt_accepted,
-                    true,
-                    Some(&terminal_key),
-                    Some(&payload),
+                    HarnessInvocationStateUpdate {
+                        state,
+                        attempt: view.attempt,
+                        prompt_accepted: view.prompt_accepted,
+                        terminal: true,
+                        terminal_request_digest: Some(&terminal_key),
+                        terminal_payload: Some(&payload),
+                    },
                 )
                 .await?;
             }
@@ -1463,15 +1475,19 @@ pub(super) async fn cancel_harness_invocations_for_task(
     Ok(())
 }
 
-async fn update_invocation_state(
-    tx: &mut Transaction<'_, Postgres>,
-    invocation_id: &HarnessInvocationId,
+struct HarnessInvocationStateUpdate<'a> {
     state: HarnessInvocationState,
     attempt: u64,
     prompt_accepted: bool,
     terminal: bool,
-    terminal_request_digest: Option<&str>,
-    terminal_payload: Option<&Value>,
+    terminal_request_digest: Option<&'a str>,
+    terminal_payload: Option<&'a Value>,
+}
+
+async fn update_invocation_state(
+    tx: &mut Transaction<'_, Postgres>,
+    invocation_id: &HarnessInvocationId,
+    update: HarnessInvocationStateUpdate<'_>,
 ) -> Result<HarnessInvocationView, StoreError> {
     let row = sqlx::query(
         "UPDATE harness_invocations SET state = $1, attempt = $2, prompt_accepted = $3, terminal = $4, \
@@ -1480,12 +1496,12 @@ async fn update_invocation_state(
          RETURNING invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload",
     )
-    .bind(state.as_str())
-    .bind(harness_i64(attempt, "harness attempt is malformed")?)
-    .bind(prompt_accepted)
-    .bind(terminal)
-    .bind(terminal_request_digest)
-    .bind(terminal_payload)
+    .bind(update.state.as_str())
+    .bind(harness_i64(update.attempt, "harness attempt is malformed")?)
+    .bind(update.prompt_accepted)
+    .bind(update.terminal)
+    .bind(update.terminal_request_digest)
+    .bind(update.terminal_payload)
     .bind(invocation_id.as_uuid())
     .fetch_one(&mut **tx)
     .await?;

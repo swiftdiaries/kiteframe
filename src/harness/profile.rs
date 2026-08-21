@@ -39,11 +39,11 @@ pub struct HarnessProfile {
 
 impl HarnessProfile {
     pub fn from_json(bytes: &[u8]) -> Result<Self, HarnessFailure> {
-        let raw: RawHarnessProfile = serde_json::from_slice(bytes)
+        let mut raw: RawHarnessProfile = serde_json::from_slice(bytes)
             .map_err(|e| HarnessFailure::new("harness_profile_unavailable", e.to_string()))?;
-        let id = HarnessProfileId::new(raw.id)?;
-        let required = unique_capabilities(raw.required, "required")?;
-        let optional = unique_capabilities(raw.optional, "optional")?;
+        let id = HarnessProfileId::new(std::mem::take(&mut raw.id))?;
+        let required = unique_capabilities(std::mem::take(&mut raw.required), "required")?;
+        let optional = unique_capabilities(std::mem::take(&mut raw.optional), "optional")?;
         if !required.is_disjoint(&optional) {
             return Err(HarnessFailure::new(
                 "harness_profile_unavailable",
@@ -70,16 +70,7 @@ impl HarnessProfile {
                 "source revision does not match the pinned profile",
             ));
         }
-        validate_pinned_profile(
-            id.as_str(),
-            raw.transport,
-            &raw.source_repository,
-            &raw.program,
-            &raw.args,
-            &required,
-            &optional,
-            raw.fresh_sessions_only,
-        )?;
+        validate_pinned_profile(id.as_str(), &raw, &required, &optional)?;
         if raw.program.is_empty() || raw.source_repository.is_empty() {
             return Err(HarnessFailure::new(
                 "harness_profile_unavailable",
@@ -187,13 +178,9 @@ fn unique_capabilities(
 
 fn validate_pinned_profile(
     id: &str,
-    transport: HarnessTransport,
-    source_repository: &str,
-    program: &str,
-    args: &[String],
+    profile: &RawHarnessProfile,
     required: &BTreeSet<HarnessCapability>,
     optional: &BTreeSet<HarnessCapability>,
-    fresh_sessions_only: bool,
 ) -> Result<(), HarnessFailure> {
     let core = BTreeSet::from([
         HarnessCapability::FreshSession,
@@ -238,13 +225,13 @@ fn validate_pinned_profile(
         ),
         _ => return Ok(()),
     };
-    if transport != expected_transport
-        || source_repository != expected_repo
-        || program != expected_program
-        || args != expected_args
+    if profile.transport != expected_transport
+        || profile.source_repository != expected_repo
+        || profile.program != expected_program
+        || profile.args != expected_args
         || required != &core
         || optional != &expected_optional
-        || fresh_sessions_only != expected_fresh
+        || profile.fresh_sessions_only != expected_fresh
     {
         return Err(HarnessFailure::new(
             "harness_profile_unavailable",

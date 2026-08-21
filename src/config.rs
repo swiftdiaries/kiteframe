@@ -513,8 +513,7 @@ fn resolve_program(
         canonical_or_original(path)
     } else {
         let environment = environment?;
-        let path = resolve_bare_program(value, environment)?;
-        path
+        resolve_bare_program(value, environment)?
     };
     if !resolved.is_absolute() || (!path.is_absolute() && path.components().count() != 1) {
         return None;
@@ -606,10 +605,11 @@ fn valid_literal_arguments(program: &Path, arguments: &[String]) -> bool {
             return false;
         }
         workspace_override = is_workspace_override(argument);
-        if let Some((flag, path)) = argument.split_once('=') {
-            if is_workspace_override(flag) && !Path::new(path).is_absolute() {
-                return false;
-            }
+        if let Some((flag, path)) = argument.split_once('=')
+            && is_workspace_override(flag)
+            && !Path::new(path).is_absolute()
+        {
+            return false;
         }
         if matches!(argument.as_str(), "-H" | "--header")
             && arguments
