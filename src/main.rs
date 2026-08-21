@@ -9,8 +9,9 @@ use std::{
 };
 
 use agent_client_protocol::{ConnectTo, Stdio};
+use kiteframe::config::ExternalHarnessCommands;
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessProfile, HarnessRegistry, HarnessRouteTable,
+    AcpHarnessPlugin, AcpLimits, DenyAllHarnessApprovals, HarnessProfile, HarnessRegistry,
     builtin_harness_profile,
 };
 use kiteframe::protocol::transport::{AcpService, BearerAuthenticator, RemoteService};
@@ -40,14 +41,78 @@ fn builtin_profile_from_attestation(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))
 }
 
-async fn configured_builtin_registry(
-    store: Arc<PostgresStore>,
-    model: Arc<dyn ModelClient>,
-    profile: HarnessProfile,
-) -> Result<Arc<HarnessRegistry>, Box<dyn std::error::Error>> {
-    let plugin = Arc::new(BuiltinHarnessPlugin::new(profile.clone(), model));
-    let mut registry = HarnessRegistry::new();
-    registry.register(plugin).await?;
+const CODEX_ACP_PROFILE: &[u8] = include_bytes!("../config/harness-profiles/codex-acp-v1.json");
+const DEEPSEEK_ACP_PROFILE: &[u8] =
+    include_bytes!("../config/harness-profiles/deepseek-harness-acp-v1.json");
+const CODEX_ACP_REPOSITORY: &str = "https://github.com/zed-industries/codex-acp.git";
+const CODEX_ACP_REVISION: &str = "296069e841634cd4bb9bc4515602d836e49231ec";
+const CODEX_ACP_DIGEST: &str = "90a4c4b57334a1c75da6b45ab43c801ed38cece5f097231071215eeb77f660dd";
+const DEEPSEEK_ACP_REPOSITORY: &str = "https://github.com/deepseek-ai/deepseek-harness.git";
+const DEEPSEEK_ACP_REVISION: &str = "141eb6fef83422698aef7a981029e843e8161534";
+const DEEPSEEK_ACP_DIGEST: &str =
+    "1e9857d42a3f060be63bf67d09026c4ec7466d861a31ff1e52c205bc16c6e2b3";
+
+fn external_profile(
+    bytes: &[u8],
+    id: &str,
+    repository: &str,
+    source_revision: &str,
+    digest: &str,
+) -> Result<HarnessProfile, io::Error> {
+    let profile = HarnessProfile::from_json(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    if profile.id.as_str() != id
+        || profile.source_repository != repository
+        || profile.source_revision != source_revision
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "harness_protocol_incompatible: checked-in external profile attestation drifted",
+        ));
+    }
+    let observed_digest = profile
+        .digest()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    if observed_digest != digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "harness_protocol_incompatible: checked-in external profile digest drifted",
+        ));
+    }
+    Ok(profile)
+}
+
+fn external_acp_profiles() -> Result<(HarnessProfile, HarnessProfile), io::Error> {
+    Ok((
+        external_profile(
+            CODEX_ACP_PROFILE,
+            "codex-acp-v1",
+            CODEX_ACP_REPOSITORY,
+            CODEX_ACP_REVISION,
+            CODEX_ACP_DIGEST,
+        )?,
+        external_profile(
+            DEEPSEEK_ACP_PROFILE,
+            "deepseek-harness-acp-v1",
+            DEEPSEEK_ACP_REPOSITORY,
+            DEEPSEEK_ACP_REVISION,
+            DEEPSEEK_ACP_DIGEST,
+        )?,
+    ))
+}
+
+fn external_acp_limits() -> AcpLimits {
+    AcpLimits {
+        max_frame_bytes: 1024 * 1024,
+        shutdown_grace: SHUTDOWN_GRACE,
+        max_pre_accept_attempts: 3,
+    }
+}
+
+async fn register_profile(
+    store: &PostgresStore,
+    profile: &HarnessProfile,
+) -> Result<(), Box<dyn std::error::Error>> {
     store
         .register_harness_plugin(HarnessPluginRegistration {
             profile_id: profile.id.clone(),
@@ -58,7 +123,49 @@ async fn configured_builtin_registry(
             enabled: true,
         })
         .await?;
+    Ok(())
+}
+
+async fn configured_harness_registry(
+    store: Arc<PostgresStore>,
+    model: Arc<dyn ModelClient>,
+    builtin_profile: HarnessProfile,
+    external_commands: ExternalHarnessCommands,
+) -> Result<Arc<HarnessRegistry>, Box<dyn std::error::Error>> {
+    let mut registry = HarnessRegistry::new();
+    registry
+        .register(Arc::new(BuiltinHarnessPlugin::new(
+            builtin_profile.clone(),
+            model,
+        )))
+        .await?;
+    register_profile(store.as_ref(), &builtin_profile).await?;
+
+    let (codex_profile, deepseek_profile) = external_acp_profiles()?;
+    for (profile, command) in [
+        (codex_profile, external_commands.codex),
+        (deepseek_profile, external_commands.deepseek),
+    ] {
+        let Some(command) = command else {
+            continue;
+        };
+        let plugin = AcpHarnessPlugin::new(profile.clone(), command, external_acp_limits());
+        let pre_accept_attempt_limit = plugin.pre_accept_attempt_limit();
+        registry
+            .register_with_pre_accept_attempt_limit(Arc::new(plugin), pre_accept_attempt_limit)
+            .await?;
+        register_profile(store.as_ref(), &profile).await?;
+    }
     Ok(Arc::new(registry))
+}
+
+#[cfg(test)]
+async fn configured_builtin_registry(
+    store: Arc<PostgresStore>,
+    model: Arc<dyn ModelClient>,
+    profile: HarnessProfile,
+) -> Result<Arc<HarnessRegistry>, Box<dyn std::error::Error>> {
+    configured_harness_registry(store, model, profile, ExternalHarnessCommands::default()).await
 }
 
 #[tokio::main]
@@ -69,6 +176,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     init_logging();
     let config = HarnessConfig::from_env()?;
+    let external_harness_commands = config.external_harness_commands();
+    let harness_routes = config.harness_routes();
     let builtin_profile =
         builtin_profile_from_attestation(option_env!("KITEFRAME_SOURCE_REVISION"))?;
     let store = Arc::new(
@@ -104,13 +213,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             claimed = agent_recovery.claimed,
             "agent command recovery complete"
         );
-        let builtin_profile_id = builtin_profile.id.clone();
-        let harness_registry =
-            configured_builtin_registry(store.clone(), model.clone(), builtin_profile).await?;
+        let harness_registry = configured_harness_registry(
+            store.clone(),
+            model.clone(),
+            builtin_profile,
+            external_harness_commands,
+        )
+        .await?;
         let agent_dispatcher = Arc::new(application.agent_kernel().with_harness_registry_routes(
             harness_registry,
             Arc::new(DenyAllHarnessApprovals),
-            HarnessRouteTable::new(builtin_profile_id.clone(), builtin_profile_id),
+            harness_routes,
         ));
         let application = Arc::new(application);
 

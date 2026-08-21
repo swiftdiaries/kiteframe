@@ -1,6 +1,27 @@
-use std::{collections::HashSet, fmt, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    fmt,
+    path::Path,
+    time::Duration,
+};
 
-use crate::{PrincipalId, ResponsesConfig, RuntimeCeilings, Secret, StoreLimits};
+use crate::{
+    PrincipalId, ResponsesConfig, RuntimeCeilings, Secret, StoreLimits,
+    harness::{AcpCommand, HarnessProfileId, HarnessRouteTable},
+};
+
+const BUILTIN_HARNESS_PROFILE_ID: &str = "builtin-v1";
+const CODEX_ACP_COMMAND: &str = "KITEFRAME_CODEX_ACP_COMMAND_JSON";
+const CODEX_ACP_SOURCE_REVISION: &str = "KITEFRAME_CODEX_ACP_SOURCE_REVISION";
+const DEEPSEEK_ACP_COMMAND: &str = "KITEFRAME_DSH_ACP_COMMAND_JSON";
+const DEEPSEEK_ACP_SOURCE_REVISION: &str = "KITEFRAME_DSH_ACP_SOURCE_REVISION";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExternalHarnessCommands {
+    pub codex: Option<AcpCommand>,
+    pub deepseek: Option<AcpCommand>,
+}
 
 #[derive(Clone, Debug)]
 pub enum HarnessMode {
@@ -41,6 +62,8 @@ pub struct HarnessConfig {
     pub acp_v2_enabled: bool,
     pub max_remote_connections: usize,
     pub store_limits: StoreLimits,
+    external_harness_commands: ExternalHarnessCommands,
+    harness_routes: HarnessRouteTable,
 }
 
 impl fmt::Debug for HarnessConfig {
@@ -55,6 +78,8 @@ impl fmt::Debug for HarnessConfig {
             .field("acp_v2_enabled", &self.acp_v2_enabled)
             .field("max_remote_connections", &self.max_remote_connections)
             .field("store_limits", &self.store_limits)
+            .field("external_harness_commands", &"[REDACTED]")
+            .field("harness_routes", &self.harness_routes)
             .finish()
     }
 }
@@ -62,6 +87,51 @@ impl fmt::Debug for HarnessConfig {
 impl HarnessConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_values(|name| std::env::var(name).ok())
+    }
+
+    /// Builds a complete configuration with deterministic non-secret defaults for integration
+    /// tests that only exercise deployment configuration parsing.
+    pub fn from_test_values(
+        values: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> Result<Self, ConfigError> {
+        let mut configured = HashMap::from([
+            (
+                "KITEFRAME_DATABASE_URL".to_owned(),
+                "postgres://test".to_owned(),
+            ),
+            (
+                "KITEFRAME_PRINCIPAL".to_owned(),
+                "test-principal".to_owned(),
+            ),
+            (
+                "KITEFRAME_RESPONSES_BASE_URL".to_owned(),
+                "https://model.example/v1".to_owned(),
+            ),
+            (
+                "KITEFRAME_RESPONSES_API_KEY".to_owned(),
+                "test-model-key".to_owned(),
+            ),
+            (
+                "KITEFRAME_RESPONSES_MODEL".to_owned(),
+                "test-model".to_owned(),
+            ),
+        ]);
+        configured.extend(
+            values
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
+        Self::from_values(|name| configured.get(name).cloned())
+    }
+
+    #[must_use]
+    pub fn external_harness_commands(&self) -> ExternalHarnessCommands {
+        self.external_harness_commands.clone()
+    }
+
+    #[must_use]
+    pub fn harness_routes(&self) -> HarnessRouteTable {
+        self.harness_routes.clone()
     }
 
     fn from_values(mut value: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -176,6 +246,24 @@ impl HarnessConfig {
                 }
             },
         };
+        let external_harness_commands = ExternalHarnessCommands {
+            codex: parse_external_command(
+                value(CODEX_ACP_COMMAND),
+                value(CODEX_ACP_SOURCE_REVISION),
+                CODEX_ACP_COMMAND,
+                CODEX_ACP_SOURCE_REVISION,
+            )?,
+            deepseek: parse_external_command(
+                value(DEEPSEEK_ACP_COMMAND),
+                value(DEEPSEEK_ACP_SOURCE_REVISION),
+                DEEPSEEK_ACP_COMMAND,
+                DEEPSEEK_ACP_SOURCE_REVISION,
+            )?,
+        };
+        let harness_routes = HarnessRouteTable::new(
+            parse_route(value("KITEFRAME_REASONING_HARNESS_PROFILE"))?,
+            parse_route(value("KITEFRAME_CODING_HARNESS_PROFILE"))?,
+        );
 
         Ok(Self {
             database_url,
@@ -186,8 +274,119 @@ impl HarnessConfig {
             acp_v2_enabled,
             max_remote_connections,
             store_limits,
+            external_harness_commands,
+            harness_routes,
         })
     }
+}
+
+fn parse_route(value: Option<String>) -> Result<HarnessProfileId, ConfigError> {
+    HarnessProfileId::new(value.unwrap_or_else(|| BUILTIN_HARNESS_PROFILE_ID.to_owned()))
+        .map_err(|_| ConfigError::InvalidHarnessRoute)
+}
+
+fn parse_external_command(
+    command: Option<String>,
+    source_revision: Option<String>,
+    command_name: &'static str,
+    source_revision_name: &'static str,
+) -> Result<Option<AcpCommand>, ConfigError> {
+    match (command, source_revision) {
+        (None, None) => Ok(None),
+        (Some(_), None) | (None, Some(_)) => Err(ConfigError::IncompleteExternalHarnessCommand {
+            command_name,
+            source_revision_name,
+        }),
+        (Some(command), Some(source_revision)) => {
+            if !is_full_revision(&source_revision) {
+                return Err(ConfigError::InvalidExternalHarnessSourceRevision {
+                    source_revision_name,
+                });
+            }
+            let command: Vec<String> = serde_json::from_str(&command)
+                .map_err(|_| ConfigError::InvalidExternalHarnessCommand { command_name })?;
+            let (program, args) = command
+                .split_first()
+                .ok_or(ConfigError::InvalidExternalHarnessCommand { command_name })?;
+            if !valid_program(program) || !valid_literal_arguments(args) {
+                return Err(ConfigError::InvalidExternalHarnessCommand { command_name });
+            }
+            Ok(Some(AcpCommand {
+                program: program.into(),
+                args: args.iter().map(OsString::from).collect(),
+                source_revision,
+            }))
+        }
+    }
+}
+
+fn is_full_revision(value: &str) -> bool {
+    value.len() == 40
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !value.bytes().all(|byte| byte == b'0')
+}
+
+fn valid_program(value: &str) -> bool {
+    if !valid_literal(value) {
+        return false;
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return true;
+    }
+    if path.components().count() != 1 {
+        return false;
+    }
+    !matches!(
+        value,
+        "sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell" | "pwsh"
+    )
+}
+
+fn valid_literal_arguments(arguments: &[String]) -> bool {
+    let mut workspace_override = false;
+    for argument in arguments {
+        if !valid_literal(argument) || contains_secret_flag(argument) {
+            return false;
+        }
+        if workspace_override && !Path::new(argument).is_absolute() {
+            return false;
+        }
+        workspace_override = is_workspace_override(argument);
+        if let Some((flag, path)) = argument.split_once('=') {
+            if is_workspace_override(flag) && !Path::new(path).is_absolute() {
+                return false;
+            }
+        }
+    }
+    !workspace_override
+}
+
+fn valid_literal(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('\0')
+        && !value.contains([
+            '\n', '\r', '|', '&', ';', '<', '>', '$', '`', '\'', '"', '*', '?',
+        ])
+}
+
+fn contains_secret_flag(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "api-key",
+        "api_key",
+        "authorization",
+        "bearer",
+    ]
+    .iter()
+    .any(|name| normalized.starts_with(&format!("--{name}")))
+}
+
+fn is_workspace_override(value: &str) -> bool {
+    matches!(value, "--dir" | "--cwd" | "--workspace" | "--prefix" | "-C")
 }
 
 fn parse_quota(value: Option<String>, default: usize) -> Result<usize, ConfigError> {
@@ -293,6 +492,17 @@ pub enum ConfigError {
     InvalidDeploymentQuota,
     #[error("agent runtime ceilings must be between 1 and their hard maximum")]
     InvalidAgentRuntimeCeiling,
+    #[error("{command_name} and {source_revision_name} must be configured together")]
+    IncompleteExternalHarnessCommand {
+        command_name: &'static str,
+        source_revision_name: &'static str,
+    },
+    #[error("{command_name} must be a safe non-empty JSON string array")]
+    InvalidExternalHarnessCommand { command_name: &'static str },
+    #[error("{source_revision_name} must be a nonzero full 40-hex commit hash")]
+    InvalidExternalHarnessSourceRevision { source_revision_name: &'static str },
+    #[error("configured harness route profile id is invalid")]
+    InvalidHarnessRoute,
 }
 
 #[cfg(test)]

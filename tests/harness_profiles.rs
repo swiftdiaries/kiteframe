@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 
 use kiteframe::harness::{HarnessCapability, HarnessProfile, HarnessRouteTable};
-use kiteframe::{HarnessRole, ModelRole};
+use kiteframe::{HarnessConfig, HarnessRole, ModelRole};
 use serde_json::Value;
 
 fn profile(path: &str) -> HarnessProfile {
@@ -145,4 +145,108 @@ fn observed_protocol_mismatch_fails_closed() {
         })
         .unwrap_err();
     assert_eq!(error.code, "harness_protocol_incompatible");
+}
+
+#[test]
+fn command_overrides_are_json_arrays_without_shell_interpolation() {
+    let config = HarnessConfig::from_test_values([
+        (
+            "KITEFRAME_CODEX_ACP_COMMAND_JSON",
+            r#"["/opt/codex-acp/bin/codex-acp"]"#,
+        ),
+        (
+            "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+            "296069e841634cd4bb9bc4515602d836e49231ec",
+        ),
+        (
+            "KITEFRAME_DSH_ACP_COMMAND_JSON",
+            r#"["pnpm","--dir","/opt/deepseek-harness","run","demo:acp"]"#,
+        ),
+        (
+            "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+            "141eb6fef83422698aef7a981029e843e8161534",
+        ),
+    ])
+    .unwrap();
+
+    let commands = config.external_harness_commands();
+    assert_eq!(
+        commands.codex.unwrap().program.to_string_lossy(),
+        "/opt/codex-acp/bin/codex-acp"
+    );
+    assert_eq!(commands.deepseek.unwrap().program.to_string_lossy(), "pnpm");
+}
+
+#[test]
+fn external_commands_require_complete_attestation_and_safe_literal_arguments() {
+    let cases = [
+        (
+            "command without a source revision",
+            [("KITEFRAME_CODEX_ACP_COMMAND_JSON", r#"["codex-acp"]"#)].as_slice(),
+        ),
+        (
+            "source revision without a command",
+            [(
+                "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+                "141eb6fef83422698aef7a981029e843e8161534",
+            )]
+            .as_slice(),
+        ),
+        (
+            "shell command form",
+            [
+                (
+                    "KITEFRAME_CODEX_ACP_COMMAND_JSON",
+                    r#"["sh","-c","codex-acp"]"#,
+                ),
+                (
+                    "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    "296069e841634cd4bb9bc4515602d836e49231ec",
+                ),
+            ]
+            .as_slice(),
+        ),
+        (
+            "secret command argument",
+            [
+                (
+                    "KITEFRAME_DSH_ACP_COMMAND_JSON",
+                    r#"["pnpm","--token=secret-value"]"#,
+                ),
+                (
+                    "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+                    "141eb6fef83422698aef7a981029e843e8161534",
+                ),
+            ]
+            .as_slice(),
+        ),
+    ];
+
+    for (name, values) in cases {
+        assert!(
+            HarnessConfig::from_test_values(values.iter().copied()).is_err(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn harness_routes_default_to_builtin_and_preserve_selected_unconfigured_profile() {
+    let routes = HarnessConfig::from_test_values([
+        ("KITEFRAME_REASONING_HARNESS_PROFILE", "codex-acp-v1"),
+        (
+            "KITEFRAME_CODING_HARNESS_PROFILE",
+            "deepseek-harness-acp-v1",
+        ),
+    ])
+    .unwrap()
+    .harness_routes();
+    assert_eq!(routes.reasoning.as_str(), "codex-acp-v1");
+    assert_eq!(routes.coding.as_str(), "deepseek-harness-acp-v1");
+
+    let defaults = HarnessConfig::from_test_values([])
+        .unwrap()
+        .harness_routes();
+    assert_eq!(defaults.reasoning.as_str(), "builtin-v1");
+    assert_eq!(defaults.coding.as_str(), "builtin-v1");
 }
