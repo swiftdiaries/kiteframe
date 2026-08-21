@@ -171,3 +171,73 @@ This round changes only `src/engine/harness.rs`, the live ACP recovery tests,
 and this report. No schema, adapter protocol, retry/ownership policy, or goal
 authority contract changed. Untracked `fuzz/` and `site/` remain untouched and
 unstaged.
+
+---
+
+# Final Review Fix: Isolated Python Client CI Smoke
+
+Date: 2026-08-22
+
+Status: COMPLETE
+
+Review base: `3887425`
+
+Commit message: `ci: isolate client smoke verification`
+
+## Findings closed
+
+The Rust job ran its complete PostgreSQL suite against `kiteframe_ci`, then
+launched the production harness for the Python live-client smoke against that
+same database. Test rows could therefore influence a real harness startup and
+the live client test. Separately, the standalone Python job ran Pyright from
+the repository root, which made it type-check unrelated fixture code rather
+than only the Python client project.
+
+## Resolution
+
+- Added `tests/ci/isolated_database.py`, which validates a generated,
+  identifier-safe database name; uses argument-vector `createdb`/`dropdb`
+  calls; derives the new PostgreSQL URL while preserving connection options;
+  and writes the URL only to GitHub's output file.
+- The Rust job now creates a run-scoped database after Rust tests, passes that
+  URL only to the Python live smoke, and force-drops it in an `always()` step.
+  Harness startup and migrations therefore still execute against a real empty
+  PostgreSQL database.
+- Added a helper unit test and a repository-shape assertion that requires the
+  Rust-test -> create -> Python-smoke -> cleanup order plus the corrected
+  Pyright working directory.
+- Pyright now runs as `uv run pyright` from `clients/python`; its existing Ruff
+  and test commands remain unchanged.
+
+## TDD evidence
+
+The new URL-helper test was first run without its implementation and failed
+with the expected missing `isolated_database.py` error. The repository-shape
+test then failed because the workflow had no isolated-database stage. Both
+passed after the minimal helper and workflow changes.
+
+The prior Pyright command reproduced RED with one unrelated fixture error:
+`tests/fixtures/responses_ready.py` overrides `BaseHTTPRequestHandler`
+`log_message` using `_format` rather than `format`. The corrected
+client-directory command is GREEN with zero errors.
+
+## Verification
+
+- CI YAML parsed successfully.
+- Isolated-database helper unit test passed.
+- Full repository-shape suite passed.
+- `cargo fmt --all --check` and
+  `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- Python client Ruff and corrected Pyright passed with zero diagnostics.
+- Local CI-sequence reproduction used two disposable PostgreSQL 16 databases:
+  a baseline with a deliberate `ci_contamination_marker`, and a fresh
+  live-smoke target. The fresh target had no marker, acquired real migrations,
+  and ran the compiled harness plus all Python client tests: **25 passed**.
+  Both databases were force-dropped and their absence confirmed afterward.
+
+## Scope
+
+This fix changes only CI isolation/typecheck wiring, its small PostgreSQL
+helper and checks, and this report. It does not change production Rust, client
+behavior, migrations, or the TypeScript smoke paths. Untracked `fuzz/` and
+`site/` remain untouched and unstaged.

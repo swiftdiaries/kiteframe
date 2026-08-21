@@ -133,6 +133,36 @@ fn no_v1_runtime_surface_exposes_cordis_package_lifecycle() {
     }
 }
 
+#[test]
+fn ci_runs_the_python_live_smoke_in_a_disposable_database_after_rust_tests() {
+    let workflow = std::fs::read_to_string(".github/workflows/ci.yml").unwrap();
+
+    let rust_tests = workflow.find("- name: Test all targets").unwrap();
+    let create = workflow
+        .find("- name: Create isolated Python live-smoke database")
+        .unwrap();
+    let smoke = workflow
+        .find("- name: Exercise Python client against the compiled harness")
+        .unwrap();
+    let drop = workflow
+        .find("- name: Drop isolated Python live-smoke database")
+        .unwrap();
+
+    assert!(rust_tests < create && create < smoke && smoke < drop);
+    for required in [
+        "tests/ci/isolated_database.py create",
+        "tests/ci/isolated_database.py drop",
+        "if: ${{ always() }}",
+        "KITEFRAME_INTEGRATION_DATABASE_URL: ${{ steps.python-live-smoke-database.outputs.database_url }}",
+        "working-directory: clients/python\n        run: uv run pyright",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "CI workflow is missing: {required}"
+        );
+    }
+}
+
 fn collect_rust_sources(directory: &std::path::Path, sources: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(directory).unwrap() {
         let path = entry.unwrap().path();

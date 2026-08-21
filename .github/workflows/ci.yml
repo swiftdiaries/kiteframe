@@ -43,18 +43,42 @@ jobs:
       - name: Test all targets
         run: cargo test --all-targets --all-features -- --test-threads=1
 
+      - name: Verify isolated database helper
+        run: python3 tests/ci/test_isolated_database.py
+
       - name: Install uv for live Python client smoke
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.11"
+
+      - name: Create isolated Python live-smoke database
+        id: python-live-smoke-database
+        shell: bash
+        env:
+          KITEFRAME_SMOKE_DATABASE_NAME: kiteframe_ci_python_live_${{ github.run_id }}_${{ github.run_attempt }}
+        run: |
+          python3 tests/ci/isolated_database.py create \
+            --database-url "$DATABASE_URL" \
+            --database-name "$KITEFRAME_SMOKE_DATABASE_NAME" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Exercise Python client against the compiled harness
         run: |
           cargo build --bin kiteframe-harness
           uv run --project clients/python pytest -q clients/python/tests
         env:
-          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
+          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ steps.python-live-smoke-database.outputs.database_url }}
           KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
+
+      - name: Drop isolated Python live-smoke database
+        if: ${{ always() }}
+        shell: bash
+        env:
+          KITEFRAME_SMOKE_DATABASE_NAME: kiteframe_ci_python_live_${{ github.run_id }}_${{ github.run_attempt }}
+        run: |
+          python3 tests/ci/isolated_database.py drop \
+            --database-url "$DATABASE_URL" \
+            --database-name "$KITEFRAME_SMOKE_DATABASE_NAME"
 
       - name: Install Bun for live TypeScript client smoke
         uses: oven-sh/setup-bun@v2
@@ -116,7 +140,8 @@ jobs:
         working-directory: clients/python
 
       - name: Type-check Python client
-        run: uv run --project clients/python pyright
+        working-directory: clients/python
+        run: uv run pyright
 
   python-wheels:
     name: Python wheel (${{ matrix.name }})
