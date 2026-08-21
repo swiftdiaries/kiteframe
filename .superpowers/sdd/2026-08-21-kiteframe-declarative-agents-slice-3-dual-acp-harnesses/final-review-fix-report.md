@@ -449,3 +449,54 @@ This round changes the test-only live readiness seam, its deterministic
 regressions, the public-guide structural guard, and this append-only report.
 It does not launch a provider, modify production configuration parsing, or
 log credentials. Untracked `fuzz/` and `site/` remain untouched and unstaged.
+
+---
+
+# Final Review Fix: Refresh Public Slice 3 Status and Evidence
+
+Date: 2026-08-22
+
+Status: COMPLETE
+
+Review base: `b790a0c`
+
+Commit message: `docs: refresh Slice 3 implementation status`
+
+## Finding closed
+
+The approved design's non-normative status still described Slice 3, Codex ACP,
+and DeepSeek Harness ACP as unimplemented future work. The lifecycle reference
+also stopped its evidence at `d746ce5`, omitted the approved Gate B and final
+remediation commits, used stale migration evidence, and could be read as
+claiming a final whole-branch approval.
+
+## Resolution
+
+- Updated the design status to record Slices 1–3 as implemented and Slices 4–8
+  as prospective, while preserving the approved roadmap's historical planned
+  tense and all normative product boundaries.
+- Recorded the Slice 3 evidence range through `b790a0c`, Gate B approval and
+  fixes (`af0763b`, `424ffda`), and final-review remediation
+  (`1a46135`, `3887425`, `fa07acd`, `817f65e`, `7eb454c`, `b790a0c`).
+- Recorded the current 19-migration SQLx set, strict CI isolation state, latest
+  verified static/test results, and command-absent live-provider skips.
+- Stated explicitly that the final whole-branch re-review remains pending.
+- Added repository-shape coverage that rejects stale Slice 3 status/evidence
+  heads and any claim that later slices are implemented.
+
+## Verification
+
+- `cargo test --test repository_shape`: 10 passed.
+- `cargo test --test harness_profiles`: 15 passed.
+- `cargo test --test harness_acp_live -- --nocapture`: 4 passed; both provider
+  targets emitted their honest command-absent `SKIP` lines.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `git diff --check`: passed.
+
+## Scope
+
+This fix changes only the public status/evidence documentation, its structural
+guard, and this append-only report. It launches no provider and does not change
+production behavior, migrations, or CI execution. Untracked `fuzz/` and
+`site/` remain untouched and unstaged.

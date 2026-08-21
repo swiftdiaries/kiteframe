@@ -1,6 +1,6 @@
 # Kiteframe Declarative Agents and Plugin Runtime Design
 
-- **Status:** Approved roadmap; Slices 1–2 implemented and Slices 3–8 planned
+- **Status:** Approved roadmap; Slices 1–3 implemented and Slices 4–8 planned
 - **Date:** 2026-08-17
 - **Revised:** 2026-08-21 to require Codex and DeepSeek Harness in V1
 - **Repository:** `swiftdiaries/kiteframe`
@@ -67,8 +67,10 @@ remain superseded. NXL is a design reference, not a syntax, runtime, or wire
 compatibility target.
 
 This document is a design artifact, not implementation evidence. The
-non-normative implementation-status note below records the narrower completed
-foundation; the remaining design is still prospective.
+non-normative implementation-status note below records the completed
+foundation and Slice 3 harness boundary. The Slice 4–8 product path remains
+prospective. Historical roadmap sections retain their approved planned-tense
+design language; they do not override the current non-normative status.
 
 ### Non-normative implementation status
 
@@ -137,12 +139,15 @@ feature audit passed; Python reported 24 tests passed and one pre-existing
 live-harness skip; TypeScript typecheck, tests, and build passed; and diff
 checks passed with a clean worktree.
 
-Slices 3–8 and the end-to-end product loop remain unimplemented. In
-particular, this note does not claim the GitHub, Codex, DeepSeek Harness, or
-Cursor/VS Code editor path is operational. The GitHub-typed `babysit_pr` goal
-cannot complete from Slice 2 harness evidence alone; later context, connector,
-and product slices must provide the authorized GitHub evidence and product
-loop.
+Slice 3 is implemented: the built-in Responses path, Codex ACP, and DeepSeek
+Harness ACP share the versioned `HarnessPlugin` boundary and deterministic
+portable-core/recovery evidence. This is a harness boundary, not the complete
+product loop. Slices 4–8 remain prospective and unimplemented: context/event
+ingress, guarded work delivery, connector control plane, the editor path, and
+the `babysit_pr` release scenario. In particular, this note does not claim the
+GitHub connector or Cursor/VS Code product path is operational; the
+GitHub-typed `babysit_pr` goal still requires those later slices' authorized
+GitHub evidence and product loop.
 
 ## Normative language
 

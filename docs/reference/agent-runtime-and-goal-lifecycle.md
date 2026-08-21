@@ -349,20 +349,32 @@ authority that validates and commits durable task, goal, snapshot, command,
 policy, and evidence state. A harness terminal cannot complete or block a
 durable goal.
 
-- Implementation range: `ca09f321672f90da5acca6aa2abf7e69ce6a6694..d746ce5`.
-  Current Slice 3 production implementation commit: `d746ce5`. The separate
-  release-gating test stability prerequisite is `840b0fb`.
-- Review status: Tasks 1–7 received their cumulative Slice 3 review and strict
-  lint closure; this Task 8 publication is the evidence input to the remaining
-  cross-task release review.
-- Deterministic harness/profile/recovery matrix: rerun on 2026-08-22, including
-  strict `cargo clippy --all-targets --all-features -- -D warnings`, the full
-  `cargo test --all-features` suite, the portable harness/profile/recovery
-  suites, repository shape, no-default-features harness check, Python client
-  suite, TypeScript test suite, and TypeScript typecheck.
-- PostgreSQL matrix: rerun on 2026-08-22 against a disposable PostgreSQL 16
-  instance for the harness-store, lock-order, ACP recovery, agent lifecycle,
-  and full Rust suites; the container is removed after this publication gate.
+- Implementation range and evidence head:
+  `ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c`. The production Slice 3
+  implementation closed at `d746ce5`; `840b0fb` is the release-gating
+  cancellation-test prerequisite. The post-implementation Gate B fixes are
+  `af0763b` (durable unavailable profiles) and `424ffda` (exact runtime
+  identity binding). Final-review remediation is `1a46135`, `3887425`,
+  `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`.
+- Review status: Gate B is approved after the `af0763b` and `424ffda` fixes.
+  The final-review remediation commits above are recorded, but a fresh
+  whole-branch re-review of the final evidence head is still pending; this
+  status does not claim final whole-branch approval.
+- Latest verified deterministic results: strict
+  `cargo clippy --all-targets --all-features -- -D warnings`,
+  `cargo fmt --all -- --check`, and
+  `cargo build --all-targets --all-features` passed. `cargo test --test
+  repository_shape` passed 10 tests; `cargo test --test harness_profiles`
+  passed 15 tests; and `cargo test --test harness_acp_live -- --nocapture`
+  passed 4 tests with both provider targets honestly skipped because their
+  complete live configuration is absent. The strict CI wiring is present and
+  verified: it runs the Python live smoke in an isolated disposable database
+  after Rust tests, then always drops that database; the corresponding local
+  PostgreSQL simulation passed all 25 Python client tests.
+- PostgreSQL schema evidence: the current embedded SQLx migration set contains
+  19 migrations (`0001` through `0019`). The configured PostgreSQL matrices
+  were run against disposable PostgreSQL 16 instances; each such database was
+  removed after its verification gate.
 - Codex live result: `SKIP codex live: KITEFRAME_CODEX_ACP_COMMAND_JSON is absent`.
 - DeepSeek live result: `SKIP DeepSeek live: KITEFRAME_DSH_ACP_COMMAND_JSON is absent`.
 

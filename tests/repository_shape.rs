@@ -111,6 +111,47 @@ fn public_docs_name_both_v1_acp_profiles_and_exclude_dynamic_cordis() {
 }
 
 #[test]
+fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_slices() {
+    let design = std::fs::read_to_string(
+        "docs/superpowers/specs/2026-08-17-kiteframe-declarative-agents-and-plugin-runtime-design.md",
+    )
+    .unwrap();
+    let reference =
+        std::fs::read_to_string("docs/reference/agent-runtime-and-goal-lifecycle.md").unwrap();
+
+    for required in [
+        "Slices 1–3 implemented and Slices 4–8 planned",
+        "Slice 3 is implemented: the built-in Responses path, Codex ACP, and DeepSeek",
+        "Slices 4–8 remain prospective and unimplemented",
+    ] {
+        assert!(
+            design.contains(required),
+            "stale Slice 3 status: {required}"
+        );
+    }
+    assert!(
+        !design.contains("Slices 3–8 and the end-to-end product loop remain unimplemented"),
+        "Slice 3 is incorrectly recorded as unimplemented"
+    );
+
+    for required in [
+        "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c",
+        "af0763b",
+        "424ffda",
+        "1a46135`, `3887425`,",
+        "fa07acd`, `817f65e`, `7eb454c`, and `b790a0c",
+        "whole-branch re-review of the final evidence head is still pending",
+        "19 migrations (`0001` through `0019`)",
+        "cargo test --test harness_acp_live -- --nocapture",
+    ] {
+        assert!(
+            reference.contains(required),
+            "missing current evidence: {required}"
+        );
+    }
+}
+
+#[test]
 fn public_testing_guide_locks_complete_live_acp_certification_examples() {
     let guide = std::fs::read_to_string("docs/guides/testing-kiteframe.md").unwrap();
     assert_live_acp_certification_examples(&guide).unwrap();
