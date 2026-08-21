@@ -1,9 +1,11 @@
+mod acp;
 mod builtin;
 mod plugin;
 mod profile;
 mod registry;
 mod types;
 
+pub use acp::*;
 pub use builtin::{
     BuiltinHarnessPlugin, HarnessExecutionError, HarnessExecutionResult, builtin_harness_profile,
 };

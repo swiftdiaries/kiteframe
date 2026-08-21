@@ -1,0 +1,6 @@
+[
+  {
+    "expect": { "method": "initialize" },
+    "respond": { "protocolVersion": 2, "agentCapabilities": {} }
+  }
+]

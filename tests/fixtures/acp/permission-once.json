@@ -1,0 +1,47 @@
+[
+  {
+    "expect": { "method": "initialize", "params": { "protocolVersion": 1 } },
+    "respond": {
+      "protocolVersion": 1,
+      "agentCapabilities": {},
+      "agentInfo": { "name": "kiteframe-fake-acp", "version": "1.0.0" }
+    }
+  },
+  {
+    "expect": { "method": "session/new" },
+    "respond": { "sessionId": "session-1" }
+  },
+  {
+    "expect": { "method": "session/prompt" },
+    "saveId": "prompt"
+  },
+  {
+    "request": {
+      "id": 700,
+      "method": "session/request_permission",
+      "params": {
+        "sessionId": "session-1",
+        "toolCall": { "toolCallId": "tool-1", "title": "Run harmless fixture tool" },
+        "options": [
+          { "optionId": "allow-always-id", "name": "Always", "kind": "allow_always" },
+          { "optionId": "allow-once-id", "name": "Once", "kind": "allow_once" },
+          { "optionId": "reject-once-id", "name": "Reject", "kind": "reject_once" }
+        ]
+      }
+    },
+    "expectResponse": { "id": 700 }
+  },
+  {
+    "notify": {
+      "method": "session/update",
+      "params": {
+        "sessionId": "session-1",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "{\"fields\":{\"answer\":\"done\"},\"outcome\":\"ok\"}" }
+        }
+      }
+    }
+  },
+  { "respondTo": "prompt", "respond": { "stopReason": "end_turn" } }
+]

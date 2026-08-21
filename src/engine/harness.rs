@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
-    HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal, HarnessTransport,
-    PostgresHarnessEventSink, canonical_outcome_unknown_terminal_payload,
+    HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal,
+    HarnessTransport, PostgresHarnessEventSink, canonical_outcome_unknown_terminal_payload,
     dispatch_with_terminal_journal, postgres_harness_acceptance_barrier, terminal_idempotency_key,
 };
 use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
@@ -16,7 +16,6 @@ use crate::{
 };
 
 const HARNESS_DISPATCHER_CLAIMANT: &str = "harness-dispatcher-v1";
-const MAX_PRE_ACCEPT_ATTEMPTS: u64 = 3;
 
 pub struct AgentCommandDispatcher {
     kernel: Arc<AgentKernel>,
@@ -335,13 +334,15 @@ impl AgentCommandDispatcher {
                 failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
             }
             HarnessTerminal::Retryable(_) => {
+                let max_pre_accept_attempts =
+                    registered_pre_accept_attempt_limit(&self.registry, &invocation.profile_id)?;
                 let retry = self
                     .kernel
                     .store()
                     .record_harness_retryable_failure(
                         &invocation.invocation_id,
                         invocation.attempt,
-                        MAX_PRE_ACCEPT_ATTEMPTS,
+                        max_pre_accept_attempts,
                         &terminal_key,
                         &terminal_payload,
                     )
@@ -418,6 +419,15 @@ impl AgentCommandDispatcher {
             failure_request(execution, claimed, &terminal_key, "harness_outcome_unknown")?;
         failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
     }
+}
+
+fn registered_pre_accept_attempt_limit(
+    registry: &HarnessRegistry,
+    profile_id: &HarnessProfileId,
+) -> Result<u64, StoreError> {
+    registry
+        .pre_accept_attempt_limit(profile_id)
+        .map_err(|error| StoreError::InvalidData(error.to_string()))
 }
 
 fn is_builtin_command_unavailable(transport: HarnessTransport, failure: &HarnessFailure) -> bool {

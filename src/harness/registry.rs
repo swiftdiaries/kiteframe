@@ -20,6 +20,7 @@ const STABLE_FAILURE_CODES: [&str; 7] = [
     "harness_failed",
     "harness_outcome_unknown",
 ];
+const DEFAULT_MAX_PRE_ACCEPT_ATTEMPTS: u64 = 3;
 
 /// Terminal-journal read boundary that must run before adapter work is admitted.
 #[async_trait::async_trait]
@@ -71,6 +72,7 @@ pub struct HarnessRegistry {
 struct RegisteredPlugin {
     digest: String,
     plugin: Arc<dyn HarnessPlugin>,
+    max_pre_accept_attempts: u64,
 }
 
 struct ActiveInvocations {
@@ -124,6 +126,21 @@ impl HarnessRegistry {
     }
 
     pub async fn register(&mut self, plugin: Arc<dyn HarnessPlugin>) -> Result<(), HarnessFailure> {
+        self.register_with_pre_accept_attempt_limit(plugin, DEFAULT_MAX_PRE_ACCEPT_ATTEMPTS)
+            .await
+    }
+
+    pub async fn register_with_pre_accept_attempt_limit(
+        &mut self,
+        plugin: Arc<dyn HarnessPlugin>,
+        max_pre_accept_attempts: u64,
+    ) -> Result<(), HarnessFailure> {
+        if max_pre_accept_attempts == 0 {
+            return Err(HarnessFailure::new(
+                "harness_profile_unavailable",
+                "pre-accept attempt limit must be greater than zero",
+            ));
+        }
         let profile = plugin.profile();
         let capabilities = plugin
             .describe_capabilities()
@@ -136,7 +153,9 @@ impl HarnessRegistry {
             .lock()
             .expect("harness registry lock is not poisoned");
         if let Some(existing) = plugins.get(&profile.id) {
-            if existing.digest == digest {
+            if existing.digest == digest
+                && existing.max_pre_accept_attempts == max_pre_accept_attempts
+            {
                 return Ok(());
             }
             return Err(HarnessFailure::new(
@@ -144,7 +163,14 @@ impl HarnessRegistry {
                 "harness profile registration conflicts with the active digest",
             ));
         }
-        plugins.insert(profile.id.clone(), RegisteredPlugin { digest, plugin });
+        plugins.insert(
+            profile.id.clone(),
+            RegisteredPlugin {
+                digest,
+                plugin,
+                max_pre_accept_attempts,
+            },
+        );
         Ok(())
     }
 
@@ -165,6 +191,23 @@ impl HarnessRegistry {
             .expect("harness registry lock is not poisoned")
             .get(profile_id)
             .map(|registered| registered.digest.clone())
+            .ok_or_else(|| {
+                HarnessFailure::new(
+                    "harness_profile_unavailable",
+                    "selected harness profile is not registered",
+                )
+            })
+    }
+
+    pub(crate) fn pre_accept_attempt_limit(
+        &self,
+        profile_id: &super::HarnessProfileId,
+    ) -> Result<u64, HarnessFailure> {
+        self.plugins
+            .lock()
+            .expect("harness registry lock is not poisoned")
+            .get(profile_id)
+            .map(|registered| registered.max_pre_accept_attempts)
             .ok_or_else(|| {
                 HarnessFailure::new(
                     "harness_profile_unavailable",
@@ -437,5 +480,90 @@ async fn append_pending(
             let _ = pending.persisted.send(Err(outcome_unknown.clone()));
             Err(outcome_unknown)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::harness::{
+        HARNESS_PROTOCOL_VERSION, HarnessCapabilities, HarnessCapability, HarnessProfile,
+        HarnessProfileId,
+    };
+
+    struct StaticPlugin {
+        profile: HarnessProfile,
+    }
+
+    #[async_trait::async_trait]
+    impl HarnessPlugin for StaticPlugin {
+        fn profile(&self) -> &HarnessProfile {
+            &self.profile
+        }
+
+        async fn describe_capabilities(&self) -> Result<HarnessCapabilities, HarnessFailure> {
+            Ok(HarnessCapabilities {
+                protocol_version: HARNESS_PROTOCOL_VERSION,
+                implementation_name: "static-test-plugin".to_owned(),
+                implementation_version: "1".to_owned(),
+                supported: self.profile.required.clone(),
+            })
+        }
+
+        async fn start_invocation(
+            &self,
+            _request: HarnessRequestEnvelope,
+            _events: HarnessEventSender,
+            _approvals: Arc<dyn HarnessApprovalBroker>,
+            _cancellation: super::super::HarnessCancellation,
+        ) -> HarnessTerminal {
+            HarnessTerminal::Cancelled
+        }
+    }
+
+    fn plugin(id: &str) -> Arc<dyn HarnessPlugin> {
+        Arc::new(StaticPlugin {
+            profile: HarnessProfile {
+                id: HarnessProfileId::new(id).unwrap(),
+                transport: HarnessTransport::AcpStdio,
+                source_repository: "https://example.test/static.git".to_owned(),
+                source_revision: "1111111111111111111111111111111111111111".to_owned(),
+                program: "static-test-plugin".to_owned(),
+                args: vec![],
+                required: BTreeSet::from([HarnessCapability::FreshSession]),
+                optional: BTreeSet::new(),
+                fresh_sessions_only: true,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn registration_retains_profile_specific_pre_accept_attempt_limit() {
+        let mut registry = HarnessRegistry::new();
+        let custom_id = HarnessProfileId::new("custom-limit-v1").unwrap();
+        registry
+            .register_with_pre_accept_attempt_limit(plugin(custom_id.as_str()), 1)
+            .await
+            .unwrap();
+        assert_eq!(registry.pre_accept_attempt_limit(&custom_id).unwrap(), 1);
+
+        let default_id = HarnessProfileId::new("default-limit-v1").unwrap();
+        registry
+            .register(plugin(default_id.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(registry.pre_accept_attempt_limit(&default_id).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_zero_pre_accept_attempt_limit() {
+        let mut registry = HarnessRegistry::new();
+        let error = registry
+            .register_with_pre_accept_attempt_limit(plugin("zero-limit-v1"), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "harness_profile_unavailable");
     }
 }

@@ -1,0 +1,15 @@
+[
+  {
+    "expect": { "method": "initialize" },
+    "respond": {
+      "protocolVersion": 1,
+      "agentCapabilities": {},
+      "agentInfo": { "name": "kiteframe-fake-acp", "version": "1.0.0" }
+    }
+  },
+  {
+    "expect": { "method": "session/new" },
+    "respond": { "sessionId": "session-1" }
+  },
+  { "expect": { "method": "session/prompt" }, "exitAfterRead": 17 }
+]

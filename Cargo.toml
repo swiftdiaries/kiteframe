@@ -13,6 +13,11 @@ path = "src/lib.rs"
 name = "kiteframe-harness"
 path = "src/main.rs"
 
+[[bin]]
+name = "kiteframe-fake-acp"
+path = "src/bin/kiteframe-fake-acp.rs"
+required-features = ["test-support"]
+
 [features]
 default = []
 acp-v2 = ["agent-client-protocol/unstable_protocol_v2"]

@@ -18,7 +18,7 @@ use super::{
     HarnessRequestEnvelope, HarnessTerminal, emit_and_wait,
 };
 
-const DURABLE_GOAL_DIRECTIVE: &str = "Treat the complete structured goal in the first input item as durable across this invocation and every repeated or recovered invocation. Preserve its objective, criterion ids, human success statements, required evidence types, constraints, and blocked conditions. The complete_task function completes only this bounded harness task and yields invocation evidence; it never completes or blocks the enclosing Kiteframe goal. Only the Rust kernel's CompleteGoal and BlockGoal authority may complete or block that goal.";
+pub(crate) const DURABLE_GOAL_DIRECTIVE: &str = "Treat the complete structured goal in the first input item as durable across this invocation and every repeated or recovered invocation. Preserve its objective, criterion ids, human success statements, required evidence types, constraints, and blocked conditions. The complete_task function completes only this bounded harness task and yields invocation evidence; it never completes or blocks the enclosing Kiteframe goal. Only the Rust kernel's CompleteGoal and BlockGoal authority may complete or block that goal.";
 const BUILTIN_PERMISSION_REQUEST_TOOL: &str = "kiteframe/request_permission";
 
 pub fn builtin_harness_profile(source_revision: &str) -> Result<HarnessProfile, HarnessFailure> {
@@ -283,7 +283,7 @@ fn is_function_call(item: &Value) -> bool {
     item.get("type").and_then(Value::as_str) == Some("function_call")
 }
 
-fn validate_schema_completion(
+pub(crate) fn validate_schema_completion(
     result_schema: &ClosedSchema,
     outcome: &str,
     fields: &Value,
