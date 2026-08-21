@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::dsl::{CompiledDefinition, DefinitionKind};
 use crate::harness::{
-    HARNESS_PROTOCOL_VERSION, HarnessApprovalDecision, HarnessInvocationEvent, HarnessInvocationId,
-    HarnessProfileId, HarnessTransport,
+    HARNESS_PROTOCOL_VERSION, HarnessInvocationEvent, HarnessInvocationId, HarnessProfileId,
+    HarnessTransport,
 };
 use crate::{
     AgentCommandId, AgentExecutionView, AgentPolicyDecision, CatalogEpochId, FrameId, GoalContract,
@@ -186,57 +186,8 @@ impl HarnessInvocationEventRecord {
 }
 
 pub(crate) fn harness_event_from_value(value: Value) -> Result<HarnessInvocationEvent, StoreError> {
-    let object = value.as_object().ok_or_else(|| {
-        StoreError::InvalidData("harness invocation event is malformed".to_owned())
-    })?;
-    let only = |keys: &[&str]| {
-        object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
-    };
-    let text = |key: &str| {
-        object
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                StoreError::InvalidData("harness invocation event is malformed".to_owned())
-            })
-    };
-    match object.get("type").and_then(Value::as_str) {
-        Some("started") if only(&["type"]) => Ok(HarnessInvocationEvent::Started),
-        Some("cancelled") if only(&["type"]) => Ok(HarnessInvocationEvent::Cancelled),
-        Some("progress") if only(&["type", "message"]) => Ok(HarnessInvocationEvent::Progress {
-            message: text("message")?,
-        }),
-        Some("assistant_message") if only(&["type", "text"]) => {
-            Ok(HarnessInvocationEvent::AssistantMessage {
-                text: text("text")?,
-            })
-        }
-        Some("approval_requested") if only(&["type", "request_id", "title"]) => {
-            Ok(HarnessInvocationEvent::ApprovalRequested {
-                request_id: text("request_id")?,
-                title: text("title")?,
-            })
-        }
-        Some("approval_resolved") if only(&["type", "request_id", "decision"]) => {
-            let decision = match text("decision")?.as_str() {
-                "allow_once" => HarnessApprovalDecision::AllowOnce,
-                "reject_once" => HarnessApprovalDecision::RejectOnce,
-                _ => {
-                    return Err(StoreError::InvalidData(
-                        "harness invocation event is malformed".to_owned(),
-                    ));
-                }
-            };
-            Ok(HarnessInvocationEvent::ApprovalResolved {
-                request_id: text("request_id")?,
-                decision,
-            })
-        }
-        _ => Err(StoreError::InvalidData(
-            "harness invocation event is malformed".to_owned(),
-        )),
-    }
+    serde_json::from_value(value)
+        .map_err(|_| StoreError::InvalidData("harness invocation event is malformed".to_owned()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -605,4 +556,71 @@ pub enum StoreError {
     InvalidData(String),
     #[error("runtime state is invalid: {0}")]
     RuntimeStateInvalid(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StoreError, harness_event_from_value};
+    use crate::harness::{HarnessApprovalDecision, HarnessInvocationEvent};
+    use serde_json::json;
+
+    #[test]
+    fn canonical_approval_requested_stored_json_decodes() {
+        assert_eq!(
+            harness_event_from_value(json!({
+                "type": "approval_requested",
+                "requestId": "permission-7",
+                "title": "Need permission"
+            }))
+            .unwrap(),
+            HarnessInvocationEvent::ApprovalRequested {
+                request_id: "permission-7".to_owned(),
+                title: "Need permission".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_approval_resolved_stored_json_decodes() {
+        assert_eq!(
+            harness_event_from_value(json!({
+                "type": "approval_resolved",
+                "requestId": "permission-7",
+                "decision": "reject_once"
+            }))
+            .unwrap(),
+            HarnessInvocationEvent::ApprovalResolved {
+                request_id: "permission-7".to_owned(),
+                decision: HarnessApprovalDecision::RejectOnce,
+            }
+        );
+    }
+
+    #[test]
+    fn stored_json_rejects_legacy_unknown_and_extra_approval_shapes() {
+        for malformed in [
+            json!({
+                "type": "approval_requested",
+                "request_id": "permission-7",
+                "title": "Need permission"
+            }),
+            json!({
+                "type": "approval_resolved",
+                "request_id": "permission-7",
+                "decision": "allow_once"
+            }),
+            json!({"type": "approval_unknown", "requestId": "permission-7"}),
+            json!({
+                "type": "approval_requested",
+                "requestId": "permission-7",
+                "title": "Need permission",
+                "extra": true
+            }),
+        ] {
+            assert!(matches!(
+                harness_event_from_value(malformed),
+                Err(StoreError::InvalidData(_))
+            ));
+        }
+    }
 }

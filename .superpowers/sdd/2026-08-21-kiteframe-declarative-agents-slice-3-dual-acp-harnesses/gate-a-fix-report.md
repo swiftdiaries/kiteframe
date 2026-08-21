@@ -293,3 +293,52 @@ Round-3 changes are limited to `migrations/0016_harness_gate_a.sql`, `src/harnes
 - Confirmed migration registration/invocation/event lock order and versioned built-in coexistence logic from round 2 remain unchanged.
 - Confirmed `fuzz/` and `site/` remain untouched and untracked.
 - Remaining concern is environmental only: live PostgreSQL migration/store/replay/lock-order execution is still required before final Gate A approval.
+
+---
+
+## Gate A re-review fix wave — round 4
+
+### Outcome
+
+Round 4 closes the durable event-row decoding mismatch. PostgreSQL rows converted by migration 0016 to canonical v1 camelCase approval keys are now decoded through the same closed `HarnessInvocationEvent` serde contract used for protocol serialization, and row reconstruction still validates sequence-zero/Started and the canonical v1 envelope digest before returning data.
+
+### Single-source durable event decoding
+
+- Removed the handwritten `harness_event_from_value` variant/key schema, including its obsolete `request_id` approval branches.
+- Stored JSON now uses `serde_json::from_value::<HarnessInvocationEvent>`. The enum's tagged, snake-case variant names, camel-case fields, closed approval decision enum, and `deny_unknown_fields` are the single Rust shape contract.
+- Canonical `ApprovalRequested` and `ApprovalResolved` rows with `requestId` decode successfully. Legacy snake_case approval rows, unknown event types, and extra fields fail as `StoreError::InvalidData`.
+- `harness_event_record_from_row` continues to call `HarnessInvocationEventRecord::validate_digest` after decoding, so the closed shape is followed by canonical protocol-version/invocation/sequence/event digest validation.
+- The database-gated `approval_request_and_one_shot_decision_are_durable_events` append/read-back test remains intact. It exercises the real PostgreSQL row decoder when `DATABASE_URL` is available and therefore covers 0016-migrated camelCase approval data.
+
+### Round-4 RED evidence
+
+`cargo test --lib store::models::tests -- --nocapture` initially reported `0 passed; 3 failed`. Both canonical `requestId` variants returned `InvalidData("harness invocation event is malformed")`, while the legacy-rejection test failed because the handwritten decoder still accepted snake_case approvals.
+
+### Round-4 GREEN evidence
+
+- `cargo test --lib store::models::tests -- --nocapture` — 3 passed.
+- `cargo test --test harness_store --test harness_plugin_protocol --test harness_profiles --test harness_builtin_conformance -- --nocapture` — 18 + 19 + 7 + 6 passed; live store bodies explicitly self-skipped because `DATABASE_URL` is unset.
+- `cargo test --lib -- --nocapture` — 33 passed.
+- `cargo test --test agent_direct_bridge --test agent_goal_authority --test agent_transition_store -- --nocapture` — 21 + 15 + 16 passed.
+- `cargo test --test sequential_runtime --test structured_runtime --test recovery -- --nocapture` — 9 + 5 + 6 passed.
+- `cargo test --bin kiteframe-harness -- --nocapture` — 4 passed.
+- `cargo check --all-targets --all-features` — passed.
+- `cargo check --no-default-features --lib --bin kiteframe-harness` — passed.
+- `cargo fmt --all -- --check` — passed.
+- `git diff --check` — passed before the report append and is rerun in the final diff check.
+
+### Round-4 PostgreSQL limitation
+
+`cargo test --test postgres_lock_order -- --nocapture` again exited 101 with exactly `1 passed; 15 failed`. The static global-order test passed; every live test stopped at `DATABASE_URL is required for PostgreSQL lock-order tests: NotPresent`. The approval append/read-back test compiled and was retained, but its database body self-skipped for the same missing environment variable. CI or another PostgreSQL-backed environment remains the authoritative live row-decoding gate.
+
+### Round-4 files and self-review
+
+Round-4 changes are limited to `src/store/models.rs` and this report.
+
+- Confirmed durable row decoding and protocol serialization share `HarnessInvocationEvent` serde rather than parallel field lists.
+- Confirmed the error boundary remains the stable `StoreError::InvalidData` class without exposing serde internals.
+- Confirmed canonical row decoding happens before existing sequence and v1 envelope-digest validation.
+- Confirmed migration 0016 already converts valid 0014 approval keys to `requestId`, exactly matching the decoder now used.
+- Confirmed no migration, frozen API, dispatcher, acceptance, profile, or legacy runtime behavior changed in round 4.
+- Confirmed `fuzz/` and `site/` remain untouched and untracked.
+- Remaining concern is environmental only: live PostgreSQL approval append/read-back and lock-order execution still require `DATABASE_URL`.
