@@ -142,7 +142,7 @@ impl HarnessRegistry {
         }
         let Some((token, _active_guard)) = self.reserve_active(&request.invocation_id) else {
             return HarnessTerminal::Failed(HarnessFailure::new(
-                "harness_invocation_active",
+                "harness_failed",
                 "harness invocation id is already active",
             ));
         };
@@ -264,8 +264,9 @@ async fn append_pending(
             Ok(())
         }
         Err(error) => {
-            let _ = pending.persisted.send(Err(error.clone()));
-            Err(error)
+            let outcome_unknown = HarnessFailure::new("harness_outcome_unknown", error.detail);
+            let _ = pending.persisted.send(Err(outcome_unknown.clone()));
+            Err(outcome_unknown)
         }
     }
 }

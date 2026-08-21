@@ -245,9 +245,7 @@ impl HarnessEventSink for PostgresHarnessEventSink {
         self.store
             .append_harness_event_envelope(&event)
             .await
-            .map_err(|error| {
-                HarnessFailure::new("harness_event_persistence_failed", error.to_string())
-            })
+            .map_err(|error| HarnessFailure::new("harness_outcome_unknown", error.to_string()))
     }
 }
 

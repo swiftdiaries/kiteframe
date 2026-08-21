@@ -524,7 +524,7 @@ async fn duplicate_active_invocation_is_rejected_without_replacing_cancellation_
     assert!(matches!(
         duplicate,
         Ok(HarnessTerminal::Failed(HarnessFailure {
-            code: "harness_invocation_active",
+            code: "harness_failed",
             ..
         }))
     ));
@@ -599,7 +599,7 @@ async fn sink_failure_acknowledges_every_accepted_pending_event() {
         assert!(matches!(
             acknowledgement,
             Err(HarnessFailure {
-                code: "harness_event_persistence_failed",
+                code: "harness_outcome_unknown",
                 ..
             })
         ));
@@ -645,4 +645,88 @@ fn journal_record_preserves_the_validated_envelope_digest() {
     .unwrap();
     assert_eq!(record.event_digest, envelope.event_digest);
     assert!(record.validate_digest().is_ok());
+}
+
+#[test]
+fn legacy_event_digest_replays_only_when_the_canonical_event_is_identical() {
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let versioned = HarnessInvocationEventRecord::new(
+        invocation_id.clone(),
+        0,
+        HarnessInvocationEvent::Started,
+    )
+    .unwrap();
+    let mut legacy = versioned.clone();
+    legacy.event_digest = kiteframe::canonical_sha256(&legacy.event).unwrap();
+    assert!(legacy.is_compatible_replay_of(&versioned).unwrap());
+
+    let drift = HarnessInvocationEventRecord::new(
+        invocation_id,
+        0,
+        HarnessInvocationEvent::Progress {
+            message: "different event".to_owned(),
+        },
+    )
+    .unwrap();
+    assert!(!legacy.is_compatible_replay_of(&drift).unwrap());
+}
+
+#[tokio::test]
+async fn surfaced_harness_failure_codes_are_closed() {
+    let allowed = [
+        "harness_profile_unavailable",
+        "harness_protocol_incompatible",
+        "harness_capability_unsupported",
+        "harness_permission_rejected",
+        "harness_cancelled",
+        "harness_failed",
+        "harness_outcome_unknown",
+    ];
+    let registry = registry_with(Arc::new(FakePlugin::wait_for_cancel())).await;
+    let invocation = request();
+    let invocation_id = invocation.invocation_id.clone();
+    let active = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .invoke(
+                    invocation,
+                    Arc::new(DenyAllHarnessApprovals),
+                    Arc::new(RecordingHarnessEventSink::default()),
+                )
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let duplicate = registry
+        .invoke(
+            HarnessInvocationRequest {
+                invocation_id: invocation_id.clone(),
+                ..request()
+            },
+            Arc::new(DenyAllHarnessApprovals),
+            Arc::new(RecordingHarnessEventSink::default()),
+        )
+        .await;
+    let HarnessTerminal::Failed(duplicate_error) = duplicate else {
+        panic!("duplicate invocation must fail")
+    };
+    assert!(allowed.contains(&duplicate_error.code));
+    assert!(registry.cancel(&invocation_id).await);
+    let _ = active.await;
+
+    let sink_failure = registry_with(Arc::new(FakePlugin::events_then_success(vec![
+        HarnessInvocationEvent::Started,
+    ])))
+    .await
+    .invoke(
+        request(),
+        Arc::new(DenyAllHarnessApprovals),
+        Arc::new(FailingHarnessEventSink),
+    )
+    .await;
+    let HarnessTerminal::OutcomeUnknown(sink_error) = sink_failure else {
+        panic!("sink failure must be outcome unknown")
+    };
+    assert!(allowed.contains(&sink_error.code));
 }

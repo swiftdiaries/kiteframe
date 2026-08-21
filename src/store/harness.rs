@@ -271,7 +271,7 @@ impl PostgresStore {
         let mut tx = self.pool().begin().await?;
         let _ = lock_harness_invocation(&mut tx, &event.invocation_id).await?;
         if let Some(existing) = sqlx::query(
-            "SELECT event_digest FROM harness_invocation_events \
+            "SELECT invocation_id, sequence, event_digest, event FROM harness_invocation_events \
              WHERE invocation_id = $1 AND sequence = $2 FOR UPDATE",
         )
         .bind(event.invocation_id.as_uuid())
@@ -279,7 +279,8 @@ impl PostgresStore {
         .fetch_optional(&mut *tx)
         .await?
         {
-            if existing.get::<String, _>("event_digest") == event.event_digest {
+            let stored = harness_event_record_from_row(&existing)?;
+            if stored.event_digest == event.event_digest || stored.is_compatible_replay_of(event)? {
                 tx.commit().await?;
                 return Ok(());
             }
@@ -309,15 +310,16 @@ impl PostgresStore {
         .bind(event_json)
         .execute(&mut *tx)
         .await?;
-        let stored: String = sqlx::query_scalar(
-            "SELECT event_digest FROM harness_invocation_events \
+        let stored = sqlx::query(
+            "SELECT invocation_id, sequence, event_digest, event FROM harness_invocation_events \
              WHERE invocation_id = $1 AND sequence = $2 FOR UPDATE",
         )
         .bind(event.invocation_id.as_uuid())
         .bind(sequence)
         .fetch_one(&mut *tx)
         .await?;
-        if stored != event.event_digest {
+        let stored = harness_event_record_from_row(&stored)?;
+        if stored.event_digest != event.event_digest && !stored.is_compatible_replay_of(event)? {
             return Err(StoreError::IdempotencyConflict);
         }
         tx.commit().await?;

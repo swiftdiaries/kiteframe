@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use kiteframe::{
-    AgentCommandId, CreateSession, PostgresStore, PrincipalId, StoreError,
+    AgentCommandId, CreateSession, PostgresStore, PrincipalId, StoreError, canonical_sha256,
     harness::{
-        HarnessApprovalDecision, HarnessInvocationEvent, HarnessInvocationId, HarnessProfileId,
-        HarnessTransport,
+        HarnessApprovalDecision, HarnessEventEnvelope, HarnessInvocationEvent, HarnessInvocationId,
+        HarnessProfileId, HarnessTransport,
     },
     store::{
         HarnessInvocationEventRecord, HarnessInvocationState, HarnessInvocationView,
@@ -355,6 +355,44 @@ async fn event_sequence_replay_is_idempotent_and_digest_drift_conflicts() {
             .unwrap_err(),
         StoreError::IdempotencyConflict,
     ));
+}
+
+#[tokio::test]
+async fn legacy_event_digest_replays_a_versioned_envelope_when_content_is_identical() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let envelope = HarnessEventEnvelope::new(
+        invocation.invocation_id.clone(),
+        0,
+        HarnessInvocationEvent::Started,
+    );
+    let legacy_digest = canonical_sha256(&envelope.event).unwrap();
+    sqlx::query(
+        "INSERT INTO harness_invocation_events (invocation_id, sequence, event_digest, event) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(invocation.invocation_id.as_uuid())
+    .bind(0_i64)
+    .bind(&legacy_digest)
+    .bind(serde_json::to_value(&envelope.event).unwrap())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    fixture
+        .store
+        .append_harness_event_envelope(&envelope)
+        .await
+        .expect("identical legacy event replays successfully");
+    let stored = fixture
+        .store
+        .harness_invocation_events(&invocation.invocation_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].event_digest, legacy_digest);
 }
 
 #[tokio::test]

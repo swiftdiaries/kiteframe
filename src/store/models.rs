@@ -179,6 +179,19 @@ impl HarnessInvocationEventRecord {
             ))
         }
     }
+
+    pub fn is_compatible_replay_of(&self, incoming: &Self) -> Result<bool, StoreError> {
+        self.validate_digest()?;
+        incoming.validate_digest()?;
+        if self.invocation_id != incoming.invocation_id || self.sequence != incoming.sequence {
+            return Ok(false);
+        }
+        let stored_event = canonical_sha256(&self.event)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let incoming_event = canonical_sha256(&incoming.event)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        Ok(stored_event == incoming_event)
+    }
 }
 
 pub(crate) fn harness_event_from_value(value: Value) -> Result<HarnessInvocationEvent, StoreError> {
