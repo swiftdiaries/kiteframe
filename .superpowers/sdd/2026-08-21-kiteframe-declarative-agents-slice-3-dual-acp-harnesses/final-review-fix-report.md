@@ -467,8 +467,9 @@ Commit message: `docs: refresh Slice 3 implementation status`
 The approved design's non-normative status still described Slice 3, Codex ACP,
 and DeepSeek Harness ACP as unimplemented future work. The lifecycle reference
 also stopped its evidence at `d746ce5`, omitted the approved Gate B and final
-remediation commits, used stale migration evidence, and could be read as
-claiming a final whole-branch approval.
+remediation commits, used stale migration evidence, and still reported Gate B
+as pending. It did not distinguish Gate B approval from the later final
+whole-branch re-review, which remains pending.
 
 ## Resolution
 
