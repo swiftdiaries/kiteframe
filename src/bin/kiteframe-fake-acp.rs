@@ -18,7 +18,8 @@ fn run() -> Result<(), String> {
             .ok_or("KITEFRAME_FAKE_ACP_SCRIPT is required")?,
     );
     let observation_path = std::env::var_os("KITEFRAME_FAKE_ACP_OBSERVATION").map(PathBuf::from);
-    let allow_eof = std::env::var_os("KITEFRAME_FAKE_ACP_ALLOW_EOF").is_some();
+    let allow_registration_eof =
+        std::env::var_os("KITEFRAME_FAKE_ACP_ALLOW_REGISTRATION_EOF").is_some();
     let script: Vec<Value> = serde_json::from_slice(
         &std::fs::read(&script_path).map_err(|error| format!("could not read script: {error}"))?,
     )
@@ -35,12 +36,17 @@ fn run() -> Result<(), String> {
         "methods": [],
         "promptBlockCount": null,
         "promptText": null,
+        "scriptComplete": false,
         "environmentKeys": std::env::vars_os()
             .filter_map(|(key, _)| key.into_string().ok())
             .collect::<Vec<_>>(),
     });
 
     for (index, entry) in script.iter().enumerate() {
+        if let Some(code) = entry.get("exitCode").and_then(Value::as_i64) {
+            save_observation(observation_path.as_ref(), &observation)?;
+            std::process::exit(code as i32);
+        }
         if let Some(millis) = entry.get("sleepMillis").and_then(Value::as_u64) {
             std::thread::sleep(Duration::from_millis(millis));
             continue;
@@ -75,8 +81,8 @@ fn run() -> Result<(), String> {
                     "params": request.get("params").cloned().unwrap_or_else(|| json!({})),
                 }),
             )?;
-            let Some(mut response) = read_frame(&mut input, index, allow_eof)? else {
-                return Ok(());
+            let Some(mut response) = read_frame(&mut input, index, false)? else {
+                unreachable!("EOF is never allowed while awaiting a request response");
             };
             if entry
                 .get("allowCancelBeforeResponse")
@@ -91,8 +97,8 @@ fn run() -> Result<(), String> {
                     .unwrap()
                     .push(json!("session/cancel"));
                 save_observation(observation_path.as_ref(), &observation)?;
-                let Some(cancel_response) = read_frame(&mut input, index, allow_eof)? else {
-                    return Ok(());
+                let Some(cancel_response) = read_frame(&mut input, index, false)? else {
+                    unreachable!("EOF is never allowed while awaiting a permission response");
                 };
                 response = cancel_response;
             }
@@ -123,7 +129,10 @@ fn run() -> Result<(), String> {
         let expected = entry
             .get("expect")
             .ok_or_else(|| format!("script entry {index} has no action"))?;
-        let Some(frame) = read_frame(&mut input, index, allow_eof)? else {
+        let registration_eof = allow_registration_eof
+            && expected.get("method").and_then(Value::as_str) == Some("session/new")
+            && observation["methods"] == json!(["initialize"]);
+        let Some(frame) = read_frame(&mut input, index, registration_eof)? else {
             return Ok(());
         };
         assert_partial(expected, &frame, "request")?;
@@ -182,7 +191,16 @@ fn run() -> Result<(), String> {
             }
         }
     }
+    observation["scriptComplete"] = Value::Bool(true);
     save_observation(observation_path.as_ref(), &observation)?;
+    let mut trailing = String::new();
+    if input
+        .read_line(&mut trailing)
+        .map_err(|error| format!("final EOF read failed: {error}"))?
+        != 0
+    {
+        return Err("received JSON-RPC input after script completion".to_owned());
+    }
     Ok(())
 }
 

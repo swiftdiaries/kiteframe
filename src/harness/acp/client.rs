@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -20,6 +22,65 @@ const MAX_PENDING_REQUESTS: usize = 32;
 const MAX_INBOUND_REQUESTS: usize = 32;
 const SHUTDOWN_RUNNING: u8 = 0;
 const SHUTDOWN_STDIN_CLOSED: u8 = 1;
+const FRAME_QUEUED: u8 = 0;
+const FRAME_WRITING: u8 = 1;
+const FRAME_WRITTEN: u8 = 2;
+const FRAME_CANCELLED: u8 = 3;
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcpTestBarrierPoint {
+    BeforeAdmission,
+    BeforeWrite,
+    BeforeAcknowledgement,
+}
+
+#[cfg(feature = "test-support")]
+pub struct AcpTestBarrier {
+    method: &'static str,
+    point: AcpTestBarrierPoint,
+    entered: AtomicBool,
+    released: AtomicBool,
+    entered_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl AcpTestBarrier {
+    #[must_use]
+    pub fn new(method: &'static str, point: AcpTestBarrierPoint) -> Self {
+        Self {
+            method,
+            point,
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            entered_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub async fn wait_until_entered(&self) {
+        while !self.entered.load(Ordering::Acquire) {
+            self.entered_notify.notified().await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+
+    async fn pause(&self, method: &str, point: AcpTestBarrierPoint) {
+        if self.method != method || self.point != point {
+            return;
+        }
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
+        while !self.released.load(Ordering::Acquire) {
+            self.release_notify.notified().await;
+        }
+    }
+}
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AcpError {
@@ -49,9 +110,27 @@ pub enum AcpInbound {
 enum WriterMessage {
     Frame {
         bytes: Vec<u8>,
+        method: String,
+        control: Arc<FrameControl>,
         written: oneshot::Sender<Result<(), AcpError>>,
     },
     Close,
+}
+
+#[derive(Default)]
+struct FrameControl(AtomicU8);
+
+impl FrameControl {
+    fn cancel_before_write(&self) -> bool {
+        self.0
+            .compare_exchange(
+                FRAME_QUEUED,
+                FRAME_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 struct IoTasks {
@@ -62,31 +141,139 @@ struct IoTasks {
 
 #[derive(Clone)]
 struct ConnectionState {
-    pending: Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
-    failure: Arc<AsyncMutex<Option<AcpError>>>,
+    requests: Arc<PendingRequests>,
     inbound: mpsc::Sender<Result<AcpInbound, AcpError>>,
     cancellation: CancellationToken,
 }
 
 type PendingSender = oneshot::Sender<Result<Value, AcpError>>;
 
+#[derive(Default)]
+struct PendingRequestState {
+    pending: BTreeMap<u64, PendingSender>,
+    failure: Option<AcpError>,
+}
+
+#[derive(Default)]
+struct PendingRequests(StdMutex<PendingRequestState>);
+
+impl PendingRequests {
+    fn admit(&self, id: u64, sender: PendingSender) -> Result<(), AcpError> {
+        let mut state = self
+            .0
+            .lock()
+            .expect("ACP pending request lock is not poisoned");
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        if state.pending.len() >= MAX_PENDING_REQUESTS {
+            return Err(AcpError::Limit("too many pending requests".to_owned()));
+        }
+        state.pending.insert(id, sender);
+        Ok(())
+    }
+
+    fn remove(&self, id: u64) -> Option<PendingSender> {
+        self.0
+            .lock()
+            .expect("ACP pending request lock is not poisoned")
+            .pending
+            .remove(&id)
+    }
+
+    fn failure(&self) -> Option<AcpError> {
+        self.0
+            .lock()
+            .expect("ACP pending request lock is not poisoned")
+            .failure
+            .clone()
+    }
+
+    fn fail_once(&self, error: AcpError) -> Option<Vec<PendingSender>> {
+        let mut state = self
+            .0
+            .lock()
+            .expect("ACP pending request lock is not poisoned");
+        if state.failure.is_some() {
+            return None;
+        }
+        state.failure = Some(error);
+        Some(std::mem::take(&mut state.pending).into_values().collect())
+    }
+
+    fn fail_and_drain(&self, error: AcpError) -> Vec<PendingSender> {
+        let mut state = self
+            .0
+            .lock()
+            .expect("ACP pending request lock is not poisoned");
+        if state.failure.is_none() {
+            state.failure = Some(error);
+        }
+        std::mem::take(&mut state.pending).into_values().collect()
+    }
+}
+
 struct PendingRequestGuard {
     id: u64,
-    pending: Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
+    requests: Arc<PendingRequests>,
+}
+
+pub(crate) struct AcpPreparedRequest {
+    writer: mpsc::Sender<WriterMessage>,
+    requests: Arc<PendingRequests>,
+    response: oneshot::Receiver<Result<Value, AcpError>>,
+    bytes: Option<Vec<u8>>,
+    method: &'static str,
+    control: Arc<FrameControl>,
+    _pending: PendingRequestGuard,
+}
+
+impl AcpPreparedRequest {
+    pub(crate) async fn write(&mut self) -> Result<(), AcpError> {
+        let bytes = self
+            .bytes
+            .take()
+            .ok_or_else(|| AcpError::Protocol("ACP request was already written".to_owned()))?;
+        write_frame(
+            &self.writer,
+            bytes,
+            self.method.to_owned(),
+            self.control.clone(),
+            &self.requests,
+        )
+        .await
+    }
+
+    pub(crate) fn cancel_before_write(&self) -> bool {
+        self.control.cancel_before_write()
+    }
+
+    pub(crate) async fn response<R>(self) -> Result<R, AcpError>
+    where
+        R: DeserializeOwned,
+    {
+        let value = match self.response.await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(self.requests.failure().unwrap_or_else(|| {
+                    AcpError::ConnectionLost("ACP connection closed".to_owned())
+                }));
+            }
+        };
+        serde_json::from_value(value).map_err(|error| AcpError::Protocol(error.to_string()))
+    }
 }
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        self.pending
-            .lock()
-            .expect("ACP pending request lock is not poisoned")
-            .remove(&self.id);
+        self.requests.remove(self.id);
     }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum JsonRpcRequestId {
-    Number(u64),
+    Null,
+    Number(i64),
     String(String),
 }
 
@@ -99,15 +286,16 @@ enum InboundRequestState {
 pub struct AcpStdioClient {
     writer: mpsc::Sender<WriterMessage>,
     inbound: AsyncMutex<mpsc::Receiver<Result<AcpInbound, AcpError>>>,
-    pending: Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
+    requests: Arc<PendingRequests>,
     inbound_requests: Arc<std::sync::Mutex<BTreeMap<JsonRpcRequestId, InboundRequestState>>>,
     next_id: AtomicU64,
     child: AsyncMutex<Child>,
-    failure: Arc<AsyncMutex<Option<AcpError>>>,
     connection_cancel: CancellationToken,
     shutdown_lock: AsyncMutex<()>,
     io_tasks: StdMutex<Option<IoTasks>>,
     limits: AcpLimits,
+    #[cfg(feature = "test-support")]
+    test_barrier: Option<Arc<AcpTestBarrier>>,
 }
 
 impl AcpStdioClient {
@@ -116,6 +304,28 @@ impl AcpStdioClient {
         workspace: &Path,
         limits: AcpLimits,
         environment: &BTreeMap<OsString, OsString>,
+    ) -> Result<Self, AcpError> {
+        Self::spawn_inner(command, workspace, limits, environment, None).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn spawn_with_test_barrier(
+        command: &AcpCommand,
+        workspace: &Path,
+        limits: AcpLimits,
+        environment: &BTreeMap<OsString, OsString>,
+        barrier: Arc<AcpTestBarrier>,
+    ) -> Result<Self, AcpError> {
+        Self::spawn_inner(command, workspace, limits, environment, Some(barrier)).await
+    }
+
+    async fn spawn_inner(
+        command: &AcpCommand,
+        workspace: &Path,
+        limits: AcpLimits,
+        environment: &BTreeMap<OsString, OsString>,
+        #[cfg(feature = "test-support")] test_barrier: Option<Arc<AcpTestBarrier>>,
+        #[cfg(not(feature = "test-support"))] _test_barrier: Option<Arc<()>>,
     ) -> Result<Self, AcpError> {
         if !workspace.is_absolute() {
             return Err(AcpError::Protocol(
@@ -153,14 +363,12 @@ impl AcpStdioClient {
         let (writer, writer_rx) = mpsc::channel::<WriterMessage>(MAX_PENDING_REQUESTS);
         let (inbound_tx, inbound) =
             mpsc::channel::<Result<AcpInbound, AcpError>>(MAX_PENDING_REQUESTS);
-        let pending = Arc::new(StdMutex::new(BTreeMap::new()));
+        let requests = Arc::new(PendingRequests::default());
         let inbound_requests = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-        let failure = Arc::new(AsyncMutex::new(None));
         let connection_cancel = CancellationToken::new();
         let shutdown_phase = Arc::new(AtomicU8::new(SHUTDOWN_RUNNING));
         let connection = ConnectionState {
-            pending: pending.clone(),
-            failure: failure.clone(),
+            requests: requests.clone(),
             inbound: inbound_tx,
             cancellation: connection_cancel.clone(),
         };
@@ -170,6 +378,8 @@ impl AcpStdioClient {
             writer_rx,
             connection.clone(),
             shutdown_phase.clone(),
+            #[cfg(feature = "test-support")]
+            test_barrier.clone(),
         ));
         let reader_task = tokio::spawn(reader_task(
             stdout,
@@ -187,11 +397,10 @@ impl AcpStdioClient {
         Ok(Self {
             writer,
             inbound: AsyncMutex::new(inbound),
-            pending,
+            requests,
             inbound_requests,
             next_id: AtomicU64::new(1),
             child: AsyncMutex::new(child),
-            failure,
             connection_cancel,
             shutdown_lock: AsyncMutex::new(()),
             io_tasks: StdMutex::new(Some(IoTasks {
@@ -200,6 +409,8 @@ impl AcpStdioClient {
                 stderr: Some(stderr_task),
             })),
             limits,
+            #[cfg(feature = "test-support")]
+            test_barrier,
         })
     }
 
@@ -208,32 +419,9 @@ impl AcpStdioClient {
         P: Serialize,
         R: DeserializeOwned,
     {
-        if let Some(error) = self.failure.lock().await.clone() {
-            return Err(error);
-        }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self
-                .pending
-                .lock()
-                .expect("ACP pending request lock is not poisoned");
-            if pending.len() >= MAX_PENDING_REQUESTS {
-                return Err(AcpError::Limit("too many pending requests".to_owned()));
-            }
-            pending.insert(id, tx);
-        }
-        let _pending_guard = PendingRequestGuard {
-            id,
-            pending: self.pending.clone(),
-        };
-        let frame = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
-        self.write_json(&frame).await?;
-        let value = match rx.await {
-            Ok(result) => result?,
-            Err(_) => return Err(self.classify_process_loss().await),
-        };
-        serde_json::from_value(value).map_err(|error| AcpError::Protocol(error.to_string()))
+        let mut request = self.prepare_request(method, params).await?;
+        request.write().await?;
+        request.response().await
     }
 
     pub async fn initialize(&self) -> Result<InitializeResponse, AcpError> {
@@ -258,7 +446,17 @@ impl AcpStdioClient {
         session_id: String,
         text: String,
     ) -> Result<PromptResponse, AcpError> {
-        self.request(
+        let mut request = self.prepare_prompt(session_id, text).await?;
+        request.write().await?;
+        request.response().await
+    }
+
+    pub(crate) async fn prepare_prompt(
+        &self,
+        session_id: String,
+        text: String,
+    ) -> Result<AcpPreparedRequest, AcpError> {
+        self.prepare_request(
             "session/prompt",
             PromptRequest {
                 session_id,
@@ -269,6 +467,44 @@ impl AcpStdioClient {
             },
         )
         .await
+    }
+
+    async fn prepare_request<P>(
+        &self,
+        method: &'static str,
+        params: P,
+    ) -> Result<AcpPreparedRequest, AcpError>
+    where
+        P: Serialize,
+    {
+        #[cfg(feature = "test-support")]
+        if let Some(barrier) = &self.test_barrier {
+            barrier
+                .pause(method, AcpTestBarrierPoint::BeforeAdmission)
+                .await;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let frame = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+        let mut bytes =
+            serde_json::to_vec(&frame).map_err(|error| AcpError::Protocol(error.to_string()))?;
+        if bytes.len() > self.limits.max_frame_bytes {
+            return Err(AcpError::Limit("outbound frame is too large".to_owned()));
+        }
+        bytes.push(b'\n');
+        let (sender, response) = oneshot::channel();
+        self.requests.admit(id, sender)?;
+        Ok(AcpPreparedRequest {
+            writer: self.writer.clone(),
+            requests: self.requests.clone(),
+            response,
+            bytes: Some(bytes),
+            method,
+            control: Arc::new(FrameControl::default()),
+            _pending: PendingRequestGuard {
+                id,
+                requests: self.requests.clone(),
+            },
+        })
     }
 
     pub async fn cancel(&self, session_id: String) -> Result<(), AcpError> {
@@ -327,7 +563,7 @@ impl AcpStdioClient {
             }
             _ = tokio::time::sleep(settle) => {}
         }
-        if let Some(error) = self.failure.lock().await.clone() {
+        if let Some(error) = self.requests.failure() {
             return Err(error);
         }
         let mut child = self.child.lock().await;
@@ -371,25 +607,23 @@ impl AcpStdioClient {
             return Err(AcpError::Limit("outbound frame is too large".to_owned()));
         }
         bytes.push(b'\n');
-        let (written, acknowledgement) = oneshot::channel();
-        if self
-            .writer
-            .send(WriterMessage::Frame { bytes, written })
-            .await
-            .is_err()
-        {
-            return Err(self.classify_process_loss().await);
-        }
-        acknowledgement
-            .await
-            .map_err(|_| AcpError::ConnectionLost("ACP writer acknowledgement closed".to_owned()))?
+        write_frame(
+            &self.writer,
+            bytes,
+            value
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("response")
+                .to_owned(),
+            Arc::new(FrameControl::default()),
+            &self.requests,
+        )
+        .await
     }
 
     async fn classify_process_loss(&self) -> AcpError {
-        self.failure
-            .lock()
-            .await
-            .clone()
+        self.requests
+            .failure()
             .unwrap_or_else(|| AcpError::ConnectionLost("ACP connection closed".to_owned()))
     }
 
@@ -430,7 +664,7 @@ impl AcpStdioClient {
         deadline: tokio::time::Instant,
         tasks: &mut IoTasks,
     ) -> Result<(), AcpError> {
-        if let Some(error) = self.failure.lock().await.clone() {
+        if let Some(error) = self.requests.failure() {
             return Err(error);
         }
         tokio::time::timeout_at(deadline, self.writer.send(WriterMessage::Close))
@@ -453,27 +687,15 @@ impl AcpStdioClient {
         }
         join_before_deadline(&mut tasks.reader, deadline, "reader").await?;
         join_before_deadline(&mut tasks.stderr, deadline, "stderr").await?;
-        if let Some(error) = self.failure.lock().await.clone() {
+        if let Some(error) = self.requests.failure() {
             return Err(error);
         }
         Ok(())
     }
 
     async fn force_cleanup(&self, tasks: &mut IoTasks, error: AcpError) {
-        {
-            let mut failure = self.failure.lock().await;
-            if failure.is_none() {
-                *failure = Some(error.clone());
-            }
-        }
         self.connection_cancel.cancel();
-        let drained = std::mem::take(
-            &mut *self
-                .pending
-                .lock()
-                .expect("ACP pending request lock is not poisoned"),
-        );
-        for (_, sender) in drained {
+        for sender in self.requests.fail_and_drain(error.clone()) {
             let _ = sender.send(Err(error.clone()));
         }
         {
@@ -538,11 +760,40 @@ async fn abort_and_join(task: &mut Option<JoinHandle<()>>) {
     }
 }
 
+async fn write_frame(
+    writer: &mpsc::Sender<WriterMessage>,
+    bytes: Vec<u8>,
+    method: String,
+    control: Arc<FrameControl>,
+    requests: &Arc<PendingRequests>,
+) -> Result<(), AcpError> {
+    let (written, acknowledgement) = oneshot::channel();
+    writer
+        .send(WriterMessage::Frame {
+            bytes,
+            method,
+            control,
+            written,
+        })
+        .await
+        .map_err(|_| {
+            requests
+                .failure()
+                .unwrap_or_else(|| AcpError::ConnectionLost("ACP writer task closed".to_owned()))
+        })?;
+    acknowledgement.await.map_err(|_| {
+        requests.failure().unwrap_or_else(|| {
+            AcpError::ConnectionLost("ACP writer acknowledgement closed".to_owned())
+        })
+    })?
+}
+
 async fn writer_task(
     mut stdin: tokio::process::ChildStdin,
     mut receiver: mpsc::Receiver<WriterMessage>,
     connection: ConnectionState,
     shutdown_phase: Arc<AtomicU8>,
+    #[cfg(feature = "test-support")] test_barrier: Option<Arc<AcpTestBarrier>>,
 ) {
     loop {
         let message = tokio::select! {
@@ -553,14 +804,52 @@ async fn writer_task(
             },
         };
         let (result, written) = match message {
-            WriterMessage::Frame { bytes, written } => (
-                async {
+            WriterMessage::Frame {
+                bytes,
+                method,
+                control,
+                written,
+            } => {
+                let _ = &method;
+                #[cfg(feature = "test-support")]
+                if let Some(barrier) = &test_barrier {
+                    barrier
+                        .pause(&method, AcpTestBarrierPoint::BeforeWrite)
+                        .await;
+                }
+                if control
+                    .0
+                    .compare_exchange(
+                        FRAME_QUEUED,
+                        FRAME_WRITING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    let _ = written.send(Err(AcpError::Protocol(
+                        "ACP frame was cancelled before write".to_owned(),
+                    )));
+                    continue;
+                }
+                let result = async {
                     stdin.write_all(&bytes).await?;
                     stdin.flush().await
                 }
-                .await,
-                Some(written),
-            ),
+                .await;
+                #[cfg(feature = "test-support")]
+                if result.is_ok()
+                    && let Some(barrier) = &test_barrier
+                {
+                    barrier
+                        .pause(&method, AcpTestBarrierPoint::BeforeAcknowledgement)
+                        .await;
+                }
+                if result.is_ok() {
+                    control.0.store(FRAME_WRITTEN, Ordering::Release);
+                }
+                (result, Some(written))
+            }
             WriterMessage::Close => {
                 let result = async {
                     stdin.flush().await?;
@@ -607,7 +896,7 @@ async fn reader_task(
                 Ok(frame) => {
                     if let Err(error) = dispatch_frame(
                         frame,
-                        &connection.pending,
+                        &connection.requests,
                         &inbound_requests,
                         &connection.inbound,
                     )
@@ -681,7 +970,7 @@ async fn read_bounded_frame<R: tokio::io::AsyncBufRead + Unpin>(
 
 async fn dispatch_frame(
     frame: Value,
-    pending: &Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
+    requests: &Arc<PendingRequests>,
     inbound_requests: &Arc<std::sync::Mutex<BTreeMap<JsonRpcRequestId, InboundRequestState>>>,
     inbound: &mpsc::Sender<Result<AcpInbound, AcpError>>,
 ) -> Result<(), AcpError> {
@@ -746,10 +1035,8 @@ async fn dispatch_frame(
         .get("id")
         .and_then(Value::as_u64)
         .ok_or_else(|| AcpError::Protocol("response id is not an unsigned integer".to_owned()))?;
-    let sender = pending
-        .lock()
-        .expect("ACP pending request lock is not poisoned")
-        .remove(&id)
+    let sender = requests
+        .remove(id)
         .ok_or_else(|| AcpError::Protocol("duplicate or unknown response id".to_owned()))?;
     let result = match (object.get("result"), object.get("error")) {
         (Some(result), None) => Ok(result.clone()),
@@ -763,15 +1050,24 @@ async fn dispatch_frame(
 }
 
 fn json_rpc_request_id(value: &Value) -> Result<JsonRpcRequestId, AcpError> {
-    if let Some(value) = value.as_u64() {
-        return Ok(JsonRpcRequestId::Number(value));
+    match value {
+        Value::Null => Ok(JsonRpcRequestId::Null),
+        Value::Number(value) => value.as_i64().map(JsonRpcRequestId::Number).ok_or_else(|| {
+            AcpError::Protocol("JSON-RPC numeric request id must fit signed int64".to_owned())
+        }),
+        Value::String(value) => Ok(JsonRpcRequestId::String(value.clone())),
+        _ => Err(AcpError::Protocol(
+            "JSON-RPC request id must be null, a signed integer, or a string".to_owned(),
+        )),
     }
-    if let Some(value) = value.as_str() {
-        return Ok(JsonRpcRequestId::String(value.to_owned()));
-    }
-    Err(AcpError::Protocol(
-        "JSON-RPC request id must be an unsigned integer or string".to_owned(),
-    ))
+}
+
+pub(crate) fn canonical_request_id(value: &Value) -> Result<String, AcpError> {
+    Ok(match json_rpc_request_id(value)? {
+        JsonRpcRequestId::Null => "null".to_owned(),
+        JsonRpcRequestId::Number(value) => format!("number:{value}"),
+        JsonRpcRequestId::String(value) => format!("string:{value}"),
+    })
 }
 
 fn parse_remote_error(value: &Value) -> Result<AcpError, AcpError> {
@@ -800,20 +1096,11 @@ fn parse_remote_error(value: &Value) -> Result<AcpError, AcpError> {
 }
 
 async fn fail_connection(error: AcpError, connection: &ConnectionState) {
-    let mut stored = connection.failure.lock().await;
-    if stored.is_some() {
+    let Some(drained) = connection.requests.fail_once(error.clone()) else {
         return;
-    }
-    *stored = Some(error.clone());
-    drop(stored);
+    };
     connection.cancellation.cancel();
-    let drained = std::mem::take(
-        &mut *connection
-            .pending
-            .lock()
-            .expect("ACP pending request lock is not poisoned"),
-    );
-    for (_, sender) in drained {
+    for sender in drained {
         let _ = sender.send(Err(error.clone()));
     }
     let _ = connection.inbound.send(Err(error)).await;

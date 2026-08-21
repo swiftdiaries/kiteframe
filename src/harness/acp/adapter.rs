@@ -17,7 +17,7 @@ use super::super::{
 };
 use super::client::{
     AcpError, AcpInbound, AcpStdioClient, ContentBlock, RequestPermission, SessionNotification,
-    SessionUpdate, StopReason,
+    SessionUpdate, StopReason, canonical_request_id,
 };
 use super::permissions::select_permission_once;
 use crate::{RuntimeHistoryItem, RuntimeHistoryKind, canonical_json};
@@ -110,6 +110,8 @@ pub struct AcpHarnessPlugin {
     command: AcpCommand,
     limits: AcpLimits,
     environment: BTreeMap<OsString, OsString>,
+    #[cfg(feature = "test-support")]
+    test_barrier: Option<Arc<super::client::AcpTestBarrier>>,
 }
 
 impl AcpHarnessPlugin {
@@ -120,6 +122,8 @@ impl AcpHarnessPlugin {
             command,
             limits,
             environment: BTreeMap::new(),
+            #[cfg(feature = "test-support")]
+            test_barrier: None,
         }
     }
 
@@ -139,12 +143,42 @@ impl AcpHarnessPlugin {
             command,
             limits,
             environment,
+            #[cfg(feature = "test-support")]
+            test_barrier: None,
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_test_barrier(mut self, barrier: Arc<super::client::AcpTestBarrier>) -> Self {
+        self.test_barrier = Some(barrier);
+        self
     }
 
     #[must_use]
     pub fn pre_accept_attempt_limit(&self) -> u64 {
         u64::from(self.limits.max_pre_accept_attempts)
+    }
+
+    async fn spawn_client(&self, workspace: &std::path::Path) -> Result<AcpStdioClient, AcpError> {
+        #[cfg(feature = "test-support")]
+        if let Some(barrier) = &self.test_barrier {
+            return AcpStdioClient::spawn_with_test_barrier(
+                &self.command,
+                workspace,
+                self.limits.clone(),
+                &self.environment,
+                barrier.clone(),
+            )
+            .await;
+        }
+        AcpStdioClient::spawn(
+            &self.command,
+            workspace,
+            self.limits.clone(),
+            &self.environment,
+        )
+        .await
     }
 
     fn validate_configuration(&self) -> Result<(), HarnessFailure> {
@@ -203,14 +237,7 @@ impl AcpHarnessPlugin {
                     .limits
                     .active_execution_millis_remaining,
             );
-        let client = match AcpStdioClient::spawn(
-            &self.command,
-            &request.invocation.workspace,
-            self.limits.clone(),
-            &self.environment,
-        )
-        .await
-        {
+        let client = match self.spawn_client(&request.invocation.workspace).await {
             Ok(client) => client,
             Err(error) => return pre_accept_error(error),
         };
@@ -272,24 +299,63 @@ impl AcpHarnessPlugin {
 
         let cancel_once = Arc::new(CancelOnce::default());
         let mut prompt_state = PromptState::Ready;
-        if cancellation.is_cancelled() {
+        let mut prompt_request = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                let _ = client.shutdown().await;
+                return HarnessTerminal::Cancelled;
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                client.kill().await;
+                return HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+                    "harness_outcome_unknown",
+                    "ACP active execution limit expired after prompt acceptance",
+                ));
+            }
+            request = client.prepare_prompt(session.session_id.clone(), prompt) => match request {
+                Ok(request) => request,
+                Err(error) => {
+                    let _ = client.shutdown().await;
+                    return post_accept_error(error);
+                }
+            }
+        };
+        debug_assert_eq!(prompt_state, PromptState::Ready);
+        let write = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => None,
+            _ = tokio::time::sleep_until(deadline) => {
+                client.kill().await;
+                return HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+                    "harness_outcome_unknown",
+                    "ACP active execution limit expired while sending the accepted prompt",
+                ));
+            }
+            result = prompt_request.write() => Some(result),
+        };
+        if write.is_none() {
             prompt_state = PromptState::Cancelling;
-            if cancel_once
-                .send(&client, &session.session_id, deadline)
-                .await
-                .is_err()
+            if !prompt_request.cancel_before_write()
+                && cancel_once
+                    .send(&client, &session.session_id, deadline)
+                    .await
+                    .is_err()
             {
                 client.kill().await;
             }
+            drop(prompt_request);
             debug_assert_eq!(prompt_state, PromptState::Cancelling);
             let _ = client.shutdown().await;
             return HarnessTerminal::Cancelled;
         }
-
-        debug_assert_eq!(prompt_state, PromptState::Ready);
-        let prompt_request = client.prompt(session.session_id.clone(), prompt);
-        tokio::pin!(prompt_request);
+        if let Err(error) = write.expect("prompt write branch is present") {
+            drop(prompt_request);
+            let _ = client.shutdown().await;
+            return post_accept_error(error);
+        }
         prompt_state = PromptState::InFlight;
+        let prompt_request = prompt_request.response::<super::client::PromptResponse>();
+        tokio::pin!(prompt_request);
         let mut assistant_output =
             AssistantOutput::new(request.invocation.payload.limits.response_item_bytes);
         let terminal = loop {
@@ -407,8 +473,18 @@ impl AcpHarnessPlugin {
                 }
             }
         };
-        let _ = client.shutdown().await;
-        terminal
+        if matches!(terminal, HarnessTerminal::Completed(_))
+            && let Err(error) = client.verify_alive_before_shutdown().await
+        {
+            let _ = client.shutdown().await;
+            return post_accept_error(error);
+        }
+        let shutdown = client.shutdown().await;
+        match (terminal, shutdown) {
+            (HarnessTerminal::Completed(_), Err(error)) => post_accept_error(error),
+            (terminal, Ok(())) => terminal,
+            (terminal, Err(_)) => terminal,
+        }
     }
 }
 
@@ -451,14 +527,10 @@ impl HarnessPlugin for AcpHarnessPlugin {
         let workspace = std::env::current_dir().map_err(|error| {
             HarnessFailure::new("harness_profile_unavailable", error.to_string())
         })?;
-        let client = AcpStdioClient::spawn(
-            &self.command,
-            &workspace,
-            self.limits.clone(),
-            &self.environment,
-        )
-        .await
-        .map_err(describe_error)?;
+        let client = self
+            .spawn_client(&workspace)
+            .await
+            .map_err(describe_error)?;
         let initialize = match tokio::time::timeout(
             self.limits.shutdown_grace.max(Duration::from_secs(1)),
             client.initialize(),
@@ -580,16 +652,12 @@ async fn handle_permission(
     cancel_once: Arc<CancelOnce>,
     deadline: tokio::time::Instant,
 ) -> Result<Option<HarnessTerminal>, HarnessTerminal> {
-    let request_id = match &id {
-        Value::String(value) => value.clone(),
-        Value::Number(value) => value.to_string(),
-        _ => {
-            return Err(HarnessTerminal::Failed(HarnessFailure::new(
-                "harness_protocol_incompatible",
-                "ACP permission request id is invalid",
-            )));
-        }
-    };
+    let request_id = canonical_request_id(&id).map_err(|error| {
+        HarnessTerminal::Failed(HarnessFailure::new(
+            "harness_protocol_incompatible",
+            error.to_string(),
+        ))
+    })?;
     let request: RequestPermission = match serde_json::from_value(params) {
         Ok(request) => request,
         Err(error) => {
