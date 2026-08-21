@@ -6,10 +6,12 @@ use std::sync::{Arc, Mutex};
 
 use kiteframe::dsl::{Limits, compile};
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessCapability, HarnessProfile, HarnessProfileId, HarnessRegistry,
-    HarnessTransport,
+    DenyAllHarnessApprovals, HarnessCapability, HarnessInvocationId, HarnessProfile,
+    HarnessProfileId, HarnessRegistry, HarnessTransport,
 };
-use kiteframe::store::HarnessPluginRegistration;
+use kiteframe::store::{
+    HarnessInvocationState, HarnessPluginRegistration, PrepareHarnessInvocation,
+};
 use kiteframe::{
     AgentCommandDispatcher, AgentCommandId, AgentCommandView, AgentExecutionView, AgentKernel,
     AgentSelector, BuiltinHarnessPlugin, CancelUserTask, CatalogTool, ClaimAgentCommand,
@@ -622,6 +624,190 @@ async fn invocation_is_persisted_and_claimed_before_model_call() {
     .await
     .unwrap();
     assert_eq!(source_event_id, format!("harness-result:{}", invocation.0));
+}
+
+#[tokio::test]
+async fn terminal_journal_replay_converges_a_crash_between_settle_and_kernel_completion() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    let claimed = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session_id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: command.id.clone(),
+            expected_command_revision: command.revision,
+            claimant: "harness-dispatcher-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new(format!(
+                "harness-dispatcher-v1:{}",
+                command.id.as_uuid()
+            ))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    let profile = builtin_profile();
+    let profile_digest = profile.digest().unwrap();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let invocation = fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &invocation_id,
+            command_id: &claimed.id,
+            command_revision: claimed.revision,
+            profile_id: &profile.id,
+            profile_digest: &profile_digest,
+            payload_digest: &claimed.payload_digest,
+        })
+        .await
+        .unwrap();
+    let started = fixture
+        .store
+        .mark_harness_invocation_started(&invocation_id, invocation.attempt)
+        .await
+        .unwrap();
+    let accepted = fixture
+        .store
+        .mark_harness_prompt_accepted(&invocation_id, started.attempt)
+        .await
+        .unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation_id.as_uuid());
+    fixture
+        .store
+        .settle_harness_invocation(
+            &invocation_id,
+            accepted.attempt,
+            HarnessInvocationState::Completed,
+            &terminal_key,
+            &json!({
+                "type":"completed",
+                "outcome":"ok",
+                "fields":{"answer":"replayed"},
+                "history":[],
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    assert_eq!(
+        fixture.model.calls(),
+        0,
+        "terminal replay never calls the model"
+    );
+    assert_eq!(fixture.current().await.lifecycle, TaskLifecycle::Succeeded);
+    assert_eq!(fixture.current().await.goal_phase, GoalPhase::Active);
+    assert_eq!(fixture.command_state(&command.id).await, "completed");
+    assert_eq!(fixture.evidence().await.len(), 1);
+    let terminal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM harness_invocations WHERE command_id = $1 AND terminal = TRUE",
+    )
+    .bind(command.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(terminal_count, 1);
+    let source_event_id: String = sqlx::query_scalar(
+        "SELECT source_event_id FROM agent_transitions WHERE task_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(fixture.task_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        source_event_id,
+        format!("harness-result:{}", invocation_id.as_uuid())
+    );
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(fixture.evidence().await.len(), 1);
+}
+
+#[tokio::test]
+async fn failed_terminal_journal_replay_converges_the_kernel_failure_once() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    let claimed = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session_id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: command.id.clone(),
+            expected_command_revision: command.revision,
+            claimant: "harness-dispatcher-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new(format!(
+                "harness-dispatcher-v1:{}",
+                command.id.as_uuid()
+            ))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    let profile = builtin_profile();
+    let profile_digest = profile.digest().unwrap();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let invocation = fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &invocation_id,
+            command_id: &claimed.id,
+            command_revision: claimed.revision,
+            profile_id: &profile.id,
+            profile_digest: &profile_digest,
+            payload_digest: &claimed.payload_digest,
+        })
+        .await
+        .unwrap();
+    let started = fixture
+        .store
+        .mark_harness_invocation_started(&invocation_id, invocation.attempt)
+        .await
+        .unwrap();
+    let accepted = fixture
+        .store
+        .mark_harness_prompt_accepted(&invocation_id, started.attempt)
+        .await
+        .unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation_id.as_uuid());
+    fixture
+        .store
+        .settle_harness_invocation(
+            &invocation_id,
+            accepted.attempt,
+            HarnessInvocationState::Failed,
+            &terminal_key,
+            &json!({
+                "type":"failed",
+                "code":"harness_failed",
+                "detail":"replayed failure",
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    assert_eq!(fixture.model.calls(), 0);
+    let current = fixture.current().await;
+    assert_eq!(current.lifecycle, TaskLifecycle::Failed);
+    assert_eq!(current.goal_phase, GoalPhase::Active);
+    assert_eq!(fixture.command_state(&command.id).await, "failed");
+    assert!(fixture.evidence().await.is_empty());
+    let failure_key: Option<String> =
+        sqlx::query_scalar("SELECT completion_idempotency_key FROM agent_commands WHERE id = $1")
+            .bind(command.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(failure_key.as_deref(), Some(terminal_key.as_str()));
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert!(fixture.evidence().await.is_empty());
 }
 
 #[tokio::test]

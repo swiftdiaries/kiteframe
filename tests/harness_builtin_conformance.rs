@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use harness_conformance::{
     HarnessConformanceCase, HarnessConformanceDriver, HarnessConformanceObservation,
-    assert_normative_harness,
+    RecordingTerminalJournal, assert_normative_harness,
 };
 
 struct BuiltinConformanceDriver;
@@ -209,9 +209,41 @@ async fn invoke(
 impl HarnessConformanceDriver for BuiltinConformanceDriver {
     async fn run(&mut self, case: HarnessConformanceCase) -> HarnessConformanceObservation {
         let (terminal, terminal_count) = match case {
-            HarnessConformanceCase::Complete | HarnessConformanceCase::Replay => {
+            HarnessConformanceCase::Complete => {
                 let result = invoke(json!({"type":"function_call","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"done"}}}), false).await;
                 (result.2, result.3)
+            }
+            HarnessConformanceCase::Replay => {
+                let plugin = Arc::new(BuiltinHarnessPlugin::new(
+                    profile(),
+                    Arc::new(TestModel {
+                        response: json!({"type":"function_call","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"done"}}}),
+                        delay: false,
+                    }),
+                ));
+                let mut registry = HarnessRegistry::new();
+                registry.register(plugin).await.unwrap();
+                let request = request();
+                let invocation_id = request.invocation_id.clone();
+                let journal = RecordingTerminalJournal::default();
+                let first = registry
+                    .invoke(
+                        request.clone(),
+                        Arc::new(DenyAllHarnessApprovals),
+                        Arc::new(RecordingSink(Mutex::new(vec![]))),
+                    )
+                    .await;
+                journal.record(invocation_id.clone(), first.clone()).await;
+                let second = registry
+                    .invoke(
+                        request,
+                        Arc::new(DenyAllHarnessApprovals),
+                        Arc::new(RecordingSink(Mutex::new(vec![]))),
+                    )
+                    .await;
+                journal.record(invocation_id, second.clone()).await;
+                assert_eq!(first, second);
+                (second, journal.terminal_count().await)
             }
             HarnessConformanceCase::RejectPermission => {
                 let plugin = Arc::new(BuiltinHarnessPlugin::new(

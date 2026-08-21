@@ -600,9 +600,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
-    use super::{ActiveDispatchGuard, DispatchRoute, dispatch_route};
-    use crate::harness::HarnessInvocationId;
-    use crate::{KernelCommandPayload, RequestContext, WaitForEvent};
+    use super::{ActiveDispatchGuard, DispatchRoute, dispatch_route, terminal_from_record};
+    use crate::harness::{HarnessInvocationId, HarnessProfileId, HarnessTerminal};
+    use crate::store::{HarnessInvocationState, HarnessInvocationView};
+    use crate::{AgentCommandId, KernelCommandPayload, RequestContext, WaitForEvent};
     use serde_json::json;
 
     #[test]
@@ -630,5 +631,54 @@ mod tests {
         assert!(ActiveDispatchGuard::reserve(active.clone(), &invocation).is_none());
         drop(first);
         assert!(ActiveDispatchGuard::reserve(active, &invocation).is_some());
+    }
+
+    #[test]
+    fn terminal_payload_reconstruction_preserves_completed_and_failed_kernel_inputs() {
+        let invocation_id = HarnessInvocationId::new(uuid::Uuid::now_v7());
+        let completed = terminal_from_record(&HarnessInvocationView {
+            invocation_id: invocation_id.clone(),
+            command_id: AgentCommandId::new(uuid::Uuid::now_v7()),
+            command_revision: 0,
+            profile_id: HarnessProfileId::new("builtin-v1").unwrap(),
+            profile_digest: "sha256:profile".to_owned(),
+            payload_digest: "sha256:payload".to_owned(),
+            state: HarnessInvocationState::Completed,
+            attempt: 0,
+            prompt_accepted: true,
+            terminal: true,
+            terminal_request_digest: Some(format!("harness-terminal:{}", invocation_id.as_uuid())),
+            terminal_payload: Some(json!({
+                "type":"completed",
+                "outcome":"ok",
+                "fields":{"answer":"replayed"},
+                "history":[],
+            })),
+        })
+        .unwrap();
+        assert!(matches!(completed, HarnessTerminal::Completed(output)
+            if output.outcome == "ok" && output.fields == json!({"answer":"replayed"})));
+
+        let failed = terminal_from_record(&HarnessInvocationView {
+            invocation_id,
+            command_id: AgentCommandId::new(uuid::Uuid::now_v7()),
+            command_revision: 0,
+            profile_id: HarnessProfileId::new("builtin-v1").unwrap(),
+            profile_digest: "sha256:profile".to_owned(),
+            payload_digest: "sha256:payload".to_owned(),
+            state: HarnessInvocationState::Failed,
+            attempt: 0,
+            prompt_accepted: false,
+            terminal: true,
+            terminal_request_digest: Some("harness-terminal:test".to_owned()),
+            terminal_payload: Some(json!({
+                "type":"failed",
+                "code":"harness_failed",
+                "detail":"replayed failure",
+            })),
+        })
+        .unwrap();
+        assert!(matches!(failed, HarnessTerminal::Failed(failure)
+            if failure.code == "harness_failed" && failure.detail == "replayed failure"));
     }
 }

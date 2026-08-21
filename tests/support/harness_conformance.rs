@@ -1,4 +1,8 @@
+use std::collections::BTreeMap;
+
+use kiteframe::harness::HarnessInvocationId;
 use kiteframe::{GoalPhase, HarnessTerminal};
+use tokio::sync::Mutex;
 
 pub enum HarnessConformanceCase {
     Complete,
@@ -12,6 +16,29 @@ pub struct HarnessConformanceObservation {
     pub terminal: HarnessTerminal,
     pub terminal_count: u64,
     pub goal_phase: GoalPhase,
+}
+
+#[derive(Default)]
+pub struct RecordingTerminalJournal {
+    terminals: Mutex<BTreeMap<HarnessInvocationId, HarnessTerminal>>,
+}
+
+impl RecordingTerminalJournal {
+    pub async fn record(&self, invocation_id: HarnessInvocationId, terminal: HarnessTerminal) {
+        let mut terminals = self.terminals.lock().await;
+        match terminals.entry(invocation_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(terminal);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                assert_eq!(entry.get(), &terminal, "terminal replay drifted");
+            }
+        }
+    }
+
+    pub async fn terminal_count(&self) -> u64 {
+        self.terminals.lock().await.len() as u64
+    }
 }
 
 #[async_trait::async_trait]
