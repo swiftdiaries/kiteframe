@@ -1622,7 +1622,7 @@ async fn blocked_goal_is_not_redispatched_to_the_model() {
 }
 
 #[tokio::test]
-async fn cancellation_during_model_execution_audits_the_late_result_only_on_the_command() {
+async fn cancellation_during_model_execution_preserves_authority_for_either_terminal_race_winner() {
     let _guard = BRIDGE_TEST_LOCK.lock().await;
     let Some(fixture) = BridgeFixture::started().await else {
         return;
@@ -1699,78 +1699,89 @@ async fn cancellation_during_model_execution_audits_the_late_result_only_on_the_
             .fetch_one(&fixture.pool)
             .await
             .unwrap();
-    assert_eq!(completion_key, format!("harness-result:{invocation_id}"));
     assert!(
         audited
             .get::<Option<String>, _>("completion_request_digest")
             .is_some()
     );
-    assert!(audited.get::<Option<Value>, _>("failure").is_none());
-    let result = audited.get::<Option<Value>, _>("result").unwrap();
-    let event: RuntimeEvent = serde_json::from_value(result).unwrap();
-    let RuntimeEvent::HarnessResult {
-        event_id,
-        command_key,
-        outcome,
-        fields,
-        evidence_id,
-        history,
-    } = event
-    else {
-        panic!("late audit must retain the harness result")
-    };
-    assert_eq!(outcome, "ok");
-    assert_eq!(fields, json!({"answer": "too late"}));
-    let replay = CompleteAgentCommand {
-        session_id: fixture.session_id.clone(),
-        task_id: fixture.task_id.clone(),
-        command_id: command.id.clone(),
-        expected_command_revision: 1,
-        idempotency_key: IdempotencyKey::new(completion_key).unwrap(),
-        event: RuntimeEvent::HarnessResult {
-            event_id: event_id.clone(),
-            command_key: command_key.clone(),
-            outcome: outcome.clone(),
-            fields: fields.clone(),
-            evidence_id: evidence_id.clone(),
-            history: history.clone(),
-        },
-    };
-    fixture
-        .store
-        .audit_late_agent_command_completion(&fixture.principal, &replay)
-        .await
-        .unwrap();
-    let command_after_replay: Value =
-        sqlx::query_scalar("SELECT to_jsonb(c) FROM agent_commands c WHERE c.id = $1")
-            .bind(command.id.as_uuid())
-            .fetch_one(&fixture.pool)
-            .await
-            .unwrap();
+    match completion_key.as_str() {
+        key if key == format!("harness-result:{invocation_id}") => {
+            assert!(audited.get::<Option<Value>, _>("failure").is_none());
+            let result = audited.get::<Option<Value>, _>("result").unwrap();
+            let event: RuntimeEvent = serde_json::from_value(result).unwrap();
+            let RuntimeEvent::HarnessResult {
+                event_id,
+                command_key,
+                outcome,
+                fields,
+                evidence_id,
+                history,
+            } = event
+            else {
+                panic!("late audit must retain the harness result")
+            };
+            assert_eq!(outcome, "ok");
+            assert_eq!(fields, json!({"answer": "too late"}));
+            let replay = CompleteAgentCommand {
+                session_id: fixture.session_id.clone(),
+                task_id: fixture.task_id.clone(),
+                command_id: command.id.clone(),
+                expected_command_revision: 1,
+                idempotency_key: IdempotencyKey::new(completion_key).unwrap(),
+                event: RuntimeEvent::HarnessResult {
+                    event_id: event_id.clone(),
+                    command_key: command_key.clone(),
+                    outcome: outcome.clone(),
+                    fields: fields.clone(),
+                    evidence_id: evidence_id.clone(),
+                    history: history.clone(),
+                },
+            };
+            fixture
+                .store
+                .audit_late_agent_command_completion(&fixture.principal, &replay)
+                .await
+                .unwrap();
+            let command_after_replay: Value =
+                sqlx::query_scalar("SELECT to_jsonb(c) FROM agent_commands c WHERE c.id = $1")
+                    .bind(command.id.as_uuid())
+                    .fetch_one(&fixture.pool)
+                    .await
+                    .unwrap();
 
-    let mut conflicting = replay;
-    conflicting.event = RuntimeEvent::HarnessResult {
-        event_id,
-        command_key,
-        outcome,
-        fields: json!({"answer": "conflicting late result"}),
-        evidence_id,
-        history,
-    };
-    assert!(matches!(
-        fixture
-            .store
-            .audit_late_agent_command_completion(&fixture.principal, &conflicting)
-            .await,
-        Err(StoreError::IdempotencyConflict)
-    ));
-    let command_after_conflict: Value =
-        sqlx::query_scalar("SELECT to_jsonb(c) FROM agent_commands c WHERE c.id = $1")
-            .bind(command.id.as_uuid())
-            .fetch_one(&fixture.pool)
-            .await
-            .unwrap();
-    assert_eq!(command_after_conflict, command_after_replay);
+            let mut conflicting = replay;
+            conflicting.event = RuntimeEvent::HarnessResult {
+                event_id,
+                command_key,
+                outcome,
+                fields: json!({"answer": "conflicting late result"}),
+                evidence_id,
+                history,
+            };
+            assert!(matches!(
+                fixture
+                    .store
+                    .audit_late_agent_command_completion(&fixture.principal, &conflicting)
+                    .await,
+                Err(StoreError::IdempotencyConflict)
+            ));
+            let command_after_conflict: Value =
+                sqlx::query_scalar("SELECT to_jsonb(c) FROM agent_commands c WHERE c.id = $1")
+                    .bind(command.id.as_uuid())
+                    .fetch_one(&fixture.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(command_after_conflict, command_after_replay);
+        }
+        key if key == format!("harness-terminal:{invocation_id}") => {
+            assert!(audited.get::<Option<Value>, _>("result").is_none());
+            assert_eq!(
+                audited.get::<Option<Value>, _>("failure").unwrap(),
+                json!({"code": "harness_cancelled"})
+            );
+        }
+        other => panic!("unexpected cancellation-race terminal receipt: {other}"),
+    }
     assert_eq!(
         non_command_fingerprint(&fixture.pool, &fixture.task_id).await,
         after_cancel
