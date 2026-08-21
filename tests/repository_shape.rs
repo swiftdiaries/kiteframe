@@ -130,7 +130,7 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
 
     let contradictory_design = design.replacen(
         "\n## Normative language",
-        "\nSlices 4–8 remain prospective but are implemented and delivered.\n\n## Normative language",
+        "\nSlices 4–8 remain prospective but are\nimplemented and delivered.\n\n## Normative language",
         1,
     );
     assert!(
@@ -140,13 +140,38 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
 
     let additional_stale_range = reference.replacen(
         "Initial Tasks 1–7",
-        "Historical range `ca09f321672f90da5acca6aa2abf7e69ce6a6694..d746ce5`. Initial Tasks 1–7",
+        "Historical range ca09f321672f90da5acca6aa2abf7e69ce6a6694..d746ce5. Initial Tasks 1–7",
         1,
     );
     assert!(
         assert_status_evidence(&design, &additional_stale_range, &migrations).is_err(),
         "status guard accepted an additional stale evidence range"
     );
+
+    for explicitly_negative in [
+        "Slices 4–8 are not implemented.",
+        "Slices 4–8 are not yet implemented.",
+        "Slices 4–8 have not been implemented.",
+        "Slices 4–8 are never delivered.",
+    ] {
+        assert!(
+            assert_no_later_slice_delivery_claim(explicitly_negative).is_ok(),
+            "status guard rejected explicit later-slice negation: {explicitly_negative}"
+        );
+    }
+
+    let canonical_range = "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c";
+    for rendered_range in [
+        format!("`{canonical_range}`"),
+        canonical_range.to_owned(),
+        format!("[implementation range](https://example.test/{canonical_range})"),
+    ] {
+        assert_eq!(
+            commit_ranges(&rendered_range),
+            [canonical_range],
+            "range scanner missed Markdown context: {rendered_range}"
+        );
+    }
 }
 
 fn assert_status_evidence(
@@ -243,8 +268,8 @@ fn canonical_section<'a>(
 }
 
 fn require_text(section: &str, required: &str, message: &str) -> Result<(), String> {
-    let normalized_section = section.split_whitespace().collect::<Vec<_>>().join(" ");
-    let normalized_required = required.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized_section = normalize_markdown_whitespace(section);
+    let normalized_required = normalize_markdown_whitespace(required);
     if normalized_section.contains(&normalized_required) {
         Ok(())
     } else {
@@ -253,8 +278,10 @@ fn require_text(section: &str, required: &str, message: &str) -> Result<(), Stri
 }
 
 fn assert_no_later_slice_delivery_claim(section: &str) -> Result<(), String> {
-    let normalized = section.to_ascii_lowercase().replace('–', "-");
-    for statement in normalized.split(['.', '\n']) {
+    let normalized = normalize_markdown_whitespace(section)
+        .to_ascii_lowercase()
+        .replace('–', "-");
+    for statement in normalized.split(['.', ';', '!', '?']) {
         let mentions_later_slice = statement.contains("slices 4-8")
             || (4..=8).any(|slice| statement.contains(&format!("slice {slice}")));
         if mentions_later_slice && contains_positive_delivery_word(statement) {
@@ -273,26 +300,76 @@ fn contains_positive_delivery_word(statement: &str) -> bool {
         .collect::<Vec<_>>();
     words.iter().enumerate().any(|(index, word)| {
         matches!(*word, "implemented" | "delivered" | "operational")
-            && !matches!(
-                index.checked_sub(1).map(|previous| words[previous]),
-                Some("not" | "never")
-            )
+            && !delivery_word_is_explicitly_negated(&words, index)
     })
+}
+
+fn delivery_word_is_explicitly_negated(words: &[&str], delivery_index: usize) -> bool {
+    let clause_start = words[..delivery_index]
+        .iter()
+        .rposition(|word| matches!(*word, "but" | "however"))
+        .map_or(0, |index| index + 1);
+    words[clause_start..delivery_index]
+        .iter()
+        .rev()
+        .take(4)
+        .any(|word| matches!(*word, "not" | "never"))
+}
+
+fn normalize_markdown_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn assert_exact_evidence_range(evidence: &str) -> Result<(), String> {
     let canonical_range = "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c";
-    let ranges = evidence
-        .split('`')
-        .filter(|fragment| fragment.contains(".."))
-        .collect::<Vec<_>>();
-    if ranges.len() == 1 && ranges[0] == canonical_range {
+    let ranges = commit_ranges(evidence);
+    if ranges == [canonical_range] {
         Ok(())
     } else {
         Err(format!(
             "expected exactly one canonical Slice 3 implementation range, found {ranges:?}"
         ))
     }
+}
+
+fn commit_ranges(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if !is_ascii_hex(bytes[cursor]) || (cursor > 0 && is_ascii_hex(bytes[cursor - 1])) {
+            cursor += 1;
+            continue;
+        }
+
+        let left_start = cursor;
+        while cursor < bytes.len() && is_ascii_hex(bytes[cursor]) {
+            cursor += 1;
+        }
+        let left_end = cursor;
+        if !(7..=40).contains(&(left_end - left_start))
+            || bytes.get(cursor..cursor + 2) != Some(b"..")
+        {
+            continue;
+        }
+
+        let right_start = cursor + 2;
+        let mut right_end = right_start;
+        while right_end < bytes.len() && is_ascii_hex(bytes[right_end]) {
+            right_end += 1;
+        }
+        if (7..=40).contains(&(right_end - right_start))
+            && (right_end == bytes.len() || !is_ascii_hex(bytes[right_end]))
+        {
+            ranges.push(&text[left_start..right_end]);
+        }
+        cursor = right_end;
+    }
+    ranges
+}
+
+fn is_ascii_hex(byte: u8) -> bool {
+    byte.is_ascii_hexdigit()
 }
 
 fn embedded_migration_versions() -> Result<Vec<u32>, String> {
