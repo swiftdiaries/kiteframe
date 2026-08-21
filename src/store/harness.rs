@@ -4,7 +4,7 @@ use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 use crate::harness::{
     HarnessEventEnvelope, HarnessInvocationId, HarnessProfileId, HarnessTransport,
     canonical_builtin_unavailable_terminal_payload, canonical_outcome_unknown_terminal_payload,
-    terminal_idempotency_key,
+    canonical_pre_accept_exhaustion_payload, terminal_idempotency_key,
 };
 use crate::{AgentCommandId, RuntimeEvent, UserTaskId, canonical_sha256};
 
@@ -266,12 +266,16 @@ impl PostgresStore {
         request_digest: &str,
         terminal_payload: &Value,
     ) -> Result<HarnessInvocationView, StoreError> {
-        if max_pre_accept_attempts == 0
-            || request_digest.is_empty()
-            || !terminal_payload.is_object()
-        {
+        if max_pre_accept_attempts == 0 || request_digest.is_empty() {
             return Err(StoreError::InvalidData(
                 "harness retryable failure request is malformed".to_owned(),
+            ));
+        }
+        let canonical_payload = normalize_harness_pre_accept_exhaustion_payload(terminal_payload)?;
+        let canonical_key = terminal_idempotency_key(invocation_id);
+        if request_digest != canonical_key {
+            return Err(StoreError::InvalidData(
+                "harness retryable failure receipt key is malformed".to_owned(),
             ));
         }
         let mut tx = self.pool().begin().await?;
@@ -280,7 +284,7 @@ impl PostgresStore {
         if let Some((stored_digest, stored_payload)) =
             harness_exhaustion_for_update(&mut tx, invocation_id).await?
         {
-            if stored_digest == request_digest && stored_payload == *terminal_payload {
+            if stored_digest == canonical_key && stored_payload == canonical_payload {
                 tx.commit().await?;
                 return Ok(view);
             }
@@ -292,8 +296,8 @@ impl PostgresStore {
             return Ok(view);
         }
         if view.state == HarnessInvocationState::Failed && view.attempt == expected_attempt {
-            if view.terminal_request_digest.as_deref() == Some(request_digest)
-                && view.terminal_payload.as_ref() == Some(terminal_payload)
+            if view.terminal_request_digest.as_deref() == Some(&canonical_key)
+                && view.terminal_payload.as_ref() == Some(&canonical_payload)
             {
                 tx.commit().await?;
                 return Ok(view);
@@ -314,8 +318,8 @@ impl PostgresStore {
                 &mut tx,
                 invocation_id,
                 expected_attempt,
-                request_digest,
-                terminal_payload,
+                &canonical_key,
+                &canonical_payload,
             )
             .await?;
             tx.commit().await?;
@@ -466,7 +470,7 @@ impl PostgresStore {
         invocation_id: &HarnessInvocationId,
     ) -> Result<Option<(String, Value)>, StoreError> {
         let row = sqlx::query(
-            "SELECT pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload \
+            "SELECT invocation_id, pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload \
              FROM harness_invocations WHERE invocation_id = $1",
         )
         .bind(invocation_id.as_uuid())
@@ -559,6 +563,25 @@ impl PostgresStore {
         let mut tx = self.pool().begin().await?;
         let (command_state, view) =
             lock_harness_invocation_with_command(&mut tx, invocation_id).await?;
+        let exhaustion = harness_exhaustion_for_update(&mut tx, invocation_id).await?;
+        let normalized_exhaustion_payload;
+        let terminal_payload = if let Some((exhaustion_key, exhaustion_payload)) = exhaustion {
+            match state {
+                HarnessInvocationState::Failed if request_digest == exhaustion_key => {
+                    normalized_exhaustion_payload = exhaustion_payload;
+                    &normalized_exhaustion_payload
+                }
+                HarnessInvocationState::Cancelled
+                    if request_digest == terminal_idempotency_key(invocation_id)
+                        && *terminal_payload == serde_json::json!({"type":"cancelled"}) =>
+                {
+                    terminal_payload
+                }
+                _ => return Err(StoreError::IdempotencyConflict),
+            }
+        } else {
+            terminal_payload
+        };
         if command_state == "cancelled" {
             if view.terminal && state == HarnessInvocationState::Cancelled {
                 if view.terminal_request_digest.as_deref() == Some(request_digest)
@@ -1124,13 +1147,43 @@ fn exhaustion_from_row(row: &PgRow) -> Result<Option<(String, Value)>, StoreErro
     let payload: Option<Value> = row.get("exhaustion_payload");
     match (exhausted, request_digest, payload) {
         (false, None, None) => Ok(None),
-        (true, Some(request_digest), Some(payload)) if payload.is_object() => {
+        (true, Some(request_digest), Some(payload)) => {
+            let invocation_id = HarnessInvocationId::new(row.get("invocation_id"));
+            validate_harness_pre_accept_exhaustion_receipt(
+                &invocation_id,
+                &request_digest,
+                &payload,
+            )?;
             Ok(Some((request_digest, payload)))
         }
         _ => Err(StoreError::InvalidData(
             "harness pre-accept exhaustion marker is malformed".to_owned(),
         )),
     }
+}
+
+fn normalize_harness_pre_accept_exhaustion_payload(payload: &Value) -> Result<Value, StoreError> {
+    if !payload.is_object() {
+        return Err(StoreError::InvalidData(
+            "harness retryable failure receipt is malformed".to_owned(),
+        ));
+    }
+    Ok(canonical_pre_accept_exhaustion_payload())
+}
+
+fn validate_harness_pre_accept_exhaustion_receipt(
+    invocation_id: &HarnessInvocationId,
+    request_digest: &str,
+    payload: &Value,
+) -> Result<(), StoreError> {
+    if request_digest != terminal_idempotency_key(invocation_id)
+        || *payload != canonical_pre_accept_exhaustion_payload()
+    {
+        return Err(StoreError::InvalidData(
+            "harness pre-accept exhaustion marker is malformed".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_invocation_identity_replay(
@@ -1198,7 +1251,7 @@ async fn harness_exhaustion_for_update(
     invocation_id: &HarnessInvocationId,
 ) -> Result<Option<(String, Value)>, StoreError> {
     let row = sqlx::query(
-        "SELECT pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload \
+        "SELECT invocation_id, pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload \
          FROM harness_invocations WHERE invocation_id = $1 FOR UPDATE",
     )
     .bind(invocation_id.as_uuid())
@@ -1360,12 +1413,81 @@ fn is_harness_invocation_identity_conflict(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        terminal_from_completed_command, terminal_state_matches_command_winner,
-        validate_command_revision_replay, validate_invocation_identity_replay,
+        normalize_harness_pre_accept_exhaustion_payload, terminal_from_completed_command,
+        terminal_state_matches_command_winner, validate_command_revision_replay,
+        validate_harness_pre_accept_exhaustion_receipt, validate_invocation_identity_replay,
     };
     use crate::harness::{HarnessInvocationId, HarnessProfileId};
     use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
     use crate::{AgentCommandId, EvidenceId, RuntimeCommandKey, RuntimeEvent, StoreError};
+
+    #[test]
+    fn retryable_process_details_normalize_to_the_canonical_exhaustion_receipt() {
+        for retryable_detail in [
+            "ACP EOF before prompt acceptance",
+            "process exited with status 137",
+            "transport timed out while initializing",
+        ] {
+            assert_eq!(
+                normalize_harness_pre_accept_exhaustion_payload(&serde_json::json!({
+                    "type": "failed",
+                    "code": "harness_failed",
+                    "detail": retryable_detail,
+                }))
+                .unwrap(),
+                serde_json::json!({
+                    "type": "failed",
+                    "code": "harness_failed",
+                    "detail": "harness pre-accept attempt budget exhausted",
+                }),
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustion_decoder_rejects_noncanonical_key_and_payload() {
+        let invocation_id = HarnessInvocationId::new(uuid::Uuid::now_v7());
+        let canonical_key = format!("harness-terminal:{}", invocation_id.as_uuid());
+        let canonical_payload = serde_json::json!({
+            "type": "failed",
+            "code": "harness_failed",
+            "detail": "harness pre-accept attempt budget exhausted",
+        });
+        for (key, payload) in [
+            (
+                "harness-terminal:wrong".to_owned(),
+                canonical_payload.clone(),
+            ),
+            (
+                canonical_key.clone(),
+                serde_json::json!({
+                    "type": "failed",
+                    "code": "harness_failed",
+                    "detail": "different retryable process detail",
+                }),
+            ),
+            (
+                canonical_key.clone(),
+                serde_json::json!({
+                    "type": "failed",
+                    "code": "harness_failed",
+                    "detail": "harness pre-accept attempt budget exhausted",
+                    "extra": true,
+                }),
+            ),
+        ] {
+            assert!(matches!(
+                validate_harness_pre_accept_exhaustion_receipt(&invocation_id, &key, &payload),
+                Err(StoreError::InvalidData(_))
+            ));
+        }
+        validate_harness_pre_accept_exhaustion_receipt(
+            &invocation_id,
+            &canonical_key,
+            &canonical_payload,
+        )
+        .unwrap();
+    }
 
     fn stored_invocation() -> HarnessInvocationView {
         HarnessInvocationView {

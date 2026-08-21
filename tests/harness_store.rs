@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use kiteframe::{
@@ -12,9 +13,69 @@ use kiteframe::{
     },
 };
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+struct IsolatedMigrationDatabase {
+    admin_url: url::Url,
+    database_name: String,
+    database_url: String,
+    pool: PgPool,
+}
+
+impl IsolatedMigrationDatabase {
+    async fn new() -> Option<Self> {
+        let database_url = std::env::var("DATABASE_URL").ok()?;
+        let mut admin_url = url::Url::parse(&database_url).expect("database URL");
+        admin_url.set_path("/postgres");
+        let database_name = format!("kiteframe_harness_migration_{}", Uuid::now_v7().simple());
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(admin_url.as_str())
+            .await
+            .expect("connect database administrator");
+        sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create isolated migration database");
+        admin.close().await;
+
+        let mut isolated_url = admin_url.clone();
+        isolated_url.set_path(&format!("/{database_name}"));
+        let database_url = isolated_url.to_string();
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect isolated migration database");
+        Some(Self {
+            admin_url,
+            database_name,
+            database_url,
+            pool,
+        })
+    }
+
+    async fn drop(self) {
+        self.pool.close().await;
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(self.admin_url.as_str())
+            .await
+            .expect("reconnect database administrator");
+        sqlx::query(&format!(
+            "DROP DATABASE \"{}\" WITH (FORCE)",
+            self.database_name
+        ))
+        .execute(&admin)
+        .await
+        .expect("drop isolated migration database");
+        admin.close().await;
+    }
+}
 
 struct HarnessStoreFixture {
     store: Arc<PostgresStore>,
@@ -351,6 +412,59 @@ fn gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation() {
 }
 
 #[tokio::test]
+async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
+    let Some(fresh) = IsolatedMigrationDatabase::new().await else {
+        eprintln!("SKIP harness receipt closure migration: DATABASE_URL is not set");
+        return;
+    };
+    MIGRATOR
+        .run(&fresh.pool)
+        .await
+        .expect("fresh migrations through 0018 succeed");
+    let fresh_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&fresh.pool)
+            .await
+            .unwrap();
+    assert_eq!(fresh_versions, (1..=18).collect::<Vec<_>>());
+    fresh.drop().await;
+
+    let Some(upgrade) = IsolatedMigrationDatabase::new().await else {
+        unreachable!("DATABASE_URL was available for fresh migration");
+    };
+    let through_0017 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 17)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0017
+        .run(&upgrade.pool)
+        .await
+        .expect("historical migrations through 0017 succeed");
+    MIGRATOR
+        .run(&upgrade.pool)
+        .await
+        .expect("upgrade from 0017 through 0018 succeeds");
+    let upgraded_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&upgrade.pool)
+            .await
+            .unwrap();
+    assert_eq!(upgraded_versions, (1..=18).collect::<Vec<_>>());
+    assert!(
+        upgrade
+            .database_url
+            .contains("kiteframe_harness_migration_")
+    );
+    upgrade.drop().await;
+}
+
+#[tokio::test]
 async fn database_digest_rejects_every_malformed_v1_event_shape() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
@@ -574,7 +688,7 @@ async fn cancelled_command_atomically_settles_pre_accept_and_late_terminals_as_c
             &prepared.invocation_id,
             0,
             3,
-            "sha256:retry-after-cancel",
+            &format!("harness-terminal:{}", prepared.invocation_id.as_uuid()),
             &json!({"type":"failed","code":"harness_failed","detail":"late retry"}),
         )
         .await
@@ -1136,7 +1250,7 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
             &invocation.invocation_id,
             0,
             1,
-            "sha256:retry-a",
+            &format!("harness-terminal:{}", invocation.invocation_id.as_uuid()),
             &json!({"type":"failed","code":"harness_failed","detail":"retry"}),
         )
         .await
@@ -1160,25 +1274,28 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
     assert!(sqlx::Row::get::<bool, _>(&closure, "pre_accept_exhausted"));
     assert_eq!(
         sqlx::Row::get::<String, _>(&closure, "exhaustion_request_digest"),
-        "sha256:retry-a"
+        format!("harness-terminal:{}", invocation.invocation_id.as_uuid())
     );
     assert_eq!(
         sqlx::Row::get::<serde_json::Value, _>(&closure, "exhaustion_payload"),
-        json!({"type":"failed","code":"harness_failed","detail":"retry"})
+        json!({
+            "type":"failed",
+            "code":"harness_failed",
+            "detail":"harness pre-accept attempt budget exhausted"
+        })
     );
-    assert!(matches!(
-        fixture
-            .store
-            .record_harness_retryable_failure(
-                &invocation.invocation_id,
-                0,
-                1,
-                "sha256:retry-drift",
-                &json!({"type":"failed","code":"harness_failed","detail":"drift"}),
-            )
-            .await,
-        Err(StoreError::IdempotencyConflict)
-    ));
+    let replay = fixture
+        .store
+        .record_harness_retryable_failure(
+            &invocation.invocation_id,
+            0,
+            1,
+            &format!("harness-terminal:{}", invocation.invocation_id.as_uuid()),
+            &json!({"type":"failed","code":"harness_failed","detail":"drift"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, exhausted);
 }
 
 async fn cancelled_terminal_fixture() -> Option<(HarnessStoreFixture, HarnessInvocationView)> {
@@ -1243,45 +1360,141 @@ async fn terminal_prompt_acceptance_is_immutable_in_the_database() {
 }
 
 #[tokio::test]
-async fn exhausted_terminal_rows_reject_mismatched_digest_payload_and_state() {
+async fn every_terminal_column_including_updated_at_is_immutable_and_leaves_the_row_unchanged() {
+    let Some((fixture, terminal)) = cancelled_terminal_fixture().await else {
+        return;
+    };
+    let before: serde_json::Value = sqlx::query_scalar(
+        "SELECT row_to_json(harness_invocations) FROM harness_invocations WHERE invocation_id = $1",
+    )
+    .bind(terminal.invocation_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+
+    for mutation in [
+        "state = 'failed'",
+        "attempt = attempt + 1",
+        "prompt_accepted = TRUE",
+        "terminal = FALSE",
+        "terminal_request_digest = 'harness-terminal:wrong'",
+        "terminal_payload = '{\"type\":\"failed\"}'::jsonb",
+        "pre_accept_exhausted = TRUE, exhaustion_request_digest = 'harness-terminal:wrong', exhaustion_payload = '{\"type\":\"failed\",\"code\":\"harness_failed\",\"detail\":\"harness pre-accept attempt budget exhausted\"}'::jsonb",
+        "updated_at = updated_at + INTERVAL '1 second'",
+    ] {
+        let error = sqlx::query(&format!(
+            "UPDATE harness_invocations SET {mutation} WHERE invocation_id = $1"
+        ))
+        .bind(terminal.invocation_id.as_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("55000"),
+            "terminal mutation must be rejected: {mutation}"
+        );
+        let after: serde_json::Value = sqlx::query_scalar(
+            "SELECT row_to_json(harness_invocations) FROM harness_invocations WHERE invocation_id = $1",
+        )
+        .bind(terminal.invocation_id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(after, before, "terminal row changed after: {mutation}");
+    }
+}
+
+#[tokio::test]
+async fn exhaustion_receipt_rejects_noncanonical_shapes_in_the_database() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
     };
-    let exhaustion_payload = json!({
+    let canonical_payload = json!({
         "type": "failed",
         "code": "harness_failed",
-        "detail": "retry budget exhausted"
+        "detail": "harness pre-accept attempt budget exhausted"
     });
-    for (suffix, state, terminal_digest, terminal_payload) in [
+    for (
+        suffix,
+        state,
+        terminal,
+        terminal_digest,
+        terminal_payload,
+        exhaustion_digest,
+        exhaustion_payload,
+    ) in [
         (
-            "digest",
-            "failed",
-            "harness-terminal:wrong",
-            exhaustion_payload.clone(),
+            "key",
+            "started",
+            false,
+            None,
+            None,
+            "harness-terminal:wrong".to_owned(),
+            canonical_payload.clone(),
         ),
         (
-            "payload",
-            "failed",
-            "exhaustion-digest",
-            json!({"type":"failed","code":"harness_failed","detail":"contradictory"}),
+            "code",
+            "started",
+            false,
+            None,
+            None,
+            String::new(),
+            json!({"type":"failed","code":"not_harness_failed","detail":"harness pre-accept attempt budget exhausted"}),
+        ),
+        (
+            "detail",
+            "started",
+            false,
+            None,
+            None,
+            String::new(),
+            json!({"type":"failed","code":"harness_failed","detail":"retry budget exhausted"}),
+        ),
+        (
+            "extra_field",
+            "started",
+            false,
+            None,
+            None,
+            String::new(),
+            json!({"type":"failed","code":"harness_failed","detail":"harness pre-accept attempt budget exhausted","retryable":true}),
         ),
         (
             "state",
+            "completed",
+            true,
+            None,
+            Some(json!({"type":"completed","outcome":"ok","fields":{},"history":[]})),
+            String::new(),
+            canonical_payload.clone(),
+        ),
+        (
+            "cancel_shape",
             "cancelled",
-            "exhaustion-digest",
-            exhaustion_payload.clone(),
+            true,
+            None,
+            Some(json!({"type":"cancelled","detail":"not canonical"})),
+            String::new(),
+            canonical_payload.clone(),
         ),
     ] {
         let command_id = fixture.additional_command().await;
         let invocation_id = Uuid::now_v7();
+        let canonical_key = format!("harness-terminal:{invocation_id}");
+        let terminal_digest = terminal_digest.unwrap_or_else(|| canonical_key.clone());
+        let exhaustion_digest = if exhaustion_digest.is_empty() {
+            canonical_key
+        } else {
+            exhaustion_digest
+        };
         let mut tx = fixture.pool.begin().await.unwrap();
         let result = sqlx::query(
             "INSERT INTO harness_invocations \
              (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
               state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
               pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload) \
-             VALUES ($1, $2, 0, $3, $4, $5, $6, 0, FALSE, TRUE, $7, $8, TRUE, \
-                     'exhaustion-digest', $9)",
+             VALUES ($1, $2, 0, $3, $4, $5, $6, 0, FALSE, $7, $8, $9, TRUE, $10, $11)",
         )
         .bind(invocation_id)
         .bind(command_id.as_uuid())
@@ -1289,9 +1502,11 @@ async fn exhausted_terminal_rows_reject_mismatched_digest_payload_and_state() {
         .bind(&fixture.profile_digest)
         .bind(format!("sha256:exhaustion-{suffix}"))
         .bind(state)
+        .bind(terminal)
         .bind(terminal_digest)
         .bind(terminal_payload)
-        .bind(&exhaustion_payload)
+        .bind(exhaustion_digest)
+        .bind(exhaustion_payload)
         .execute(&mut *tx)
         .await;
         tx.rollback().await.unwrap();

@@ -197,7 +197,7 @@ mod postgres_recovery_boundaries {
                 &retryable.invocation_id,
                 0,
                 3,
-                "sha256:retryable-failure",
+                &format!("harness-terminal:{}", retryable.invocation_id.as_uuid()),
                 &json!({"type":"failed","code":"process_lost","detail":"before acceptance"}),
             )
             .await

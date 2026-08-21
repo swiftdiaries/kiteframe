@@ -138,6 +138,14 @@ pub(crate) fn terminal_idempotency_key(invocation_id: &HarnessInvocationId) -> S
     format!("harness-terminal:{}", invocation_id.as_uuid())
 }
 
+pub(crate) fn canonical_pre_accept_exhaustion_payload() -> Value {
+    json!({
+        "type": "failed",
+        "code": "harness_failed",
+        "detail": "harness pre-accept attempt budget exhausted",
+    })
+}
+
 pub(crate) fn canonical_outcome_unknown_terminal_payload() -> Value {
     json!({
         "type": "outcome_unknown",
