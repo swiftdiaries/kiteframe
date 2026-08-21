@@ -1634,6 +1634,117 @@ mod integrated_postgres_fake_restart {
     }
 
     #[tokio::test]
+    async fn direct_dispatch_settles_committed_exhaustion_without_restart_or_launch() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+
+        let process_log = recovery.workspace.join("inline-exhaustion-processes.jsonl");
+        let exhausted_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterRetryCommit,
+        ));
+        let (first_dispatcher, first_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(exhausted_barrier.clone()),
+                1,
+                Some(&process_log),
+            )
+            .await;
+        let exhausting = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        exhausted_barrier.wait_until_entered().await;
+        let exhausted = recovery.invocation().await.unwrap();
+        let command_before = recovery.pending_or_owned_command().await;
+        let exhaustion_receipt: (bool, Option<String>, Option<Value>) = sqlx::query_as(
+            "SELECT pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload \
+             FROM harness_invocations WHERE invocation_id = $1",
+        )
+        .bind(exhausted.invocation_id.as_uuid())
+        .fetch_one(recovery.store.pool())
+        .await
+        .unwrap();
+        let process_counts_before = process_log_counts(&process_log);
+        exhausting.abort();
+        exhausted_barrier.release();
+        assert!(exhausting.await.unwrap_err().is_cancelled());
+
+        let (direct, direct_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                None,
+                1,
+                Some(&process_log),
+            )
+            .await;
+        let first_tick = direct.tick_agent_commands(8).await.unwrap();
+        let terminal = recovery.invocation().await.unwrap();
+        let command = recovery.pending_or_owned_command().await;
+        let command_result: Option<Value> =
+            sqlx::query_scalar("SELECT result FROM agent_commands WHERE id = $1")
+                .bind(command.id.as_uuid())
+                .fetch_one(recovery.store.pool())
+                .await
+                .unwrap();
+        let second_tick = direct.tick_agent_commands(8).await.unwrap();
+        let replay = recovery.invocation().await.unwrap();
+        let process_counts_after = process_log_counts(&process_log);
+        let first_prompts = prompt_count(&first_observation);
+        let direct_prompts = prompt_count(&direct_observation);
+        recovery.cleanup().await;
+
+        let terminal_key = format!("harness-terminal:{}", exhausted.invocation_id.as_uuid());
+        let terminal_payload = serde_json::json!({
+            "type": "failed",
+            "code": "harness_failed",
+            "detail": "harness pre-accept attempt budget exhausted",
+        });
+        assert_eq!(exhausted.state, HarnessInvocationState::Started);
+        assert!(!exhausted.terminal);
+        assert_eq!(command_before.state, kiteframe::AgentCommandState::Claimed);
+        assert_eq!(
+            exhaustion_receipt,
+            (
+                true,
+                Some(terminal_key.clone()),
+                Some(terminal_payload.clone())
+            )
+        );
+        assert_eq!(process_counts_before, (1, 0));
+        assert_eq!(first_tick, 1);
+        assert_eq!(terminal.state, HarnessInvocationState::Failed);
+        assert!(terminal.terminal);
+        assert_eq!(terminal.terminal_request_digest, Some(terminal_key));
+        assert_eq!(terminal.terminal_payload, Some(terminal_payload));
+        assert_eq!(command.state, kiteframe::AgentCommandState::Completed);
+        assert_eq!(command_result.as_ref().unwrap()["type"], "command_failed");
+        assert_eq!(
+            command_result.as_ref().unwrap()["payload"]["code"],
+            "harness_failed"
+        );
+        assert_eq!(second_tick, 0);
+        assert_eq!(replay.state, HarnessInvocationState::Failed);
+        assert_eq!(
+            replay.terminal_request_digest,
+            terminal.terminal_request_digest
+        );
+        assert_eq!(replay.terminal_payload, terminal.terminal_payload);
+        assert_eq!(process_counts_after, process_counts_before);
+        assert_eq!(first_prompts, 0);
+        assert_eq!(direct_prompts, 0);
+    }
+
+    #[tokio::test]
     async fn recovery_exhausts_stale_started_at_limit_without_launching() {
         let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
         let Some(mut recovery) = RecoveryFixture::new().await else {

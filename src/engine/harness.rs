@@ -469,7 +469,20 @@ impl AgentCommandDispatcher {
                             Err(error) => return Err(error),
                         }
                     }
-                    HarnessInvocationState::Started => return Ok(()),
+                    HarnessInvocationState::Started => {
+                        if self
+                            .kernel
+                            .store()
+                            .harness_pre_accept_exhaustion(&prepared.invocation_id)
+                            .await?
+                            .is_some()
+                        {
+                            return self
+                                .settle_pre_accept_exhausted(execution, &claimed, &prepared)
+                                .await;
+                        }
+                        return Ok(());
+                    }
                     HarnessInvocationState::Accepted => {
                         return self
                             .settle_outcome_unknown(
