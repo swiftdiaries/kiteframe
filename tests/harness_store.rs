@@ -20,6 +20,7 @@ struct HarnessStoreFixture {
     store: Arc<PostgresStore>,
     pool: PgPool,
     command_id: AgentCommandId,
+    transition_id: Uuid,
     profile_id: HarnessProfileId,
     profile_digest: String,
 }
@@ -109,22 +110,61 @@ impl HarnessStoreFixture {
             store,
             pool,
             command_id,
+            transition_id,
             profile_id,
             profile_digest,
         })
     }
 
-    async fn prepare(&self, payload_digest: &str) -> Result<HarnessInvocationView, StoreError> {
+    async fn prepare_with(
+        &self,
+        invocation_id: &HarnessInvocationId,
+        payload_digest: &str,
+    ) -> Result<HarnessInvocationView, StoreError> {
+        self.prepare_for(&self.command_id, invocation_id, payload_digest)
+            .await
+    }
+
+    async fn prepare_for(
+        &self,
+        command_id: &AgentCommandId,
+        invocation_id: &HarnessInvocationId,
+        payload_digest: &str,
+    ) -> Result<HarnessInvocationView, StoreError> {
         self.store
             .prepare_harness_invocation(PrepareHarnessInvocation {
-                invocation_id: &HarnessInvocationId::new(Uuid::now_v7()),
-                command_id: &self.command_id,
+                invocation_id,
+                command_id,
                 command_revision: 0,
                 profile_id: &self.profile_id,
                 profile_digest: &self.profile_digest,
                 payload_digest,
             })
             .await
+    }
+
+    async fn prepare(&self, payload_digest: &str) -> Result<HarnessInvocationView, StoreError> {
+        self.prepare_with(&HarnessInvocationId::new(Uuid::now_v7()), payload_digest)
+            .await
+    }
+
+    async fn additional_command(&self) -> AgentCommandId {
+        let command_id = AgentCommandId::new(Uuid::now_v7());
+        sqlx::query(
+            "INSERT INTO agent_commands \
+             (id, task_id, transition_id, ordinal, schema_version, runtime_key, command_kind, payload, payload_digest) \
+             SELECT $1, task_id, $2, 1, 1, 'harness:store:second', 'invoke_harness', \
+                    $3, 'sha256:command-second' \
+             FROM agent_commands WHERE id = $4",
+        )
+        .bind(command_id.as_uuid())
+        .bind(self.transition_id)
+        .bind(json!({"type": "invoke_harness", "payload": {}}))
+        .bind(self.command_id.as_uuid())
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        command_id
     }
 
     fn event(
@@ -176,6 +216,8 @@ fn harness_migration_has_closed_state_and_identity_guards() {
         "outcome_unknown",
         "reject_harness_invocation_mutation",
         "reject_harness_invocation_event_mutation",
+        "BEFORE UPDATE OR DELETE ON harness_invocations",
+        "jsonb_typeof(event->'decision') = 'string'",
     ] {
         assert!(sql.contains(required), "missing schema guard: {required}");
     }
@@ -186,12 +228,36 @@ async fn prepare_is_idempotent_for_one_command_revision_and_rejects_drift() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
     };
-    let prepared = fixture.prepare("sha256:payload-a").await.unwrap();
-    let replay = fixture.prepare("sha256:payload-a").await.unwrap();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let prepared = fixture
+        .prepare_with(&invocation_id, "sha256:payload-a")
+        .await
+        .unwrap();
+    let replay = fixture
+        .prepare_with(&invocation_id, "sha256:payload-a")
+        .await
+        .unwrap();
     assert_eq!(replay.invocation_id, prepared.invocation_id);
     assert_eq!(replay.state, HarnessInvocationState::Prepared);
-    let error = fixture.prepare("sha256:payload-b").await.unwrap_err();
+    let error = fixture
+        .prepare_with(&invocation_id, "sha256:payload-b")
+        .await
+        .unwrap_err();
     assert!(matches!(error, StoreError::IdempotencyConflict));
+    let identity_drift = fixture
+        .prepare_with(
+            &HarnessInvocationId::new(Uuid::now_v7()),
+            "sha256:payload-a",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(identity_drift, StoreError::IdempotencyConflict));
+    let second_command = fixture.additional_command().await;
+    let command_drift = fixture
+        .prepare_for(&second_command, &invocation_id, "sha256:payload-a")
+        .await
+        .unwrap_err();
+    assert!(matches!(command_drift, StoreError::IdempotencyConflict));
 }
 
 #[tokio::test]
@@ -214,6 +280,42 @@ async fn accepted_process_death_is_recovered_as_outcome_unknown() {
     assert!(recovered.iter().any(|view| {
         view.invocation_id == invocation.invocation_id
             && view.state == HarnessInvocationState::OutcomeUnknown
+    }));
+}
+
+#[tokio::test]
+async fn recovery_settles_all_accepted_rows_before_limiting_retryable_work() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let retryable_id = HarnessInvocationId::new(Uuid::now_v7());
+    fixture
+        .prepare_with(&retryable_id, "sha256:payload-retryable")
+        .await
+        .unwrap();
+    let accepted_id = HarnessInvocationId::new(Uuid::now_v7());
+    let second_command = fixture.additional_command().await;
+    let accepted = fixture
+        .prepare_for(&second_command, &accepted_id, "sha256:payload-accepted")
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&accepted.invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&accepted.invocation_id, 0)
+        .await
+        .unwrap();
+
+    let recovered = fixture.store.recover_harness_invocations(1).await.unwrap();
+    assert!(recovered.iter().any(|view| {
+        view.invocation_id == accepted_id && view.state == HarnessInvocationState::OutcomeUnknown
+    }));
+    assert!(recovered.iter().any(|view| {
+        view.invocation_id == retryable_id && view.state == HarnessInvocationState::Prepared
     }));
 }
 
@@ -300,18 +402,31 @@ async fn retryable_failure_retries_only_before_prompt_acceptance_and_then_fails(
         .unwrap();
     let retry = fixture
         .store
-        .record_harness_retryable_failure(&invocation.invocation_id, 0, 1)
+        .record_harness_retryable_failure(&invocation.invocation_id, 0, 1, "sha256:retry-a")
         .await
         .unwrap();
     assert_eq!(retry.state, HarnessInvocationState::Started);
     assert_eq!(retry.attempt, 1);
     let failed = fixture
         .store
-        .record_harness_retryable_failure(&invocation.invocation_id, 1, 1)
+        .record_harness_retryable_failure(&invocation.invocation_id, 1, 1, "sha256:retry-b")
         .await
         .unwrap();
     assert_eq!(failed.state, HarnessInvocationState::Failed);
     assert!(failed.terminal);
+    fixture
+        .store
+        .record_harness_retryable_failure(&invocation.invocation_id, 1, 1, "sha256:retry-b")
+        .await
+        .unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .record_harness_retryable_failure(&invocation.invocation_id, 1, 1, "sha256:retry-c")
+            .await
+            .unwrap_err(),
+        StoreError::IdempotencyConflict,
+    ));
 }
 
 #[tokio::test]
@@ -406,6 +521,15 @@ async fn immutable_identity_and_invalid_state_edges_are_rejected_by_database() {
             .unwrap_err();
     assert_eq!(
         edge_error.as_database_error().unwrap().code().as_deref(),
+        Some("55000")
+    );
+    let delete_error = sqlx::query("DELETE FROM harness_invocations WHERE invocation_id = $1")
+        .bind(invocation.invocation_id.as_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        delete_error.as_database_error().unwrap().code().as_deref(),
         Some("55000")
     );
 }

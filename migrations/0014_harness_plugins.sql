@@ -57,6 +57,7 @@ CREATE TABLE harness_invocation_events (
                 AND event - 'type' - 'request_id' - 'title' = '{}'::jsonb
             WHEN 'approval_resolved' THEN event ? 'request_id' AND event ? 'decision'
                 AND jsonb_typeof(event->'request_id') = 'string'
+                AND jsonb_typeof(event->'decision') = 'string'
                 AND event->>'decision' IN ('allow_once', 'reject_once')
                 AND event - 'type' - 'request_id' - 'decision' = '{}'::jsonb
             ELSE FALSE
@@ -78,6 +79,10 @@ CREATE TRIGGER harness_plugin_registrations_reject_update_delete
 
 CREATE FUNCTION reject_harness_invocation_mutation() RETURNS trigger AS $$
 BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'harness invocations are immutable' USING ERRCODE = '55000';
+    END IF;
+
     IF NEW.invocation_id IS DISTINCT FROM OLD.invocation_id
         OR NEW.command_id IS DISTINCT FROM OLD.command_id
         OR NEW.command_revision IS DISTINCT FROM OLD.command_revision
@@ -129,7 +134,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE TRIGGER harness_invocations_reject_invalid_update
-    BEFORE UPDATE ON harness_invocations
+    BEFORE UPDATE OR DELETE ON harness_invocations
     FOR EACH ROW EXECUTE FUNCTION reject_harness_invocation_mutation();
 
 CREATE FUNCTION reject_harness_invocation_event_mutation() RETURNS trigger AS $$

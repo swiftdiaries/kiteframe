@@ -69,7 +69,21 @@ impl PostgresStore {
         {
             return Err(StoreError::IdempotencyConflict);
         }
-        sqlx::query(
+        if let Some(row) = sqlx::query(
+            "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest \
+             FROM harness_invocations WHERE invocation_id = $1 FOR UPDATE",
+        )
+        .bind(request.invocation_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let view = harness_invocation_from_row(&row)?;
+            validate_prepare_replay(&view, &request)?;
+            tx.commit().await?;
+            return Ok(view);
+        }
+        let insert = sqlx::query(
             "INSERT INTO harness_invocations \
              (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
               state, attempt, prompt_accepted) \
@@ -83,7 +97,13 @@ impl PostgresStore {
         .bind(request.profile_digest)
         .bind(request.payload_digest)
         .execute(&mut *tx)
-        .await?;
+        .await;
+        if let Err(error) = insert {
+            if is_harness_invocation_identity_conflict(&error) {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            return Err(error.into());
+        }
         let row = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
                     state, attempt, prompt_accepted, terminal, terminal_request_digest \
@@ -132,12 +152,21 @@ impl PostgresStore {
         invocation_id: &HarnessInvocationId,
         expected_attempt: u64,
         max_pre_accept_attempts: u64,
+        request_digest: &str,
     ) -> Result<HarnessInvocationView, StoreError> {
+        if request_digest.is_empty() {
+            return Err(StoreError::InvalidData(
+                "harness retryable failure request is malformed".to_owned(),
+            ));
+        }
         let mut tx = self.pool().begin().await?;
         let view = lock_harness_invocation(&mut tx, invocation_id).await?;
         if view.state == HarnessInvocationState::Failed && view.attempt == expected_attempt {
-            tx.commit().await?;
-            return Ok(view);
+            if view.terminal_request_digest.as_deref() == Some(request_digest) {
+                tx.commit().await?;
+                return Ok(view);
+            }
+            return Err(StoreError::IdempotencyConflict);
         }
         if view.state != HarnessInvocationState::Started
             || view.prompt_accepted
@@ -160,7 +189,7 @@ impl PostgresStore {
                     HarnessInvocationState::Failed,
                     expected_attempt,
                     true,
-                    Some("harness-retry-exhausted"),
+                    Some(request_digest),
                 )
             };
         let view = update_invocation_state(
@@ -332,43 +361,42 @@ impl PostgresStore {
         limit: i64,
     ) -> Result<Vec<HarnessInvocationView>, StoreError> {
         let mut tx = self.pool().begin().await?;
-        let rows = sqlx::query(
+        let accepted_rows = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
                     state, attempt, prompt_accepted, terminal, terminal_request_digest \
              FROM harness_invocations \
-             WHERE state IN ('prepared', 'started', 'accepted') \
+             WHERE state = 'accepted' ORDER BY created_at, invocation_id FOR UPDATE",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut recovered = Vec::with_capacity(accepted_rows.len() + limit.clamp(1, 256) as usize);
+        for row in accepted_rows {
+            let view = harness_invocation_from_row(&row)?;
+            recovered.push(
+                update_invocation_state(
+                    &mut tx,
+                    &view.invocation_id,
+                    HarnessInvocationState::OutcomeUnknown,
+                    view.attempt,
+                    true,
+                    true,
+                    Some("harness-recovery-outcome-unknown"),
+                )
+                .await?,
+            );
+        }
+        let retryable_rows = sqlx::query(
+            "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest \
+             FROM harness_invocations \
+             WHERE state = 'prepared' OR (state = 'started' AND prompt_accepted = FALSE) \
              ORDER BY created_at, invocation_id LIMIT $1 FOR UPDATE",
         )
         .bind(limit.clamp(1, 256))
         .fetch_all(&mut *tx)
         .await?;
-        let mut recovered = Vec::with_capacity(rows.len());
-        for row in rows {
-            let view = harness_invocation_from_row(&row)?;
-            match view.state {
-                HarnessInvocationState::Accepted => {
-                    recovered.push(
-                        update_invocation_state(
-                            &mut tx,
-                            &view.invocation_id,
-                            HarnessInvocationState::OutcomeUnknown,
-                            view.attempt,
-                            true,
-                            true,
-                            Some("harness-recovery-outcome-unknown"),
-                        )
-                        .await?,
-                    );
-                }
-                HarnessInvocationState::Prepared => recovered.push(view),
-                HarnessInvocationState::Started if !view.prompt_accepted => recovered.push(view),
-                HarnessInvocationState::Started => {
-                    return Err(StoreError::InvalidData(
-                        "started harness invocation has accepted prompt".to_owned(),
-                    ));
-                }
-                _ => unreachable!("recovery query only selects nonterminal invocation states"),
-            }
+        for row in retryable_rows {
+            recovered.push(harness_invocation_from_row(&row)?);
         }
         tx.commit().await?;
         Ok(recovered)
@@ -509,4 +537,11 @@ async fn update_invocation_state(
 
 fn harness_i64(value: u64, message: &str) -> Result<i64, StoreError> {
     i64::try_from(value).map_err(|_| StoreError::InvalidData(message.to_owned()))
+}
+
+fn is_harness_invocation_identity_conflict(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|database_error| {
+        database_error.code().as_deref() == Some("23505")
+            && database_error.constraint() == Some("harness_invocations_pkey")
+    })
 }
