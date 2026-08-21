@@ -111,19 +111,92 @@ fn public_docs_name_both_v1_acp_profiles_and_exclude_dynamic_cordis() {
 }
 
 #[test]
-fn public_testing_guide_names_both_live_acp_auth_environment_gates() {
+fn public_testing_guide_locks_complete_live_acp_certification_examples() {
     let guide = std::fs::read_to_string("docs/guides/testing-kiteframe.md").unwrap();
-    for name in [
-        "KITEFRAME_CODEX_ACP_ENV_JSON",
-        "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON",
-        "KITEFRAME_DSH_ACP_ENV_JSON",
-        "KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON",
+    assert_live_acp_certification_examples(&guide).unwrap();
+
+    for (field, expected, replacement) in [
+        (
+            "Codex command",
+            r#"["/absolute/codex-acp"]"#,
+            r#"["/wrong/codex-acp"]"#,
+        ),
+        (
+            "Codex revision",
+            "296069e841634cd4bb9bc4515602d836e49231ec",
+            "0000000000000000000000000000000000000001",
+        ),
+        (
+            "Codex authentication map",
+            r#"{"OPENAI_API_KEY":"<obtain-from-secret-manager-or-session>"}"#,
+            r#"{"OPENAI_API_KEY":"<incorrect-placeholder>"}"#,
+        ),
+        (
+            "Codex required key list",
+            r#"["OPENAI_API_KEY"]"#,
+            r#"["WRONG_KEY"]"#,
+        ),
+        (
+            "DeepSeek command",
+            r#"["pnpm","--dir","/absolute/deepseek-harness","run","demo:acp"]"#,
+            r#"["pnpm","run","wrong:acp"]"#,
+        ),
+        (
+            "DeepSeek revision",
+            "141eb6fef83422698aef7a981029e843e8161534",
+            "0000000000000000000000000000000000000002",
+        ),
+        (
+            "DeepSeek authentication map",
+            r#"{"DEEPSEEK_API_KEY":"<obtain-from-secret-manager-or-session>","PATH":"/absolute/bin"}"#,
+            r#"{"DEEPSEEK_API_KEY":"<incorrect-placeholder>","PATH":"/absolute/bin"}"#,
+        ),
+        (
+            "DeepSeek required key list",
+            r#"["DEEPSEEK_API_KEY"]"#,
+            r#"["WRONG_KEY"]"#,
+        ),
     ] {
+        let mutated = guide.replacen(expected, replacement, 1);
         assert!(
-            guide.contains(name),
-            "missing live ACP auth variable: {name}"
+            assert_live_acp_certification_examples(&mutated).is_err(),
+            "guard accepted drift in {field}"
         );
     }
+}
+
+fn assert_live_acp_certification_examples(guide: &str) -> Result<(), String> {
+    for (name, snippet) in [
+        (
+            "Codex authentication map",
+            r#"export KITEFRAME_CODEX_ACP_ENV_JSON='{"OPENAI_API_KEY":"<obtain-from-secret-manager-or-session>"}'"#,
+        ),
+        (
+            "Codex required key list",
+            r#"export KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON='["OPENAI_API_KEY"]'"#,
+        ),
+        (
+            "Codex command and revision",
+            r#"KITEFRAME_CODEX_ACP_COMMAND_JSON='["/absolute/codex-acp"]' KITEFRAME_CODEX_ACP_SOURCE_REVISION='296069e841634cd4bb9bc4515602d836e49231ec' cargo test --test harness_acp_live codex_acp_live_core -- --exact --nocapture"#,
+        ),
+        (
+            "DeepSeek authentication map and PATH",
+            r#"export KITEFRAME_DSH_ACP_ENV_JSON='{"DEEPSEEK_API_KEY":"<obtain-from-secret-manager-or-session>","PATH":"/absolute/bin"}'"#,
+        ),
+        (
+            "DeepSeek required key list",
+            r#"export KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON='["DEEPSEEK_API_KEY"]'"#,
+        ),
+        (
+            "DeepSeek command and revision",
+            r#"KITEFRAME_DSH_ACP_COMMAND_JSON='["pnpm","--dir","/absolute/deepseek-harness","run","demo:acp"]' KITEFRAME_DSH_ACP_SOURCE_REVISION='141eb6fef83422698aef7a981029e843e8161534' cargo test --test harness_acp_live deepseek_harness_acp_live_core -- --exact --nocapture"#,
+        ),
+    ] {
+        if !guide.contains(snippet) {
+            return Err(format!("missing or drifted {name}"));
+        }
+    }
+    Ok(())
 }
 
 #[test]

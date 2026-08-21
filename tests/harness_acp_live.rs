@@ -86,26 +86,13 @@ impl LiveTarget {
         }
     }
 
-    const fn auth_skip_line(self) -> &'static str {
-        match self {
-            Self::Codex => "SKIP codex live: explicit Codex ACP auth environment is absent",
-            Self::DeepSeek => {
-                "SKIP DeepSeek live: explicit DeepSeek ACP auth environment is absent"
-            }
-        }
-    }
-
     fn readiness(
         self,
         mut value: impl FnMut(&str) -> Option<String>,
     ) -> Result<LiveReadiness, kiteframe::ConfigError> {
-        let command = value(self.command_name());
-        let Some(command) = command else {
-            return Ok(LiveReadiness::Skip(self.skip_line()));
-        };
         let config = HarnessConfig::from_test_values(
             [
-                (self.command_name(), Some(command)),
+                (self.command_name(), value(self.command_name())),
                 (
                     self.source_revision_name(),
                     value(self.source_revision_name()),
@@ -129,12 +116,14 @@ impl LiveTarget {
                 config.external_harness_environments().deepseek,
             ),
         };
-        let command = command.expect("a configured live target has a parsed command");
-        let Some(environment) =
-            environment.filter(|environment| environment.required_values_present())
-        else {
-            return Ok(LiveReadiness::Skip(self.auth_skip_line()));
+        let Some(command) = command else {
+            return Ok(LiveReadiness::Skip(self.skip_line()));
         };
+        let environment = environment
+            .filter(|environment| environment.required_values_present())
+            .ok_or(kiteframe::ConfigError::InvalidExternalHarnessEnvironment {
+                command_name: self.command_name(),
+            })?;
         Ok(LiveReadiness::Ready {
             command,
             environment: environment.values(),
@@ -435,7 +424,7 @@ fn live_target_readiness_requires_explicit_auth_and_reports_honest_skips() {
             if line == "SKIP codex live: KITEFRAME_CODEX_ACP_COMMAND_JSON is absent"
     ));
 
-    assert!(matches!(
+    assert!(
         LiveTarget::DeepSeek
             .readiness(|name| match name {
                 "KITEFRAME_DSH_ACP_COMMAND_JSON" => {
@@ -446,29 +435,166 @@ fn live_target_readiness_requires_explicit_auth_and_reports_honest_skips() {
                 }
                 _ => None,
             })
-            .unwrap(),
-        LiveReadiness::Skip(line)
-            if line == "SKIP DeepSeek live: explicit DeepSeek ACP auth environment is absent"
-    ));
+            .is_err(),
+        "a configured target without explicit required authentication must fail"
+    );
 
-    assert!(matches!(
-        LiveTarget::Codex
-            .readiness(|name| match name {
-                "KITEFRAME_CODEX_ACP_COMMAND_JSON" => {
-                    Some(r#"["/opt/codex-acp"]"#.to_owned())
-                }
-                "KITEFRAME_CODEX_ACP_SOURCE_REVISION" => {
-                    Some("296069e841634cd4bb9bc4515602d836e49231ec".to_owned())
-                }
-                "KITEFRAME_CODEX_ACP_ENV_JSON" => {
-                    Some(r#"{"CODEX_API_KEY":"placeholder-not-a-secret"}"#.to_owned())
-                }
-                "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON" => {
-                    Some(r#"["CODEX_API_KEY"]"#.to_owned())
-                }
-                _ => None,
+    let codex = LiveTarget::Codex
+        .readiness(|name| match name {
+            "KITEFRAME_CODEX_ACP_COMMAND_JSON" => Some(r#"["/absolute/codex-acp"]"#.to_owned()),
+            "KITEFRAME_CODEX_ACP_SOURCE_REVISION" => {
+                Some("296069e841634cd4bb9bc4515602d836e49231ec".to_owned())
+            }
+            "KITEFRAME_CODEX_ACP_ENV_JSON" => {
+                Some(r#"{"OPENAI_API_KEY":"placeholder-not-a-secret"}"#.to_owned())
+            }
+            "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON" => Some(r#"["OPENAI_API_KEY"]"#.to_owned()),
+            _ => None,
+        })
+        .unwrap();
+    let LiveReadiness::Ready {
+        command,
+        environment,
+    } = codex
+    else {
+        panic!("complete documented Codex configuration must be ready");
+    };
+    assert_eq!(command.program, PathBuf::from("/absolute/codex-acp"));
+    assert!(command.args.is_empty());
+    assert!(environment.contains_key(&std::ffi::OsString::from("OPENAI_API_KEY")));
+
+    let directory =
+        std::env::temp_dir().join(format!("kiteframe-live-readiness-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let pnpm = directory.join("pnpm");
+    std::fs::write(&pnpm, "placeholder executable").unwrap();
+    let expected_pnpm = std::fs::canonicalize(&pnpm).unwrap();
+    let environment = serde_json::json!({
+        "DEEPSEEK_API_KEY": "placeholder-not-a-secret",
+        "PATH": directory.to_string_lossy(),
+    })
+    .to_string();
+    let deepseek = LiveTarget::DeepSeek.readiness(|name| match name {
+        "KITEFRAME_DSH_ACP_COMMAND_JSON" => {
+            Some(r#"["pnpm","--dir","/absolute/deepseek-harness","run","demo:acp"]"#.to_owned())
+        }
+        "KITEFRAME_DSH_ACP_SOURCE_REVISION" => {
+            Some("141eb6fef83422698aef7a981029e843e8161534".to_owned())
+        }
+        "KITEFRAME_DSH_ACP_ENV_JSON" => Some(environment.clone()),
+        "KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON" => Some(r#"["DEEPSEEK_API_KEY"]"#.to_owned()),
+        _ => None,
+    });
+    std::fs::remove_dir_all(&directory).unwrap();
+    let deepseek = deepseek.unwrap();
+    let LiveReadiness::Ready {
+        command,
+        environment,
+    } = deepseek
+    else {
+        panic!("complete documented DeepSeek configuration must be ready");
+    };
+    assert_eq!(command.program, expected_pnpm);
+    assert_eq!(
+        command.args,
+        vec![
+            std::ffi::OsString::from("--dir"),
+            std::ffi::OsString::from("/absolute/deepseek-harness"),
+            std::ffi::OsString::from("run"),
+            std::ffi::OsString::from("demo:acp"),
+        ]
+    );
+    assert!(environment.contains_key(&std::ffi::OsString::from("DEEPSEEK_API_KEY")));
+    assert!(environment.contains_key(&std::ffi::OsString::from("PATH")));
+}
+
+#[test]
+fn live_target_readiness_rejects_partial_configuration_without_echoing_values() {
+    let cases = [
+        (
+            "command only",
+            vec![("KITEFRAME_CODEX_ACP_COMMAND_JSON", r#"["/opt/codex-acp"]"#)],
+        ),
+        (
+            "command and revision without live auth",
+            vec![
+                ("KITEFRAME_CODEX_ACP_COMMAND_JSON", r#"["/opt/codex-acp"]"#),
+                (
+                    "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    "296069e841634cd4bb9bc4515602d836e49231ec",
+                ),
+            ],
+        ),
+        (
+            "environment without required keys",
+            vec![
+                ("KITEFRAME_CODEX_ACP_COMMAND_JSON", r#"["/opt/codex-acp"]"#),
+                (
+                    "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    "296069e841634cd4bb9bc4515602d836e49231ec",
+                ),
+                (
+                    "KITEFRAME_CODEX_ACP_ENV_JSON",
+                    r#"{"OPENAI_API_KEY":"private-sentinel"}"#,
+                ),
+            ],
+        ),
+        (
+            "revision only",
+            vec![(
+                "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                "296069e841634cd4bb9bc4515602d836e49231ec",
+            )],
+        ),
+        (
+            "environment only",
+            vec![(
+                "KITEFRAME_CODEX_ACP_ENV_JSON",
+                r#"{"OPENAI_API_KEY":"private-sentinel"}"#,
+            )],
+        ),
+        (
+            "required keys only",
+            vec![(
+                "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON",
+                r#"["OPENAI_API_KEY"]"#,
+            )],
+        ),
+        (
+            "malformed command",
+            vec![
+                ("KITEFRAME_CODEX_ACP_COMMAND_JSON", "not-json"),
+                (
+                    "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    "296069e841634cd4bb9bc4515602d836e49231ec",
+                ),
+            ],
+        ),
+        (
+            "blank command",
+            vec![
+                ("KITEFRAME_CODEX_ACP_COMMAND_JSON", ""),
+                (
+                    "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    "296069e841634cd4bb9bc4515602d836e49231ec",
+                ),
+            ],
+        ),
+    ];
+
+    for (case, values) in cases {
+        let error = LiveTarget::Codex
+            .readiness(|name| {
+                values
+                    .iter()
+                    .find(|(configured_name, _)| *configured_name == name)
+                    .map(|(_, value)| (*value).to_owned())
             })
-            .unwrap(),
-        LiveReadiness::Ready { .. }
-    ));
+            .err()
+            .unwrap_or_else(|| panic!("{case} must not become a live skip"));
+        assert!(
+            !error.to_string().contains("private-sentinel"),
+            "{case} exposed an environment value"
+        );
+    }
 }

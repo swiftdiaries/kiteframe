@@ -377,3 +377,75 @@ This fix changes only the public testing guide, its structural guard, the
 live-test readiness seam and regression, and this append-only report. No
 provider process was spawned; no secret values were supplied or logged.
 Untracked `fuzz/` and `site/` remain untouched and unstaged.
+
+---
+
+# Final Review Fix Round 1: Align ACP Live Readiness With Production Parsing
+
+Date: 2026-08-22
+
+Status: COMPLETE
+
+Review base: `7eb454c`
+
+Commit message: `test: align ACP live readiness with production`
+
+## Findings closed
+
+The test-only live readiness seam returned the command-absent skip before it
+read a target's source revision, child environment, or required-key list. A
+partial deployment such as a revision-only or environment-only target could
+therefore be reported as an unconfigured live skip even though production
+configuration rejects it.
+
+The previous public-guide guard also verified only that the four variable
+names occurred somewhere in the document. It could not detect drift in a
+provider's argv, revision attestation, authentication map, required-key list,
+or DeepSeek's required absolute `PATH` entry.
+
+## Resolution
+
+- Readiness now collects all four target variables and invokes the same
+  `HarnessConfig` target parser before choosing a skip. Only a target with all
+  variables absent returns its existing exact command-absent `SKIP`; partial,
+  malformed, and blank target configuration propagates the parser's
+  value-free error.
+- Added non-spawning readiness coverage for command-only, revision-only,
+  environment-only, required-key-only, malformed-command, and blank-command
+  configurations. The environment-only case uses a private sentinel and
+  proves its value is absent from the error.
+- The complete Codex example now proves ready with its exact argv, revision,
+  `OPENAI_API_KEY` map and required-key list. The complete DeepSeek example
+  creates only a placeholder `pnpm` file for resolution, proves ready with its
+  exact argv/revision, `DEEPSEEK_API_KEY`, required-key list, and absolute
+  `PATH`, and never spawns a provider.
+- Replaced the name-only guide test with an exact snippet contract. Its
+  negative mutations separately prove that changing either provider's command,
+  revision, authentication JSON, or required-key JSON is rejected by the
+  guard.
+
+## TDD evidence
+
+The new partial-configuration regression first failed on the prior
+revision-only path: it returned a `SKIP` instead of an error. The readiness
+refactor made that case and all other partial-config cases pass through the
+production parser before a skip is selected.
+
+## Verification
+
+- `cargo test --test repository_shape`: 9 passed.
+- `cargo test --test harness_profiles`: 15 passed.
+- `cargo test --test harness_acp_live -- --nocapture`: 4 passed; both current
+  unconfigured provider targets emitted only their exact command-absent
+  `SKIP` lines.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `cargo build --all-targets --all-features`: passed.
+- `cargo fmt --all -- --check`: passed.
+- `git diff --check`: passed.
+
+## Scope
+
+This round changes the test-only live readiness seam, its deterministic
+regressions, the public-guide structural guard, and this append-only report.
+It does not launch a provider, modify production configuration parsing, or
+log credentials. Untracked `fuzz/` and `site/` remain untouched and unstaged.
