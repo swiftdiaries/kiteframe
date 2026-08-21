@@ -350,13 +350,16 @@ policy, and evidence state. A harness terminal cannot complete or block a
 durable goal.
 
 - Implementation range and evidence head:
-  `ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c`. The production Slice 3
-  implementation closed at `d746ce5`; `840b0fb` is the release-gating
-  cancellation-test prerequisite. The post-implementation Gate B fixes are
-  `af0763b` (durable unavailable profiles) and `424ffda` (exact runtime
-  identity binding). Final-review remediation is `1a46135`, `3887425`,
-  `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`.
+  `ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c`. Initial Tasks 1–7
+  implementation ended at `d746ce5`; `840b0fb` is the release-gating
+  cancellation-test prerequisite. Later production remediations are
+  `af0763b`, `424ffda`, `1a46135`, and `3887425`. CI, documentation, and test
+  evidence fixes are `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`.
 - Review status: Gate B is approved after the `af0763b` and `424ffda` fixes.
+  Its final APPROVE verdict and zero findings are recorded in
+  `.superpowers/sdd/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses/progress.md`
+  and
+  `.superpowers/sdd/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses/gate-b-fix-report.md`.
   The final-review remediation commits above are recorded, but a fresh
   whole-branch re-review of the final evidence head is still pending; this
   status does not claim final whole-branch approval.

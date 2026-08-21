@@ -119,36 +119,195 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
     let reference =
         std::fs::read_to_string("docs/reference/agent-runtime-and-goal-lifecycle.md").unwrap();
 
-    for required in [
+    let migrations = embedded_migration_versions().unwrap();
+    assert_status_evidence(&design, &reference, &migrations).unwrap();
+
+    let stale_head = reference.replacen("..b790a0c", "..d746ce5", 1);
+    assert!(
+        assert_status_evidence(&design, &stale_head, &migrations).is_err(),
+        "status guard accepted stale Slice 3 evidence head"
+    );
+
+    let contradictory_design = design.replacen(
+        "\n## Normative language",
+        "\nSlices 4–8 are implemented and delivered.\n\n## Normative language",
+        1,
+    );
+    assert!(
+        assert_status_evidence(&contradictory_design, &reference, &migrations).is_err(),
+        "status guard accepted a delivered later-slice claim in the design status"
+    );
+
+    let contradictory_reference = reference.replacen(
+        "\nCordis auto-composability",
+        "\nSlices 4–8 are implemented and delivered.\n\nCordis auto-composability",
+        1,
+    );
+    assert!(
+        assert_status_evidence(&design, &contradictory_reference, &migrations).is_err(),
+        "status guard accepted a delivered later-slice claim in the evidence"
+    );
+}
+
+fn assert_status_evidence(
+    design: &str,
+    reference: &str,
+    migration_versions: &[u32],
+) -> Result<(), String> {
+    let design_header = canonical_section(
+        design,
+        "# Kiteframe Declarative Agents",
+        "## Executive summary",
+    )?;
+    require_text(
+        design_header,
         "Slices 1–3 implemented and Slices 4–8 planned",
+        "design header has stale Slice status",
+    )?;
+
+    let design_status = canonical_section(
+        design,
+        "### Non-normative implementation status",
+        "## Normative language",
+    )?;
+    for required in [
         "Slice 3 is implemented: the built-in Responses path, Codex ACP, and DeepSeek",
         "Slices 4–8 remain prospective and unimplemented",
     ] {
-        assert!(
-            design.contains(required),
-            "stale Slice 3 status: {required}"
-        );
+        require_text(design_status, required, "design status is incomplete")?;
     }
-    assert!(
-        !design.contains("Slices 3–8 and the end-to-end product loop remain unimplemented"),
-        "Slice 3 is incorrectly recorded as unimplemented"
-    );
+    if design_status.contains("Slices 3–8 and the end-to-end product loop remain unimplemented") {
+        return Err("design status incorrectly records Slice 3 as unimplemented".to_owned());
+    }
+    assert_no_later_slice_delivery_claim(design_status)?;
 
+    let evidence = canonical_section(
+        reference,
+        "## Slice 3 implementation evidence — 2026-08-22",
+        "\nCordis auto-composability",
+    )?;
     for required in [
         "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c",
-        "af0763b",
-        "424ffda",
-        "1a46135`, `3887425`,",
-        "fa07acd`, `817f65e`, `7eb454c`, and `b790a0c",
+        "Initial Tasks 1–7 implementation ended at `d746ce5`",
+        "Later production remediations are `af0763b`, `424ffda`, `1a46135`, and `3887425`",
+        "CI, documentation, and test evidence fixes are `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`",
+        "Gate B is approved after the `af0763b` and `424ffda` fixes",
+        "final APPROVE verdict and zero findings",
         "whole-branch re-review of the final evidence head is still pending",
-        "19 migrations (`0001` through `0019`)",
         "cargo test --test harness_acp_live -- --nocapture",
     ] {
-        assert!(
-            reference.contains(required),
-            "missing current evidence: {required}"
-        );
+        require_text(evidence, required, "Slice 3 evidence is stale")?;
     }
+
+    let expected_versions = (1..=migration_versions.len() as u32).collect::<Vec<_>>();
+    if migration_versions != expected_versions {
+        return Err(format!(
+            "migration versions are not contiguous from 0001: {migration_versions:?}"
+        ));
+    }
+    let first = migration_versions.first().ok_or("no embedded migrations")?;
+    let last = migration_versions.last().ok_or("no embedded migrations")?;
+    let migration_evidence = format!(
+        "{} migrations (`{first:04}` through `{last:04}`)",
+        migration_versions.len()
+    );
+    require_text(evidence, &migration_evidence, "migration evidence drifted")?;
+
+    let later_slice_scope = reference
+        .split_once("\nCordis auto-composability")
+        .map(|(_, scope)| scope)
+        .ok_or("missing Slice 3 later-slice boundary")?;
+    require_text(
+        later_slice_scope,
+        "Slices 4–8:\nnot implemented by this evidence",
+        "later Slice status is missing",
+    )?;
+    assert_no_later_slice_delivery_claim(evidence)?;
+    assert_no_later_slice_delivery_claim(later_slice_scope)?;
+    Ok(())
+}
+
+fn canonical_section<'a>(
+    document: &'a str,
+    heading: &str,
+    closing_marker: &str,
+) -> Result<&'a str, String> {
+    let (_, after_heading) = document
+        .split_once(heading)
+        .ok_or_else(|| format!("missing canonical heading: {heading}"))?;
+    let (section, _) = after_heading
+        .split_once(closing_marker)
+        .ok_or_else(|| format!("missing canonical section boundary: {closing_marker}"))?;
+    Ok(section)
+}
+
+fn require_text(section: &str, required: &str, message: &str) -> Result<(), String> {
+    let normalized_section = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized_required = required.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized_section.contains(&normalized_required) {
+        Ok(())
+    } else {
+        Err(format!("{message}: {required}"))
+    }
+}
+
+fn assert_no_later_slice_delivery_claim(section: &str) -> Result<(), String> {
+    let normalized = section.to_ascii_lowercase().replace('–', "-");
+    for statement in normalized.split(['.', '\n']) {
+        let mentions_later_slice = statement.contains("slices 4-8")
+            || (4..=8).any(|slice| statement.contains(&format!("slice {slice}")));
+        let claims_delivery = ["implemented", "delivered", "operational"]
+            .iter()
+            .any(|claim| statement.contains(claim));
+        let preserves_prospective_status = [
+            "not implemented",
+            "unimplemented",
+            "prospective",
+            "deferred",
+            "planned",
+        ]
+        .iter()
+        .any(|status| statement.contains(status));
+        if mentions_later_slice && claims_delivery && !preserves_prospective_status {
+            return Err(format!(
+                "contradictory later-slice delivery claim: {statement}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn embedded_migration_versions() -> Result<Vec<u32>, String> {
+    let mut versions = std::fs::read_dir("migrations")
+        .map_err(|error| format!("read migrations: {error}"))?
+        .map(|entry| entry.map_err(|error| format!("read migration entry: {error}")))
+        .filter_map(|entry| match entry {
+            Ok(entry)
+                if entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "sql") =>
+            {
+                Some(Ok(entry))
+            }
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .map(|entry| {
+            let entry = entry?;
+            entry
+                .file_name()
+                .to_string_lossy()
+                .split_once('_')
+                .map(|(prefix, _)| prefix.parse::<u32>())
+                .ok_or_else(|| {
+                    format!("migration lacks numeric prefix: {}", entry.path().display())
+                })?
+                .map_err(|error| format!("invalid migration prefix: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    versions.sort_unstable();
+    Ok(versions)
 }
 
 #[test]
