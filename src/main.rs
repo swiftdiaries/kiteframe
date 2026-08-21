@@ -553,7 +553,7 @@ async fn run_remote(
     enum StopReason {
         Signal(io::Result<()>),
         Server(io::Result<()>),
-        Scheduler(Result<(), kiteframe::EngineError>),
+        Scheduler(Result<(), SchedulerError>),
     }
     let reason = tokio::select! {
         signal = shutdown_signal() => StopReason::Signal(signal),
@@ -614,11 +614,25 @@ async fn shutdown_signal() -> io::Result<()> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+enum SchedulerError {
+    #[error(transparent)]
+    Engine(#[from] kiteframe::EngineError),
+    #[error(transparent)]
+    Harness(#[from] kiteframe::HarnessDispatcherError),
+}
+
+impl SchedulerError {
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Harness(error) if error.is_fatal())
+    }
+}
+
 async fn run_scheduler(
     engine: Arc<Engine>,
     agent_dispatcher: Arc<AgentCommandDispatcher>,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), kiteframe::EngineError> {
+) -> Result<(), SchedulerError> {
     loop {
         if *shutdown.borrow() {
             return Ok(());
@@ -635,9 +649,10 @@ async fn run_scheduler(
                 let agents = agent_dispatcher
                     .tick_agent_commands(engine.config.scheduler_batch_size)
                     .await?;
-                Ok::<usize, kiteframe::EngineError>(legacy + agents)
+                Ok::<usize, SchedulerError>(legacy + agents)
             } => match result {
                 Ok(applied) => applied,
+                Err(error) if error.is_fatal() => return Err(error),
                 Err(error) => {
                     tracing::warn!(error = %error, "scheduler tick failed; retaining service availability");
                     0
@@ -1188,5 +1203,92 @@ mod tests {
             .unwrap();
         store.pool().close().await;
         isolated_database.drop().await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_exits_fatally_when_owned_reservation_reconciliation_is_unavailable() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let database = IsolatedSchedulerDatabase::create(&database_url).await;
+        let store = Arc::new(PostgresStore::connect(&database.url).await.unwrap());
+        let accepted = accept_scheduler_agent(
+            &store,
+            "Fail fast when owned reconciliation is unavailable.",
+            "acme/scheduler-fatal",
+            143,
+        )
+        .await;
+        let model = Arc::new(RecoveringModel(AtomicUsize::new(0)));
+        let engine = Arc::new(Engine {
+            store: store.clone(),
+            model: model.clone(),
+            tools: Arc::new(kiteframe::InProcessToolRegistry::new()),
+            authorizer: Arc::new(PersistedAuthorizer::new(store.clone())),
+            config: EngineConfig::default(),
+        });
+        let kernel = Application::new(store.clone(), engine.clone()).agent_kernel();
+        start_scheduler_agent(&kernel, &accepted).await;
+        let profile = builtin_harness_profile("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let registry = configured_builtin_registry(store.clone(), model.clone(), profile)
+            .await
+            .unwrap();
+        let fault = Arc::new(kiteframe::HarnessDispatcherTestFault::new([
+            kiteframe::HarnessDispatcherTestFaultPoint::WorkspaceLoad,
+            kiteframe::HarnessDispatcherTestFaultPoint::Reconciliation,
+        ]));
+        let dispatcher = Arc::new(
+            kernel
+                .clone()
+                .with_harness_registry(registry, Arc::new(DenyAllHarnessApprovals))
+                .with_test_fault(fault.clone()),
+        );
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_scheduler(engine, dispatcher, shutdown_rx),
+        )
+        .await
+        .expect("fatal reconciliation failure stops the scheduler")
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SchedulerError::Harness(kiteframe::HarnessDispatcherError::ReconciliationFailed { .. })
+        ));
+        assert!(fault.fired(kiteframe::HarnessDispatcherTestFaultPoint::WorkspaceLoad));
+        assert!(fault.fired(kiteframe::HarnessDispatcherTestFaultPoint::Reconciliation));
+        assert_eq!(model.0.load(Ordering::Acquire), 0);
+        let invocation_state: String = sqlx::query_scalar(
+            "SELECT invocations.state FROM harness_invocations invocations \
+             JOIN agent_commands commands ON commands.id = invocations.command_id \
+             WHERE commands.task_id = $1",
+        )
+        .bind(accepted.task_id.as_uuid())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(invocation_state, "started");
+
+        kernel
+            .cancel_task(
+                &accepted.principal,
+                CancelUserTask {
+                    session_id: accepted.session_id,
+                    task_id: accepted.task_id,
+                    expected_task_revision: 1,
+                    expected_goal_revision: 0,
+                    reason: Some("Scheduler fatal-path test cleanup.".to_owned()),
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "cleanup-fatal-{}",
+                        Uuid::now_v7()
+                    ))
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        store.pool().close().await;
+        database.drop().await;
     }
 }

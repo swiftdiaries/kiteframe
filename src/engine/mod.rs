@@ -3,9 +3,12 @@ mod recovery;
 mod transition;
 
 pub use crate::harness::{HarnessExecutionError, HarnessExecutionResult};
-pub use harness::{AgentCommandDispatcher, HarnessRecoveryReport};
+pub use harness::{AgentCommandDispatcher, HarnessDispatcherError, HarnessRecoveryReport};
 #[cfg(feature = "test-support")]
-pub use harness::{HarnessDispatcherTestBarrier, HarnessDispatcherTestBarrierPoint};
+pub use harness::{
+    HarnessDispatcherTestBarrier, HarnessDispatcherTestBarrierPoint, HarnessDispatcherTestFault,
+    HarnessDispatcherTestFaultPoint,
+};
 pub use recovery::RecoveryReport;
 pub use transition::{FrameSnapshot, TransitionError, next_command};
 

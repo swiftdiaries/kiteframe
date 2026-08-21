@@ -3,13 +3,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "test-support")]
+use crate::harness::HarnessEventEnvelope;
 use crate::harness::{
-    HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
-    HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal, HarnessTransport,
-    PostgresHarnessEventSink, canonical_builtin_unavailable_terminal_payload,
-    canonical_outcome_unknown_terminal_payload, canonical_profile_digest_mismatch_terminal,
-    canonical_profile_unavailable_terminal, dispatch_with_terminal_journal,
-    postgres_harness_acceptance_barrier, terminal_idempotency_key,
+    HarnessApprovalBroker, HarnessEventSink, HarnessFailure, HarnessInvocationId,
+    HarnessInvocationRequest, HarnessRegistry, HarnessRouteTable, HarnessTerminal,
+    HarnessTerminalJournal, HarnessTransport, PostgresHarnessEventSink,
+    canonical_builtin_unavailable_terminal_payload, canonical_outcome_unknown_terminal_payload,
+    canonical_profile_digest_mismatch_terminal, canonical_profile_unavailable_terminal,
+    dispatch_with_terminal_journal, postgres_harness_acceptance_barrier, terminal_idempotency_key,
 };
 use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
 use crate::{
@@ -19,6 +21,24 @@ use crate::{
 };
 
 const HARNESS_DISPATCHER_CLAIMANT: &str = "harness-dispatcher-v1";
+
+#[derive(Debug, thiserror::Error)]
+pub enum HarnessDispatcherError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("owned harness reservation reconciliation failed after `{dispatch}`: {reconciliation}")]
+    ReconciliationFailed {
+        dispatch: StoreError,
+        reconciliation: StoreError,
+    },
+}
+
+impl HarnessDispatcherError {
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::ReconciliationFailed { .. })
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 /// One bounded recovery page. The three counters are mutually exclusive and
@@ -36,9 +56,83 @@ pub enum HarnessDispatcherTestBarrierPoint {
     BeforeJournalInsert,
     AfterPrepare,
     AfterAttemptReservation,
+    BeforeOwnedReconciliation,
     AfterRetryCommit,
     BeforeCommandTerminal,
     AfterCommandTerminal,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum HarnessDispatcherTestFaultPoint {
+    WorkspaceLoad,
+    EventLoad,
+    EventPersistence,
+    RegistryBoundary,
+    CancellationPoll,
+    Reconciliation,
+}
+
+#[cfg(feature = "test-support")]
+pub struct HarnessDispatcherTestFault {
+    armed: std::sync::atomic::AtomicBool,
+    pending: Mutex<BTreeSet<HarnessDispatcherTestFaultPoint>>,
+    fired: Mutex<BTreeSet<HarnessDispatcherTestFaultPoint>>,
+}
+
+#[cfg(feature = "test-support")]
+impl HarnessDispatcherTestFault {
+    #[must_use]
+    pub fn new(points: impl IntoIterator<Item = HarnessDispatcherTestFaultPoint>) -> Self {
+        Self::with_armed(points, true)
+    }
+
+    #[must_use]
+    pub fn new_disarmed(points: impl IntoIterator<Item = HarnessDispatcherTestFaultPoint>) -> Self {
+        Self::with_armed(points, false)
+    }
+
+    fn with_armed(
+        points: impl IntoIterator<Item = HarnessDispatcherTestFaultPoint>,
+        armed: bool,
+    ) -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(armed),
+            pending: Mutex::new(points.into_iter().collect()),
+            fired: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    pub fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn fired(&self, point: HarnessDispatcherTestFaultPoint) -> bool {
+        self.fired
+            .lock()
+            .expect("dispatcher test fault lock is not poisoned")
+            .contains(&point)
+    }
+
+    fn fail(&self, point: HarnessDispatcherTestFaultPoint) -> Result<(), StoreError> {
+        if !self.armed.load(std::sync::atomic::Ordering::Acquire)
+            || !self
+                .pending
+                .lock()
+                .expect("dispatcher test fault lock is not poisoned")
+                .remove(&point)
+        {
+            return Ok(());
+        }
+        self.fired
+            .lock()
+            .expect("dispatcher test fault lock is not poisoned")
+            .insert(point);
+        Err(StoreError::InvalidData(format!(
+            "injected owned harness dispatcher fault at {point:?}"
+        )))
+    }
 }
 
 #[cfg(feature = "test-support")]
@@ -98,6 +192,8 @@ pub struct AgentCommandDispatcher {
     recovery_lock: tokio::sync::Mutex<()>,
     #[cfg(feature = "test-support")]
     test_barrier: Option<Arc<HarnessDispatcherTestBarrier>>,
+    #[cfg(feature = "test-support")]
+    test_fault: Mutex<Option<Arc<HarnessDispatcherTestFault>>>,
 }
 
 impl AgentKernel {
@@ -134,6 +230,8 @@ impl AgentKernel {
             recovery_lock: tokio::sync::Mutex::new(()),
             #[cfg(feature = "test-support")]
             test_barrier: None,
+            #[cfg(feature = "test-support")]
+            test_fault: Mutex::new(None),
         }
     }
 }
@@ -147,10 +245,41 @@ impl AgentCommandDispatcher {
     }
 
     #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_test_fault(mut self, fault: Arc<HarnessDispatcherTestFault>) -> Self {
+        *self
+            .test_fault
+            .get_mut()
+            .expect("dispatcher test fault lock is not poisoned") = Some(fault);
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn install_test_fault(&self, fault: Arc<HarnessDispatcherTestFault>) {
+        *self
+            .test_fault
+            .lock()
+            .expect("dispatcher test fault lock is not poisoned") = Some(fault);
+    }
+
+    #[cfg(feature = "test-support")]
     async fn pause_test_barrier(&self, point: HarnessDispatcherTestBarrierPoint) {
         if let Some(barrier) = &self.test_barrier {
             barrier.pause(point).await;
         }
+    }
+
+    #[cfg(feature = "test-support")]
+    fn fail_test_fault(&self, point: HarnessDispatcherTestFaultPoint) -> Result<(), StoreError> {
+        if let Some(fault) = self
+            .test_fault
+            .lock()
+            .expect("dispatcher test fault lock is not poisoned")
+            .clone()
+        {
+            fault.fail(point)?;
+        }
+        Ok(())
     }
 
     pub async fn recover_harness_invocations(
@@ -298,7 +427,7 @@ impl AgentCommandDispatcher {
             .await
     }
 
-    pub async fn tick_agent_commands(&self, limit: i64) -> Result<usize, StoreError> {
+    pub async fn tick_agent_commands(&self, limit: i64) -> Result<usize, HarnessDispatcherError> {
         if limit <= 0 {
             return Ok(0);
         }
@@ -313,7 +442,8 @@ impl AgentCommandDispatcher {
                 sqlx::query_scalar("SELECT session_id FROM user_tasks WHERE id = $1")
                     .bind(listed.task_id.as_uuid())
                     .fetch_one(self.kernel.store().pool())
-                    .await?,
+                    .await
+                    .map_err(StoreError::from)?,
             );
             let context = self
                 .kernel
@@ -347,7 +477,7 @@ impl AgentCommandDispatcher {
                     match self.kernel.store().claim_agent_command(request).await {
                         Ok(claimed) => claimed,
                         Err(StoreError::RevisionConflict) => continue,
-                        Err(error) => return Err(error),
+                        Err(error) => return Err(error.into()),
                     }
                 }
                 AgentCommandState::Claimed
@@ -370,7 +500,7 @@ impl AgentCommandDispatcher {
         &self,
         execution: &crate::AgentExecutionView,
         claimed: crate::AgentCommandView,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), HarnessDispatcherError> {
         match dispatch_route(&claimed.payload) {
             DispatchRoute::Harness => self.dispatch_harness(execution, claimed).await,
             DispatchRoute::Unavailable => {
@@ -380,11 +510,14 @@ impl AgentCommandDispatcher {
                     &format!("harness-unavailable:{}", claimed.id.as_uuid()),
                     "runtime_command_unavailable",
                 )?;
-                unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+                unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                    .await
+                    .map_err(Into::into)
             }
             DispatchRoute::InternalAuthority => Err(StoreError::AgentTransitionInvalid(
                 "internal authority command reached dispatcher".to_owned(),
-            )),
+            )
+            .into()),
         }
     }
 
@@ -392,7 +525,7 @@ impl AgentCommandDispatcher {
         &self,
         execution: &crate::AgentExecutionView,
         claimed: crate::AgentCommandView,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), HarnessDispatcherError> {
         let KernelCommandPayload::InvokeHarness(payload) = &claimed.payload else {
             unreachable!("harness route must contain InvokeHarness")
         };
@@ -406,7 +539,7 @@ impl AgentCommandDispatcher {
             .await?;
         let (prepared, runtime_registration) = if let Some(stored) = stored {
             if stored.payload_digest != claimed.payload_digest {
-                return Err(StoreError::IdempotencyConflict);
+                return Err(StoreError::IdempotencyConflict.into());
             }
             let runtime_registration = self.registry.runtime_registration(&stored.profile_id);
             (stored, runtime_registration)
@@ -428,7 +561,8 @@ impl AgentCommandDispatcher {
                     "harness_profile_unavailable",
                 )?;
                 return failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
-                    .await;
+                    .await
+                    .map_err(Into::into);
             };
             let runtime_registration = self.registry.runtime_registration(&profile_id);
             let max_pre_accept_attempts = runtime_registration
@@ -463,6 +597,7 @@ impl AgentCommandDispatcher {
             |terminal| async {
                 self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
                     .await
+                    .map_err(Into::into)
             },
             || async {
                 let Some(runtime_registration) = runtime_registration else {
@@ -473,7 +608,8 @@ impl AgentCommandDispatcher {
                             &prepared,
                             canonical_profile_unavailable_terminal(),
                         )
-                        .await;
+                        .await
+                        .map_err(Into::into);
                 };
                 if runtime_registration.profile_digest() != prepared.profile_digest {
                     return self
@@ -483,7 +619,8 @@ impl AgentCommandDispatcher {
                             &prepared,
                             canonical_profile_digest_mismatch_terminal(),
                         )
-                        .await;
+                        .await
+                        .map_err(Into::into);
                 }
                 let Some(_active) =
                     ActiveDispatchGuard::reserve(self.active.clone(), &prepared.invocation_id)
@@ -503,7 +640,7 @@ impl AgentCommandDispatcher {
                         {
                             Ok(prepared) => prepared,
                             Err(StoreError::RevisionConflict) => return Ok(()),
-                            Err(error) => return Err(error),
+                            Err(error) => return Err(error.into()),
                         }
                     }
                     HarnessInvocationState::Started => {
@@ -516,7 +653,8 @@ impl AgentCommandDispatcher {
                         {
                             return self
                                 .settle_pre_accept_exhausted(execution, &claimed, &prepared)
-                                .await;
+                                .await
+                                .map_err(Into::into);
                         }
                         return Ok(());
                     }
@@ -528,7 +666,8 @@ impl AgentCommandDispatcher {
                                 &prepared.invocation_id,
                                 prepared.attempt,
                             )
-                            .await;
+                            .await
+                            .map_err(Into::into);
                     }
                     HarnessInvocationState::Completed
                     | HarnessInvocationState::Cancelled
@@ -542,84 +681,274 @@ impl AgentCommandDispatcher {
                     )
                     .await;
                 }
-                if prepared.terminal {
-                    return self
-                        .settle_harness_terminal(
+                let mut reconciliation_attempted = false;
+                let owned_result: Result<(), StoreError> = async {
+                    if prepared.terminal {
+                        return self
+                            .settle_harness_terminal(
+                                execution,
+                                &claimed,
+                                &prepared,
+                                terminal_from_record(&prepared)?,
+                            )
+                            .await;
+                    }
+                    #[cfg(feature = "test-support")]
+                    self.fail_test_fault(HarnessDispatcherTestFaultPoint::WorkspaceLoad)?;
+                    let workspace: String =
+                        sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
+                            .bind(execution.task.session_id.as_uuid())
+                            .fetch_one(self.kernel.store().pool())
+                            .await?;
+                    let request = HarnessInvocationRequest {
+                        invocation_id: prepared.invocation_id.clone(),
+                        command_id: claimed.id.clone(),
+                        command_revision: claimed.revision,
+                        profile_id,
+                        workspace: PathBuf::from(workspace),
+                        payload: payload.clone(),
+                        payload_digest: claimed.payload_digest.clone(),
+                    };
+                    #[cfg(feature = "test-support")]
+                    self.fail_test_fault(HarnessDispatcherTestFaultPoint::EventLoad)?;
+                    let next_sequence = u64::try_from(
+                        self.kernel
+                            .store()
+                            .harness_invocation_events(&prepared.invocation_id)
+                            .await?
+                            .len(),
+                    )
+                    .map_err(|_| {
+                        StoreError::InvalidData("harness event sequence is malformed".to_owned())
+                    })?;
+                    let store = self.kernel.store_arc();
+                    let event_sink: Arc<dyn HarnessEventSink> =
+                        Arc::new(PostgresHarnessEventSink::new(store.clone()));
+                    #[cfg(feature = "test-support")]
+                    let event_sink: Arc<dyn HarnessEventSink> = if let Some(fault) = self
+                        .test_fault
+                        .lock()
+                        .expect("dispatcher test fault lock is not poisoned")
+                        .clone()
+                    {
+                        Arc::new(FaultInjectingHarnessEventSink {
+                            inner: event_sink,
+                            fault,
+                        })
+                    } else {
+                        event_sink
+                    };
+                    #[cfg(feature = "test-support")]
+                    self.fail_test_fault(HarnessDispatcherTestFaultPoint::RegistryBoundary)?;
+                    let lifecycle = self
+                        .registry
+                        .invoke_registered_managed_from_sequence_with_acceptance_barrier(
+                            runtime_registration,
+                            request,
+                            self.approvals.clone(),
+                            event_sink,
+                            next_sequence,
+                            postgres_harness_acceptance_barrier(
+                                store,
+                                prepared.invocation_id.clone(),
+                                prepared.attempt,
+                            ),
+                        );
+                    tokio::pin!(lifecycle);
+                    let cancellation = self.wait_for_command_cancellation(&claimed.id);
+                    tokio::pin!(cancellation);
+                    let lifecycle = tokio::select! {
+                        biased;
+                        lifecycle = &mut lifecycle => lifecycle,
+                        cancelled = &mut cancellation => {
+                            let _ = self.registry.cancel(&prepared.invocation_id).await;
+                            let lifecycle = lifecycle.await;
+                            if let Err(error) = cancelled {
+                                let _ = lifecycle.finish().await;
+                                return Err(error);
+                            }
+                            lifecycle
+                        }
+                    };
+                    let terminal = lifecycle.terminal().clone();
+                    if matches!(terminal, HarnessTerminal::OutcomeUnknown(_)) {
+                        reconciliation_attempted = true;
+                        match self
+                            .reconcile_owned_reservation(
+                                execution,
+                                &claimed,
+                                &prepared.invocation_id,
+                            )
+                            .await
+                        {
+                            Ok(()) => reconciliation_attempted = false,
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        self.settle_harness_terminal(
                             execution,
                             &claimed,
                             &prepared,
-                            terminal_from_record(&prepared)?,
+                            terminal.clone(),
                         )
-                        .await;
-                }
-                let workspace: String =
-                    sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
-                        .bind(execution.task.session_id.as_uuid())
-                        .fetch_one(self.kernel.store().pool())
                         .await?;
-                let request = HarnessInvocationRequest {
-                    invocation_id: prepared.invocation_id.clone(),
-                    command_id: claimed.id.clone(),
-                    command_revision: claimed.revision,
-                    profile_id,
-                    workspace: PathBuf::from(workspace),
-                    payload: payload.clone(),
-                    payload_digest: claimed.payload_digest.clone(),
-                };
-                let next_sequence = u64::try_from(
-                    self.kernel
-                        .store()
-                        .harness_invocation_events(&prepared.invocation_id)
-                        .await?
-                        .len(),
-                )
-                .map_err(|_| {
-                    StoreError::InvalidData("harness event sequence is malformed".to_owned())
-                })?;
-                let store = self.kernel.store_arc();
-                let lifecycle = self
-                    .registry
-                    .invoke_registered_managed_from_sequence_with_acceptance_barrier(
-                        runtime_registration,
-                        request,
-                        self.approvals.clone(),
-                        Arc::new(PostgresHarnessEventSink::new(store.clone())),
-                        next_sequence,
-                        postgres_harness_acceptance_barrier(
-                            store,
-                            prepared.invocation_id.clone(),
-                            prepared.attempt,
-                        ),
-                    );
-                tokio::pin!(lifecycle);
-                let cancellation = self.wait_for_command_cancellation(&claimed.id);
-                tokio::pin!(cancellation);
-                let lifecycle = tokio::select! {
-                    biased;
-                    lifecycle = &mut lifecycle => lifecycle,
-                    cancelled = &mut cancellation => {
-                        cancelled?;
-                        let _ = self.registry.cancel(&prepared.invocation_id).await;
-                        lifecycle.await
                     }
-                };
-                let terminal = lifecycle.terminal().clone();
-                self.settle_harness_terminal(execution, &claimed, &prepared, terminal.clone())
-                    .await?;
-                let lifecycle_terminal = lifecycle.finish().await;
-                if lifecycle_terminal != terminal {
-                    self.kernel
-                        .store()
-                        .record_harness_lifecycle_failure(
-                            &prepared.invocation_id,
-                            lifecycle_failure(&lifecycle_terminal),
-                        )
-                        .await?;
+                    let lifecycle_terminal = lifecycle.finish().await;
+                    if lifecycle_terminal != terminal {
+                        self.kernel
+                            .store()
+                            .record_harness_lifecycle_failure(
+                                &prepared.invocation_id,
+                                lifecycle_failure(&lifecycle_terminal),
+                            )
+                            .await?;
+                    }
+                    Ok(())
                 }
-                Ok(())
+                .await;
+                match owned_result {
+                    Ok(()) => Ok(()),
+                    Err(reconciliation) if reconciliation_attempted => {
+                        Err(HarnessDispatcherError::ReconciliationFailed {
+                            dispatch: StoreError::AgentTransitionInvalid(
+                                "owned harness uncertainty required durable reconciliation"
+                                    .to_owned(),
+                            ),
+                            reconciliation,
+                        })
+                    }
+                    Err(dispatch) => {
+                        self.reconcile_owned_dispatch_error(
+                            execution,
+                            &claimed,
+                            &prepared.invocation_id,
+                            dispatch,
+                        )
+                        .await
+                    }
+                }
             },
         )
         .await
+    }
+
+    async fn reconcile_owned_dispatch_error(
+        &self,
+        execution: &crate::AgentExecutionView,
+        claimed: &crate::AgentCommandView,
+        invocation_id: &HarnessInvocationId,
+        dispatch: StoreError,
+    ) -> Result<(), HarnessDispatcherError> {
+        self.reconcile_owned_reservation(execution, claimed, invocation_id)
+            .await
+            .map_err(
+                |reconciliation| HarnessDispatcherError::ReconciliationFailed {
+                    dispatch,
+                    reconciliation,
+                },
+            )
+    }
+
+    async fn reconcile_owned_reservation(
+        &self,
+        execution: &crate::AgentExecutionView,
+        claimed: &crate::AgentCommandView,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<(), StoreError> {
+        #[cfg(feature = "test-support")]
+        self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::BeforeOwnedReconciliation)
+            .await;
+        #[cfg(feature = "test-support")]
+        self.fail_test_fault(HarnessDispatcherTestFaultPoint::Reconciliation)?;
+        let Some(invocation) = self
+            .kernel
+            .store()
+            .refresh_harness_recovery_invocation(invocation_id)
+            .await?
+        else {
+            return Ok(());
+        };
+        match invocation.state {
+            HarnessInvocationState::Prepared => Ok(()),
+            HarnessInvocationState::Started if invocation.prompt_accepted => {
+                self.settle_outcome_unknown(
+                    execution,
+                    claimed,
+                    &invocation.invocation_id,
+                    invocation.attempt,
+                )
+                .await
+            }
+            HarnessInvocationState::Started => {
+                if self
+                    .kernel
+                    .store()
+                    .harness_pre_accept_exhaustion(&invocation.invocation_id)
+                    .await?
+                    .is_some()
+                {
+                    return self
+                        .settle_pre_accept_exhausted(execution, claimed, &invocation)
+                        .await;
+                }
+                let terminal = owned_pre_accept_failure();
+                let terminal_key = terminal_idempotency_key(&invocation.invocation_id);
+                let terminal_payload = terminal_payload(&terminal);
+                let retried = self
+                    .kernel
+                    .store()
+                    .record_harness_retryable_failure_with_stored_limit(
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                        &terminal_key,
+                        &terminal_payload,
+                    )
+                    .await?;
+                if retried.state == HarnessInvocationState::Cancelled {
+                    return Ok(());
+                }
+                if self
+                    .kernel
+                    .store()
+                    .harness_pre_accept_exhaustion(&invocation.invocation_id)
+                    .await?
+                    .is_some()
+                {
+                    self.settle_pre_accept_exhausted(execution, claimed, &retried)
+                        .await?;
+                }
+                Ok(())
+            }
+            HarnessInvocationState::Accepted => {
+                self.settle_outcome_unknown(
+                    execution,
+                    claimed,
+                    &invocation.invocation_id,
+                    invocation.attempt,
+                )
+                .await
+            }
+            HarnessInvocationState::OutcomeUnknown => {
+                self.settle_outcome_unknown(
+                    execution,
+                    claimed,
+                    &invocation.invocation_id,
+                    invocation.attempt,
+                )
+                .await
+            }
+            HarnessInvocationState::Completed
+            | HarnessInvocationState::Cancelled
+            | HarnessInvocationState::Failed => {
+                self.settle_harness_terminal(
+                    execution,
+                    claimed,
+                    &invocation,
+                    terminal_from_record(&invocation)?,
+                )
+                .await
+            }
+        }
     }
 
     async fn settle_harness_terminal(
@@ -848,6 +1177,8 @@ impl AgentCommandDispatcher {
         &self,
         command_id: &crate::AgentCommandId,
     ) -> Result<bool, StoreError> {
+        #[cfg(feature = "test-support")]
+        self.fail_test_fault(HarnessDispatcherTestFaultPoint::CancellationPoll)?;
         let state: String = sqlx::query_scalar("SELECT state FROM agent_commands WHERE id = $1")
             .bind(command_id.as_uuid())
             .fetch_one(self.kernel.store().pool())
@@ -1051,7 +1382,7 @@ impl<'a> PreparedHarnessTerminalJournal<'a> {
 
 #[async_trait::async_trait]
 impl HarnessTerminalJournal for PreparedHarnessTerminalJournal<'_> {
-    type Error = StoreError;
+    type Error = HarnessDispatcherError;
 
     async fn terminal(
         &self,
@@ -1060,12 +1391,14 @@ impl HarnessTerminalJournal for PreparedHarnessTerminalJournal<'_> {
         if self.invocation.invocation_id != *invocation_id {
             return Err(StoreError::InvalidData(
                 "terminal journal invocation identity drifted".to_owned(),
-            ));
+            )
+            .into());
         }
         self.invocation
             .terminal
             .then(|| terminal_from_record(self.invocation))
             .transpose()
+            .map_err(Into::into)
     }
 }
 
@@ -1100,6 +1433,30 @@ impl Drop for ActiveDispatchGuard {
             .expect("dispatcher active lock is not poisoned")
             .remove(&self.invocation_id);
     }
+}
+
+#[cfg(feature = "test-support")]
+struct FaultInjectingHarnessEventSink {
+    inner: Arc<dyn HarnessEventSink>,
+    fault: Arc<HarnessDispatcherTestFault>,
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl HarnessEventSink for FaultInjectingHarnessEventSink {
+    async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
+        self.fault
+            .fail(HarnessDispatcherTestFaultPoint::EventPersistence)
+            .map_err(|error| HarnessFailure::new("harness_outcome_unknown", error.to_string()))?;
+        self.inner.append(event).await
+    }
+}
+
+fn owned_pre_accept_failure() -> HarnessTerminal {
+    HarnessTerminal::Failed(HarnessFailure::new(
+        "harness_failed",
+        "owned harness reservation failed before durable acceptance",
+    ))
 }
 
 fn terminal_payload(terminal: &HarnessTerminal) -> serde_json::Value {

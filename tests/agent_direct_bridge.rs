@@ -17,12 +17,12 @@ use kiteframe::{
     AgentSelector, BuiltinHarnessPlugin, CancelUserTask, CatalogTool, ClaimAgentCommand,
     ClosedSchema, CompleteAgentCommand, CreateSession, EffectKind, EvidenceId, EvidenceRecord,
     EvidenceSourceIdentity, GoalContract, GoalPhase, HarnessConfig, HarnessDispatcherTestBarrier,
-    HarnessDispatcherTestBarrierPoint, HarnessExecutionError, IdempotencyKey, InvokeHarness,
-    KernelCommandPayload, ModelClient, ModelError, ModelRequest, ModelResponse, OperationalStatus,
-    PauseUserTask, PostgresStore, PrincipalId, RecoverySupport, RequestContext, RuntimeCeilings,
-    RuntimeEvent, StartAgent, StartRun, StoreError, SubmitUserTask, SuccessCriterion,
-    TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot,
-    UserTaskId, WaitForEvent, canonical_sha256,
+    HarnessDispatcherTestBarrierPoint, HarnessDispatcherTestFault, HarnessDispatcherTestFaultPoint,
+    HarnessExecutionError, IdempotencyKey, InvokeHarness, KernelCommandPayload, ModelClient,
+    ModelError, ModelRequest, ModelResponse, OperationalStatus, PauseUserTask, PostgresStore,
+    PrincipalId, RecoverySupport, RequestContext, RuntimeCeilings, RuntimeEvent, StartAgent,
+    StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
+    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId, WaitForEvent, canonical_sha256,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -618,6 +618,25 @@ impl BridgeFixture {
                 .unwrap();
         }
     }
+}
+
+async fn builtin_dispatcher_with_fault(
+    fixture: &BridgeFixture,
+    fault: Arc<HarnessDispatcherTestFault>,
+    max_pre_accept_attempts: u64,
+) -> AgentCommandDispatcher {
+    let profile = builtin_profile();
+    let plugin = Arc::new(BuiltinHarnessPlugin::new(profile, fixture.model.clone()));
+    let mut registry = HarnessRegistry::new();
+    registry
+        .register_with_pre_accept_attempt_limit(plugin, max_pre_accept_attempts)
+        .await
+        .unwrap();
+    fixture
+        .kernel
+        .clone()
+        .with_harness_registry(Arc::new(registry), Arc::new(DenyAllHarnessApprovals))
+        .with_test_fault(fault)
 }
 
 #[derive(Clone, Copy)]
@@ -2419,6 +2438,194 @@ async fn cancellation_during_model_or_tool_failure_audits_only_command_failure_m
         );
         assert_eq!(fixture.evidence().await.len(), 0);
     }
+}
+
+#[tokio::test]
+async fn owned_pre_accept_store_failures_consume_the_attempt_without_stranding_started() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    for (point, attempt_limit, terminal) in [
+        (HarnessDispatcherTestFaultPoint::WorkspaceLoad, 3, false),
+        (HarnessDispatcherTestFaultPoint::EventLoad, 3, false),
+        (HarnessDispatcherTestFaultPoint::EventPersistence, 3, false),
+        (HarnessDispatcherTestFaultPoint::RegistryBoundary, 1, true),
+    ] {
+        let Some(fixture) = BridgeFixture::started().await else {
+            eprintln!("SKIP owned reservation reconciliation: DATABASE_URL is absent");
+            return;
+        };
+        let command = fixture.pending_command().await;
+        fixture
+            .model
+            .complete("ok", json!({"answer":"one owned retry"}));
+        let fault = Arc::new(HarnessDispatcherTestFault::new([point]));
+        let dispatcher =
+            builtin_dispatcher_with_fault(&fixture, fault.clone(), attempt_limit).await;
+
+        assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+        assert!(fault.fired(point));
+        let reconciled = fixture
+            .store
+            .harness_invocation_for_command_revision(&command.id, command.revision + 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(reconciled.state, HarnessInvocationState::Started);
+        assert_eq!(fixture.model.calls(), 0);
+
+        if terminal {
+            assert_eq!(reconciled.state, HarnessInvocationState::Failed);
+            assert!(reconciled.terminal);
+            assert_eq!(
+                reconciled.terminal_payload,
+                Some(json!({
+                    "type":"failed",
+                    "code":"harness_failed",
+                    "detail":"harness pre-accept attempt budget exhausted",
+                }))
+            );
+            assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+            assert_eq!(fixture.model.calls(), 0);
+        } else {
+            assert_eq!(reconciled.state, HarnessInvocationState::Prepared);
+            assert_eq!(reconciled.attempt, 1);
+            assert!(!reconciled.terminal);
+            assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+            assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+            assert_eq!(fixture.model.calls(), 1);
+            let completed = fixture
+                .store
+                .harness_invocation_for_command_revision(&command.id, command.revision + 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.state, HarnessInvocationState::Completed);
+            assert_eq!(completed.attempt, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn owned_post_accept_poll_failure_cancels_lifecycle_and_settles_outcome_unknown_once() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        eprintln!("SKIP owned accepted reconciliation: DATABASE_URL is absent");
+        return;
+    };
+    let command = fixture.pending_command().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    fixture.model.on_request(move |_| {
+        let entered_tx = entered_tx.clone();
+        async move {
+            if let Some(entered_tx) = entered_tx.lock().unwrap().take() {
+                let _ = entered_tx.send(());
+            }
+            std::future::pending::<Result<ModelResponse, ModelError>>().await
+        }
+    });
+    let fault = Arc::new(HarnessDispatcherTestFault::new_disarmed([
+        HarnessDispatcherTestFaultPoint::CancellationPoll,
+    ]));
+    let dispatcher = Arc::new(builtin_dispatcher_with_fault(&fixture, fault.clone(), 3).await);
+    let tick = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        async move { dispatcher.tick_agent_commands(8).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx)
+        .await
+        .expect("accepted model call starts")
+        .expect("accepted model entry sender remains live");
+    fault.arm();
+
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), tick)
+            .await
+            .expect("owned lifecycle cancellation is bounded")
+            .expect("owned dispatcher joins")
+            .unwrap(),
+        1
+    );
+    assert!(fault.fired(HarnessDispatcherTestFaultPoint::CancellationPoll));
+    let reconciled = fixture
+        .store
+        .harness_invocation_for_command_revision(&command.id, command.revision + 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconciled.state, HarnessInvocationState::OutcomeUnknown);
+    assert!(reconciled.terminal);
+    assert_eq!(
+        reconciled.terminal_payload,
+        Some(json!({
+            "type":"outcome_unknown",
+            "code":"harness_outcome_unknown",
+            "detail":"harness terminal outcome is unknown",
+        }))
+    );
+    assert_eq!(fixture.model.calls(), 1);
+    assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(fixture.model.calls(), 1);
+}
+
+#[tokio::test]
+async fn principal_cancellation_remains_authoritative_during_owned_error_reconciliation() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        eprintln!("SKIP owned cancellation reconciliation: DATABASE_URL is absent");
+        return;
+    };
+    let command = fixture.pending_command().await;
+    let fault = Arc::new(HarnessDispatcherTestFault::new([
+        HarnessDispatcherTestFaultPoint::WorkspaceLoad,
+    ]));
+    let barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+        HarnessDispatcherTestBarrierPoint::BeforeOwnedReconciliation,
+    ));
+    let dispatcher = Arc::new(
+        builtin_dispatcher_with_fault(&fixture, fault, 3)
+            .await
+            .with_test_barrier(barrier.clone()),
+    );
+    let tick = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        async move { dispatcher.tick_agent_commands(8).await }
+    });
+    barrier.wait_until_entered().await;
+    let current = fixture.current().await;
+    fixture
+        .kernel
+        .cancel_task(
+            &fixture.principal,
+            CancelUserTask {
+                session_id: fixture.session_id.clone(),
+                task_id: fixture.task_id.clone(),
+                expected_task_revision: current.task_revision,
+                expected_goal_revision: current.goal_revision,
+                reason: Some("Cancel while owned reservation is reconciling.".to_owned()),
+                idempotency_key: IdempotencyKey::new(format!(
+                    "cancel-owned-reconciliation-{}",
+                    Uuid::now_v7()
+                ))
+                .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    barrier.release();
+
+    assert_eq!(tick.await.unwrap().unwrap(), 1);
+    let reconciled = fixture
+        .store
+        .harness_invocation_for_command_revision(&command.id, command.revision + 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconciled.state, HarnessInvocationState::Cancelled);
+    assert!(reconciled.terminal);
+    assert_eq!(fixture.command_state(&command.id).await, "cancelled");
+    assert_eq!(fixture.current().await.lifecycle, TaskLifecycle::Cancelled);
+    assert_eq!(fixture.model.calls(), 0);
+    assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 0);
 }
 
 #[tokio::test]

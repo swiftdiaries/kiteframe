@@ -757,8 +757,9 @@ mod integrated_postgres_fake_restart {
     use kiteframe::{
         AgentCommandDispatcher, AgentCommandId, AgentKernel, AgentSelector, CreateSession,
         GoalContract, GoalPhase, HarnessDispatcherTestBarrier, HarnessDispatcherTestBarrierPoint,
-        IdempotencyKey, PrincipalId, RuntimeCeilings, StartAgent, SubmitUserTask, SuccessCriterion,
-        TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+        HarnessDispatcherTestFault, HarnessDispatcherTestFaultPoint, IdempotencyKey, PrincipalId,
+        RuntimeCeilings, StartAgent, SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer,
+        TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
     };
     use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
@@ -996,6 +997,28 @@ mod integrated_postgres_fake_restart {
                 process_log,
             )
             .await
+        }
+
+        async fn dispatcher_with_fault(
+            &mut self,
+            registration_script: &str,
+            invocation_script: Option<&str>,
+            acp_barrier: Arc<AcpTestBarrier>,
+            fault: Arc<HarnessDispatcherTestFault>,
+            process_log: &std::path::Path,
+        ) -> (Arc<AgentCommandDispatcher>, PathBuf) {
+            let (dispatcher, observation) = self
+                .configured_dispatcher(
+                    registration_script,
+                    invocation_script,
+                    acp_barrier,
+                    None,
+                    limits(),
+                    Some(process_log),
+                )
+                .await;
+            dispatcher.install_test_fault(fault);
+            (dispatcher, observation)
         }
 
         async fn configured_dispatcher(
@@ -1866,6 +1889,72 @@ mod integrated_postgres_fake_restart {
         assert_eq!(terminal.state, HarnessInvocationState::Failed);
         assert_eq!(terminal.attempt, 0);
         assert_eq!(process_counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn accepted_acp_poll_failure_owns_bounded_cancel_and_shutdown_without_duplicate_process()
+    {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let process_log = recovery
+            .workspace
+            .join("owned-poll-failure-processes.jsonl");
+        let acp_barrier = Arc::new(AcpTestBarrier::new_disarmed(
+            "session/prompt",
+            AcpTestBarrierPoint::BeforeWrite,
+        ));
+        acp_barrier.arm();
+        let fault = Arc::new(HarnessDispatcherTestFault::new_disarmed([
+            HarnessDispatcherTestFaultPoint::CancellationPoll,
+        ]));
+        let (dispatcher, observation) = recovery
+            .dispatcher_with_fault(
+                "core-success.json",
+                None,
+                acp_barrier.clone(),
+                fault.clone(),
+                &process_log,
+            )
+            .await;
+        let tick = tokio::spawn({
+            let dispatcher = dispatcher.clone();
+            async move { dispatcher.tick_agent_commands(8).await }
+        });
+        acp_barrier.wait_until_entered().await;
+        let accepted = recovery.invocation().await.unwrap();
+        assert_eq!(accepted.state, HarnessInvocationState::Accepted);
+        fault.arm();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !fault.fired(HarnessDispatcherTestFaultPoint::CancellationPoll) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation polling fault fires while ACP lifecycle is owned");
+        acp_barrier.release();
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), tick)
+                .await
+                .expect("ACP cancel and shutdown stay bounded")
+                .expect("dispatcher task joins")
+                .unwrap(),
+            1
+        );
+        let terminal = recovery.invocation().await.unwrap();
+        let command = recovery.pending_or_owned_command().await;
+        let processes = process_log_counts(&process_log);
+        let prompts = prompt_count(&observation);
+        assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+        recovery.cleanup().await;
+
+        assert_eq!(terminal.state, HarnessInvocationState::OutcomeUnknown);
+        assert!(terminal.terminal);
+        assert_eq!(command.state, kiteframe::AgentCommandState::Completed);
+        assert_eq!(processes, (1, 0));
+        assert_eq!(prompts, 0);
     }
 
     #[tokio::test]
