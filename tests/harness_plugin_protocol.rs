@@ -127,11 +127,15 @@ impl HarnessEventSink for FailAfterOneHarnessEventSink {
 enum FakeMode {
     Events(Vec<HarnessInvocationEvent>),
     WaitForCancel,
+    Retryable(HarnessFailure),
+    Failed(HarnessFailure),
+    OutcomeUnknown(HarnessFailure),
 }
 
 struct FakePlugin {
     profile: HarnessProfile,
     protocol_version: u16,
+    describe_failure: Option<HarnessFailure>,
     mode: FakeMode,
 }
 
@@ -187,6 +191,7 @@ impl FakePlugin {
         Self {
             profile: profile(),
             protocol_version,
+            describe_failure: None,
             mode: FakeMode::Events(vec![]),
         }
     }
@@ -195,6 +200,7 @@ impl FakePlugin {
         Self {
             profile: profile(),
             protocol_version: 1,
+            describe_failure: None,
             mode: FakeMode::Events(events),
         }
     }
@@ -203,7 +209,26 @@ impl FakePlugin {
         Self {
             profile: profile(),
             protocol_version: 1,
+            describe_failure: None,
             mode: FakeMode::WaitForCancel,
+        }
+    }
+
+    fn with_describe_failure(code: &'static str) -> Self {
+        Self {
+            profile: profile(),
+            protocol_version: 1,
+            describe_failure: Some(HarnessFailure::new(code, "plugin handshake detail")),
+            mode: FakeMode::Events(vec![]),
+        }
+    }
+
+    fn with_terminal(mode: FakeMode) -> Self {
+        Self {
+            profile: profile(),
+            protocol_version: 1,
+            describe_failure: None,
+            mode,
         }
     }
 }
@@ -215,6 +240,9 @@ impl HarnessPlugin for FakePlugin {
     }
 
     async fn describe_capabilities(&self) -> Result<HarnessCapabilities, HarnessFailure> {
+        if let Some(error) = &self.describe_failure {
+            return Err(error.clone());
+        }
         Ok(HarnessCapabilities {
             protocol_version: self.protocol_version,
             implementation_name: "fake".to_owned(),
@@ -245,6 +273,9 @@ impl HarnessPlugin for FakePlugin {
                 cancellation.cancelled().await;
                 HarnessTerminal::Cancelled
             }
+            FakeMode::Retryable(error) => HarnessTerminal::Retryable(error.clone()),
+            FakeMode::Failed(error) => HarnessTerminal::Failed(error.clone()),
+            FakeMode::OutcomeUnknown(error) => HarnessTerminal::OutcomeUnknown(error.clone()),
         }
     }
 }
@@ -729,4 +760,51 @@ async fn surfaced_harness_failure_codes_are_closed() {
         panic!("sink failure must be outcome unknown")
     };
     assert!(allowed.contains(&sink_error.code));
+}
+
+#[tokio::test]
+async fn plugin_originated_failure_codes_are_normalized_at_registry_boundaries() {
+    let mut registry = HarnessRegistry::new();
+    let registration_error = registry
+        .register(Arc::new(FakePlugin::with_describe_failure(
+            "plugin_custom_error",
+        )))
+        .await
+        .unwrap_err();
+    assert_eq!(registration_error.code, "harness_failed");
+    assert_eq!(registration_error.detail, "plugin handshake detail");
+
+    for (mode, expected_code) in [
+        (
+            FakeMode::Retryable(HarnessFailure::new("plugin_custom_error", "retry detail")),
+            "harness_failed",
+        ),
+        (
+            FakeMode::Failed(HarnessFailure::new("plugin_custom_error", "failed detail")),
+            "harness_failed",
+        ),
+        (
+            FakeMode::OutcomeUnknown(HarnessFailure::new(
+                "plugin_custom_error",
+                "uncertain detail",
+            )),
+            "harness_outcome_unknown",
+        ),
+    ] {
+        let terminal = registry_with(Arc::new(FakePlugin::with_terminal(mode)))
+            .await
+            .invoke(
+                request(),
+                Arc::new(DenyAllHarnessApprovals),
+                Arc::new(RecordingHarnessEventSink::default()),
+            )
+            .await;
+        let failure = match terminal {
+            HarnessTerminal::Retryable(error)
+            | HarnessTerminal::Failed(error)
+            | HarnessTerminal::OutcomeUnknown(error) => error,
+            _ => panic!("plugin terminal failure must remain a terminal failure"),
+        };
+        assert_eq!(failure.code, expected_code);
+    }
 }

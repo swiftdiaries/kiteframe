@@ -10,6 +10,16 @@ use super::{
     HarnessRequestEnvelope, HarnessTerminal,
 };
 
+const STABLE_FAILURE_CODES: [&str; 7] = [
+    "harness_profile_unavailable",
+    "harness_protocol_incompatible",
+    "harness_capability_unsupported",
+    "harness_permission_rejected",
+    "harness_cancelled",
+    "harness_failed",
+    "harness_outcome_unknown",
+];
+
 #[derive(Clone)]
 pub struct HarnessRegistry {
     plugins: Arc<Mutex<BTreeMap<super::HarnessProfileId, RegisteredPlugin>>>,
@@ -74,7 +84,10 @@ impl HarnessRegistry {
 
     pub async fn register(&mut self, plugin: Arc<dyn HarnessPlugin>) -> Result<(), HarnessFailure> {
         let profile = plugin.profile();
-        let capabilities = plugin.describe_capabilities().await?;
+        let capabilities = plugin
+            .describe_capabilities()
+            .await
+            .map_err(|error| normalize_failure(error, "harness_failed"))?;
         profile.validate_observed(&capabilities)?;
         let digest = profile.digest()?;
         let mut plugins = self
@@ -199,8 +212,9 @@ impl HarnessRegistry {
         if let Some(error) = persistence_failure {
             return HarnessTerminal::OutcomeUnknown(error);
         }
-        let terminal =
-            terminal.expect("plugin completion is required without a persistence failure");
+        let terminal = normalize_terminal(
+            terminal.expect("plugin completion is required without a persistence failure"),
+        );
         if matches!(terminal, HarnessTerminal::Completed(_)) && !started {
             return HarnessTerminal::Failed(HarnessFailure::new(
                 "harness_protocol_incompatible",
@@ -239,6 +253,29 @@ impl HarnessRegistry {
                 generation,
             },
         ))
+    }
+}
+
+fn normalize_terminal(terminal: HarnessTerminal) -> HarnessTerminal {
+    match terminal {
+        HarnessTerminal::Retryable(error) => {
+            HarnessTerminal::Retryable(normalize_failure(error, "harness_failed"))
+        }
+        HarnessTerminal::Failed(error) => {
+            HarnessTerminal::Failed(normalize_failure(error, "harness_failed"))
+        }
+        HarnessTerminal::OutcomeUnknown(error) => {
+            HarnessTerminal::OutcomeUnknown(normalize_failure(error, "harness_outcome_unknown"))
+        }
+        completed_or_cancelled => completed_or_cancelled,
+    }
+}
+
+fn normalize_failure(error: HarnessFailure, fallback: &'static str) -> HarnessFailure {
+    if STABLE_FAILURE_CODES.contains(&error.code) {
+        error
+    } else {
+        HarnessFailure::new(fallback, error.detail)
     }
 }
 
