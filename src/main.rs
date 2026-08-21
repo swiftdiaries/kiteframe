@@ -166,6 +166,7 @@ async fn configured_harness_registry(
             external_environments.deepseek,
         ),
     ] {
+        register_profile(store.as_ref(), &profile).await?;
         let Some(command) = command else {
             continue;
         };
@@ -179,7 +180,6 @@ async fn configured_harness_registry(
         registry
             .register_with_pre_accept_attempt_limit(Arc::new(plugin), pre_accept_attempt_limit)
             .await?;
-        register_profile(store.as_ref(), &profile).await?;
     }
     Ok(Arc::new(registry))
 }
@@ -733,6 +733,66 @@ mod tests {
                 .to_string()
                 .starts_with("harness_protocol_incompatible:")
         );
+    }
+
+    #[tokio::test]
+    async fn selected_external_profile_without_a_command_keeps_durable_profile_identity() {
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let database = IsolatedSchedulerDatabase::create(&database_url).await;
+        let store = Arc::new(PostgresStore::connect(&database.url).await.unwrap());
+        let builtin = builtin_harness_profile("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let model: Arc<dyn ModelClient> = Arc::new(RecoveringModel(AtomicUsize::new(0)));
+        let registry = configured_harness_registry(
+            store.clone(),
+            model,
+            builtin.clone(),
+            ExternalHarnessCommands::default(),
+            ExternalHarnessEnvironments::default(),
+        )
+        .await
+        .unwrap();
+        let selected = HarnessConfig::from_test_values([(
+            "KITEFRAME_REASONING_HARNESS_PROFILE",
+            "codex-acp-v1",
+        )])
+        .unwrap()
+        .harness_routes(builtin.id)
+        .reasoning;
+        let (codex, deepseek) = external_acp_profiles().unwrap();
+
+        assert_eq!(selected, codex.id);
+        assert!(registry.profile_digest(&selected).is_err());
+        assert_eq!(
+            store.harness_plugin_registration(&selected).await.unwrap(),
+            Some(HarnessPluginRegistration {
+                profile_id: codex.id.clone(),
+                profile_digest: codex.digest().unwrap(),
+                source_repository: codex.source_repository.clone(),
+                source_revision: codex.source_revision.clone(),
+                transport: codex.transport,
+                enabled: true,
+            })
+        );
+        assert_eq!(
+            store
+                .harness_plugin_registration(&deepseek.id)
+                .await
+                .unwrap(),
+            Some(HarnessPluginRegistration {
+                profile_id: deepseek.id.clone(),
+                profile_digest: deepseek.digest().unwrap(),
+                source_repository: deepseek.source_repository.clone(),
+                source_revision: deepseek.source_revision.clone(),
+                transport: deepseek.transport,
+                enabled: true,
+            })
+        );
+
+        drop(registry);
+        drop(store);
+        database.drop().await;
     }
 
     struct RecoveringModel(AtomicUsize);

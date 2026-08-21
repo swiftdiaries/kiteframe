@@ -162,6 +162,13 @@ pub(crate) fn canonical_builtin_unavailable_terminal_payload() -> Value {
     })
 }
 
+pub(crate) fn canonical_profile_unavailable_terminal() -> HarnessTerminal {
+    HarnessTerminal::Failed(HarnessFailure::new(
+        "harness_profile_unavailable",
+        "selected harness profile is not registered",
+    ))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HarnessInvocationRequest {

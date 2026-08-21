@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
-    HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal,
-    HarnessTransport, PostgresHarnessEventSink, canonical_builtin_unavailable_terminal_payload,
-    canonical_outcome_unknown_terminal_payload, dispatch_with_terminal_journal,
-    postgres_harness_acceptance_barrier, terminal_idempotency_key,
+    HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal, HarnessTransport,
+    PostgresHarnessEventSink, canonical_builtin_unavailable_terminal_payload,
+    canonical_outcome_unknown_terminal_payload, canonical_profile_unavailable_terminal,
+    dispatch_with_terminal_journal, postgres_harness_acceptance_barrier, terminal_idempotency_key,
 };
 use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
 use crate::{
@@ -413,12 +413,25 @@ impl AgentCommandDispatcher {
                 .routes
                 .select(execution.task.preferences.harness_role, payload.role)
                 .clone();
-            let profile_digest = self
+            let Some(registration) = self
+                .kernel
+                .store()
+                .harness_plugin_registration(&profile_id)
+                .await?
+            else {
+                let failure = failure_request(
+                    execution,
+                    &claimed,
+                    &format!("harness-profile-unavailable:{}", claimed.id.as_uuid()),
+                    "harness_profile_unavailable",
+                )?;
+                return failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                    .await;
+            };
+            let max_pre_accept_attempts = self
                 .registry
-                .profile_digest(&profile_id)
-                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-            let max_pre_accept_attempts =
-                registered_pre_accept_attempt_limit(&self.registry, &profile_id)?;
+                .pre_accept_attempt_limit(&profile_id)
+                .unwrap_or(1);
             let candidate = HarnessInvocationId::new(uuid::Uuid::now_v7());
             self.kernel
                 .store()
@@ -428,7 +441,7 @@ impl AgentCommandDispatcher {
                         command_id: &claimed.id,
                         command_revision: claimed.revision,
                         profile_id: &profile_id,
-                        profile_digest: &profile_digest,
+                        profile_digest: &registration.profile_digest,
                         payload_digest: &claimed.payload_digest,
                     },
                     max_pre_accept_attempts,
@@ -448,6 +461,16 @@ impl AgentCommandDispatcher {
                     .await
             },
             || async {
+                if self.registry.profile_digest(&profile_id).is_err() {
+                    return self
+                        .settle_harness_terminal(
+                            execution,
+                            &claimed,
+                            &prepared,
+                            canonical_profile_unavailable_terminal(),
+                        )
+                        .await;
+                }
                 let Some(_active) =
                     ActiveDispatchGuard::reserve(self.active.clone(), &prepared.invocation_id)
                 else {
@@ -968,15 +991,6 @@ impl AgentCommandDispatcher {
             )
             .await
     }
-}
-
-fn registered_pre_accept_attempt_limit(
-    registry: &HarnessRegistry,
-    profile_id: &HarnessProfileId,
-) -> Result<u64, StoreError> {
-    registry
-        .pre_accept_attempt_limit(profile_id)
-        .map_err(|error| StoreError::InvalidData(error.to_string()))
 }
 
 fn is_builtin_command_unavailable(transport: HarnessTransport, failure: &HarnessFailure) -> bool {

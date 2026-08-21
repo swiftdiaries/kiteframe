@@ -87,6 +87,20 @@ impl PostgresStore {
         transport_from_row(&transport)
     }
 
+    pub async fn harness_plugin_registration(
+        &self,
+        profile_id: &HarnessProfileId,
+    ) -> Result<Option<HarnessPluginRegistration>, StoreError> {
+        let row = sqlx::query(
+            "SELECT profile_id, profile_digest, source_repository, source_revision, transport, enabled \
+             FROM harness_plugin_registrations WHERE profile_id = $1",
+        )
+        .bind(profile_id.as_str())
+        .fetch_optional(self.pool())
+        .await?;
+        row.as_ref().map(registration_from_row).transpose()
+    }
+
     pub async fn harness_invocation_for_command_revision(
         &self,
         command_id: &AgentCommandId,

@@ -9,6 +9,7 @@ use super::{
     HarnessAcceptanceBarrier, HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSender,
     HarnessEventSink, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest, HarnessPlugin,
     HarnessRequestEnvelope, HarnessTerminal, HarnessTerminalReporter, HarnessTransport,
+    canonical_profile_unavailable_terminal,
 };
 
 const STABLE_FAILURE_CODES: [&str; 7] = [
@@ -403,12 +404,7 @@ impl HarnessRegistry {
             .get(&request.profile_id)
             .map(|registered| registered.plugin.clone())
         else {
-            return ManagedHarnessInvocation::settled(HarnessTerminal::Failed(
-                HarnessFailure::new(
-                    "harness_profile_unavailable",
-                    "selected harness profile is not registered",
-                ),
-            ));
+            return ManagedHarnessInvocation::settled(canonical_profile_unavailable_terminal());
         };
         let envelope = HarnessRequestEnvelope::new(request.clone());
         if let Err(error) = envelope.validate() {
