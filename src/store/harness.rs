@@ -5,7 +5,7 @@ use crate::harness::{
     HarnessEventEnvelope, HarnessInvocationId, HarnessProfileId, HarnessTransport,
     canonical_outcome_unknown_terminal_payload, terminal_idempotency_key,
 };
-use crate::{AgentCommandId, UserTaskId};
+use crate::{AgentCommandId, RuntimeEvent, UserTaskId};
 
 use super::{
     HarnessInvocationEventRecord, HarnessInvocationState, HarnessInvocationView,
@@ -444,6 +444,9 @@ impl PostgresStore {
             tx.commit().await?;
             return Ok(view);
         }
+        if !terminal_state_matches_command_winner(state, &command_state) {
+            return Err(StoreError::RevisionConflict);
+        }
         if view.terminal {
             if view.state == state
                 && view.terminal_request_digest.as_deref() == Some(request_digest)
@@ -487,21 +490,17 @@ impl PostgresStore {
         if limit <= 0 {
             return Ok(Vec::new());
         }
-        let mut tx = self.pool().begin().await?;
         let excluded = excluded
             .iter()
             .map(HarnessInvocationId::as_uuid)
             .collect::<Vec<_>>();
-        let rows = sqlx::query(
-            "SELECT invocations.invocation_id, invocations.command_id, invocations.command_revision, \
-                    invocations.profile_id, invocations.profile_digest, invocations.payload_digest, \
-                    invocations.state, invocations.attempt, invocations.prompt_accepted, \
-                    invocations.terminal, invocations.terminal_request_digest, invocations.terminal_payload, \
-                    commands.state AS command_state \
+        let candidates = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT invocations.invocation_id \
              FROM harness_invocations invocations \
              JOIN agent_commands commands ON commands.id = invocations.command_id \
-             WHERE NOT (invocations.invocation_id = ANY($2)) AND ( \
+             WHERE NOT (invocations.invocation_id = ANY($1)) AND ( \
                     (invocations.terminal = FALSE AND commands.state = 'cancelled') \
+                 OR (invocations.terminal = FALSE AND commands.state = 'completed') \
                  OR (invocations.state = 'accepted' AND commands.state = 'claimed') \
                  OR (invocations.terminal = TRUE AND commands.completion_idempotency_key IS NULL) \
                  OR (commands.state = 'claimed' AND (invocations.state = 'prepared' \
@@ -509,40 +508,91 @@ impl PostgresStore {
              ) \
              ORDER BY CASE \
                     WHEN invocations.terminal = FALSE AND commands.state = 'cancelled' THEN 0 \
-                    WHEN invocations.state = 'accepted' THEN 1 \
-                    WHEN invocations.terminal = TRUE THEN 2 \
-                    ELSE 3 END, \
+                    WHEN invocations.terminal = FALSE AND commands.state = 'completed' THEN 1 \
+                    WHEN invocations.state = 'accepted' THEN 2 \
+                    WHEN invocations.terminal = TRUE THEN 3 \
+                    ELSE 4 END, \
                     invocations.created_at, invocations.invocation_id \
-             LIMIT $1 FOR UPDATE OF commands, invocations",
+             LIMIT 256",
         )
-        .bind(limit.min(256))
         .bind(excluded)
-        .fetch_all(&mut *tx)
+        .fetch_all(self.pool())
         .await?;
-        let mut recovered = Vec::with_capacity(rows.len());
-        for row in rows {
-            let view = harness_invocation_from_row(&row)?;
-            let command_state: String = row.get("command_state");
-            if command_state == "cancelled" && !view.terminal {
-                recovered.push(settle_harness_cancelled(&mut tx, &view).await?);
-            } else if view.state == HarnessInvocationState::Accepted {
-                recovered.push(
-                    update_invocation_state(
-                        &mut tx,
-                        &view.invocation_id,
-                        HarnessInvocationState::OutcomeUnknown,
-                        view.attempt,
-                        true,
-                        true,
-                        Some(&terminal_idempotency_key(&view.invocation_id)),
-                        Some(&canonical_outcome_unknown_terminal_payload()),
-                    )
-                    .await?,
-                );
-            } else {
+        let total_limit = usize::try_from(limit.min(256)).expect("positive recovery limit");
+        let mut recovered = Vec::with_capacity(total_limit);
+        for invocation_id in candidates {
+            if let Some(view) = self
+                .recover_one_harness_invocation(&HarnessInvocationId::new(invocation_id))
+                .await?
+            {
                 recovered.push(view);
+                if recovered.len() == total_limit {
+                    break;
+                }
             }
         }
+        Ok(recovered)
+    }
+
+    pub async fn refresh_harness_recovery_invocation(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<Option<HarnessInvocationView>, StoreError> {
+        self.recover_one_harness_invocation(invocation_id).await
+    }
+
+    async fn recover_one_harness_invocation(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<Option<HarnessInvocationView>, StoreError> {
+        let mut tx = self.pool().begin().await?;
+        // This helper owns at most one command lock. Every recovery candidate
+        // therefore follows the frozen command-first order without ever
+        // acquiring a classification-ordered multi-command lock set.
+        let (command_state, view) =
+            lock_harness_invocation_with_command(&mut tx, invocation_id).await?;
+        let command = sqlx::query(
+            "SELECT completion_idempotency_key, result FROM agent_commands WHERE id = $1",
+        )
+        .bind(view.command_id.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        let recovered = if command_state == "cancelled" && !view.terminal {
+            Some(settle_harness_cancelled(&mut tx, &view).await?)
+        } else if command_state == "completed" && !view.terminal {
+            let result = command.get::<Option<Value>, _>("result").ok_or_else(|| {
+                StoreError::InvalidData("completed harness command result is absent".to_owned())
+            })?;
+            let (state, payload) = terminal_from_completed_command(result)?;
+            Some(
+                update_invocation_state(
+                    &mut tx,
+                    &view.invocation_id,
+                    state,
+                    view.attempt,
+                    view.prompt_accepted,
+                    true,
+                    Some(&terminal_idempotency_key(&view.invocation_id)),
+                    Some(&payload),
+                )
+                .await?,
+            )
+        } else if view.state == HarnessInvocationState::Accepted && command_state == "claimed" {
+            Some(view)
+        } else if view.terminal
+            && command
+                .get::<Option<String>, _>("completion_idempotency_key")
+                .is_none()
+        {
+            Some(view)
+        } else if command_state == "claimed"
+            && (view.state == HarnessInvocationState::Prepared
+                || (view.state == HarnessInvocationState::Started && !view.prompt_accepted))
+        {
+            Some(view)
+        } else {
+            None
+        };
         tx.commit().await?;
         Ok(recovered)
     }
@@ -552,6 +602,77 @@ fn transport_name(transport: HarnessTransport) -> &'static str {
     match transport {
         HarnessTransport::Builtin => "builtin",
         HarnessTransport::AcpStdio => "acp_stdio",
+    }
+}
+
+fn terminal_state_matches_command_winner(
+    state: HarnessInvocationState,
+    command_state: &str,
+) -> bool {
+    match state {
+        HarnessInvocationState::Completed | HarnessInvocationState::OutcomeUnknown => {
+            command_state == "completed"
+        }
+        HarnessInvocationState::Failed => matches!(command_state, "completed" | "failed"),
+        HarnessInvocationState::Cancelled => {
+            matches!(command_state, "claimed" | "completed" | "cancelled")
+        }
+        HarnessInvocationState::Prepared
+        | HarnessInvocationState::Started
+        | HarnessInvocationState::Accepted => false,
+    }
+}
+
+fn terminal_from_completed_command(
+    result: Value,
+) -> Result<(HarnessInvocationState, Value), StoreError> {
+    match serde_json::from_value::<RuntimeEvent>(result)
+        .map_err(|error| StoreError::InvalidData(error.to_string()))?
+    {
+        RuntimeEvent::HarnessResult {
+            outcome,
+            fields,
+            history,
+            ..
+        } => Ok((
+            HarnessInvocationState::Completed,
+            serde_json::json!({
+                "type": "completed",
+                "outcome": outcome,
+                "fields": fields,
+                "history": history,
+            }),
+        )),
+        RuntimeEvent::CommandFailed { code, .. } if code == "harness_outcome_unknown" => Ok((
+            HarnessInvocationState::OutcomeUnknown,
+            canonical_outcome_unknown_terminal_payload(),
+        )),
+        RuntimeEvent::CommandFailed { code, .. } if code == "harness_cancelled" => Ok((
+            HarnessInvocationState::Cancelled,
+            serde_json::json!({"type": "cancelled"}),
+        )),
+        RuntimeEvent::CommandFailed { code, .. } => Ok((
+            HarnessInvocationState::Failed,
+            serde_json::json!({
+                "type": "failed",
+                "code": if matches!(
+                    code.as_str(),
+                    "harness_profile_unavailable"
+                        | "harness_protocol_incompatible"
+                        | "harness_capability_unsupported"
+                        | "harness_permission_rejected"
+                        | "harness_failed"
+                ) {
+                    code
+                } else {
+                    "harness_failed".to_owned()
+                },
+                "detail": "harness command completed before terminal journal settlement",
+            }),
+        )),
+        _ => Err(StoreError::InvalidData(
+            "completed harness command result is incompatible".to_owned(),
+        )),
     }
 }
 
@@ -770,10 +891,13 @@ fn is_harness_invocation_identity_conflict(error: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_command_revision_replay, validate_invocation_identity_replay};
+    use super::{
+        terminal_from_completed_command, terminal_state_matches_command_winner,
+        validate_command_revision_replay, validate_invocation_identity_replay,
+    };
     use crate::harness::{HarnessInvocationId, HarnessProfileId};
     use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
-    use crate::{AgentCommandId, StoreError};
+    use crate::{AgentCommandId, EvidenceId, RuntimeCommandKey, RuntimeEvent, StoreError};
 
     fn stored_invocation() -> HarnessInvocationView {
         HarnessInvocationView {
@@ -820,5 +944,53 @@ mod tests {
             validate_invocation_identity_replay(&stored, &reused_uuid),
             Err(StoreError::IdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn terminal_journal_requires_the_command_cas_winner() {
+        assert!(!terminal_state_matches_command_winner(
+            HarnessInvocationState::Completed,
+            "claimed"
+        ));
+        assert!(terminal_state_matches_command_winner(
+            HarnessInvocationState::Completed,
+            "completed"
+        ));
+        assert!(terminal_state_matches_command_winner(
+            HarnessInvocationState::Cancelled,
+            "cancelled"
+        ));
+        assert!(terminal_state_matches_command_winner(
+            HarnessInvocationState::Failed,
+            "completed"
+        ));
+        assert!(terminal_state_matches_command_winner(
+            HarnessInvocationState::OutcomeUnknown,
+            "completed"
+        ));
+    }
+
+    #[test]
+    fn completed_command_result_reconstructs_the_missing_harness_terminal() {
+        let event = RuntimeEvent::HarnessResult {
+            event_id: "harness-result:test".to_owned(),
+            command_key: RuntimeCommandKey::new("harness:test").unwrap(),
+            outcome: "ok".to_owned(),
+            fields: serde_json::json!({"answer":"stable"}),
+            evidence_id: EvidenceId::new(uuid::Uuid::now_v7()),
+            history: vec![],
+        };
+        let (state, payload) =
+            terminal_from_completed_command(serde_json::to_value(event).unwrap()).unwrap();
+        assert_eq!(state, HarnessInvocationState::Completed);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "type":"completed",
+                "outcome":"ok",
+                "fields":{"answer":"stable"},
+                "history":[],
+            })
+        );
     }
 }

@@ -292,6 +292,10 @@ impl AcpHarnessPlugin {
                 return HarnessTerminal::Failed(error);
             }
         };
+        #[cfg(feature = "test-support")]
+        if let Some(barrier) = &self.test_barrier {
+            barrier.pause_before_acceptance().await;
+        }
         if let Err(error) = events.commit_acceptance().await {
             let _ = client.shutdown().await;
             return if error.code == "harness_cancelled" {

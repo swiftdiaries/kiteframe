@@ -224,6 +224,26 @@ impl HarnessStoreFixture {
             ))
             .await
     }
+
+    async fn exclude_other_invocations(
+        &self,
+        keep: &[HarnessInvocationId],
+    ) -> Vec<HarnessInvocationId> {
+        let keep = keep
+            .iter()
+            .map(HarnessInvocationId::as_uuid)
+            .collect::<Vec<_>>();
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT invocation_id FROM harness_invocations WHERE NOT (invocation_id = ANY($1))",
+        )
+        .bind(keep)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(HarnessInvocationId::new)
+        .collect()
+    }
 }
 
 #[test]
@@ -418,7 +438,7 @@ async fn terminal_prepare_replay_discards_a_fresh_candidate_and_returns_the_stor
 }
 
 #[tokio::test]
-async fn accepted_process_death_is_recovered_as_outcome_unknown() {
+async fn accepted_process_death_is_classified_without_preempting_command_authority() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
     };
@@ -433,25 +453,22 @@ async fn accepted_process_death_is_recovered_as_outcome_unknown() {
         .mark_harness_prompt_accepted(&invocation.invocation_id, 0)
         .await
         .unwrap();
-    let recovered = fixture.store.recover_harness_invocations(16).await.unwrap();
+    let excluded = fixture
+        .exclude_other_invocations(std::slice::from_ref(&invocation.invocation_id))
+        .await;
+    let recovered = fixture
+        .store
+        .recover_harness_invocations_excluding(16, &excluded)
+        .await
+        .unwrap();
     let recovered = recovered
         .into_iter()
         .find(|view| view.invocation_id == invocation.invocation_id)
         .expect("accepted invocation is recovered");
-    assert_eq!(recovered.state, HarnessInvocationState::OutcomeUnknown);
-    let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
-    assert_eq!(
-        recovered.terminal_request_digest.as_deref(),
-        Some(terminal_key.as_str())
-    );
-    assert_eq!(
-        recovered.terminal_payload,
-        Some(json!({
-            "type":"outcome_unknown",
-            "code":"harness_outcome_unknown",
-            "detail":"harness terminal outcome is unknown",
-        }))
-    );
+    assert_eq!(recovered.state, HarnessInvocationState::Accepted);
+    assert!(!recovered.terminal);
+    assert_eq!(recovered.terminal_request_digest, None);
+    assert_eq!(recovered.terminal_payload, None);
 }
 
 #[tokio::test]
@@ -481,27 +498,34 @@ async fn recovery_limit_is_total_and_exclusion_makes_bounded_scans_progress() {
         .await
         .unwrap();
 
+    let others = fixture
+        .exclude_other_invocations(&[retryable_id.clone(), accepted_id.clone()])
+        .await;
     let first = fixture
         .store
-        .recover_harness_invocations_excluding(1, &[])
+        .recover_harness_invocations_excluding(1, &others)
         .await
         .unwrap();
     assert_eq!(first.len(), 1, "limit is a total row bound");
     assert_eq!(first[0].invocation_id, accepted_id);
-    assert_eq!(first[0].state, HarnessInvocationState::OutcomeUnknown);
+    assert_eq!(first[0].state, HarnessInvocationState::Accepted);
 
+    let mut after_first = others.clone();
+    after_first.push(accepted_id.clone());
     let second = fixture
         .store
-        .recover_harness_invocations_excluding(1, &[accepted_id])
+        .recover_harness_invocations_excluding(1, &after_first)
         .await
         .unwrap();
     assert_eq!(second.len(), 1);
     assert_eq!(second[0].invocation_id, retryable_id);
     assert_eq!(second[0].state, HarnessInvocationState::Prepared);
 
+    let mut after_second = after_first;
+    after_second.push(retryable_id.clone());
     let drained = fixture
         .store
-        .recover_harness_invocations_excluding(1, &[first[0].invocation_id.clone(), retryable_id])
+        .recover_harness_invocations_excluding(1, &after_second)
         .await
         .unwrap();
     assert!(drained.is_empty());
@@ -609,6 +633,67 @@ async fn command_cancellation_lock_winner_forces_a_waiting_late_success_to_cance
 }
 
 #[tokio::test]
+async fn completed_journal_requires_the_completed_command_cas_winner() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture
+        .prepare("sha256:payload-completion-order")
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation.invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&invocation.invocation_id, 0)
+        .await
+        .unwrap();
+
+    let error = fixture
+        .store
+        .settle_harness_invocation(
+            &invocation.invocation_id,
+            0,
+            HarnessInvocationState::Completed,
+            "sha256:completion-before-command-cas",
+            &json!({"type":"completed","outcome":"ok","fields":{},"history":[]}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::RevisionConflict));
+    let still_accepted = fixture
+        .store
+        .harness_invocation_for_command_revision(&fixture.command_id, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_accepted.state, HarnessInvocationState::Accepted);
+
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let cancelled = fixture
+        .store
+        .settle_harness_invocation(
+            &invocation.invocation_id,
+            0,
+            HarnessInvocationState::Completed,
+            "sha256:late-completion",
+            &json!({"type":"completed","outcome":"ok","fields":{},"history":[]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cancelled.state, HarnessInvocationState::Cancelled);
+}
+
+#[tokio::test]
 async fn recovery_settles_cancelled_command_rows_instead_of_reselecting_them_as_retryable() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
@@ -625,9 +710,12 @@ async fn recovery_settles_cancelled_command_rows_instead_of_reselecting_them_as_
     .await
     .unwrap();
 
+    let excluded = fixture
+        .exclude_other_invocations(std::slice::from_ref(&invocation.invocation_id))
+        .await;
     let recovered = fixture
         .store
-        .recover_harness_invocations_excluding(1, &[])
+        .recover_harness_invocations_excluding(1, &excluded)
         .await
         .unwrap();
     assert_eq!(recovered.len(), 1);
@@ -637,6 +725,111 @@ async fn recovery_settles_cancelled_command_rows_instead_of_reselecting_them_as_
         recovered[0].terminal_payload,
         Some(json!({"type":"cancelled"}))
     );
+}
+
+#[tokio::test]
+async fn two_command_recovery_uses_single_command_transactions_without_deadlock() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let first = fixture.prepare("sha256:first-lock-order").await.unwrap();
+    let second_command = fixture.additional_command().await;
+    let second = fixture
+        .prepare_for(
+            &second_command,
+            &HarnessInvocationId::new(Uuid::now_v7()),
+            "sha256:second-lock-order",
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&second.invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&second.invocation_id, 0)
+        .await
+        .unwrap();
+
+    let store_a = fixture.store.clone();
+    let store_b = fixture.store.clone();
+    let first_id = first.invocation_id.clone();
+    let second_id = second.invocation_id.clone();
+    let others = fixture
+        .exclude_other_invocations(&[first_id.clone(), second_id.clone()])
+        .await;
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(5), async move {
+        let mut exclude_second = others.clone();
+        exclude_second.push(second_id);
+        let mut exclude_first = others;
+        exclude_first.push(first_id);
+        tokio::join!(
+            store_a.recover_harness_invocations_excluding(1, &exclude_second),
+            store_b.recover_harness_invocations_excluding(1, &exclude_first),
+        )
+    })
+    .await
+    .expect("two-command recovery must not deadlock");
+    assert_eq!(a.unwrap().len(), 1);
+    assert_eq!(b.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stale_recovery_batch_refresh_converges_a_cancelled_sibling_before_counting() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let accepted = fixture.prepare("sha256:accepted-sibling").await.unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&accepted.invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&accepted.invocation_id, 0)
+        .await
+        .unwrap();
+    let sibling_command = fixture.additional_command().await;
+    let sibling = fixture
+        .prepare_for(
+            &sibling_command,
+            &HarnessInvocationId::new(Uuid::now_v7()),
+            "sha256:prepared-sibling",
+        )
+        .await
+        .unwrap();
+    let excluded = fixture
+        .exclude_other_invocations(&[
+            accepted.invocation_id.clone(),
+            sibling.invocation_id.clone(),
+        ])
+        .await;
+    let selected = fixture
+        .store
+        .recover_harness_invocations_excluding(2, &excluded)
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 2);
+
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 \
+         WHERE id = $1 AND state = 'claimed'",
+    )
+    .bind(sibling_command.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let refreshed = fixture
+        .store
+        .refresh_harness_recovery_invocation(&sibling.invocation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed.state, HarnessInvocationState::Cancelled);
+    assert!(refreshed.terminal);
 }
 
 #[tokio::test]
@@ -660,21 +853,39 @@ async fn event_sequence_replay_is_idempotent_and_digest_drift_conflicts() {
         .append_harness_invocation_event(&event)
         .await
         .unwrap();
+    let progress = fixture.event(
+        &invocation.invocation_id,
+        1,
+        HarnessInvocationEvent::Progress {
+            message: "first bytes".to_owned(),
+        },
+    );
+    fixture
+        .store
+        .append_harness_invocation_event(&progress)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .append_harness_invocation_event(&progress)
+        .await
+        .unwrap();
     let drift = fixture.event(
         &invocation.invocation_id,
-        0,
+        1,
         HarnessInvocationEvent::Progress {
             message: "different bytes".to_owned(),
         },
     );
-    assert!(matches!(
-        fixture
-            .store
-            .append_harness_invocation_event(&drift)
-            .await
-            .unwrap_err(),
-        StoreError::IdempotencyConflict,
-    ));
+    let error = fixture
+        .store
+        .append_harness_invocation_event(&drift)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, StoreError::IdempotencyConflict),
+        "unexpected drift error: {error:?}"
+    );
 }
 
 #[tokio::test]

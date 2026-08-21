@@ -544,8 +544,186 @@ async fn restart_recovers_kernel_before_marking_accepted_harness_work_unknown() 
         .load_agent_command_context(session_id, task_id, claimed.id)
         .await
         .unwrap();
-    assert_eq!(context.command.state, kiteframe::AgentCommandState::Failed);
+    assert_eq!(
+        context.command.state,
+        kiteframe::AgentCommandState::Completed
+    );
     assert_eq!(context.execution.goal_phase, GoalPhase::Active);
+    drop(dispatcher);
+    drop(kernel);
+    drop(reopened);
+    database.drop().await;
+}
+
+#[tokio::test]
+async fn accepted_recovery_cancels_and_counts_a_stale_preaccept_sibling() {
+    let _guard = RESTART_TEST_LOCK.lock().await;
+    let Some(mut fixture) = RestartAgentFixture::started_fork().await else {
+        eprintln!("SKIP stale sibling harness recovery: DATABASE_URL is absent");
+        return;
+    };
+    fixture.complete_root_into_two_pending_children().await;
+    let mut pending = fixture
+        .store
+        .dispatchable_agent_commands(64)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|command| command.task_id == fixture.task_id)
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|command| *command.id.as_uuid());
+    assert_eq!(pending.len(), 2);
+    let mut claimed = Vec::new();
+    for command in pending {
+        claimed.push(
+            fixture
+                .store
+                .claim_agent_command(ClaimAgentCommand {
+                    session_id: fixture.session.id.clone(),
+                    task_id: fixture.task_id.clone(),
+                    command_id: command.id.clone(),
+                    expected_command_revision: command.revision,
+                    claimant: "harness-dispatcher-v1".to_owned(),
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "harness-dispatcher-v1:{}",
+                        command.id.as_uuid()
+                    ))
+                    .unwrap(),
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    let profile = builtin_harness_profile("0123456789abcdef0123456789abcdef01234567").unwrap();
+    let profile_digest = profile.digest().unwrap();
+    fixture
+        .store
+        .register_harness_plugin(HarnessPluginRegistration {
+            profile_id: profile.id.clone(),
+            profile_digest: profile_digest.clone(),
+            source_repository: profile.source_repository.clone(),
+            source_revision: profile.source_revision.clone(),
+            transport: profile.transport,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let accepted_id = HarnessInvocationId::new(Uuid::now_v7());
+    fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &accepted_id,
+            command_id: &claimed[0].id,
+            command_revision: claimed[0].revision,
+            profile_id: &profile.id,
+            profile_digest: &profile_digest,
+            payload_digest: &claimed[0].payload_digest,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&accepted_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&accepted_id, 0)
+        .await
+        .unwrap();
+    let sibling_id = HarnessInvocationId::new(Uuid::now_v7());
+    fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &sibling_id,
+            command_id: &claimed[1].id,
+            command_revision: claimed[1].revision,
+            profile_id: &profile.id,
+            profile_digest: &profile_digest,
+            payload_digest: &claimed[1].payload_digest,
+        })
+        .await
+        .unwrap();
+    let evidence_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM goal_evidence WHERE task_id = $1")
+            .bind(fixture.task_id.as_uuid())
+            .fetch_one(fixture.store.pool())
+            .await
+            .unwrap();
+
+    let database = fixture.database.clone();
+    let database_url = fixture.database_url.clone();
+    let session_id = fixture.session.id.clone();
+    let task_id = fixture.task_id.clone();
+    drop(fixture.kernel);
+    drop(fixture.store);
+
+    let reopened = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let kernel = Arc::new(AgentKernel::new(
+        Arc::clone(&reopened),
+        Arc::new(KiteAgentRuntime::new(RuntimeCeilings::default())),
+        Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&reopened))),
+    ));
+    assert_eq!(
+        kernel.recover(32).await.unwrap(),
+        AgentRecoveryReport {
+            pending: 0,
+            claimed: 2,
+        }
+    );
+    let mut registry = HarnessRegistry::new();
+    registry
+        .register(Arc::new(BuiltinHarnessPlugin::new(
+            profile,
+            Arc::new(NeverModel),
+        )))
+        .await
+        .unwrap();
+    let dispatcher = kernel
+        .clone()
+        .with_harness_registry(Arc::new(registry), Arc::new(DenyAllHarnessApprovals));
+    let report = dispatcher.recover_harness_invocations(2).await.unwrap();
+    assert_eq!(report.outcome_unknown, 1);
+    assert_eq!(report.retryable_pre_accept, 0);
+    assert_eq!(report.terminal, 1);
+    let accepted = reopened
+        .harness_invocation_for_command_revision(&claimed[0].id, claimed[0].revision)
+        .await
+        .unwrap()
+        .unwrap();
+    let sibling = reopened
+        .harness_invocation_for_command_revision(&claimed[1].id, claimed[1].revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        accepted.state,
+        kiteframe::store::HarnessInvocationState::OutcomeUnknown
+    );
+    assert_eq!(
+        sibling.state,
+        kiteframe::store::HarnessInvocationState::Cancelled
+    );
+    let sibling_context = reopened
+        .load_agent_command_context(session_id, task_id.clone(), claimed[1].id.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        sibling_context.command.state,
+        kiteframe::AgentCommandState::Cancelled
+    );
+    assert_eq!(sibling_context.execution.goal_phase, GoalPhase::Active);
+    let evidence_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM goal_evidence WHERE task_id = $1")
+            .bind(task_id.as_uuid())
+            .fetch_one(reopened.pool())
+            .await
+            .unwrap();
+    assert_eq!(evidence_after, evidence_before);
+    assert_eq!(
+        dispatcher.recover_harness_invocations(1).await.unwrap(),
+        kiteframe::HarnessRecoveryReport::default()
+    );
     drop(dispatcher);
     drop(kernel);
     drop(reopened);

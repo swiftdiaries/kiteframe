@@ -35,6 +35,7 @@ pub struct AgentCommandDispatcher {
     routes: HarnessRouteTable,
     active: Arc<Mutex<BTreeSet<HarnessInvocationId>>>,
     recovery_seen: Arc<Mutex<BTreeSet<HarnessInvocationId>>>,
+    recovery_lock: tokio::sync::Mutex<()>,
 }
 
 impl AgentKernel {
@@ -68,6 +69,7 @@ impl AgentKernel {
             routes,
             active: Arc::new(Mutex::new(BTreeSet::new())),
             recovery_seen: Arc::new(Mutex::new(BTreeSet::new())),
+            recovery_lock: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -80,6 +82,7 @@ impl AgentCommandDispatcher {
         if limit <= 0 {
             return Ok(HarnessRecoveryReport::default());
         }
+        let _recovery = self.recovery_lock.lock().await;
         let excluded = self
             .recovery_seen
             .lock()
@@ -94,7 +97,24 @@ impl AgentCommandDispatcher {
             .await?;
         let mut seen = BTreeSet::new();
         let mut report = HarnessRecoveryReport::default();
-        for invocation in recovered {
+        for candidate in recovered {
+            let invocation = if candidate.terminal {
+                candidate
+            } else {
+                let Some(invocation) = self
+                    .kernel
+                    .store()
+                    .refresh_harness_recovery_invocation(&candidate.invocation_id)
+                    .await?
+                else {
+                    self.recovery_seen
+                        .lock()
+                        .expect("dispatcher recovery lock is not poisoned")
+                        .insert(candidate.invocation_id);
+                    continue;
+                };
+                invocation
+            };
             if !seen.insert(invocation.invocation_id.clone()) {
                 continue;
             }
@@ -118,13 +138,15 @@ impl AgentCommandDispatcher {
                 | HarnessInvocationState::Failed => {
                     report.terminal += 1;
                     let context = self.recovered_command_context(&invocation).await?;
-                    self.settle_harness_terminal(
-                        &context.execution,
-                        &context.command,
-                        &invocation,
-                        terminal_from_record(&invocation)?,
-                    )
-                    .await?;
+                    if context.command.state == AgentCommandState::Claimed {
+                        self.settle_harness_terminal(
+                            &context.execution,
+                            &context.command,
+                            &invocation,
+                            terminal_from_record(&invocation)?,
+                        )
+                        .await?;
+                    }
                 }
             }
             self.recovery_seen
@@ -409,17 +431,6 @@ impl AgentCommandDispatcher {
         let terminal_payload = terminal_payload(&terminal);
         match terminal {
             HarnessTerminal::Completed(output) => {
-                let settled = self
-                    .kernel
-                    .store()
-                    .settle_harness_invocation(
-                        &invocation.invocation_id,
-                        invocation.attempt,
-                        HarnessInvocationState::Completed,
-                        &terminal_key,
-                        &terminal_payload,
-                    )
-                    .await?;
                 let completion = CompleteAgentCommand {
                     session_id: execution.task.session_id.clone(),
                     task_id: claimed.task_id.clone(),
@@ -438,17 +449,24 @@ impl AgentCommandDispatcher {
                         history: output.history,
                     },
                 };
-                if settled.state == HarnessInvocationState::Cancelled {
-                    self.kernel
-                        .store()
-                        .audit_late_agent_command_completion(&execution.task.principal, &completion)
-                        .await
-                } else {
-                    complete_or_audit_late(&self.kernel, &execution.task.principal, &completion)
-                        .await
-                }
+                complete_or_audit_late(&self.kernel, &execution.task.principal, &completion)
+                    .await?;
+                self.kernel
+                    .store()
+                    .settle_harness_invocation(
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                        HarnessInvocationState::Completed,
+                        &terminal_key,
+                        &terminal_payload,
+                    )
+                    .await?;
+                Ok(())
             }
             HarnessTerminal::Cancelled => {
+                let failure =
+                    failure_request(execution, claimed, &terminal_key, "harness_cancelled")?;
+                failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await?;
                 self.kernel
                     .store()
                     .settle_harness_invocation(
@@ -459,9 +477,7 @@ impl AgentCommandDispatcher {
                         &terminal_payload,
                     )
                     .await?;
-                let failure =
-                    failure_request(execution, claimed, &terminal_key, "harness_cancelled")?;
-                failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+                Ok(())
             }
             HarnessTerminal::Retryable(_) => {
                 let max_pre_accept_attempts =
@@ -490,27 +506,6 @@ impl AgentCommandDispatcher {
                 Ok(())
             }
             HarnessTerminal::Failed(failure) => {
-                let settled = self
-                    .kernel
-                    .store()
-                    .settle_harness_invocation(
-                        &invocation.invocation_id,
-                        invocation.attempt,
-                        HarnessInvocationState::Failed,
-                        &terminal_key,
-                        &terminal_payload,
-                    )
-                    .await?;
-                if settled.state == HarnessInvocationState::Cancelled {
-                    let failure =
-                        failure_request(execution, claimed, &terminal_key, "harness_cancelled")?;
-                    return failure_or_audit_late(
-                        &self.kernel,
-                        &execution.task.principal,
-                        &failure,
-                    )
-                    .await;
-                }
                 let transport = self
                     .kernel
                     .store()
@@ -524,11 +519,23 @@ impl AgentCommandDispatcher {
                         "runtime_command_unavailable",
                     )?;
                     unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure)
-                        .await
+                        .await?;
                 } else {
                     let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
-                    failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+                    failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                        .await?;
                 }
+                self.kernel
+                    .store()
+                    .settle_harness_invocation(
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                        HarnessInvocationState::Failed,
+                        &terminal_key,
+                        &terminal_payload,
+                    )
+                    .await?;
+                Ok(())
             }
             HarnessTerminal::OutcomeUnknown(_) => {
                 self.settle_outcome_unknown(
@@ -621,7 +628,17 @@ impl AgentCommandDispatcher {
             HarnessTerminal::Retryable(failure)
             | HarnessTerminal::Failed(failure)
             | HarnessTerminal::OutcomeUnknown(failure) => {
-                let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
+                let transport = self
+                    .kernel
+                    .store()
+                    .harness_plugin_transport(&invocation.profile_id)
+                    .await?;
+                let code = if is_builtin_command_unavailable(transport, &failure) {
+                    "runtime_command_unavailable"
+                } else {
+                    failure.code
+                };
+                let failure = failure_request(execution, claimed, &terminal_key, code)?;
                 self.kernel
                     .store()
                     .audit_late_agent_command_failure(&execution.task.principal, &failure)
@@ -638,8 +655,10 @@ impl AgentCommandDispatcher {
         attempt: u64,
     ) -> Result<(), StoreError> {
         let terminal_key = terminal_idempotency_key(invocation_id);
-        let settled = self
-            .kernel
+        let failure =
+            failure_request(execution, claimed, &terminal_key, "harness_outcome_unknown")?;
+        failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await?;
+        self.kernel
             .store()
             .settle_harness_invocation(
                 invocation_id,
@@ -649,13 +668,7 @@ impl AgentCommandDispatcher {
                 &canonical_outcome_unknown_terminal_payload(),
             )
             .await?;
-        let code = if settled.state == HarnessInvocationState::Cancelled {
-            "harness_cancelled"
-        } else {
-            "harness_outcome_unknown"
-        };
-        let failure = failure_request(execution, claimed, &terminal_key, code)?;
-        failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+        Ok(())
     }
 }
 

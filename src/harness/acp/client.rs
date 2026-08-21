@@ -34,6 +34,7 @@ pub enum AcpTestBarrierPoint {
     BeforeAdmission,
     BeforeWrite,
     BeforeAcknowledgement,
+    BeforeAcceptance,
     EofBeforeShutdownClaim,
     BeforeAdapterShutdown,
 }
@@ -155,6 +156,11 @@ impl AcpTestBarrier {
             AcpTestBarrierPoint::BeforeAdapterShutdown,
         )
         .await;
+    }
+
+    pub(crate) async fn pause_before_acceptance(&self) {
+        self.pause("acceptance", AcpTestBarrierPoint::BeforeAcceptance)
+            .await;
     }
 }
 
