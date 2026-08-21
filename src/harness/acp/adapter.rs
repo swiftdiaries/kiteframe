@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -8,10 +9,11 @@ use serde_json::{Value, json};
 
 use super::super::builtin::{DURABLE_GOAL_DIRECTIVE, validate_schema_completion};
 use super::super::{
-    AcpCommand, AcpLimits, HARNESS_PROTOCOL_VERSION, HarnessApprovalBroker, HarnessApprovalRequest,
-    HarnessCancellation, HarnessCapabilities, HarnessCapability, HarnessEventSender,
-    HarnessFailure, HarnessInvocationEvent, HarnessInvocationOutput, HarnessPlugin, HarnessProfile,
-    HarnessRequestEnvelope, HarnessTerminal, HarnessTransport, PermissionOption, emit_and_wait,
+    AcpCommand, AcpLimits, HARNESS_PROTOCOL_VERSION, HarnessApprovalBroker,
+    HarnessApprovalDecision, HarnessApprovalRequest, HarnessCancellation, HarnessCapabilities,
+    HarnessCapability, HarnessEventSender, HarnessFailure, HarnessInvocationEvent,
+    HarnessInvocationOutput, HarnessPlugin, HarnessProfile, HarnessRequestEnvelope,
+    HarnessTerminal, HarnessTransport, PermissionOption, emit_and_wait,
 };
 use super::client::{
     AcpError, AcpInbound, AcpStdioClient, ContentBlock, RequestPermission, SessionNotification,
@@ -27,6 +29,81 @@ const PORTABLE_CORE: [HarnessCapability; 5] = [
     HarnessCapability::Cancel,
     HarnessCapability::CommittedOutput,
 ];
+const PERMISSION_CLEANUP_RESERVE: Duration = Duration::from_millis(25);
+const MAX_ASSISTANT_UPDATES: usize = 64;
+
+#[derive(Default)]
+struct CancelOnce {
+    sent: AtomicBool,
+}
+
+struct AssistantOutput {
+    text: String,
+    updates: usize,
+    max_bytes: u64,
+    max_updates: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptState {
+    Ready,
+    InFlight,
+    Cancelling,
+}
+
+impl AssistantOutput {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            text: String::new(),
+            updates: 0,
+            max_bytes,
+            max_updates: usize::try_from(max_bytes)
+                .unwrap_or(usize::MAX)
+                .min(MAX_ASSISTANT_UPDATES),
+        }
+    }
+
+    fn append(&mut self, text: &str) -> Result<(), HarnessFailure> {
+        if self.updates >= self.max_updates {
+            return Err(HarnessFailure::new(
+                "harness_failed",
+                "ACP assistant update count exceeded the closed invocation limit",
+            ));
+        }
+        let next_bytes = self.text.len().checked_add(text.len()).ok_or_else(|| {
+            HarnessFailure::new("harness_failed", "ACP assistant byte count overflowed")
+        })?;
+        if u64::try_from(next_bytes).unwrap_or(u64::MAX) > self.max_bytes {
+            return Err(HarnessFailure::new(
+                "harness_failed",
+                "ACP assistant text exceeded response_item_bytes",
+            ));
+        }
+        self.updates += 1;
+        self.text.push_str(text);
+        Ok(())
+    }
+}
+
+impl CancelOnce {
+    async fn send(
+        &self,
+        client: &AcpStdioClient,
+        session_id: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), AcpError> {
+        if self
+            .sent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+        tokio::time::timeout_at(deadline, client.cancel(session_id.to_owned()))
+            .await
+            .map_err(|_| AcpError::Limit("ACP cancel write exceeded active deadline".to_owned()))?
+    }
+}
 
 pub struct AcpHarnessPlugin {
     profile: HarnessProfile,
@@ -193,22 +270,53 @@ impl AcpHarnessPlugin {
             return HarnessTerminal::OutcomeUnknown(error);
         }
 
+        let cancel_once = Arc::new(CancelOnce::default());
+        let mut prompt_state = PromptState::Ready;
+        if cancellation.is_cancelled() {
+            prompt_state = PromptState::Cancelling;
+            if cancel_once
+                .send(&client, &session.session_id, deadline)
+                .await
+                .is_err()
+            {
+                client.kill().await;
+            }
+            debug_assert_eq!(prompt_state, PromptState::Cancelling);
+            let _ = client.shutdown().await;
+            return HarnessTerminal::Cancelled;
+        }
+
+        debug_assert_eq!(prompt_state, PromptState::Ready);
         let prompt_request = client.prompt(session.session_id.clone(), prompt);
         tokio::pin!(prompt_request);
-        let mut assistant_text = String::new();
-        let mut cancellation_sent = false;
+        prompt_state = PromptState::InFlight;
+        let mut assistant_output =
+            AssistantOutput::new(request.invocation.payload.limits.response_item_bytes);
         let terminal = loop {
+            if cancellation.is_cancelled() && prompt_state == PromptState::InFlight {
+                prompt_state = PromptState::Cancelling;
+                if cancel_once
+                    .send(&client, &session.session_id, deadline)
+                    .await
+                    .is_err()
+                {
+                    client.kill().await;
+                    break HarnessTerminal::Cancelled;
+                }
+                continue;
+            }
             tokio::select! {
-                _ = cancellation.cancelled(), if !cancellation_sent => {
-                    cancellation_sent = true;
-                    if client.cancel(session.session_id.clone()).await.is_err() {
+                biased;
+                _ = cancellation.cancelled(), if prompt_state == PromptState::InFlight => {
+                    prompt_state = PromptState::Cancelling;
+                    if cancel_once.send(&client, &session.session_id, deadline).await.is_err() {
                         client.kill().await;
                         break HarnessTerminal::Cancelled;
                     }
                 }
                 response = &mut prompt_request => {
                     match response {
-                        Ok(response) if cancellation_sent => {
+                        Ok(response) if prompt_state == PromptState::Cancelling => {
                             let _ = response;
                             break HarnessTerminal::Cancelled;
                         }
@@ -220,11 +328,21 @@ impl AcpHarnessPlugin {
                                 &client,
                                 &session.session_id,
                                 &events,
-                                &mut assistant_text,
+                                &mut assistant_output,
                             ).await {
                                 break terminal;
                             }
-                            break completion_terminal(&request, &assistant_text);
+                            if cancellation.is_cancelled() {
+                                if cancel_once
+                                    .send(&client, &session.session_id, deadline)
+                                    .await
+                                    .is_err()
+                                {
+                                    client.kill().await;
+                                }
+                                break HarnessTerminal::Cancelled;
+                            }
+                            break completion_terminal(&request, &assistant_output.text);
                         }
                         Ok(response) => {
                             break HarnessTerminal::Failed(HarnessFailure::new(
@@ -242,10 +360,13 @@ impl AcpHarnessPlugin {
                                 &session.session_id,
                                 params,
                                 &events,
-                                &mut assistant_text,
+                                &mut assistant_output,
                             ).await {
                                 Ok(()) => {}
-                                Err(error) => break HarnessTerminal::OutcomeUnknown(error),
+                                Err(error) => {
+                                    client.kill().await;
+                                    break update_failure_terminal(error);
+                                },
                             }
                         }
                         Ok(AcpInbound::Request { id, method, params }) if method == "session/request_permission" => {
@@ -258,6 +379,8 @@ impl AcpHarnessPlugin {
                                 &events,
                                 approvals.clone(),
                                 cancellation.clone(),
+                                cancel_once.clone(),
+                                deadline,
                             ).await {
                                 Ok(Some(terminal)) => break terminal,
                                 Ok(None) => {}
@@ -273,7 +396,7 @@ impl AcpHarnessPlugin {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     client.kill().await;
-                    break if cancellation_sent {
+                    break if prompt_state == PromptState::Cancelling {
                         HarnessTerminal::Cancelled
                     } else {
                         HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
@@ -293,14 +416,17 @@ async fn drain_pre_response_updates(
     client: &AcpStdioClient,
     session_id: &str,
     events: &HarnessEventSender,
-    assistant_text: &mut String,
+    assistant_output: &mut AssistantOutput,
 ) -> Result<(), HarnessTerminal> {
     loop {
         match client.try_recv().await {
             Ok(Some(AcpInbound::Notification { method, params })) if method == "session/update" => {
-                handle_session_update(session_id, params, events, assistant_text)
-                    .await
-                    .map_err(HarnessTerminal::OutcomeUnknown)?;
+                if let Err(error) =
+                    handle_session_update(session_id, params, events, assistant_output).await
+                {
+                    client.kill().await;
+                    return Err(update_failure_terminal(error));
+                }
             }
             Ok(Some(_)) => {
                 return Err(HarnessTerminal::Failed(HarnessFailure::new(
@@ -352,15 +478,18 @@ impl HarnessPlugin for AcpHarnessPlugin {
                 ));
             }
         };
-        let capabilities = observed_capabilities(&initialize)?;
-        tokio::task::yield_now().await;
-        if let Some(error) = client.connection_failure().await
-            && matches!(error, AcpError::Protocol(_))
-        {
+        let capabilities = match observed_capabilities(&initialize) {
+            Ok(capabilities) => capabilities,
+            Err(error) => {
+                let _ = client.shutdown().await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = client.verify_alive_before_shutdown().await {
             let _ = client.shutdown().await;
             return Err(describe_error(error));
         }
-        let _ = client.shutdown().await;
+        client.shutdown().await.map_err(describe_error)?;
         Ok(capabilities)
     }
 
@@ -404,7 +533,7 @@ async fn handle_session_update(
     expected_session: &str,
     params: Value,
     events: &HarnessEventSender,
-    assistant_text: &mut String,
+    assistant_output: &mut AssistantOutput,
 ) -> Result<(), HarnessFailure> {
     let notification: SessionNotification = serde_json::from_value(params)
         .map_err(|error| HarnessFailure::new("harness_protocol_incompatible", error.to_string()))?;
@@ -419,7 +548,7 @@ async fn handle_session_update(
         ..
     } = notification.update
     {
-        assistant_text.push_str(&text);
+        assistant_output.append(&text)?;
         emit_and_wait(events, HarnessInvocationEvent::AssistantMessage { text }).await?;
         Ok(())
     } else {
@@ -427,6 +556,14 @@ async fn handle_session_update(
             "harness_capability_unsupported",
             "ACP emitted non-text or rich session output",
         ))
+    }
+}
+
+fn update_failure_terminal(error: HarnessFailure) -> HarnessTerminal {
+    if error.code == "harness_outcome_unknown" {
+        HarnessTerminal::OutcomeUnknown(error)
+    } else {
+        HarnessTerminal::Failed(error)
     }
 }
 
@@ -440,19 +577,9 @@ async fn handle_permission(
     events: &HarnessEventSender,
     approvals: Arc<dyn HarnessApprovalBroker>,
     cancellation: HarnessCancellation,
+    cancel_once: Arc<CancelOnce>,
+    deadline: tokio::time::Instant,
 ) -> Result<Option<HarnessTerminal>, HarnessTerminal> {
-    let request: RequestPermission = serde_json::from_value(params).map_err(|error| {
-        HarnessTerminal::Failed(HarnessFailure::new(
-            "harness_protocol_incompatible",
-            error.to_string(),
-        ))
-    })?;
-    if request.session_id != expected_session {
-        return Err(HarnessTerminal::Failed(HarnessFailure::new(
-            "harness_protocol_incompatible",
-            "ACP permission session id did not match session/new",
-        )));
-    }
     let request_id = match &id {
         Value::String(value) => value.clone(),
         Value::Number(value) => value.to_string(),
@@ -463,16 +590,47 @@ async fn handle_permission(
             )));
         }
     };
+    let request: RequestPermission = match serde_json::from_value(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return reject_invalid_permission(
+                client,
+                id,
+                request_id,
+                "ACP agent permission request",
+                events,
+                deadline,
+                HarnessFailure::new("harness_protocol_incompatible", error.to_string()),
+            )
+            .await;
+        }
+    };
     let title = request
         .tool_call
         .title
         .unwrap_or_else(|| "ACP agent permission request".to_owned());
-    emit_and_wait(
+    if request.session_id != expected_session {
+        return reject_invalid_permission(
+            client,
+            id,
+            request_id,
+            &title,
+            events,
+            deadline,
+            HarnessFailure::new(
+                "harness_protocol_incompatible",
+                "ACP permission session id did not match session/new",
+            ),
+        )
+        .await;
+    }
+    emit_before_deadline(
         events,
         HarnessInvocationEvent::ApprovalRequested {
             request_id: request_id.clone(),
             title: title.clone(),
         },
+        deadline,
     )
     .await
     .map_err(HarnessTerminal::OutcomeUnknown)?;
@@ -481,23 +639,64 @@ async fn handle_permission(
         request_id: request_id.clone(),
         title,
     };
-    let decision = tokio::select! {
-        _ = cancellation.cancelled() => {
-            let _ = client.cancel(expected_session.to_owned()).await;
-            let _ = client.respond(id, json!({"outcome":{"outcome":"cancelled"}})).await;
-            return Ok(Some(HarnessTerminal::Cancelled));
-        },
-        decision = approvals.decide(approval) => decision,
+    let mut cancelled = cancellation.is_cancelled();
+    let mut approval_timed_out = false;
+    let decision_deadline = deadline
+        .checked_sub(PERMISSION_CLEANUP_RESERVE)
+        .unwrap_or(deadline);
+    let decision = if cancelled {
+        HarnessApprovalDecision::RejectOnce
+    } else {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                cancelled = true;
+                HarnessApprovalDecision::RejectOnce
+            },
+            _ = tokio::time::sleep_until(decision_deadline) => {
+                approval_timed_out = true;
+                HarnessApprovalDecision::RejectOnce
+            },
+            decision = approvals.decide(approval) => decision,
+        }
     };
-    emit_and_wait(
+    emit_before_deadline(
         events,
         HarnessInvocationEvent::ApprovalResolved {
             request_id,
             decision: decision.clone(),
         },
+        deadline,
     )
     .await
     .map_err(HarnessTerminal::OutcomeUnknown)?;
+    if cancelled {
+        cancel_once
+            .send(client, expected_session, deadline)
+            .await
+            .map_err(post_accept_error)?;
+        tokio::time::timeout_at(
+            deadline,
+            client.respond(id, json!({"outcome":{"outcome":"cancelled"}})),
+        )
+        .await
+        .map_err(|_| {
+            post_accept_error(AcpError::Limit(
+                "ACP permission cancellation response exceeded active deadline".to_owned(),
+            ))
+        })?
+        .map_err(post_accept_error)?;
+        return Ok(Some(HarnessTerminal::Cancelled));
+    }
+    if approval_timed_out {
+        respond_error_before_deadline(client, id, -32002, "approval deadline exceeded", deadline)
+            .await
+            .map_err(post_accept_error)?;
+        return Ok(Some(HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+            "harness_outcome_unknown",
+            "ACP approval broker exceeded the active execution deadline",
+        ))));
+    }
     let options = request
         .options
         .into_iter()
@@ -506,15 +705,35 @@ async fn handle_permission(
             kind: option.kind,
         })
         .collect::<Vec<_>>();
-    let option_id =
-        select_permission_once(&options, decision.clone()).map_err(HarnessTerminal::Failed)?;
-    client
-        .respond(
+    let option_id = match select_permission_once(&options, decision.clone()) {
+        Ok(option_id) => option_id,
+        Err(error) => {
+            respond_error_before_deadline(
+                client,
+                id,
+                -32001,
+                "required one-shot permission option unavailable",
+                deadline,
+            )
+            .await
+            .map_err(post_accept_error)?;
+            return Err(HarnessTerminal::Failed(error));
+        }
+    };
+    tokio::time::timeout_at(
+        deadline,
+        client.respond(
             id,
             json!({"outcome":{"outcome":"selected","optionId":option_id}}),
-        )
-        .await
-        .map_err(post_accept_error)?;
+        ),
+    )
+    .await
+    .map_err(|_| {
+        post_accept_error(AcpError::Limit(
+            "ACP permission response exceeded active deadline".to_owned(),
+        ))
+    })?
+    .map_err(post_accept_error)?;
     if decision == super::super::HarnessApprovalDecision::RejectOnce {
         return Ok(Some(HarnessTerminal::Failed(HarnessFailure::new(
             "harness_permission_rejected",
@@ -522,6 +741,68 @@ async fn handle_permission(
         ))));
     }
     Ok(None)
+}
+
+async fn reject_invalid_permission(
+    client: &AcpStdioClient,
+    id: Value,
+    request_id: String,
+    title: &str,
+    events: &HarnessEventSender,
+    deadline: tokio::time::Instant,
+    failure: HarnessFailure,
+) -> Result<Option<HarnessTerminal>, HarnessTerminal> {
+    emit_before_deadline(
+        events,
+        HarnessInvocationEvent::ApprovalRequested {
+            request_id: request_id.clone(),
+            title: title.to_owned(),
+        },
+        deadline,
+    )
+    .await
+    .map_err(HarnessTerminal::OutcomeUnknown)?;
+    emit_before_deadline(
+        events,
+        HarnessInvocationEvent::ApprovalResolved {
+            request_id,
+            decision: HarnessApprovalDecision::RejectOnce,
+        },
+        deadline,
+    )
+    .await
+    .map_err(HarnessTerminal::OutcomeUnknown)?;
+    respond_error_before_deadline(client, id, -32602, "invalid permission request", deadline)
+        .await
+        .map_err(post_accept_error)?;
+    Err(HarnessTerminal::Failed(failure))
+}
+
+async fn emit_before_deadline(
+    events: &HarnessEventSender,
+    event: HarnessInvocationEvent,
+    deadline: tokio::time::Instant,
+) -> Result<(), HarnessFailure> {
+    tokio::time::timeout_at(deadline, emit_and_wait(events, event))
+        .await
+        .map_err(|_| {
+            HarnessFailure::new(
+                "harness_outcome_unknown",
+                "ACP durable permission event exceeded active deadline",
+            )
+        })?
+}
+
+async fn respond_error_before_deadline(
+    client: &AcpStdioClient,
+    id: Value,
+    code: i64,
+    message: &'static str,
+    deadline: tokio::time::Instant,
+) -> Result<(), AcpError> {
+    tokio::time::timeout_at(deadline, client.respond_error(id, code, message))
+        .await
+        .map_err(|_| AcpError::Limit("ACP error response exceeded active deadline".to_owned()))?
 }
 
 fn canonical_prompt(invocation: &crate::InvokeHarness) -> Result<String, HarnessFailure> {

@@ -1,20 +1,25 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::super::{AcpCommand, AcpLimits, HarnessCapability};
 
 const MAX_PENDING_REQUESTS: usize = 32;
+const MAX_INBOUND_REQUESTS: usize = 32;
+const SHUTDOWN_RUNNING: u8 = 0;
+const SHUTDOWN_STDIN_CLOSED: u8 = 1;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AcpError {
@@ -42,20 +47,66 @@ pub enum AcpInbound {
 }
 
 enum WriterMessage {
-    Frame(Vec<u8>),
+    Frame {
+        bytes: Vec<u8>,
+        written: oneshot::Sender<Result<(), AcpError>>,
+    },
     Close,
+}
+
+struct IoTasks {
+    writer: Option<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
+    stderr: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+struct ConnectionState {
+    pending: Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
+    failure: Arc<AsyncMutex<Option<AcpError>>>,
+    inbound: mpsc::Sender<Result<AcpInbound, AcpError>>,
+    cancellation: CancellationToken,
 }
 
 type PendingSender = oneshot::Sender<Result<Value, AcpError>>;
 
+struct PendingRequestGuard {
+    id: u64,
+    pending: Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .expect("ACP pending request lock is not poisoned")
+            .remove(&self.id);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum JsonRpcRequestId {
+    Number(u64),
+    String(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundRequestState {
+    Pending,
+    Responded,
+}
+
 pub struct AcpStdioClient {
     writer: mpsc::Sender<WriterMessage>,
-    inbound: Mutex<mpsc::Receiver<Result<AcpInbound, AcpError>>>,
-    pending: Arc<Mutex<BTreeMap<u64, PendingSender>>>,
+    inbound: AsyncMutex<mpsc::Receiver<Result<AcpInbound, AcpError>>>,
+    pending: Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
+    inbound_requests: Arc<std::sync::Mutex<BTreeMap<JsonRpcRequestId, InboundRequestState>>>,
     next_id: AtomicU64,
-    child: Mutex<Child>,
-    failure: Arc<Mutex<Option<AcpError>>>,
+    child: AsyncMutex<Child>,
+    failure: Arc<AsyncMutex<Option<AcpError>>>,
     connection_cancel: CancellationToken,
+    shutdown_lock: AsyncMutex<()>,
+    io_tasks: StdMutex<Option<IoTasks>>,
     limits: AcpLimits,
 }
 
@@ -102,27 +153,32 @@ impl AcpStdioClient {
         let (writer, writer_rx) = mpsc::channel::<WriterMessage>(MAX_PENDING_REQUESTS);
         let (inbound_tx, inbound) =
             mpsc::channel::<Result<AcpInbound, AcpError>>(MAX_PENDING_REQUESTS);
-        let pending = Arc::new(Mutex::new(BTreeMap::new()));
-        let failure = Arc::new(Mutex::new(None));
+        let pending = Arc::new(StdMutex::new(BTreeMap::new()));
+        let inbound_requests = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let failure = Arc::new(AsyncMutex::new(None));
         let connection_cancel = CancellationToken::new();
+        let shutdown_phase = Arc::new(AtomicU8::new(SHUTDOWN_RUNNING));
+        let connection = ConnectionState {
+            pending: pending.clone(),
+            failure: failure.clone(),
+            inbound: inbound_tx,
+            cancellation: connection_cancel.clone(),
+        };
 
-        tokio::spawn(writer_task(
+        let writer_task = tokio::spawn(writer_task(
             stdin,
             writer_rx,
-            pending.clone(),
-            failure.clone(),
-            inbound_tx.clone(),
-            connection_cancel.clone(),
+            connection.clone(),
+            shutdown_phase.clone(),
         ));
-        tokio::spawn(reader_task(
+        let reader_task = tokio::spawn(reader_task(
             stdout,
             limits.max_frame_bytes,
-            pending.clone(),
-            failure.clone(),
-            inbound_tx,
-            connection_cancel.clone(),
+            connection,
+            inbound_requests.clone(),
+            shutdown_phase.clone(),
         ));
-        tokio::spawn(async move {
+        let stderr_task = tokio::spawn(async move {
             let mut stderr = stderr;
             let mut sink = tokio::io::sink();
             let _ = tokio::io::copy(&mut stderr, &mut sink).await;
@@ -130,12 +186,19 @@ impl AcpStdioClient {
 
         Ok(Self {
             writer,
-            inbound: Mutex::new(inbound),
+            inbound: AsyncMutex::new(inbound),
             pending,
+            inbound_requests,
             next_id: AtomicU64::new(1),
-            child: Mutex::new(child),
+            child: AsyncMutex::new(child),
             failure,
             connection_cancel,
+            shutdown_lock: AsyncMutex::new(()),
+            io_tasks: StdMutex::new(Some(IoTasks {
+                writer: Some(writer_task),
+                reader: Some(reader_task),
+                stderr: Some(stderr_task),
+            })),
             limits,
         })
     }
@@ -151,17 +214,21 @@ impl AcpStdioClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().await;
+            let mut pending = self
+                .pending
+                .lock()
+                .expect("ACP pending request lock is not poisoned");
             if pending.len() >= MAX_PENDING_REQUESTS {
                 return Err(AcpError::Limit("too many pending requests".to_owned()));
             }
             pending.insert(id, tx);
         }
+        let _pending_guard = PendingRequestGuard {
+            id,
+            pending: self.pending.clone(),
+        };
         let frame = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
-        if let Err(error) = self.write_json(&frame).await {
-            self.pending.lock().await.remove(&id);
-            return Err(error);
-        }
+        self.write_json(&frame).await?;
         let value = match rx.await {
             Ok(result) => result?,
             Err(_) => return Err(self.classify_process_loss().await),
@@ -214,13 +281,24 @@ impl AcpStdioClient {
     }
 
     pub async fn respond(&self, id: Value, result: Value) -> Result<(), AcpError> {
-        if !id.is_number() && !id.is_string() {
-            return Err(AcpError::Protocol(
-                "JSON-RPC request id must be a number or string".to_owned(),
-            ));
-        }
+        self.claim_inbound_response(&id)?;
         self.write_json(&json!({"jsonrpc":"2.0", "id":id, "result":result}))
             .await
+    }
+
+    pub async fn respond_error(
+        &self,
+        id: Value,
+        code: i64,
+        message: impl Into<String>,
+    ) -> Result<(), AcpError> {
+        self.claim_inbound_response(&id)?;
+        self.write_json(&json!({
+            "jsonrpc":"2.0",
+            "id":id,
+            "error":{"code":code,"message":message.into()}
+        }))
+        .await
     }
 
     pub async fn recv(&self) -> Result<AcpInbound, AcpError> {
@@ -240,30 +318,50 @@ impl AcpStdioClient {
         }
     }
 
-    pub(crate) async fn connection_failure(&self) -> Option<AcpError> {
-        self.failure.lock().await.clone()
-    }
-
-    pub async fn shutdown(&self) -> Result<(), AcpError> {
-        let _ = self.writer.send(WriterMessage::Close).await;
-        let mut child = self.child.lock().await;
-        match tokio::time::timeout(self.limits.shutdown_grace, child.wait()).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(error)) => Err(AcpError::ConnectionLost(error.to_string())),
-            Err(_) => {
-                child
-                    .start_kill()
-                    .map_err(|error| AcpError::ConnectionLost(error.to_string()))?;
-                let _ = child.wait().await;
-                Ok(())
+    pub(crate) async fn verify_alive_before_shutdown(&self) -> Result<(), AcpError> {
+        let settle = self.limits.shutdown_grace.min(Duration::from_millis(10));
+        tokio::select! {
+            biased;
+            _ = self.connection_cancel.cancelled() => {
+                return Err(self.classify_process_loss().await);
             }
+            _ = tokio::time::sleep(settle) => {}
+        }
+        if let Some(error) = self.failure.lock().await.clone() {
+            return Err(error);
+        }
+        let mut child = self.child.lock().await;
+        match child
+            .try_wait()
+            .map_err(|error| AcpError::ConnectionLost(error.to_string()))?
+        {
+            Some(status) => Err(AcpError::ConnectionLost(format!(
+                "ACP process exited before shutdown with status {status}"
+            ))),
+            None => Ok(()),
         }
     }
 
+    pub async fn shutdown(&self) -> Result<(), AcpError> {
+        let _shutdown = self.shutdown_lock.lock().await;
+        let deadline = tokio::time::Instant::now() + self.limits.shutdown_grace;
+        let mut tasks = self.take_io_tasks();
+        let graceful = self.graceful_shutdown(deadline, &mut tasks).await;
+        if let Err(error) = graceful {
+            self.force_cleanup(&mut tasks, error.clone()).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub async fn kill(&self) {
-        let mut child = self.child.lock().await;
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+        let _shutdown = self.shutdown_lock.lock().await;
+        let mut tasks = self.take_io_tasks();
+        self.force_cleanup(
+            &mut tasks,
+            AcpError::ConnectionLost("ACP process was killed".to_owned()),
+        )
+        .await;
     }
 
     async fn write_json(&self, value: &Value) -> Result<(), AcpError> {
@@ -273,10 +371,18 @@ impl AcpStdioClient {
             return Err(AcpError::Limit("outbound frame is too large".to_owned()));
         }
         bytes.push(b'\n');
-        if self.writer.send(WriterMessage::Frame(bytes)).await.is_err() {
+        let (written, acknowledgement) = oneshot::channel();
+        if self
+            .writer
+            .send(WriterMessage::Frame { bytes, written })
+            .await
+            .is_err()
+        {
             return Err(self.classify_process_loss().await);
         }
-        Ok(())
+        acknowledgement
+            .await
+            .map_err(|_| AcpError::ConnectionLost("ACP writer acknowledgement closed".to_owned()))?
     }
 
     async fn classify_process_loss(&self) -> AcpError {
@@ -286,46 +392,198 @@ impl AcpStdioClient {
             .clone()
             .unwrap_or_else(|| AcpError::ConnectionLost("ACP connection closed".to_owned()))
     }
+
+    fn claim_inbound_response(&self, id: &Value) -> Result<(), AcpError> {
+        let id = json_rpc_request_id(id)?;
+        let mut requests = self
+            .inbound_requests
+            .lock()
+            .expect("ACP inbound request ledger lock is not poisoned");
+        match requests.get_mut(&id) {
+            Some(state @ InboundRequestState::Pending) => {
+                *state = InboundRequestState::Responded;
+                Ok(())
+            }
+            Some(InboundRequestState::Responded) => Err(AcpError::Protocol(
+                "ACP inbound request already received a response".to_owned(),
+            )),
+            None => Err(AcpError::Protocol(
+                "ACP response targets an unknown inbound request".to_owned(),
+            )),
+        }
+    }
+
+    fn take_io_tasks(&self) -> IoTasks {
+        self.io_tasks
+            .lock()
+            .expect("ACP I/O task lock is not poisoned")
+            .take()
+            .unwrap_or(IoTasks {
+                writer: None,
+                reader: None,
+                stderr: None,
+            })
+    }
+
+    async fn graceful_shutdown(
+        &self,
+        deadline: tokio::time::Instant,
+        tasks: &mut IoTasks,
+    ) -> Result<(), AcpError> {
+        if let Some(error) = self.failure.lock().await.clone() {
+            return Err(error);
+        }
+        tokio::time::timeout_at(deadline, self.writer.send(WriterMessage::Close))
+            .await
+            .map_err(|_| AcpError::Limit("ACP close enqueue exceeded shutdown grace".to_owned()))?
+            .map_err(|_| AcpError::ConnectionLost("ACP writer task closed".to_owned()))?;
+        join_before_deadline(&mut tasks.writer, deadline, "writer").await?;
+
+        let status = {
+            let mut child = self.child.lock().await;
+            tokio::time::timeout_at(deadline, child.wait())
+                .await
+                .map_err(|_| AcpError::Limit("ACP child wait exceeded shutdown grace".to_owned()))?
+                .map_err(|error| AcpError::ConnectionLost(error.to_string()))?
+        };
+        if !status.success() {
+            return Err(AcpError::ConnectionLost(format!(
+                "ACP process exited with nonzero status {status}"
+            )));
+        }
+        join_before_deadline(&mut tasks.reader, deadline, "reader").await?;
+        join_before_deadline(&mut tasks.stderr, deadline, "stderr").await?;
+        if let Some(error) = self.failure.lock().await.clone() {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn force_cleanup(&self, tasks: &mut IoTasks, error: AcpError) {
+        {
+            let mut failure = self.failure.lock().await;
+            if failure.is_none() {
+                *failure = Some(error.clone());
+            }
+        }
+        self.connection_cancel.cancel();
+        let drained = std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .expect("ACP pending request lock is not poisoned"),
+        );
+        for (_, sender) in drained {
+            let _ = sender.send(Err(error.clone()));
+        }
+        {
+            let mut child = self.child.lock().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(self.limits.shutdown_grace, child.wait()).await;
+        }
+        abort_and_join(&mut tasks.writer).await;
+        abort_and_join(&mut tasks.reader).await;
+        abort_and_join(&mut tasks.stderr).await;
+    }
 }
 
 impl Drop for AcpStdioClient {
     fn drop(&mut self) {
         self.connection_cancel.cancel();
+        if let Some(mut tasks) = self
+            .io_tasks
+            .lock()
+            .expect("ACP I/O task lock is not poisoned")
+            .take()
+        {
+            abort_task(&mut tasks.writer);
+            abort_task(&mut tasks.reader);
+            abort_task(&mut tasks.stderr);
+        }
+    }
+}
+
+async fn join_before_deadline(
+    task: &mut Option<JoinHandle<()>>,
+    deadline: tokio::time::Instant,
+    name: &'static str,
+) -> Result<(), AcpError> {
+    let Some(mut handle) = task.take() else {
+        return Ok(());
+    };
+    match tokio::time::timeout_at(deadline, &mut handle).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(AcpError::ConnectionLost(format!(
+            "ACP {name} task failed: {error}"
+        ))),
+        Err(_) => {
+            *task = Some(handle);
+            Err(AcpError::Limit(format!(
+                "ACP {name} task exceeded shutdown grace"
+            )))
+        }
+    }
+}
+
+fn abort_task(task: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = task.take() {
+        task.abort();
+    }
+}
+
+async fn abort_and_join(task: &mut Option<JoinHandle<()>>) {
+    if let Some(task) = task.take() {
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_millis(100), task).await;
     }
 }
 
 async fn writer_task(
     mut stdin: tokio::process::ChildStdin,
     mut receiver: mpsc::Receiver<WriterMessage>,
-    pending: Arc<Mutex<BTreeMap<u64, PendingSender>>>,
-    failure: Arc<Mutex<Option<AcpError>>>,
-    inbound: mpsc::Sender<Result<AcpInbound, AcpError>>,
-    cancellation: CancellationToken,
+    connection: ConnectionState,
+    shutdown_phase: Arc<AtomicU8>,
 ) {
     loop {
         let message = tokio::select! {
-            _ = cancellation.cancelled() => return,
+            _ = connection.cancellation.cancelled() => return,
             message = receiver.recv() => match message {
                 Some(message) => message,
                 None => return,
             },
         };
-        let result = match message {
-            WriterMessage::Frame(bytes) => stdin.write_all(&bytes).await,
+        let (result, written) = match message {
+            WriterMessage::Frame { bytes, written } => (
+                async {
+                    stdin.write_all(&bytes).await?;
+                    stdin.flush().await
+                }
+                .await,
+                Some(written),
+            ),
             WriterMessage::Close => {
-                let _ = stdin.shutdown().await;
-                return;
+                let result = async {
+                    stdin.flush().await?;
+                    shutdown_phase.store(SHUTDOWN_STDIN_CLOSED, Ordering::Release);
+                    stdin.shutdown().await
+                }
+                .await;
+                if result.is_ok() {
+                    return;
+                }
+                (result, None)
             }
         };
+        if let Some(written) = written {
+            let _ = written.send(
+                result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| AcpError::ConnectionLost(error.to_string())),
+            );
+        }
         if let Err(error) = result {
-            fail_connection(
-                AcpError::ConnectionLost(error.to_string()),
-                &pending,
-                &failure,
-                &inbound,
-                &cancellation,
-            )
-            .await;
+            fail_connection(AcpError::ConnectionLost(error.to_string()), &connection).await;
             return;
         }
     }
@@ -334,50 +592,53 @@ async fn writer_task(
 async fn reader_task(
     stdout: tokio::process::ChildStdout,
     max_frame_bytes: usize,
-    pending: Arc<Mutex<BTreeMap<u64, PendingSender>>>,
-    failure: Arc<Mutex<Option<AcpError>>>,
-    inbound: mpsc::Sender<Result<AcpInbound, AcpError>>,
-    cancellation: CancellationToken,
+    connection: ConnectionState,
+    inbound_requests: Arc<std::sync::Mutex<BTreeMap<JsonRpcRequestId, InboundRequestState>>>,
+    shutdown_phase: Arc<AtomicU8>,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
         let frame = tokio::select! {
-            _ = cancellation.cancelled() => return,
+            _ = connection.cancellation.cancelled() => return,
             frame = read_bounded_frame(&mut reader, max_frame_bytes) => frame,
         };
         match frame {
             Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(frame) => {
-                    if let Err(error) = dispatch_frame(frame, &pending, &inbound).await {
-                        fail_connection(error, &pending, &failure, &inbound, &cancellation).await;
+                    if let Err(error) = dispatch_frame(
+                        frame,
+                        &connection.pending,
+                        &inbound_requests,
+                        &connection.inbound,
+                    )
+                    .await
+                    {
+                        fail_connection(error, &connection).await;
                         return;
                     }
                 }
                 Err(error) => {
                     fail_connection(
                         AcpError::Protocol(format!("stdout is not valid JSON-RPC: {error}")),
-                        &pending,
-                        &failure,
-                        &inbound,
-                        &cancellation,
+                        &connection,
                     )
                     .await;
                     return;
                 }
             },
             Ok(None) => {
+                if shutdown_phase.load(Ordering::Acquire) == SHUTDOWN_STDIN_CLOSED {
+                    return;
+                }
                 fail_connection(
                     AcpError::ConnectionLost("ACP process reached EOF".to_owned()),
-                    &pending,
-                    &failure,
-                    &inbound,
-                    &cancellation,
+                    &connection,
                 )
                 .await;
                 return;
             }
             Err(error) => {
-                fail_connection(error, &pending, &failure, &inbound, &cancellation).await;
+                fail_connection(error, &connection).await;
                 return;
             }
         }
@@ -420,7 +681,8 @@ async fn read_bounded_frame<R: tokio::io::AsyncBufRead + Unpin>(
 
 async fn dispatch_frame(
     frame: Value,
-    pending: &Arc<Mutex<BTreeMap<u64, PendingSender>>>,
+    pending: &Arc<StdMutex<BTreeMap<u64, PendingSender>>>,
+    inbound_requests: &Arc<std::sync::Mutex<BTreeMap<JsonRpcRequestId, InboundRequestState>>>,
     inbound: &mpsc::Sender<Result<AcpInbound, AcpError>>,
 ) -> Result<(), AcpError> {
     let object = frame
@@ -442,6 +704,19 @@ async fn dispatch_frame(
         }
         let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
         let message = if let Some(id) = object.get("id") {
+            let typed_id = json_rpc_request_id(id)?;
+            let mut requests = inbound_requests
+                .lock()
+                .expect("ACP inbound request ledger lock is not poisoned");
+            if requests.contains_key(&typed_id) {
+                return Err(AcpError::Protocol(
+                    "duplicate ACP inbound request id".to_owned(),
+                ));
+            }
+            if requests.len() >= MAX_INBOUND_REQUESTS {
+                return Err(AcpError::Limit("too many ACP inbound requests".to_owned()));
+            }
+            requests.insert(typed_id, InboundRequestState::Pending);
             AcpInbound::Request {
                 id: id.clone(),
                 method: method.to_owned(),
@@ -473,7 +748,7 @@ async fn dispatch_frame(
         .ok_or_else(|| AcpError::Protocol("response id is not an unsigned integer".to_owned()))?;
     let sender = pending
         .lock()
-        .await
+        .expect("ACP pending request lock is not poisoned")
         .remove(&id)
         .ok_or_else(|| AcpError::Protocol("duplicate or unknown response id".to_owned()))?;
     let result = match (object.get("result"), object.get("error")) {
@@ -485,6 +760,18 @@ async fn dispatch_frame(
     };
     let _ = sender.send(result);
     Ok(())
+}
+
+fn json_rpc_request_id(value: &Value) -> Result<JsonRpcRequestId, AcpError> {
+    if let Some(value) = value.as_u64() {
+        return Ok(JsonRpcRequestId::Number(value));
+    }
+    if let Some(value) = value.as_str() {
+        return Ok(JsonRpcRequestId::String(value.to_owned()));
+    }
+    Err(AcpError::Protocol(
+        "JSON-RPC request id must be an unsigned integer or string".to_owned(),
+    ))
 }
 
 fn parse_remote_error(value: &Value) -> Result<AcpError, AcpError> {
@@ -512,24 +799,24 @@ fn parse_remote_error(value: &Value) -> Result<AcpError, AcpError> {
     })
 }
 
-async fn fail_connection(
-    error: AcpError,
-    pending: &Arc<Mutex<BTreeMap<u64, PendingSender>>>,
-    failure: &Arc<Mutex<Option<AcpError>>>,
-    inbound: &mpsc::Sender<Result<AcpInbound, AcpError>>,
-    cancellation: &CancellationToken,
-) {
-    let mut stored = failure.lock().await;
+async fn fail_connection(error: AcpError, connection: &ConnectionState) {
+    let mut stored = connection.failure.lock().await;
     if stored.is_some() {
         return;
     }
     *stored = Some(error.clone());
     drop(stored);
-    cancellation.cancel();
-    for (_, sender) in std::mem::take(&mut *pending.lock().await) {
+    connection.cancellation.cancel();
+    let drained = std::mem::take(
+        &mut *connection
+            .pending
+            .lock()
+            .expect("ACP pending request lock is not poisoned"),
+    );
+    for (_, sender) in drained {
         let _ = sender.send(Err(error.clone()));
     }
-    let _ = inbound.send(Err(error)).await;
+    let _ = connection.inbound.send(Err(error)).await;
 }
 
 #[derive(Debug, Serialize)]

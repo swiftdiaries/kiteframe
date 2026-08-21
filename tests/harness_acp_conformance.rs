@@ -4,6 +4,7 @@ mod harness_conformance;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,11 +14,11 @@ use harness_conformance::{
     RecordingTerminalJournal, assert_normative_harness,
 };
 use kiteframe::harness::{
-    AcpCommand, AcpHarnessPlugin, AcpLimits, HarnessAcceptanceBarrier, HarnessApprovalBroker,
-    HarnessApprovalDecision, HarnessApprovalRequest, HarnessCapability, HarnessEventEnvelope,
-    HarnessEventSink, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
-    HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessTerminal, HarnessTransport,
-    dispatch_with_terminal_journal, select_permission_once,
+    AcpCommand, AcpHarnessPlugin, AcpLimits, AcpStdioClient, HarnessAcceptanceBarrier,
+    HarnessApprovalBroker, HarnessApprovalDecision, HarnessApprovalRequest, HarnessCapability,
+    HarnessEventEnvelope, HarnessEventSink, HarnessFailure, HarnessInvocationId,
+    HarnessInvocationRequest, HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessTerminal,
+    HarnessTransport, dispatch_with_terminal_journal, select_permission_once,
 };
 use kiteframe::{
     AgentCommandId, ClosedSchema, GoalPhase, GoalProjection, HarnessStructuralLimits,
@@ -49,6 +50,19 @@ impl HarnessAcceptanceBarrier for TestAcceptanceBarrier {
     }
 }
 
+struct CancelDuringAcceptance {
+    registry: Arc<HarnessRegistry>,
+    invocation_id: HarnessInvocationId,
+}
+
+#[async_trait]
+impl HarnessAcceptanceBarrier for CancelDuringAcceptance {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        assert!(self.registry.cancel(&self.invocation_id).await);
+        Ok(())
+    }
+}
+
 struct FixedApproval(HarnessApprovalDecision);
 
 #[async_trait]
@@ -60,6 +74,42 @@ impl HarnessApprovalBroker for FixedApproval {
 
 struct BlockingApproval {
     entered: Arc<Notify>,
+}
+
+struct CountingApproval {
+    calls: Arc<AtomicUsize>,
+    decision: HarnessApprovalDecision,
+}
+
+#[async_trait]
+impl HarnessApprovalBroker for CountingApproval {
+    async fn decide(&self, _request: HarnessApprovalRequest) -> HarnessApprovalDecision {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.decision.clone()
+    }
+}
+
+#[derive(Default)]
+struct GatedMessageSink {
+    events: Mutex<Vec<HarnessEventEnvelope>>,
+    message_entered: Notify,
+    release_message: Notify,
+}
+
+#[async_trait]
+impl HarnessEventSink for GatedMessageSink {
+    async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
+        let is_message = matches!(
+            event.event,
+            kiteframe::harness::HarnessInvocationEvent::AssistantMessage { .. }
+        );
+        self.events.lock().unwrap().push(event);
+        if is_message {
+            self.message_entered.notify_one();
+            self.release_message.notified().await;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -100,6 +150,10 @@ impl FixtureRun {
                 (
                     OsString::from("KITEFRAME_FAKE_ACP_OBSERVATION"),
                     observation.as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("KITEFRAME_FAKE_ACP_ALLOW_EOF"),
+                    OsString::from("1"),
                 ),
             ]),
         );
@@ -331,6 +385,474 @@ async fn cancellation_resolves_a_pending_permission_and_sends_cancel_once() {
     assert_eq!(observation["cancelCount"], 1);
     assert_eq!(observation["permissionResponseCount"], 1);
     assert!(observation["selectedPermissionOption"].is_null());
+    let events = run.sink.0.lock().unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::Started,
+                ..
+            },
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalRequested { .. },
+                ..
+            },
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalResolved {
+                    decision: HarnessApprovalDecision::RejectOnce,
+                    ..
+                },
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_committed_with_acceptance_prevents_prompt_write() {
+    let script = json!([
+        {
+            "expect":{"method":"initialize"},
+            "respond":stable_initialize()
+        },
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/cancel","params":{"sessionId":"session-1"}}}
+    ]);
+    let run = FixtureRun::new(write_script(&script)).await;
+    let terminal = run
+        .registry
+        .invoke_with_acceptance_barrier(
+            run.request.clone(),
+            Arc::new(FixedApproval(HarnessApprovalDecision::AllowOnce)),
+            run.sink.clone(),
+            Arc::new(CancelDuringAcceptance {
+                registry: run.registry.clone(),
+                invocation_id: run.request.invocation_id.clone(),
+            }),
+        )
+        .await;
+    assert_eq!(terminal, HarnessTerminal::Cancelled);
+    let observation = run.observation();
+    assert_eq!(observation["cancelCount"], 1);
+    assert!(
+        observation["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|method| method != "session/prompt")
+    );
+}
+
+#[tokio::test]
+async fn simultaneous_cancellation_wins_over_ready_end_turn() {
+    let run = FixtureRun::new(fixture("core-success.json")).await;
+    let sink = Arc::new(GatedMessageSink::default());
+    let task = tokio::spawn({
+        let registry = run.registry.clone();
+        let request = run.request.clone();
+        let sink = sink.clone();
+        async move {
+            registry
+                .invoke_with_acceptance_barrier(
+                    request,
+                    Arc::new(FixedApproval(HarnessApprovalDecision::AllowOnce)),
+                    sink,
+                    Arc::new(TestAcceptanceBarrier),
+                )
+                .await
+        }
+    });
+    sink.message_entered.notified().await;
+    assert!(run.registry.cancel(&run.request.invocation_id).await);
+    sink.release_message.notify_one();
+    assert_eq!(task.await.unwrap(), HarnessTerminal::Cancelled);
+}
+
+#[tokio::test]
+async fn permission_arriving_after_cancellation_is_rejected_without_second_cancel() {
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/prompt"},"saveId":"prompt"},
+        {"expect":{"method":"session/cancel","params":{"sessionId":"session-1"}}},
+        {
+            "request":permission_request(json!(700), true),
+            "allowCancelBeforeResponse":true,
+            "expectResponse":{"id":700}
+        },
+        {"respondTo":"prompt","respond":{"stopReason":"cancelled"}}
+    ]);
+    let run = Arc::new(FixtureRun::new(write_script(&script)).await);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let task = tokio::spawn({
+        let run = run.clone();
+        let calls = calls.clone();
+        async move {
+            run.registry
+                .invoke_with_acceptance_barrier(
+                    run.request.clone(),
+                    Arc::new(CountingApproval {
+                        calls,
+                        decision: HarnessApprovalDecision::AllowOnce,
+                    }),
+                    run.sink.clone(),
+                    Arc::new(TestAcceptanceBarrier),
+                )
+                .await
+        }
+    });
+    run.wait_for_method("session/prompt").await;
+    assert!(run.registry.cancel(&run.request.invocation_id).await);
+    assert_eq!(task.await.unwrap(), HarnessTerminal::Cancelled);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let observation = run.observation();
+    assert_eq!(observation["cancelCount"], 1);
+    assert_eq!(observation["permissionResponseCount"], 1);
+    let events = run.sink.0.lock().unwrap();
+    assert!(matches!(
+        &events[events.len() - 2..],
+        [
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalRequested { .. },
+                ..
+            },
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalResolved {
+                    decision: HarnessApprovalDecision::RejectOnce,
+                    ..
+                },
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn duplicate_permission_request_id_is_rejected_before_second_broker_call() {
+    let duplicate = permission_request(json!(700), true);
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/prompt"},"saveId":"prompt"},
+        {"request":duplicate,"expectResponse":{"id":700}},
+        {"request":permission_request(json!(700), true),"expectResponse":{"id":700}}
+    ]);
+    let run = FixtureRun::new(write_script(&script)).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let terminal = run
+        .registry
+        .invoke_with_acceptance_barrier(
+            run.request.clone(),
+            Arc::new(CountingApproval {
+                calls: calls.clone(),
+                decision: HarnessApprovalDecision::AllowOnce,
+            }),
+            run.sink.clone(),
+            Arc::new(TestAcceptanceBarrier),
+        )
+        .await;
+    assert_eq!(terminal_code(&terminal), Some("harness_outcome_unknown"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run.observation()["permissionResponseCount"], 1);
+}
+
+#[tokio::test]
+async fn numeric_and_string_permission_ids_are_distinct_and_each_answered_once() {
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/prompt"},"saveId":"prompt"},
+        {"request":permission_request(json!(7), true),"expectResponse":{"id":7}},
+        {"request":permission_request(json!("7"), true),"expectResponse":{"id":"7"}},
+        completion_notification(),
+        {"respondTo":"prompt","respond":{"stopReason":"end_turn"}}
+    ]);
+    let run = FixtureRun::new(write_script(&script)).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let terminal = run
+        .registry
+        .invoke_with_acceptance_barrier(
+            run.request.clone(),
+            Arc::new(CountingApproval {
+                calls: calls.clone(),
+                decision: HarnessApprovalDecision::AllowOnce,
+            }),
+            run.sink.clone(),
+            Arc::new(TestAcceptanceBarrier),
+        )
+        .await;
+    assert!(matches!(terminal, HarnessTerminal::Completed(_)));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(run.observation()["permissionResponseCount"], 2);
+}
+
+#[tokio::test]
+async fn missing_one_shot_option_gets_one_error_after_durable_resolution() {
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/prompt"},"saveId":"prompt"},
+        {
+            "request":permission_request(json!(701), false),
+            "expectResponse":{"id":701,"error":{"code":-32001}}
+        }
+    ]);
+    let run = FixtureRun::new(write_script(&script)).await;
+    let terminal = run.invoke(HarnessApprovalDecision::AllowOnce).await;
+    assert_eq!(
+        terminal_code(&terminal),
+        Some("harness_capability_unsupported")
+    );
+    assert_eq!(run.observation()["permissionResponseCount"], 1);
+    let events = run.sink.0.lock().unwrap();
+    assert!(matches!(
+        &events[events.len() - 2..],
+        [
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalRequested { .. },
+                ..
+            },
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalResolved {
+                    decision: HarnessApprovalDecision::AllowOnce,
+                    ..
+                },
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn malformed_permission_request_gets_reject_resolution_and_one_error() {
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/prompt"},"saveId":"prompt"},
+        {
+            "request":{
+                "id":703,
+                "method":"session/request_permission",
+                "params":{"sessionId":"session-1","options":[]}
+            },
+            "expectResponse":{"id":703,"error":{"code":-32602}}
+        }
+    ]);
+    let run = FixtureRun::new(write_script(&script)).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let terminal = run
+        .registry
+        .invoke_with_acceptance_barrier(
+            run.request.clone(),
+            Arc::new(CountingApproval {
+                calls: calls.clone(),
+                decision: HarnessApprovalDecision::AllowOnce,
+            }),
+            run.sink.clone(),
+            Arc::new(TestAcceptanceBarrier),
+        )
+        .await;
+    assert_eq!(
+        terminal_code(&terminal),
+        Some("harness_protocol_incompatible")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(run.observation()["permissionResponseCount"], 1);
+    let events = run.sink.0.lock().unwrap();
+    assert!(matches!(
+        &events[events.len() - 2..],
+        [
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalRequested { .. },
+                ..
+            },
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalResolved {
+                    decision: HarnessApprovalDecision::RejectOnce,
+                    ..
+                },
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn blocking_approval_is_bounded_by_the_active_execution_deadline() {
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/prompt"},"saveId":"prompt"},
+        {
+            "request":permission_request(json!(702), true),
+            "expectResponse":{"id":702,"error":{"code":-32002}}
+        }
+    ]);
+    let mut run = FixtureRun::new(write_script(&script)).await;
+    run.request.payload.limits.active_execution_millis_remaining = 200;
+    let entered = Arc::new(Notify::new());
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(1),
+        run.registry.invoke_with_acceptance_barrier(
+            run.request.clone(),
+            Arc::new(BlockingApproval {
+                entered: entered.clone(),
+            }),
+            run.sink.clone(),
+            Arc::new(TestAcceptanceBarrier),
+        ),
+    )
+    .await
+    .expect("approval broker must not outlive active execution");
+    assert_eq!(terminal_code(&terminal), Some("harness_outcome_unknown"));
+    assert_eq!(run.observation()["permissionResponseCount"], 1);
+    let events = run.sink.0.lock().unwrap();
+    assert!(matches!(
+        &events[events.len() - 2..],
+        [
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalRequested { .. },
+                ..
+            },
+            HarnessEventEnvelope {
+                event: kiteframe::harness::HarnessInvocationEvent::ApprovalResolved {
+                    decision: HarnessApprovalDecision::RejectOnce,
+                    ..
+                },
+                ..
+            }
+        ]
+    ));
+}
+
+#[tokio::test]
+async fn assistant_bytes_are_bounded_before_text_or_event_append() {
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
+        {"expect":{"method":"session/prompt"},"saveId":"prompt"},
+        {
+            "notify":{
+                "method":"session/update",
+                "params":{
+                    "sessionId":"session-1",
+                    "update":{
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"too many bytes"}
+                    }
+                }
+            }
+        },
+        {"respondTo":"prompt","respond":{"stopReason":"end_turn"}}
+    ]);
+    let mut run = FixtureRun::new(write_script(&script)).await;
+    run.request.payload.limits.response_item_bytes = 8;
+    let terminal = run.invoke(HarnessApprovalDecision::AllowOnce).await;
+    assert_eq!(terminal_code(&terminal), Some("harness_failed"));
+    assert!(run.sink.0.lock().unwrap().iter().all(|event| !matches!(
+        event.event,
+        kiteframe::harness::HarnessInvocationEvent::AssistantMessage { .. }
+    )));
+}
+
+#[tokio::test]
+async fn assistant_update_count_is_closed_before_the_overflow_event() {
+    let mut script = vec![
+        json!({"expect":{"method":"initialize"},"respond":stable_initialize()}),
+        json!({"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}}),
+        json!({"expect":{"method":"session/prompt"},"saveId":"prompt"}),
+    ];
+    for _ in 0..65 {
+        script.push(json!({
+            "notify":{
+                "method":"session/update",
+                "params":{
+                    "sessionId":"session-1",
+                    "update":{
+                        "sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":""}
+                    }
+                }
+            }
+        }));
+    }
+    script.push(json!({"respondTo":"prompt","respond":{"stopReason":"end_turn"}}));
+    let run = FixtureRun::new(write_script(&Value::Array(script))).await;
+    let terminal = run.invoke(HarnessApprovalDecision::AllowOnce).await;
+    assert_eq!(terminal_code(&terminal), Some("harness_failed"));
+    let message_count = run
+        .sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event,
+                kiteframe::harness::HarnessInvocationEvent::AssistantMessage { .. }
+            )
+        })
+        .count();
+    assert_eq!(message_count, 64);
+}
+
+#[tokio::test]
+async fn dropped_public_requests_reclaim_pending_capacity() {
+    let mut script = (0..32)
+        .map(|_| json!({"expect":{"method":"probe"}}))
+        .collect::<Vec<_>>();
+    script.push(json!({"expect":{"method":"probe"},"respond":{"ok":true}}));
+    let script = write_script(&Value::Array(script));
+    let workspace = std::env::temp_dir().join(format!("kiteframe-acp-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let observation = workspace.join("observation.json");
+    let client = Arc::new(
+        AcpStdioClient::spawn(
+            &AcpCommand {
+                program: PathBuf::from(env!("CARGO_BIN_EXE_kiteframe-fake-acp")),
+                args: vec![],
+                source_revision: SOURCE_REVISION.to_owned(),
+            },
+            &workspace,
+            limits(),
+            &BTreeMap::from([
+                (
+                    OsString::from("KITEFRAME_FAKE_ACP_SCRIPT"),
+                    script.as_os_str().to_owned(),
+                ),
+                (
+                    OsString::from("KITEFRAME_FAKE_ACP_OBSERVATION"),
+                    observation.as_os_str().to_owned(),
+                ),
+            ]),
+        )
+        .await
+        .unwrap(),
+    );
+    let mut requests = Vec::new();
+    for index in 0..32 {
+        let client = client.clone();
+        requests.push(tokio::spawn(async move {
+            client
+                .request::<_, Value>("probe", json!({"index":index}))
+                .await
+        }));
+    }
+    wait_for_observed_method_count(&observation, 32).await;
+    for request in requests {
+        request.abort();
+        let _ = request.await;
+    }
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.request::<_, Value>("probe", json!({"final":true})),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response, json!({"ok":true}));
+    let _ = client.shutdown().await;
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[tokio::test]
@@ -344,6 +866,75 @@ async fn eof_after_prompt_acceptance_is_outcome_unknown() {
 async fn protocol_mismatch_fails_before_prompt_acceptance() {
     let error = registration_error(fixture("incompatible.json")).await;
     assert_eq!(error.code, "harness_protocol_incompatible");
+}
+
+#[tokio::test]
+async fn registration_rejects_agent_that_exits_after_initialize() {
+    let script = json!([{
+        "expect":{"method":"initialize"},
+        "respond":stable_initialize()
+    }]);
+    let error = registration_error(write_script(&script)).await;
+    assert_eq!(error.code, "harness_profile_unavailable");
+}
+
+#[tokio::test]
+async fn registration_rejects_nonzero_shutdown_status() {
+    let script = json!([
+        {"expect":{"method":"initialize"},"respond":stable_initialize()},
+        {"expect":{"method":"session/new"}}
+    ]);
+    let error = registration_error(write_script(&script)).await;
+    assert_eq!(error.code, "harness_profile_unavailable");
+}
+
+#[tokio::test]
+async fn shutdown_timeout_kills_child_and_releases_blocked_writes() {
+    let script = write_script(&json!([{"sleepMillis":5000}]));
+    let workspace = std::env::temp_dir().join(format!("kiteframe-acp-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let client = Arc::new(
+        AcpStdioClient::spawn(
+            &AcpCommand {
+                program: PathBuf::from(env!("CARGO_BIN_EXE_kiteframe-fake-acp")),
+                args: vec![],
+                source_revision: SOURCE_REVISION.to_owned(),
+            },
+            &workspace,
+            AcpLimits {
+                max_frame_bytes: 64 * 1024,
+                shutdown_grace: Duration::from_millis(50),
+                max_pre_accept_attempts: 1,
+            },
+            &BTreeMap::from([(
+                OsString::from("KITEFRAME_FAKE_ACP_SCRIPT"),
+                script.as_os_str().to_owned(),
+            )]),
+        )
+        .await
+        .unwrap(),
+    );
+    let payload = "x".repeat(60 * 1024);
+    let mut writes = Vec::new();
+    for _ in 0..32 {
+        let client = client.clone();
+        let payload = payload.clone();
+        writes.push(tokio::spawn(async move {
+            client
+                .request::<_, Value>("probe", json!({"payload":payload}))
+                .await
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let started = tokio::time::Instant::now();
+    assert!(client.shutdown().await.is_err());
+    assert!(started.elapsed() < Duration::from_millis(500));
+    for write in writes {
+        let _ = tokio::time::timeout(Duration::from_millis(500), write)
+            .await
+            .expect("blocked writer task must be joined or released");
+    }
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[tokio::test]
@@ -479,6 +1070,25 @@ fn write_script(value: &Value) -> PathBuf {
     path
 }
 
+async fn wait_for_observed_method_count(path: &Path, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let observed = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value["methods"].as_array().map(Vec::len))
+            .unwrap_or(0);
+        if observed >= count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake ACP observed {observed} methods, expected at least {count}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 async fn registration_error(script: impl AsRef<Path>) -> HarnessFailure {
     let workspace = std::env::temp_dir().join(format!("kiteframe-acp-{}", Uuid::now_v7()));
     std::fs::create_dir_all(&workspace).unwrap();
@@ -507,6 +1117,55 @@ fn script_with_completion(completion: Value) -> Value {
     script[3]["notify"]["params"]["update"]["content"]["text"] =
         Value::String(serde_json::to_string(&completion).unwrap());
     script
+}
+
+fn stable_initialize() -> Value {
+    json!({
+        "protocolVersion":1,
+        "agentCapabilities":{},
+        "agentInfo":{"name":"kiteframe-fake-acp","version":"1.0.0"}
+    })
+}
+
+fn permission_request(id: Value, include_one_shot: bool) -> Value {
+    let mut options = vec![json!({
+        "optionId":"allow-always-id",
+        "name":"Always",
+        "kind":"allow_always"
+    })];
+    if include_one_shot {
+        options.extend([
+            json!({"optionId":"allow-once-id","name":"Once","kind":"allow_once"}),
+            json!({"optionId":"reject-once-id","name":"Reject","kind":"reject_once"}),
+        ]);
+    }
+    json!({
+        "id":id,
+        "method":"session/request_permission",
+        "params":{
+            "sessionId":"session-1",
+            "toolCall":{"toolCallId":"tool-1","title":"Run fixture tool"},
+            "options":options
+        }
+    })
+}
+
+fn completion_notification() -> Value {
+    json!({
+        "notify":{
+            "method":"session/update",
+            "params":{
+                "sessionId":"session-1",
+                "update":{
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{
+                        "type":"text",
+                        "text":"{\"fields\":{\"answer\":\"done\"},\"outcome\":\"ok\"}"
+                    }
+                }
+            }
+        }
+    })
 }
 
 fn terminal_code(terminal: &HarnessTerminal) -> Option<&str> {

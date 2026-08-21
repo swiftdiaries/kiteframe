@@ -18,6 +18,7 @@ fn run() -> Result<(), String> {
             .ok_or("KITEFRAME_FAKE_ACP_SCRIPT is required")?,
     );
     let observation_path = std::env::var_os("KITEFRAME_FAKE_ACP_OBSERVATION").map(PathBuf::from);
+    let allow_eof = std::env::var_os("KITEFRAME_FAKE_ACP_ALLOW_EOF").is_some();
     let script: Vec<Value> = serde_json::from_slice(
         &std::fs::read(&script_path).map_err(|error| format!("could not read script: {error}"))?,
     )
@@ -74,7 +75,9 @@ fn run() -> Result<(), String> {
                     "params": request.get("params").cloned().unwrap_or_else(|| json!({})),
                 }),
             )?;
-            let mut response = read_frame(&mut input, index)?;
+            let Some(mut response) = read_frame(&mut input, index, allow_eof)? else {
+                return Ok(());
+            };
             if entry
                 .get("allowCancelBeforeResponse")
                 .and_then(Value::as_bool)
@@ -88,7 +91,10 @@ fn run() -> Result<(), String> {
                     .unwrap()
                     .push(json!("session/cancel"));
                 save_observation(observation_path.as_ref(), &observation)?;
-                response = read_frame(&mut input, index)?;
+                let Some(cancel_response) = read_frame(&mut input, index, allow_eof)? else {
+                    return Ok(());
+                };
+                response = cancel_response;
             }
             if let Some(expected) = entry.get("expectResponse") {
                 assert_partial(expected, &response, "response")?;
@@ -117,7 +123,9 @@ fn run() -> Result<(), String> {
         let expected = entry
             .get("expect")
             .ok_or_else(|| format!("script entry {index} has no action"))?;
-        let frame = read_frame(&mut input, index)?;
+        let Some(frame) = read_frame(&mut input, index, allow_eof)? else {
+            return Ok(());
+        };
         assert_partial(expected, &frame, "request")?;
         if let Some(method) = frame.get("method").and_then(Value::as_str) {
             observation["methods"]
@@ -178,16 +186,26 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn read_frame(input: &mut impl BufRead, index: usize) -> Result<Value, String> {
+fn read_frame(
+    input: &mut impl BufRead,
+    index: usize,
+    allow_eof: bool,
+) -> Result<Option<Value>, String> {
     let mut line = String::new();
     if input
         .read_line(&mut line)
         .map_err(|error| format!("read failed: {error}"))?
         == 0
     {
-        return Err(format!("unexpected EOF at script entry {index}"));
+        return if allow_eof {
+            Ok(None)
+        } else {
+            Err(format!("unexpected EOF at script entry {index}"))
+        };
     }
-    serde_json::from_str(&line).map_err(|error| format!("invalid JSON-RPC input: {error}"))
+    serde_json::from_str(&line)
+        .map(Some)
+        .map_err(|error| format!("invalid JSON-RPC input: {error}"))
 }
 
 fn write_result(output: &mut impl Write, id: Value, result: Value) -> Result<(), String> {
