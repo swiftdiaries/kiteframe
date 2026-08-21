@@ -558,6 +558,26 @@ fn ci_structural_guard_rejects_typescript_database_fallback() {
     }
 }
 
+#[test]
+fn ci_structural_guard_rejects_weakened_remote_cleanup_commands() {
+    let workflow = std::fs::read_to_string(".github/workflows/ci.yml").unwrap();
+    for (expected, replacement) in [
+        (
+            "trap cleanup EXIT\n          python3 tests/fixtures/responses_ready.py &",
+            "python3 tests/fixtures/responses_ready.py &\n          trap cleanup EXIT",
+        ),
+        ("kill \"$pid\" 2>/dev/null || true", ":"),
+        ("wait \"$pid\" 2>/dev/null || true", ":"),
+        (
+            "(cd clients/typescript && bun test)",
+            "(cd clients/typescript && bun test test/client.test.ts)",
+        ),
+    ] {
+        let mutated = workflow.replacen(expected, replacement, 1);
+        assert!(assert_ci_isolation(&parse_ci_workflow(&mutated).unwrap()).is_err());
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CiWorkflow {
     jobs: BTreeMap<String, CiJob>,
@@ -703,6 +723,13 @@ fn assert_ci_isolation(workflow: &CiWorkflow) -> Result<(), String> {
     {
         return Err("TypeScript local smoke does not consume its database output".to_owned());
     }
+    assert_run_lines(
+        local_smoke,
+        &[
+            "(cd clients/typescript && bun install --frozen-lockfile)",
+            "(cd clients/typescript && bun test)",
+        ],
+    )?;
     assert_step(
         local_cleanup,
         None,
@@ -743,22 +770,7 @@ fn assert_ci_isolation(workflow: &CiWorkflow) -> Result<(), String> {
     {
         return Err("TypeScript remote smoke does not consume its database output".to_owned());
     }
-    let remote_run = remote_smoke
-        .run
-        .as_deref()
-        .ok_or("remote smoke has no command")?;
-    for required in [
-        "responses_pid=\"\"",
-        "harness_pid=\"\"",
-        "trap cleanup EXIT",
-    ] {
-        if !remote_run.contains(required) {
-            return Err(format!("remote smoke lacks process cleanup: {required}"));
-        }
-    }
-    if remote_run.contains("KITEFRAME_DATABASE_URL=\"$DATABASE_URL\"") {
-        return Err("remote smoke falls back to the job database URL".to_owned());
-    }
+    assert_remote_smoke_command(remote_smoke)?;
     assert_step(
         remote_cleanup,
         None,
@@ -840,6 +852,57 @@ fn assert_run_lines(step: &CiStep, expected: &[&str]) -> Result<(), String> {
             step.name.as_deref().unwrap_or("unnamed")
         ))
     }
+}
+
+fn assert_remote_smoke_command(step: &CiStep) -> Result<(), String> {
+    let lines = step
+        .run
+        .as_deref()
+        .ok_or("remote smoke has no command")?
+        .trim()
+        .lines()
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    let cleanup_prefix = [
+        "responses_pid=\"\"",
+        "harness_pid=\"\"",
+        "cleanup() {",
+        "for pid in \"$harness_pid\" \"$responses_pid\"; do",
+        "if [ -n \"$pid\" ]; then",
+        "kill \"$pid\" 2>/dev/null || true",
+        "wait \"$pid\" 2>/dev/null || true",
+        "fi",
+        "done",
+        "}",
+        "trap cleanup EXIT",
+    ];
+    if !lines.starts_with(&cleanup_prefix) {
+        return Err("remote smoke does not install the exact cleanup boundary first".to_owned());
+    }
+    let fixture = line_position(&lines, "python3 tests/fixtures/responses_ready.py &")?;
+    let harness = line_position(&lines, "./target/debug/kiteframe-harness &")?;
+    let bun_test = line_position(&lines, "(cd clients/typescript && bun test)")?;
+    if !(cleanup_prefix.len() - 1 < fixture && fixture < harness && harness < bun_test) {
+        return Err("remote smoke launch/test order is incorrect".to_owned());
+    }
+    if lines.contains(&"KITEFRAME_DATABASE_URL=\"$DATABASE_URL\" \\") {
+        return Err("remote smoke falls back to the job database URL".to_owned());
+    }
+    Ok(())
+}
+
+fn line_position(lines: &[&str], expected: &str) -> Result<usize, String> {
+    let mut matching = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == expected);
+    let (position, _) = matching
+        .next()
+        .ok_or_else(|| format!("remote smoke is missing command: {expected}"))?;
+    if matching.next().is_some() {
+        return Err(format!("remote smoke duplicates command: {expected}"));
+    }
+    Ok(position)
 }
 
 fn collect_rust_sources(directory: &std::path::Path, sources: &mut Vec<std::path::PathBuf>) {

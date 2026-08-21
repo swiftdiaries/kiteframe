@@ -552,8 +552,10 @@ workflow mappings rather than raw text.
 - Parsed YAML structural guard passed, including TypeScript fallback and decoy
   negative mutations.
 - Local compiled-harness TypeScript smoke against a fresh target: **10 passed**.
-- Remote-harness TypeScript smoke completed against a distinct fresh target;
-  the fixture and harness had no remaining processes afterward.
+- Remote-harness startup exercised a distinct fresh target; the target received
+  migrations and the fixture/harness had no remaining processes afterward.
+  This local reproduction does not claim a remote Bun test count because its
+  process runner returned no captured Bun summary.
 - A PostgreSQL 16 simulation retained `ci_contamination_marker` only in the
   poisoned baseline. Both TypeScript targets had no marker and acquired real
   SQLx migrations. All three explicitly named disposable databases were then
