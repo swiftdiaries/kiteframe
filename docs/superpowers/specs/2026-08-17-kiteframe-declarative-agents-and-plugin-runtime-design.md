@@ -1,7 +1,8 @@
 # Kiteframe Declarative Agents and Plugin Runtime Design
 
-- **Status:** Proposed; awaiting written-spec review
+- **Status:** Approved roadmap; Slices 1–2 implemented and Slices 3–8 planned
 - **Date:** 2026-08-17
+- **Revised:** 2026-08-21 to require Codex and DeepSeek Harness in V1
 - **Repository:** `swiftdiaries/kiteframe`
 - **Scope:** Declarative agents, durable goals, replaceable runtime and harness
   plugins, extensible event channels, and a Cursor/VS Code PR-babysitting
@@ -42,10 +43,10 @@ replaceable plugin families surround it:
 The first product slice is a single TypeScript extension for Cursor and VS
 Code. A terminal-averse engineer selects **Babysit Current PR**. Kiteframe
 durably watches GitHub review and required-check events, prepares bounded
-repair work, asks for approval, and invokes Codex locally through ACP. The goal
-completes when actionable reviews are resolved, required GitHub Actions checks
-pass, and GitHub reports the pull request merged. V1 does not auto-merge or
-babysit deployment after merge.
+repair work, asks for approval, and invokes the selected Codex or DeepSeek
+Harness profile locally through ACP. The goal completes when actionable reviews
+are resolved, required GitHub Actions checks pass, and GitHub reports the pull
+request merged. V1 does not auto-merge or babysit deployment after merge.
 
 The event and channel contracts are provider-neutral from the beginning. V1
 implements GitHub only, but a synthetic `service.slo.burn_rate_exceeded.v1`
@@ -137,10 +138,11 @@ live-harness skip; TypeScript typecheck, tests, and build passed; and diff
 checks passed with a clean worktree.
 
 Slices 3–8 and the end-to-end product loop remain unimplemented. In
-particular, this note does not claim the GitHub, Codex, or Cursor/VS Code
-editor path is operational. The GitHub-typed `babysit_pr` goal cannot complete
-from Slice 2 harness evidence alone; later context, connector, and product
-slices must provide the authorized GitHub evidence and product loop.
+particular, this note does not claim the GitHub, Codex, DeepSeek Harness, or
+Cursor/VS Code editor path is operational. The GitHub-typed `babysit_pr` goal
+cannot complete from Slice 2 harness evidence alone; later context, connector,
+and product slices must provide the authorized GitHub evidence and product
+loop.
 
 ## Normative language
 
@@ -161,8 +163,8 @@ V1 has twelve goals:
 4. Make the existing `.kite` runtime replaceable behind a stable agent-runtime
    transition contract.
 5. Make the existing model loop replaceable behind a stable harness contract.
-6. Run Codex locally through a provider-neutral ACP adapter while preserving
-   the existing built-in harness.
+6. Run Codex and DeepSeek Harness locally through one provider-neutral ACP
+   adapter while preserving the existing built-in harness.
 7. Normalize input and provider events through versioned semantic envelopes
    that do not expose channel-specific workflow semantics.
 8. Provide an official Python connector/control-plane host for GitHub ingress,
@@ -194,7 +196,7 @@ V1 supports:
 - GitHub pull requests;
 - unresolved actionable review threads;
 - required GitHub Actions checks;
-- a local interactive Codex worker over ACP;
+- local interactive Codex and DeepSeek Harness workers over ACP;
 - approval before repository mutation;
 - repeated repair and review cycles; and
 - completion when GitHub reports the pull request merged.
@@ -208,9 +210,11 @@ V1 does not provide:
 - unattended or server-side coding execution;
 - agent-to-agent successor execution;
 - post-merge deployment babysitting;
-- Claude Code or DeepSeek Harness production certification;
+- Claude Code production certification;
 - Slack, generic chat, or desktop frontends;
 - dynamic plugin installation, a marketplace, or third-party plugin sandbox;
+- Cordis self-modification, dynamic package activation, or runtime tool-layer
+  replacement;
 - in-process Python or TypeScript plugin loading;
 - a generic executable goal-predicate language;
 - mutation of an accepted goal contract;
@@ -558,9 +562,10 @@ approval, event, plugin, or budget counts only toward `elapsed_seconds`.
 ### Semantic harness roles
 
 `model reasoning` and `model coding` name semantic execution roles. Deployment
-policy binds those roles to the built-in harness, Codex ACP, or another
-compatible harness profile. `.kite` source MUST NOT name provider credentials,
-API endpoints, subscription identities, or raw model names.
+policy binds those roles to the built-in harness, Codex ACP, DeepSeek Harness
+ACP, or another compatible harness profile. `.kite` source MUST NOT name
+provider credentials, API endpoints, subscription identities, or raw model
+names.
 
 ### Durable event wait
 
@@ -687,10 +692,48 @@ changed, tests completed, completion, failure, cancellation, and uncertain
 outcomes.
 
 The existing direct Responses-compatible loop is the built-in harness plugin.
-The generic ACP adapter is the first external harness plugin. Codex is the only
-V1 externally verified harness. Claude Code and DeepSeek Harness MAY use the
-same adapter only after passing the same capability and conformance suite; V1
-does not claim their production support.
+The generic ACP adapter is the first external harness plugin. Codex and
+DeepSeek Harness are both required V1 harness profiles and MUST pass the same
+capability-aware conformance and release suites. Claude Code MAY use the same
+adapter only after passing those suites; V1 does not claim Claude Code
+production support.
+
+#### V1 portable ACP profile
+
+The generic adapter negotiates one required portable core:
+
+```text
+initialize
+session/new
+session/prompt
+session/cancel
+session/request_permission
+committed assistant output
+end_turn | cancelled | failed terminal outcome
+```
+
+Authentication MAY be negotiated through ACP or satisfied by an approved
+deployment-owned local credential profile. Rich prompt blocks, MCP injection,
+session load/list/resume/close, plan updates, and structured tool presentation
+are optional capabilities. A work item that requires an optional capability
+MUST fail closed during profile selection rather than silently degrade.
+
+The Codex profile MAY use its richer negotiated surfaces. The DeepSeek Harness
+profile uses its automation-oriented ACP server: a fresh session, baseline text
+prompt, one in-flight prompt per session, committed assistant output, one-shot
+permission requests, and cancellation. Kiteframe does not treat DeepSeek
+Harness persistence, Cordis plugins, or process-local queues as authoritative.
+If a DeepSeek Harness process is lost before any mutation is dispatched, the
+kernel MAY redeliver the same persisted invocation into a fresh session. Loss
+after a mutation may have been dispatched becomes `outcome_unknown` and MUST be
+reconciled before retry.
+
+V1 launches a fixed, deployment-pinned DeepSeek Harness composition. Cordis
+tool creation, dynamic package definition or activation, hot replacement,
+package-family approval, and generated-tool reuse are outside V1. Any internal
+DSH tool use remains within the invocation's granted workspace, permission,
+budget, and connector authority and cannot create an undeclared provider
+action.
 
 ### Connector/control-plane plugin
 
@@ -835,8 +878,8 @@ The V1 task proceeds as follows:
    `waiting_for_worker`.
 8. The extension displays the proposed action and requests approval before any
    repository mutation.
-9. On approval, the extension launches Codex locally through ACP against the
-   selected workspace.
+9. On approval, the extension launches the selected Codex or DeepSeek Harness
+   profile locally through ACP against the selected workspace.
 10. The harness returns normalized progress and a structured result containing
     files changed, tests run, branch or commit identity, remaining issues, and
     evidence references.
@@ -858,7 +901,8 @@ Installation is a separate workflow from normal agent execution:
 2. authenticate the user to the Kiteframe deployment through OIDC;
 3. connect and authorize GitHub;
 4. select an organization-approved harness profile;
-5. verify existing Codex authentication or enterprise gateway access;
+5. verify authentication for the selected Codex or DeepSeek Harness profile,
+   or verify enterprise gateway access;
 6. configure applicable budget policy;
 7. verify repository visibility and workspace trust; and
 8. persist only non-secret connection metadata and opaque credential
@@ -963,10 +1007,10 @@ provider_quota
 none
 ```
 
-A hard USD budget requires `exact_cost`. Subscription-backed Codex or Claude
-usage can be constrained by turns, tokens, time, or exposed quota windows, but
-Kiteframe MUST NOT present estimated equivalent cost as an enforceable dollar
-cap.
+A hard USD budget requires `exact_cost`. Subscription-backed Codex or
+DeepSeek Harness usage can be constrained by turns, tokens, time, or exposed
+quota windows, but Kiteframe MUST NOT present estimated equivalent cost as an
+enforceable dollar cap.
 
 When a budget is exhausted, deterministic monitoring continues, new billable
 work stops, and the active goal becomes `waiting_for_budget`. Execution resumes
@@ -992,6 +1036,7 @@ harness_profiles:
     endpoint: https://models.acme.internal
     allowed_harnesses:
       - codex
+      - deepseek-harness
     allowed_models:
       - organization-approved-coding-model
     executor_location: developer_machine
@@ -1063,7 +1108,7 @@ capabilities:
 extension core
   Kiteframe protocol client
   task and approval state
-  Codex ACP worker
+  ACP harness worker
   editor-neutral view models
   EditorHost
     VS Code adapter
@@ -1095,8 +1140,10 @@ connector can determine unambiguously.
 - Status viewing MAY work in an untrusted workspace.
 - Repository inspection, harness launch, and mutation require workspace trust.
 - Authentication material uses the editor's encrypted secret storage.
-- Provider credentials remain in the Codex login or operating-system store.
-- The Codex worker runs in the extension host associated with the workspace.
+- Provider credentials remain in the selected harness login or operating-system
+  store.
+- The Codex or DeepSeek Harness worker runs in the extension host associated
+  with the workspace.
 - One source tree produces marketplace-specific packages and metadata; editor
   behavior is implemented through adapters rather than forks.
 
@@ -1192,8 +1239,10 @@ against:
 - the Python connector host; and
 - the TypeScript IDE worker.
 
-Codex has a dedicated live-adapter integration suite. Other harnesses MUST pass
-the same suite before Kiteframe advertises support.
+Codex and DeepSeek Harness each have a dedicated live-adapter integration
+suite. Their deterministic profiles run the same required portable-core cases
+and every advertised optional-capability case. Other harnesses MUST pass the
+same capability-aware suite before Kiteframe advertises support.
 
 ### State-machine and recovery tests
 
@@ -1232,7 +1281,8 @@ Release evidence proves:
 2. GitHub context is collected with provenance;
 3. actionable review feedback produces a bounded work item;
 4. an offline IDE leaves the work durably queued;
-5. approval launches Codex locally through ACP;
+5. approval launches the selected Codex or DeepSeek Harness profile locally
+   through ACP;
 6. structured changes, tests, and evidence return;
 7. duplicate webhook delivery causes no duplicate transition;
 8. a second review triggers another bounded repair;
@@ -1243,8 +1293,9 @@ Additional suites verify principal isolation, data-classification enforcement,
 secret redaction, workspace trust, authorization denial, concurrent budget
 races, cancellation, plugin incompatibility, and `outcome_unknown` recovery.
 
-Live GitHub and Codex smoke tests supplement deterministic fakes but do not
-replace them.
+Live GitHub, Codex, and DeepSeek Harness smoke tests supplement deterministic
+fakes but do not replace them. The complete release scenario MUST pass once per
+required V1 harness profile.
 
 ## Cumulative V1 feature slices
 
@@ -1254,12 +1305,12 @@ V1 is delivered as eight cumulative, independently reviewable vertical slices:
 |---|---|---|
 | 1. Authoring and durable intent foundation | NXL-shaped `agent` syntax, immutable publication, canonical `UserTask`, and one digest-bound `GoalContract` land together. Existing `workflow` syntax remains compatible; agent execution stays unavailable until lifecycle authority exists. | An authenticated submission atomically freezes an exact published agent version and immutable goal without creating execution state. |
 | 2. Authoritative agent lifecycle | The existing `.kite` engine runs behind the agent-runtime transition contract with durable goal phases and evidence-backed `CompleteGoal` and `BlockGoal`. | The kernel alone validates and commits revisioned transitions; harness results cannot complete a goal. |
-| 3. Replaceable harness and plugin boundary | The direct model loop becomes the built-in harness implementation and versioned out-of-process plugin registration and messaging are added. | Built-in and protocol harness fixtures pass the same command, failure, idempotency, and recovery conformance suite. |
+| 3. Replaceable harness and plugin boundary | The direct model loop becomes the built-in harness implementation; versioned out-of-process plugin registration and messaging are added; and Codex and DeepSeek Harness profiles share one portable ACP core with negotiated optional capabilities. | Built-in, Codex, and DeepSeek Harness deterministic profiles pass the same capability-aware command, permission, cancellation, failure, idempotency, process-loss, and recovery conformance suite. |
 | 4. Context and event ingress | Immutable provenance-bearing context artifacts, semantic events, deployment bindings, deduplication, correlation, and durable waits work end to end. | GitHub and synthetic SLO fixtures traverse the same authenticated, persisted ingress and resume only the expected task revision. |
 | 5. Guarded local work delivery | Durable harness work items, approvals, IDE worker offers, leases, heartbeats, fencing, and uncertain-outcome reconciliation are operational. | Offline workers queue safely; mutating work is never reassigned after uncertainty without reconciliation. |
 | 6. Governed connector control plane | Harness authentication profiles, data classification, secret references, structural and consumption limits, exact-spend accounting where supported, and the Python connector/control-plane host enforce deployment policy. | Dispatch fails closed across identity, residency, capability, and every applicable hierarchical budget; secrets never enter durable task or protocol state. |
-| 7. GitHub, Codex, and editor path | GitHub PR/review/check connectors, the generic ACP adapter verified with Codex, and one VS Code extension artifact with a thin Cursor adapter form the interactive path. | The extension derives PR context, obtains mutation approval, and returns structured Codex evidence without Cursor-only execution dependencies. |
-| 8. `babysit_pr` release | The complete agent repeats review and repair cycles until GitHub reports the pull request merged, with recovery, security, and end-to-end evidence. | The release scenario and all normative V1 acceptance criteria pass, including channel-neutral synthetic SLO conformance. |
+| 7. GitHub, coding harnesses, and editor path | GitHub PR/review/check connectors, the generic ACP adapter verified with Codex and DeepSeek Harness, and one VS Code extension artifact with a thin Cursor adapter form the interactive path. | The extension derives PR context, obtains mutation approval, runs either approved harness profile, and returns structured evidence without Cursor-only execution dependencies. |
+| 8. `babysit_pr` release | The complete agent repeats review and repair cycles until GitHub reports the pull request merged, with recovery, security, and end-to-end evidence. | The release scenario passes once with Codex and once with DeepSeek Harness, and all normative V1 acceptance criteria pass, including channel-neutral synthetic SLO conformance. |
 
 Each slice preserves prior behavior and ends with the stated observable gate.
 Task-level plans are written only for the active slice.
@@ -1274,7 +1325,8 @@ V1 is complete only when all of the following are true:
 - no harness-native goal can directly complete a Kiteframe goal;
 - the kernel durably validates and commits every plugin transition;
 - the existing built-in model loop operates through the harness contract;
-- the generic ACP adapter completes the Codex conformance suite;
+- the generic ACP adapter completes the required portable-core and advertised
+  optional-capability conformance suites for Codex and DeepSeek Harness;
 - GitHub webhooks and polling repair produce the same semantic events;
 - event delivery is authenticated, persisted, deduplicated, and correlated;
 - context artifacts carry provenance, classification, schema, and digest;
@@ -1287,18 +1339,21 @@ V1 is complete only when all of the following are true:
 - the full `babysit_pr` release scenario completes with auditable evidence;
 - the synthetic SLO event passes channel-neutral conformance; and
 - no excluded service-monitoring, unattended-execution, auto-merge, Slack,
-  marketplace, Claude Code, or DeepSeek production claim appears in V1 release
-  evidence.
+  marketplace, Claude Code, or Cordis auto-composability claim appears in V1
+  release evidence.
 
 ## References
 
 - [Firetiger: NXL, a declarative language for agents](https://blog.firetiger.com/nxl-a-declarative-language-for-agents/)
 - [Agent Client Protocol](https://agentclientprotocol.com/)
-- [Codex ACP adapter](https://github.com/agentclientprotocol/codex-acp)
+- [Codex ACP adapter](https://github.com/zed-industries/codex-acp)
 - [Using Goals in Codex](https://developers.openai.com/cookbook/examples/codex/using_goals_in_codex)
 - [Claude Code goals](https://code.claude.com/docs/en/goal)
 - [DeepSeek Harness goal subsystem](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/goal.md)
+- [DeepSeek Harness ACP server](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/acp/acp/README.md)
+- [DeepSeek Harness ACP example](https://github.com/deepseek-ai/deepseek-harness/blob/master/examples/acp-agent/README.md)
 - [VS Code Extension API](https://code.visualstudio.com/api)
 - [Cursor Extension API](https://cursor.com/docs/extension-api)
 - [Headroom](https://github.com/headroomlabs-ai/headroom)
 - [Kiteframe minimal workflow engine design](2026-08-11-kiteframe-minimal-workflow-engine-design.md)
+- [Dual-harness Slice 3 implementation plan](../plans/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses.md)

@@ -103,9 +103,10 @@ later context and connector slices provide authorized GitHub evidence.
 
 No stable plugin/provider surface, external runtime transport, semantic
 channel binding, context/event resolver, worker/lease system, hierarchical
-budget/profile system, provider connector, Codex integration, editor worker,
-or Cursor/VS Code extension is implemented. The example is a reviewed
-language/runtime fixture, not a claim that the product vertical is operational.
+budget/profile system, provider connector, Codex or DeepSeek Harness
+integration, editor worker, or Cursor/VS Code extension is implemented. The
+example is a reviewed language/runtime fixture, not a claim that the product
+vertical is operational.
 
 ## Planned V1 slices
 
@@ -114,12 +115,12 @@ surfaces:
 
 | Slice | Intended outcome |
 |---|---|
-| 3. Replaceable harness and plugin boundary | A built-in harness behind a versioned, out-of-process plugin protocol. |
+| 3. Replaceable harness and plugin boundary | A built-in harness plus Codex and DeepSeek Harness profiles behind one versioned, capability-aware ACP/plugin protocol. |
 | 4. Context and event ingress | Provenance-bearing context, semantic events, bindings, deduplication, correlation, and durable waits. |
 | 5. Guarded local work delivery | Work items, approvals, IDE worker offers, leases, fencing, and uncertain-outcome recovery. |
 | 6. Governed connector control plane | Connector identity, secret references, data classification, profiles, and budget enforcement. |
-| 7. GitHub, Codex, and editor path | GitHub connectors, Codex-verified ACP, and VS Code with a thin Cursor adapter. |
-| 8. `babysit_pr` release | An end-to-end, auditable review-and-repair loop through pull-request merge. |
+| 7. GitHub, coding harnesses, and editor path | GitHub connectors, Codex- and DeepSeek-Harness-verified ACP, and VS Code with a thin Cursor adapter. |
+| 8. `babysit_pr` release | An end-to-end, auditable review-and-repair loop through pull-request merge, verified once per V1 harness. |
 
 The [developer guide](docs/guides/building-on-kiteframe.md) explains how to
 build against the completed boundary without depending on these future seams.
@@ -131,6 +132,7 @@ build against the completed boundary without depending on these future seams.
 - [Declarative agents and plugin runtime design](docs/superpowers/specs/2026-08-17-kiteframe-declarative-agents-and-plugin-runtime-design.md)
 - [Declarative-agent foundation plan](docs/superpowers/plans/2026-08-17-kiteframe-declarative-agents-slice-1.md)
 - [Declarative-agent lifecycle plan](docs/superpowers/plans/2026-08-17-kiteframe-declarative-agents-slice-2.md)
+- [Dual-harness Slice 3 plan](docs/superpowers/plans/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses.md)
 - [Developer guide](docs/guides/building-on-kiteframe.md)
 - [Feature-work testing guide](docs/guides/testing-kiteframe.md)
 

@@ -82,17 +82,17 @@ coverage.
 |---|---|---|
 | 1. Authoring and durable intent | Complete | Immutable agent definitions and accepted task/goal intent. |
 | 2. Authoritative lifecycle | Complete | Rust-owned transitions, commands, evidence, recovery, and bounded direct-loop execution. |
-| 3. Replaceable harness and plugins | Planned | Versioned plugin registration, messaging, and conformance around the harness boundary. |
+| 3. Replaceable harness and plugins | Planned | One portable ACP core, capability-aware conformance, and built-in, Codex, and DeepSeek Harness profiles. |
 | 4. Context and events | Planned | Authenticated context/event ingress, correlation, and durable waits. |
 | 5. Guarded work delivery | Planned | Work items, approvals, leases, fencing, and uncertain-outcome reconciliation. |
 | 6. Connector control plane | Planned | Profiles, classification, secrets, connector policy, and budgets. |
-| 7. GitHub, Codex, and editors | Planned | GitHub evidence, Codex-compatible ACP, VS Code, and a thin Cursor adapter. |
-| 8. `babysit_pr` release | Planned | The complete, evidence-backed review-and-repair product loop. |
+| 7. GitHub, coding harnesses, and editors | Planned | GitHub evidence, Codex- and DeepSeek-Harness-compatible ACP, VS Code, and a thin Cursor adapter. |
+| 8. `babysit_pr` release | Planned | The complete, evidence-backed review-and-repair product loop, verified once per V1 harness. |
 
 Do not add plugin registration, connector/provider identity, semantic-channel,
-worker/lease, budget/profile, secret, Codex, or editor fields to Slice 2
-contracts. Those are later-slice design commitments, not incomplete fields
-waiting to be filled in.
+worker/lease, budget/profile, secret, Codex, DeepSeek Harness, or editor fields
+to Slice 2 contracts. Those are later-slice design commitments, not incomplete
+fields waiting to be filled in.
 
 ## Common mistakes
 
