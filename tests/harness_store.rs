@@ -446,6 +446,140 @@ async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
         .run(&upgrade.pool)
         .await
         .expect("historical migrations through 0017 succeed");
+    let session_id = Uuid::now_v7();
+    let definition_id = Uuid::now_v7();
+    let task_id = Uuid::now_v7();
+    let transition_id = Uuid::now_v7();
+    let profile_id = format!("v17-exhaustion-{}", Uuid::now_v7());
+    let profile_digest = "sha256:v17-profile";
+    sqlx::query(
+        "INSERT INTO sessions (id, principal, working_directory, retention_until) \
+         VALUES ($1, 'v17-migration', '/v17-migration', CURRENT_TIMESTAMP + INTERVAL '1 day')",
+    )
+    .bind(session_id)
+    .execute(&upgrade.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workflow_definitions \
+         (id, name, version, definition_hash, source, compiled_definition, tool_bindings, definition_kind) \
+         VALUES ($1, 'v17-exhaustion', 1, 'sha256:v17-definition', 'agent {}', '{}'::jsonb, '[]'::jsonb, 'agent')",
+    )
+    .bind(definition_id)
+    .execute(&upgrade.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO user_tasks \
+         (id, session_id, principal, definition_id, submission_idempotency_key, request_digest, target, preferences) \
+         VALUES ($1, $2, 'v17-migration', $3, 'v17-submit', 'sha256:v17-task', '{}'::jsonb, '{}'::jsonb)",
+    )
+    .bind(task_id)
+    .bind(session_id)
+    .bind(definition_id)
+    .execute(&upgrade.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_transitions \
+         (id, task_id, idempotency_key, request_digest, expected_task_revision, expected_goal_revision, \
+          committed_task_revision, committed_goal_revision, snapshot_digest, command_digests) \
+         VALUES ($1, $2, 'v17-transition', 'sha256:v17-transition', 0, 0, 1, 0, 'sha256:v17-snapshot', '[]'::jsonb)",
+    )
+    .bind(transition_id)
+    .bind(task_id)
+    .execute(&upgrade.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO harness_plugin_registrations \
+         (profile_id, protocol_version, profile_digest, source_repository, source_revision, transport, enabled) \
+         VALUES ($1, 1, $2, 'https://example.test/v17', '0123456789abcdef0123456789abcdef01234567', 'acp_stdio', TRUE)",
+    )
+    .bind(&profile_id)
+    .bind(profile_digest)
+    .execute(&upgrade.pool)
+    .await
+    .unwrap();
+    let canonical_payload = json!({
+        "type": "failed",
+        "code": "harness_failed",
+        "detail": "harness pre-accept attempt budget exhausted"
+    });
+    let historical_rows = [
+        (
+            "started",
+            false,
+            None,
+            None,
+            "legacy-started-key",
+            json!({"type":"failed","code":"legacy_started","detail":"old started receipt"}),
+        ),
+        (
+            "failed",
+            true,
+            Some("legacy-failed-key"),
+            Some(json!({"type":"failed","code":"legacy_failed","detail":"old failed receipt"})),
+            "legacy-failed-key",
+            json!({"type":"failed","code":"legacy_failed","detail":"old failed receipt"}),
+        ),
+        (
+            "cancelled",
+            true,
+            None,
+            Some(json!({"type":"cancelled"})),
+            "legacy-cancelled-key",
+            json!({"type":"failed","code":"legacy_cancelled","detail":"old cancelled receipt"}),
+        ),
+    ];
+    let mut invocation_ids = Vec::new();
+    for (
+        ordinal,
+        (state, terminal, terminal_key, terminal_payload, exhaustion_key, exhaustion_payload),
+    ) in historical_rows.into_iter().enumerate()
+    {
+        let command_id = Uuid::now_v7();
+        let invocation_id = Uuid::now_v7();
+        let terminal_key = terminal_key
+            .map(str::to_owned)
+            .or_else(|| terminal.then(|| format!("harness-terminal:{invocation_id}")));
+        sqlx::query(
+            "INSERT INTO agent_commands \
+             (id, task_id, transition_id, ordinal, schema_version, runtime_key, command_kind, payload, payload_digest, state, claimant) \
+             VALUES ($1, $2, $3, $4, 1, $5, 'invoke_harness', '{\"type\":\"invoke_harness\",\"payload\":{}}'::jsonb, $6, 'claimed', 'v17-migration')",
+        )
+        .bind(command_id)
+        .bind(task_id)
+        .bind(transition_id)
+        .bind(i32::try_from(ordinal).unwrap())
+        .bind(format!("harness:v17:{ordinal}"))
+        .bind(format!("sha256:v17-command-{ordinal}"))
+        .execute(&upgrade.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO harness_invocations \
+             (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
+              state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
+              pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload) \
+             VALUES ($1, $2, 0, $3, $4, $5, $6, 0, FALSE, $7, $8, $9, TRUE, $10, $11)",
+        )
+        .bind(invocation_id)
+        .bind(command_id)
+        .bind(&profile_id)
+        .bind(profile_digest)
+        .bind(format!("sha256:v17-payload-{ordinal}"))
+        .bind(state)
+        .bind(terminal)
+        .bind(terminal_key)
+        .bind(terminal_payload)
+        .bind(exhaustion_key)
+        .bind(exhaustion_payload)
+        .execute(&upgrade.pool)
+        .await
+        .unwrap();
+        invocation_ids.push(invocation_id);
+    }
     MIGRATOR
         .run(&upgrade.pool)
         .await
@@ -456,6 +590,51 @@ async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
             .await
             .unwrap();
     assert_eq!(upgraded_versions, (1..=18).collect::<Vec<_>>());
+    let upgraded_rows: Vec<(String, bool, Option<String>, Option<serde_json::Value>, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT state, terminal, terminal_request_digest, terminal_payload, exhaustion_request_digest, exhaustion_payload \
+         FROM harness_invocations WHERE invocation_id = ANY($1) ORDER BY state",
+    )
+    .bind(invocation_ids.clone())
+    .fetch_all(&upgrade.pool)
+    .await
+    .unwrap();
+    assert_eq!(upgraded_rows.len(), 3);
+    for (state, terminal, terminal_key, terminal_payload, exhaustion_key, exhaustion_payload) in
+        upgraded_rows
+    {
+        let invocation_id = invocation_ids
+            .iter()
+            .copied()
+            .find(|candidate| format!("harness-terminal:{candidate}") == exhaustion_key)
+            .expect("backfilled exhaustion receipt belongs to a seeded invocation");
+        let canonical_key = format!("harness-terminal:{invocation_id}");
+        assert_eq!(exhaustion_key, canonical_key);
+        assert_eq!(exhaustion_payload, canonical_payload);
+        match state.as_str() {
+            "started" => assert!(!terminal),
+            "failed" => {
+                assert!(terminal);
+                assert_eq!(terminal_key.as_deref(), Some(canonical_key.as_str()));
+                assert_eq!(terminal_payload, Some(canonical_payload.clone()));
+            }
+            "cancelled" => {
+                assert!(terminal);
+                assert_eq!(terminal_key.as_deref(), Some(canonical_key.as_str()));
+                assert_eq!(terminal_payload, Some(json!({"type":"cancelled"})));
+            }
+            _ => panic!("unexpected migrated state: {state}"),
+        }
+    }
+    let store = PostgresStore::connect(&upgrade.database_url).await.unwrap();
+    for invocation_id in invocation_ids {
+        let result = store
+            .mark_harness_prompt_accepted(&HarnessInvocationId::new(invocation_id), 0)
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::RevisionConflict)),
+            "the store decoder must accept canonical migrated exhaustion receipts"
+        );
+    }
     assert!(
         upgrade
             .database_url
@@ -1516,6 +1695,153 @@ async fn exhaustion_receipt_rejects_noncanonical_shapes_in_the_database() {
             Some("23514"),
             "unexpected rejection for {suffix}"
         );
+    }
+}
+
+#[tokio::test]
+async fn exhausted_rows_reject_each_null_receipt_shape_without_persisting_a_row() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let canonical_payload = json!({
+        "type": "failed",
+        "code": "harness_failed",
+        "detail": "harness pre-accept attempt budget exhausted"
+    });
+
+    for (state, terminal, terminal_payload) in [
+        ("started", false, None),
+        ("failed", true, Some(canonical_payload.clone())),
+        ("cancelled", true, Some(json!({"type":"cancelled"}))),
+    ] {
+        for (suffix, exhaustion_key, exhaustion_payload) in [
+            ("missing_key", None, Some(canonical_payload.clone())),
+            (
+                "missing_payload",
+                Some("canonical"),
+                Option::<serde_json::Value>::None,
+            ),
+            ("missing_both", None, None),
+        ] {
+            let command_id = fixture.additional_command().await;
+            let invocation_id = Uuid::now_v7();
+            let canonical_key = format!("harness-terminal:{invocation_id}");
+            let exhaustion_key = exhaustion_key.map(|_| canonical_key.clone());
+            let terminal_key = if terminal {
+                Some(canonical_key.clone())
+            } else {
+                None
+            };
+            let error = sqlx::query(
+                "INSERT INTO harness_invocations \
+                 (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
+                  state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
+                  pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload) \
+                 VALUES ($1, $2, 0, $3, $4, $5, $6, 0, FALSE, $7, $8, $9, TRUE, $10, $11)",
+            )
+            .bind(invocation_id)
+            .bind(command_id.as_uuid())
+            .bind(fixture.profile_id.as_str())
+            .bind(&fixture.profile_digest)
+            .bind(format!("sha256:null-exhaustion-{state}-{suffix}"))
+            .bind(state)
+            .bind(terminal)
+            .bind(terminal_key)
+            .bind(terminal_payload.clone())
+            .bind(exhaustion_key)
+            .bind(exhaustion_payload)
+            .execute(&fixture.pool)
+            .await
+            .expect_err("null exhaustion receipt must be rejected");
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("23514"),
+                "unexpected rejection for {state}/{suffix}"
+            );
+            let persisted: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM harness_invocations WHERE invocation_id = $1",
+            )
+            .bind(invocation_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+            assert_eq!(persisted, 0, "null row persisted for {state}/{suffix}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn exhausted_rows_reject_null_receipt_updates_for_every_settlement_shape() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let canonical_payload = json!({
+        "type": "failed",
+        "code": "harness_failed",
+        "detail": "harness pre-accept attempt budget exhausted"
+    });
+    for (state, terminal, terminal_payload) in [
+        ("started", false, None),
+        ("failed", true, Some(canonical_payload.clone())),
+        ("cancelled", true, Some(json!({"type":"cancelled"}))),
+    ] {
+        let command_id = fixture.additional_command().await;
+        let invocation_id = Uuid::now_v7();
+        let canonical_key = format!("harness-terminal:{invocation_id}");
+        sqlx::query(
+            "INSERT INTO harness_invocations \
+             (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
+              state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
+              pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload) \
+             VALUES ($1, $2, 0, $3, $4, $5, $6, 0, FALSE, $7, $8, $9, TRUE, $10, $11)",
+        )
+        .bind(invocation_id)
+        .bind(command_id.as_uuid())
+        .bind(fixture.profile_id.as_str())
+        .bind(&fixture.profile_digest)
+        .bind(format!("sha256:null-update-{state}"))
+        .bind(state)
+        .bind(terminal)
+        .bind(terminal.then(|| canonical_key.clone()))
+        .bind(terminal_payload)
+        .bind(&canonical_key)
+        .bind(&canonical_payload)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+        let before: serde_json::Value = sqlx::query_scalar(
+            "SELECT row_to_json(harness_invocations) FROM harness_invocations WHERE invocation_id = $1",
+        )
+        .bind(invocation_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        for mutation in [
+            "exhaustion_request_digest = NULL",
+            "exhaustion_payload = NULL",
+            "exhaustion_request_digest = NULL, exhaustion_payload = NULL",
+        ] {
+            let error = sqlx::query(&format!(
+                "UPDATE harness_invocations SET {mutation} WHERE invocation_id = $1"
+            ))
+            .bind(invocation_id)
+            .execute(&fixture.pool)
+            .await
+            .expect_err("null exhaustion receipt update must be rejected");
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("55000"),
+                "unexpected update rejection for {state}/{mutation}"
+            );
+            let after: serde_json::Value = sqlx::query_scalar(
+                "SELECT row_to_json(harness_invocations) FROM harness_invocations WHERE invocation_id = $1",
+            )
+            .bind(invocation_id)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+            assert_eq!(after, before, "null update changed {state} row: {mutation}");
+        }
     }
 }
 

@@ -33,6 +33,8 @@ ALTER TABLE harness_invocations
         (
             pre_accept_exhausted
             AND prompt_accepted = FALSE
+            AND exhaustion_request_digest IS NOT NULL
+            AND exhaustion_payload IS NOT NULL
             AND exhaustion_request_digest = 'harness-terminal:' || invocation_id::text
             AND exhaustion_payload = jsonb_build_object(
                 'type', 'failed',
