@@ -1063,6 +1063,35 @@ async fn declared_model_tool_fails_closed_without_legacy_or_goal_authority() {
 #[tokio::test]
 async fn restart_after_builtin_command_failure_reconstructs_the_exact_terminal_once() {
     let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(uninterrupted) = BridgeFixture::started_with_declared_tool().await else {
+        eprintln!("SKIP built-in failed-command recovery: DATABASE_URL is absent");
+        return;
+    };
+    let uninterrupted_command = uninterrupted.pending_command().await;
+    uninterrupted.model.respond_with(json!({
+        "type": "function_call",
+        "call_id": "tool-uninterrupted",
+        "name": "docs/search",
+        "arguments": {},
+    }));
+    assert_eq!(
+        uninterrupted
+            .dispatcher
+            .tick_agent_commands(8)
+            .await
+            .unwrap(),
+        1
+    );
+    let uninterrupted_payload: Value = sqlx::query_scalar(
+        "SELECT terminal_payload FROM harness_invocations WHERE command_id = $1",
+    )
+    .bind(uninterrupted_command.id.as_uuid())
+    .fetch_one(&uninterrupted.pool)
+    .await
+    .unwrap();
+    uninterrupted.cleanup().await;
+    drop(uninterrupted);
+
     let Some(fixture) = BridgeFixture::started_with_declared_tool().await else {
         eprintln!("SKIP built-in failed-command recovery: DATABASE_URL is absent");
         return;
@@ -1104,6 +1133,23 @@ async fn restart_after_builtin_command_failure_reconstructs_the_exact_terminal_o
         .unwrap()
         .unwrap();
     assert!(!invocation.terminal);
+    assert!(matches!(
+        fixture
+            .store
+            .settle_harness_invocation(
+                &invocation.invocation_id,
+                invocation.attempt,
+                HarnessInvocationState::Failed,
+                &format!("harness-terminal:{}", invocation.invocation_id.as_uuid()),
+                &json!({
+                    "type":"failed",
+                    "code":"harness_capability_unsupported",
+                    "detail":"arbitrary plugin detail must not enter the built-in schema",
+                }),
+            )
+            .await,
+        Err(StoreError::IdempotencyConflict)
+    ));
     first.abort();
     barrier.release();
     assert!(first.await.unwrap_err().is_cancelled());
@@ -1134,11 +1180,15 @@ async fn restart_after_builtin_command_failure_reconstructs_the_exact_terminal_o
     assert_eq!(recovered.state, HarnessInvocationState::Failed);
     assert_eq!(
         recovered.terminal_payload,
-        Some(json!({
+        Some(uninterrupted_payload.clone())
+    );
+    assert_eq!(
+        uninterrupted_payload,
+        json!({
             "type":"failed",
             "code":"harness_capability_unsupported",
             "detail":"built-in harness capability is unavailable",
-        }))
+        })
     );
     let after_restart: Value = sqlx::query_scalar(
         "SELECT jsonb_build_object('state', state, 'key', completion_idempotency_key, \
@@ -1725,6 +1775,108 @@ async fn cancellation_during_model_execution_audits_the_late_result_only_on_the_
         non_command_fingerprint(&fixture.pool, &fixture.task_id).await,
         after_cancel
     );
+}
+
+#[tokio::test]
+async fn cancellation_after_command_completion_preserves_the_exact_command_winner_in_the_journal() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started_with_task(
+        "tools []",
+        r#"on ok(answer: string) {
+          confirmation = ask string "Confirm completion?"
+          done confirmation
+        }"#,
+        false,
+    )
+    .await
+    else {
+        eprintln!("SKIP command-winner cancellation race: DATABASE_URL is absent");
+        return;
+    };
+    let command = fixture.pending_command().await;
+    fixture.model.complete("ok", json!({"answer": "winner"}));
+    let barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+        HarnessDispatcherTestBarrierPoint::AfterCommandTerminal,
+    ));
+    let dispatcher = Arc::new(fixture.dispatcher.with_test_barrier(barrier.clone()));
+    let dispatch = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        async move { dispatcher.tick_agent_commands(8).await }
+    });
+    barrier.wait_until_entered().await;
+
+    let receipt_before: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object('state', state, 'revision', revision, \
+         'key', completion_idempotency_key, 'digest', completion_request_digest, \
+         'result', result, 'failure', failure) FROM agent_commands WHERE id = $1",
+    )
+    .bind(command.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(receipt_before["state"], "completed");
+    let journal_before: bool =
+        sqlx::query_scalar("SELECT terminal FROM harness_invocations WHERE command_id = $1")
+            .bind(command.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert!(!journal_before);
+
+    let current = fixture
+        .store
+        .get_agent_execution(fixture.session_id.clone(), fixture.task_id.clone())
+        .await
+        .unwrap();
+    fixture
+        .kernel
+        .cancel_task(
+            &fixture.principal,
+            CancelUserTask {
+                session_id: fixture.session_id.clone(),
+                task_id: fixture.task_id.clone(),
+                expected_task_revision: current.task_revision,
+                expected_goal_revision: current.goal_revision,
+                reason: Some("Cancel after the command winner committed.".to_owned()),
+                idempotency_key: IdempotencyKey::new(format!(
+                    "cancel-after-command-winner-{}",
+                    fixture.task_id.as_uuid()
+                ))
+                .unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let journal_after_cancel: Value = sqlx::query_scalar(
+        "SELECT terminal_payload FROM harness_invocations WHERE command_id = $1",
+    )
+    .bind(command.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(journal_after_cancel["type"], "completed");
+    assert_eq!(journal_after_cancel["fields"]["answer"], "winner");
+    barrier.release();
+    assert_eq!(dispatch.await.unwrap().unwrap(), 1);
+
+    let receipt_after: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object('state', state, 'revision', revision, \
+         'key', completion_idempotency_key, 'digest', completion_request_digest, \
+         'result', result, 'failure', failure) FROM agent_commands WHERE id = $1",
+    )
+    .bind(command.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(receipt_after, receipt_before);
+    let evidence_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM goal_evidence WHERE task_id = $1")
+            .bind(fixture.task_id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(evidence_count, 1);
 }
 
 #[tokio::test]

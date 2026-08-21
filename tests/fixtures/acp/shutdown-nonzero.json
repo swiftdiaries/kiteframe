@@ -1,0 +1,38 @@
+[
+  {
+    "expect": { "method": "initialize", "params": { "protocolVersion": 1 } },
+    "respond": {
+      "protocolVersion": 1,
+      "agentCapabilities": {},
+      "agentInfo": { "name": "kiteframe-fake-acp", "version": "1.0.0" }
+    }
+  },
+  {
+    "expect": {
+      "method": "session/new",
+      "params": { "additionalDirectories": [], "mcpServers": [] }
+    },
+    "respond": { "sessionId": "session-1" }
+  },
+  {
+    "expect": {
+      "method": "session/prompt",
+      "params": { "sessionId": "session-1" }
+    },
+    "saveId": "prompt"
+  },
+  {
+    "notify": {
+      "method": "session/update",
+      "params": {
+        "sessionId": "session-1",
+        "update": {
+          "sessionUpdate": "agent_message_chunk",
+          "content": { "type": "text", "text": "{\"fields\":{\"answer\":\"done\"},\"outcome\":\"ok\"}" }
+        }
+      }
+    }
+  },
+  { "respondTo": "prompt", "respond": { "stopReason": "end_turn" } },
+  { "exitCode": 17 }
+]

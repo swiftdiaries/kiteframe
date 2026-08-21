@@ -146,6 +146,14 @@ pub(crate) fn canonical_outcome_unknown_terminal_payload() -> Value {
     })
 }
 
+pub(crate) fn canonical_builtin_unavailable_terminal_payload() -> Value {
+    json!({
+        "type": "failed",
+        "code": "harness_capability_unsupported",
+        "detail": "built-in harness capability is unavailable",
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HarnessInvocationRequest {

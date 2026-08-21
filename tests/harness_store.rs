@@ -1149,6 +1149,36 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
     assert!(!exhausted.terminal);
     assert_eq!(exhausted.terminal_request_digest, None);
     assert_eq!(exhausted.terminal_payload, None);
+    let closure = sqlx::query(
+        "SELECT pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload \
+         FROM harness_invocations WHERE invocation_id = $1",
+    )
+    .bind(invocation.invocation_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert!(sqlx::Row::get::<bool, _>(&closure, "pre_accept_exhausted"));
+    assert_eq!(
+        sqlx::Row::get::<String, _>(&closure, "exhaustion_request_digest"),
+        "sha256:retry-b"
+    );
+    assert_eq!(
+        sqlx::Row::get::<serde_json::Value, _>(&closure, "exhaustion_payload"),
+        json!({"type":"failed","code":"harness_failed","detail":"retry"})
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .record_harness_retryable_failure(
+                &invocation.invocation_id,
+                1,
+                1,
+                "sha256:retry-drift",
+                &json!({"type":"failed","code":"harness_failed","detail":"drift"}),
+            )
+            .await,
+        Err(StoreError::IdempotencyConflict)
+    ));
 }
 
 #[tokio::test]

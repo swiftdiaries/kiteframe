@@ -13,7 +13,7 @@ use super::super::{
     HarnessApprovalDecision, HarnessApprovalRequest, HarnessCancellation, HarnessCapabilities,
     HarnessCapability, HarnessEventSender, HarnessFailure, HarnessInvocationEvent,
     HarnessInvocationOutput, HarnessPlugin, HarnessProfile, HarnessRequestEnvelope,
-    HarnessTerminal, HarnessTransport, PermissionOption, emit_and_wait,
+    HarnessTerminal, HarnessTerminalReporter, HarnessTransport, PermissionOption, emit_and_wait,
 };
 use super::client::{
     AcpError, AcpInbound, AcpStdioClient, ContentBlock, RequestPermission, SessionNotification,
@@ -216,6 +216,7 @@ impl AcpHarnessPlugin {
         events: HarnessEventSender,
         approvals: Arc<dyn HarnessApprovalBroker>,
         cancellation: HarnessCancellation,
+        mut reporter: Option<HarnessTerminalReporter>,
     ) -> HarnessTerminal {
         if let Err(error) = emit_and_wait(&events, HarnessInvocationEvent::Started).await {
             return HarnessTerminal::OutcomeUnknown(error);
@@ -481,25 +482,25 @@ impl AcpHarnessPlugin {
                 }
             }
         };
+        if matches!(terminal, HarnessTerminal::Completed(_)) {
+            if let Some(reporter) = reporter.take() {
+                reporter.report(terminal.clone());
+            }
+        }
         #[cfg(feature = "test-support")]
         if let Some(barrier) = &self.test_barrier {
-            if barrier.defers_adapter_shutdown() {
-                let barrier = barrier.clone();
-                let client = client.clone();
-                tokio::spawn(async move {
-                    barrier.pause_before_adapter_shutdown().await;
-                    let _ = client.shutdown().await;
-                });
-                return terminal;
-            }
             barrier.pause_before_adapter_shutdown().await;
         }
         let shutdown = client.shutdown().await;
-        match (terminal, shutdown) {
+        let terminal = match (terminal, shutdown) {
             (HarnessTerminal::Completed(_), Err(error)) => post_accept_error(error),
             (terminal, Ok(())) => terminal,
             (terminal, Err(_)) => terminal,
+        };
+        if let Some(reporter) = reporter {
+            reporter.report(terminal.clone());
         }
+        terminal
     }
 }
 
@@ -586,7 +587,34 @@ impl HarnessPlugin for AcpHarnessPlugin {
         if let Err(error) = self.validate_configuration() {
             return HarnessTerminal::Failed(error);
         }
-        self.run(request, events, approvals, cancellation).await
+        self.run(request, events, approvals, cancellation, None)
+            .await
+    }
+
+    async fn start_invocation_managed(
+        self: Arc<Self>,
+        request: HarnessRequestEnvelope,
+        events: HarnessEventSender,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        cancellation: HarnessCancellation,
+        reporter: HarnessTerminalReporter,
+    ) -> HarnessTerminal {
+        if let Err(error) = self.validate_configuration() {
+            let terminal = HarnessTerminal::Failed(error);
+            reporter.report(terminal.clone());
+            return terminal;
+        }
+        let terminal = self
+            .run(
+                request,
+                events,
+                approvals,
+                cancellation,
+                Some(reporter.clone()),
+            )
+            .await;
+        reporter.report(terminal.clone());
+        terminal
     }
 }
 

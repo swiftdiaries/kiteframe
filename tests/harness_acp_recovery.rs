@@ -635,12 +635,13 @@ mod fake_acp_boundaries {
             event.event,
             kiteframe::harness::HarnessInvocationEvent::AssistantMessage { .. }
         )));
-        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), task)
-            .await
-            .expect("the terminal is handed off before controlled shutdown")
-            .unwrap();
-        assert!(matches!(terminal, HarnessTerminal::Completed(_)));
+        assert!(
+            !task.is_finished(),
+            "the direct registry API retains lifecycle ownership through controlled shutdown"
+        );
         shutdown_barrier.release();
+        let terminal = task.await.unwrap();
+        assert!(matches!(terminal, HarnessTerminal::Completed(_)));
     }
 
     pub(super) fn fixture(name: &str) -> PathBuf {
@@ -1331,6 +1332,88 @@ mod integrated_postgres_fake_restart {
     }
 
     #[tokio::test]
+    async fn exhausted_retry_crash_recovers_terminal_without_exceeding_the_acp_budget() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+
+        let first_retry_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterRetryCommit,
+        ));
+        let (first_dispatcher, first_observation) = recovery
+            .dispatcher_with_barriers(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(first_retry_barrier.clone()),
+            )
+            .await;
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        first_retry_barrier.wait_until_entered().await;
+        first_retry_barrier.release();
+        first.await.unwrap().unwrap();
+        let incremented = recovery.invocation().await.unwrap();
+        assert_eq!(incremented.attempt, 1);
+        assert_eq!(prompt_count(&first_observation), 0);
+
+        let exhausted_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterRetryCommit,
+        ));
+        let (exhausted_dispatcher, exhausted_observation) = recovery
+            .dispatcher_with_barriers(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(exhausted_barrier.clone()),
+            )
+            .await;
+        let exhausted =
+            tokio::spawn(async move { exhausted_dispatcher.tick_agent_commands(8).await });
+        exhausted_barrier.wait_until_entered().await;
+        let closed_before_command = recovery.invocation().await.unwrap();
+        assert_eq!(closed_before_command.attempt, 1);
+        assert!(!closed_before_command.terminal);
+        assert_eq!(prompt_count(&exhausted_observation), 0);
+        exhausted.abort();
+        exhausted_barrier.release();
+        assert!(exhausted.await.unwrap_err().is_cancelled());
+
+        let restart_barrier = Arc::new(AcpTestBarrier::new_disarmed(
+            "unused",
+            AcpTestBarrierPoint::BeforeWrite,
+        ));
+        let (restarted, restart_observation) = recovery
+            .dispatcher("core-success.json", restart_barrier)
+            .await;
+        let report = restarted.recover_harness_invocations(1).await.unwrap();
+        assert_eq!(report.terminal, 1);
+        assert_eq!(report.retryable_pre_accept, 0);
+        assert_eq!(report.outcome_unknown, 0);
+        assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 0);
+        let terminal = recovery.invocation().await.unwrap();
+        assert_eq!(terminal.state, HarnessInvocationState::Failed);
+        assert_eq!(terminal.attempt, 1);
+        assert_eq!(prompt_count(&restart_observation), 0);
+        let restart_methods = std::fs::read(&restart_observation)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value["methods"].as_array().cloned())
+            .unwrap_or_default();
+        assert_eq!(
+            restart_methods,
+            vec![Value::String("initialize".to_owned())]
+        );
+        recovery.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn dispatcher_process_restart_reuses_preaccept_and_never_reprompts_postaccept() {
         let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
         for (method, point, post_accept, first_prompts, defer_shutdown) in [
@@ -1421,12 +1504,12 @@ mod integrated_postgres_fake_restart {
             assert_eq!(recovered.invocation_id, crashed.invocation_id);
             assert_eq!(recovered.profile_id, crashed.profile_id);
             if post_accept {
-                assert_eq!(report.outcome_unknown, 1);
+                assert_eq!(report.outcome_unknown, 1, "{method:?} {point:?}");
                 assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 0);
                 assert_eq!(prompt_count(&second_observation), 0);
                 assert_eq!(recovery.authority().await, authority_before);
             } else {
-                assert_eq!(report.retryable_pre_accept, 1);
+                assert_eq!(report.retryable_pre_accept, 1, "{method:?} {point:?}");
                 assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
                 let completed = recovery.invocation().await.unwrap();
                 assert_eq!(completed.invocation_id, crashed.invocation_id);
@@ -1524,6 +1607,95 @@ mod integrated_postgres_fake_restart {
         .await
         .unwrap();
         assert_eq!(receipt_after, receipt_before);
+        recovery.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn production_result_handoff_keeps_shutdown_owned_until_the_child_is_reaped() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let barrier = Arc::new(AcpTestBarrier::new_disarmed(
+            "adapter/shutdown",
+            AcpTestBarrierPoint::BeforeAdapterShutdown,
+        ));
+        let (dispatcher, observation) = recovery
+            .dispatcher_with_barriers("core-success.json", None, barrier.clone(), None)
+            .await;
+        barrier.arm();
+        let tick = tokio::spawn(async move { dispatcher.tick_agent_commands(8).await });
+        barrier.wait_until_entered().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if recovery
+                    .invocation()
+                    .await
+                    .is_some_and(|invocation| invocation.state == HarnessInvocationState::Completed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the production result must settle before subprocess shutdown");
+        let finished_before_shutdown_release = tick.is_finished();
+        barrier.release();
+        let result = tick.await.unwrap();
+        assert!(
+            !finished_before_shutdown_release,
+            "the dispatcher must retain ownership of lifecycle shutdown"
+        );
+        assert_eq!(result.unwrap(), 1);
+        let observation: Value =
+            serde_json::from_slice(&std::fs::read(observation).unwrap()).unwrap();
+        assert_eq!(observation["scriptComplete"], true);
+        recovery.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_after_result_is_audited_without_rewriting_the_command_winner() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let barrier = Arc::new(AcpTestBarrier::new_disarmed(
+            "unused",
+            AcpTestBarrierPoint::BeforeWrite,
+        ));
+        let (dispatcher, observation) = recovery.dispatcher("shutdown-nonzero.json", barrier).await;
+        assert_eq!(dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+
+        let invocation = recovery.invocation().await.unwrap();
+        assert_eq!(invocation.state, HarnessInvocationState::Completed);
+        assert_eq!(
+            invocation.terminal_payload.as_ref().unwrap()["fields"]["answer"],
+            "done"
+        );
+        let command = recovery.pending_or_owned_command().await;
+        assert_eq!(command.state, kiteframe::AgentCommandState::Completed);
+        assert_eq!(recovery.authority().await, (GoalPhase::Active, 1));
+        let audit = sqlx::query(
+            "SELECT stage, code, detail FROM harness_invocation_lifecycle_audits \
+             WHERE invocation_id = $1",
+        )
+        .bind(invocation.invocation_id.as_uuid())
+        .fetch_one(recovery.store.pool())
+        .await
+        .unwrap();
+        assert_eq!(sqlx::Row::get::<String, _>(&audit, "stage"), "shutdown");
+        assert_eq!(
+            sqlx::Row::get::<String, _>(&audit, "code"),
+            "harness_outcome_unknown"
+        );
+        let detail = sqlx::Row::get::<String, _>(&audit, "detail");
+        assert_eq!(
+            detail,
+            "ACP process connection lost: ACP process reached EOF"
+        );
+        assert_eq!(prompt_count(&observation), 1);
         recovery.cleanup().await;
     }
 }

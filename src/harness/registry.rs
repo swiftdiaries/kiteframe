@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     HarnessAcceptanceBarrier, HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSender,
     HarnessEventSink, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest, HarnessPlugin,
-    HarnessRequestEnvelope, HarnessTerminal, HarnessTransport,
+    HarnessRequestEnvelope, HarnessTerminal, HarnessTerminalReporter, HarnessTransport,
 };
 
 const STABLE_FAILURE_CODES: [&str; 7] = [
@@ -90,6 +90,86 @@ struct ActiveInvocationGuard {
     active: Arc<Mutex<ActiveInvocations>>,
     invocation_id: HarnessInvocationId,
     generation: u64,
+}
+
+struct LifecycleTask(Option<tokio::task::JoinHandle<HarnessTerminal>>);
+
+impl LifecycleTask {
+    fn new(task: tokio::task::JoinHandle<HarnessTerminal>) -> Self {
+        Self(Some(task))
+    }
+
+    fn task(&mut self) -> &mut tokio::task::JoinHandle<HarnessTerminal> {
+        self.0.as_mut().expect("lifecycle task is owned")
+    }
+
+    fn take(&mut self) -> tokio::task::JoinHandle<HarnessTerminal> {
+        self.0.take().expect("lifecycle task is owned")
+    }
+
+    async fn abort_and_wait(&mut self) {
+        let Some(task) = self.0.take() else {
+            return;
+        };
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+impl Drop for LifecycleTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+pub(crate) struct ManagedHarnessInvocation {
+    terminal: HarnessTerminal,
+    lifecycle: Option<tokio::task::JoinHandle<HarnessTerminal>>,
+    active_guard: Option<ActiveInvocationGuard>,
+    started: bool,
+    accepted: bool,
+}
+
+impl ManagedHarnessInvocation {
+    fn settled(terminal: HarnessTerminal) -> Self {
+        Self {
+            terminal,
+            lifecycle: None,
+            active_guard: None,
+            started: false,
+            accepted: false,
+        }
+    }
+
+    pub(crate) fn terminal(&self) -> &HarnessTerminal {
+        &self.terminal
+    }
+
+    pub(crate) async fn finish(mut self) -> HarnessTerminal {
+        let final_terminal = if let Some(lifecycle) = self.lifecycle.take() {
+            match lifecycle.await {
+                Ok(terminal) => validated_terminal(terminal, self.started, self.accepted),
+                Err(error) => HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+                    "harness_outcome_unknown",
+                    format!("harness lifecycle task failed: {error}"),
+                )),
+            }
+        } else {
+            self.terminal.clone()
+        };
+        self.active_guard.take();
+        final_terminal
+    }
+}
+
+impl Drop for ManagedHarnessInvocation {
+    fn drop(&mut self) {
+        if let Some(lifecycle) = self.lifecycle.take() {
+            lifecycle.abort();
+        }
+    }
 }
 
 impl Drop for ActiveInvocationGuard {
@@ -296,6 +376,26 @@ impl HarnessRegistry {
         next_sequence: u64,
         acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
     ) -> HarnessTerminal {
+        self.invoke_managed_from_sequence_with_acceptance_barrier(
+            request,
+            approvals,
+            sink,
+            next_sequence,
+            acceptance_barrier,
+        )
+        .await
+        .finish()
+        .await
+    }
+
+    pub(crate) async fn invoke_managed_from_sequence_with_acceptance_barrier(
+        &self,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+        next_sequence: u64,
+        acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
+    ) -> ManagedHarnessInvocation {
         let Some(plugin) = self
             .plugins
             .lock()
@@ -303,34 +403,63 @@ impl HarnessRegistry {
             .get(&request.profile_id)
             .map(|registered| registered.plugin.clone())
         else {
-            return HarnessTerminal::Failed(HarnessFailure::new(
-                "harness_profile_unavailable",
-                "selected harness profile is not registered",
+            return ManagedHarnessInvocation::settled(HarnessTerminal::Failed(
+                HarnessFailure::new(
+                    "harness_profile_unavailable",
+                    "selected harness profile is not registered",
+                ),
             ));
         };
         let envelope = HarnessRequestEnvelope::new(request.clone());
         if let Err(error) = envelope.validate() {
-            return HarnessTerminal::Failed(error);
+            return ManagedHarnessInvocation::settled(HarnessTerminal::Failed(error));
         }
-        let Some((token, _active_guard)) = self.reserve_active(&request.invocation_id) else {
-            return HarnessTerminal::Failed(HarnessFailure::new(
-                "harness_failed",
-                "harness invocation id is already active",
+        let Some((token, active_guard)) = self.reserve_active(&request.invocation_id) else {
+            return ManagedHarnessInvocation::settled(HarnessTerminal::Failed(
+                HarnessFailure::new("harness_failed", "harness invocation id is already active"),
             ));
         };
         let (raw_events_tx, mut events_rx) = mpsc::channel(64);
         let events_tx = HarnessEventSender::new(raw_events_tx, acceptance_barrier);
-        let invocation = plugin.start_invocation(envelope, events_tx.clone(), approvals, token);
-        tokio::pin!(invocation);
+        let (reporter, mut reported_terminal) = HarnessTerminalReporter::channel();
+        let mut lifecycle = LifecycleTask::new(tokio::spawn(plugin.start_invocation_managed(
+            envelope,
+            events_tx.clone(),
+            approvals,
+            token,
+            reporter,
+        )));
         let mut sequence = next_sequence;
         let mut started = next_sequence > 0;
         let mut terminal = None;
         let mut persistence_failure = None;
+        let mut lifecycle_finished = false;
 
         loop {
             tokio::select! {
-                result = &mut invocation => {
-                    terminal = Some(result);
+                biased;
+                result = &mut reported_terminal => match result {
+                    Ok(reported) => {
+                        terminal = Some(reported);
+                        break;
+                    }
+                    Err(_) => {
+                        terminal = Some(HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+                            "harness_outcome_unknown",
+                            "harness lifecycle closed without reporting a terminal",
+                        )));
+                        break;
+                    }
+                },
+                result = lifecycle.task() => {
+                    terminal = Some(match result {
+                        Ok(terminal) => terminal,
+                        Err(error) => HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+                            "harness_outcome_unknown",
+                            format!("harness lifecycle task failed: {error}"),
+                        )),
+                    });
+                    lifecycle_finished = true;
                     break;
                 }
                 Some(pending) = events_rx.recv() => {
@@ -369,30 +498,30 @@ impl HarnessRegistry {
         }
 
         if let Some(error) = persistence_failure {
-            return HarnessTerminal::OutcomeUnknown(error);
+            if !lifecycle_finished {
+                lifecycle.abort_and_wait().await;
+            }
+            return ManagedHarnessInvocation {
+                terminal: HarnessTerminal::OutcomeUnknown(error),
+                lifecycle: None,
+                active_guard: Some(active_guard),
+                started,
+                accepted: events_tx.acceptance_committed(),
+            };
         }
-        let terminal = normalize_terminal(
+        let accepted = events_tx.acceptance_committed();
+        let terminal = validated_terminal(
             terminal.expect("plugin completion is required without a persistence failure"),
+            started,
+            accepted,
         );
-        if matches!(terminal, HarnessTerminal::Completed(_)) && !started {
-            return HarnessTerminal::Failed(HarnessFailure::new(
-                "harness_protocol_incompatible",
-                "harness invocation completed without a durable Started event",
-            ));
+        ManagedHarnessInvocation {
+            terminal,
+            lifecycle: (!lifecycle_finished).then(|| lifecycle.take()),
+            active_guard: Some(active_guard),
+            started,
+            accepted,
         }
-        if matches!(terminal, HarnessTerminal::Completed(_)) && !events_tx.acceptance_committed() {
-            return HarnessTerminal::Failed(HarnessFailure::new(
-                "harness_protocol_incompatible",
-                "harness invocation completed without committing acceptance",
-            ));
-        }
-        if matches!(terminal, HarnessTerminal::Retryable(_)) && events_tx.acceptance_committed() {
-            return HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
-                "harness_outcome_unknown",
-                "harness returned a retryable failure after accepting external work",
-            ));
-        }
-        terminal
     }
 
     fn reserve_active(
@@ -440,6 +569,33 @@ fn normalize_terminal(terminal: HarnessTerminal) -> HarnessTerminal {
         }
         completed_or_cancelled => completed_or_cancelled,
     }
+}
+
+fn validated_terminal(
+    terminal: HarnessTerminal,
+    started: bool,
+    acceptance_committed: bool,
+) -> HarnessTerminal {
+    let terminal = normalize_terminal(terminal);
+    if matches!(terminal, HarnessTerminal::Completed(_)) && !started {
+        return HarnessTerminal::Failed(HarnessFailure::new(
+            "harness_protocol_incompatible",
+            "harness invocation completed without a durable Started event",
+        ));
+    }
+    if matches!(terminal, HarnessTerminal::Completed(_)) && !acceptance_committed {
+        return HarnessTerminal::Failed(HarnessFailure::new(
+            "harness_protocol_incompatible",
+            "harness invocation completed without committing acceptance",
+        ));
+    }
+    if matches!(terminal, HarnessTerminal::Retryable(_)) && acceptance_committed {
+        return HarnessTerminal::OutcomeUnknown(HarnessFailure::new(
+            "harness_outcome_unknown",
+            "harness returned a retryable failure after accepting external work",
+        ));
+    }
+    terminal
 }
 
 fn normalize_failure(error: HarnessFailure, fallback: &'static str) -> HarnessFailure {

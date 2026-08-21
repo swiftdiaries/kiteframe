@@ -6,8 +6,9 @@ use std::time::Duration;
 use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
     HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal,
-    HarnessTransport, PostgresHarnessEventSink, canonical_outcome_unknown_terminal_payload,
-    dispatch_with_terminal_journal, postgres_harness_acceptance_barrier, terminal_idempotency_key,
+    HarnessTransport, PostgresHarnessEventSink, canonical_builtin_unavailable_terminal_payload,
+    canonical_outcome_unknown_terminal_payload, dispatch_with_terminal_journal,
+    postgres_harness_acceptance_barrier, terminal_idempotency_key,
 };
 use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
 use crate::{
@@ -191,6 +192,24 @@ impl AgentCommandDispatcher {
                 invocation
             };
             if !seen.insert(invocation.invocation_id.clone()) {
+                continue;
+            }
+            if !invocation.terminal
+                && self
+                    .kernel
+                    .store()
+                    .harness_pre_accept_exhaustion(&invocation.invocation_id)
+                    .await?
+                    .is_some()
+            {
+                report.terminal += 1;
+                let context = self.recovered_command_context(&invocation).await?;
+                self.settle_pre_accept_exhausted(&context.execution, &context.command, &invocation)
+                    .await?;
+                self.recovery_seen
+                    .lock()
+                    .expect("dispatcher recovery lock is not poisoned")
+                    .insert(invocation.invocation_id);
                 continue;
             }
             match invocation.state {
@@ -441,6 +460,17 @@ impl AgentCommandDispatcher {
                         )
                         .await;
                 }
+                if self
+                    .kernel
+                    .store()
+                    .harness_pre_accept_exhaustion(&prepared.invocation_id)
+                    .await?
+                    .is_some()
+                {
+                    return self
+                        .settle_pre_accept_exhausted(execution, &claimed, &prepared)
+                        .await;
+                }
                 let workspace: String =
                     sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
                         .bind(execution.task.session_id.as_uuid())
@@ -466,31 +496,45 @@ impl AgentCommandDispatcher {
                     StoreError::InvalidData("harness event sequence is malformed".to_owned())
                 })?;
                 let store = self.kernel.store_arc();
-                let invocation = self.registry.invoke_from_sequence_with_acceptance_barrier(
-                    request,
-                    self.approvals.clone(),
-                    Arc::new(PostgresHarnessEventSink::new(store.clone())),
-                    next_sequence,
-                    postgres_harness_acceptance_barrier(
-                        store,
-                        prepared.invocation_id.clone(),
-                        prepared.attempt,
-                    ),
-                );
-                tokio::pin!(invocation);
+                let lifecycle = self
+                    .registry
+                    .invoke_managed_from_sequence_with_acceptance_barrier(
+                        request,
+                        self.approvals.clone(),
+                        Arc::new(PostgresHarnessEventSink::new(store.clone())),
+                        next_sequence,
+                        postgres_harness_acceptance_barrier(
+                            store,
+                            prepared.invocation_id.clone(),
+                            prepared.attempt,
+                        ),
+                    );
+                tokio::pin!(lifecycle);
                 let cancellation = self.wait_for_command_cancellation(&claimed.id);
                 tokio::pin!(cancellation);
-                let terminal = tokio::select! {
+                let lifecycle = tokio::select! {
                     biased;
-                    terminal = &mut invocation => terminal,
+                    lifecycle = &mut lifecycle => lifecycle,
                     cancelled = &mut cancellation => {
                         cancelled?;
                         let _ = self.registry.cancel(&prepared.invocation_id).await;
-                        invocation.await
+                        lifecycle.await
                     }
                 };
-                self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
-                    .await
+                let terminal = lifecycle.terminal().clone();
+                self.settle_harness_terminal(execution, &claimed, &prepared, terminal.clone())
+                    .await?;
+                let lifecycle_terminal = lifecycle.finish().await;
+                if lifecycle_terminal != terminal {
+                    self.kernel
+                        .store()
+                        .record_harness_lifecycle_failure(
+                            &prepared.invocation_id,
+                            lifecycle_failure(&lifecycle_terminal),
+                        )
+                        .await?;
+                }
+                Ok(())
             },
         )
         .await
@@ -508,6 +552,25 @@ impl AgentCommandDispatcher {
                 .settle_late_terminal_after_cancel(execution, claimed, invocation, terminal)
                 .await;
         }
+        let terminal = if let HarnessTerminal::Failed(failure) = &terminal {
+            let transport = self
+                .kernel
+                .store()
+                .harness_plugin_transport(&invocation.profile_id)
+                .await?;
+            if is_builtin_command_unavailable(transport, failure) {
+                HarnessTerminal::Failed(HarnessFailure::new(
+                    "harness_capability_unsupported",
+                    canonical_builtin_unavailable_terminal_payload()["detail"]
+                        .as_str()
+                        .expect("canonical built-in unavailable detail is a string"),
+                ))
+            } else {
+                terminal
+            }
+        } else {
+            terminal
+        };
         let terminal_key = terminal_idempotency_key(&invocation.invocation_id);
         let terminal_payload = terminal_payload(&terminal);
         match terminal {
@@ -811,6 +874,32 @@ impl AgentCommandDispatcher {
             .await?;
         Ok(())
     }
+
+    async fn settle_pre_accept_exhausted(
+        &self,
+        execution: &crate::AgentExecutionView,
+        claimed: &crate::AgentCommandView,
+        invocation: &HarnessInvocationView,
+    ) -> Result<(), StoreError> {
+        let Some((request_digest, payload)) = self
+            .kernel
+            .store()
+            .harness_pre_accept_exhaustion(&invocation.invocation_id)
+            .await?
+        else {
+            return Err(StoreError::RevisionConflict);
+        };
+        if request_digest != terminal_idempotency_key(&invocation.invocation_id) {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        self.settle_harness_terminal(
+            execution,
+            claimed,
+            invocation,
+            failed_terminal_from_payload(&payload)?,
+        )
+        .await
+    }
 }
 
 fn registered_pre_accept_attempt_limit(
@@ -824,6 +913,33 @@ fn registered_pre_accept_attempt_limit(
 
 fn is_builtin_command_unavailable(transport: HarnessTransport, failure: &HarnessFailure) -> bool {
     transport == HarnessTransport::Builtin && failure.code == "harness_capability_unsupported"
+}
+
+fn lifecycle_failure(terminal: &HarnessTerminal) -> &HarnessFailure {
+    match terminal {
+        HarnessTerminal::Retryable(failure)
+        | HarnessTerminal::Failed(failure)
+        | HarnessTerminal::OutcomeUnknown(failure) => failure,
+        HarnessTerminal::Cancelled => {
+            static CANCELLED: std::sync::LazyLock<HarnessFailure> =
+                std::sync::LazyLock::new(|| {
+                    HarnessFailure::new(
+                        "harness_cancelled",
+                        "harness lifecycle was cancelled during subprocess shutdown",
+                    )
+                });
+            &CANCELLED
+        }
+        HarnessTerminal::Completed(_) => {
+            static MISMATCH: std::sync::LazyLock<HarnessFailure> = std::sync::LazyLock::new(|| {
+                HarnessFailure::new(
+                    "harness_failed",
+                    "harness lifecycle completion changed after result settlement",
+                )
+            });
+            &MISMATCH
+        }
+    }
 }
 
 struct PreparedHarnessTerminalJournal<'a> {
@@ -989,6 +1105,20 @@ fn terminal_detail(payload: &serde_json::Value) -> Result<&str, StoreError> {
         .ok_or_else(|| {
             StoreError::InvalidData("terminal harness failure detail is malformed".to_owned())
         })
+}
+
+fn failed_terminal_from_payload(
+    payload: &serde_json::Value,
+) -> Result<HarnessTerminal, StoreError> {
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("failed") {
+        return Err(StoreError::InvalidData(
+            "exhausted harness terminal payload is malformed".to_owned(),
+        ));
+    }
+    Ok(HarnessTerminal::Failed(HarnessFailure::new(
+        terminal_code(payload)?,
+        terminal_detail(payload)?,
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

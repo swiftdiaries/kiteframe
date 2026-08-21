@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::Error as _};
@@ -13,6 +13,32 @@ use super::{
     HarnessInvocationEvent, HarnessInvocationId, HarnessInvocationRequest, HarnessPendingEvent,
     HarnessProfile, HarnessProfileId, HarnessTerminal,
 };
+
+/// Internal terminal handoff used by lifecycle-owning plugins. Implementations
+/// may report a successful child terminal before bounded process shutdown; the
+/// returned `start_invocation_managed` future must still own that shutdown to
+/// completion.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct HarnessTerminalReporter(Arc<Mutex<Option<oneshot::Sender<HarnessTerminal>>>>);
+
+impl HarnessTerminalReporter {
+    pub(crate) fn channel() -> (Self, oneshot::Receiver<HarnessTerminal>) {
+        let (sender, receiver) = oneshot::channel();
+        (Self(Arc::new(Mutex::new(Some(sender)))), receiver)
+    }
+
+    pub fn report(&self, terminal: HarnessTerminal) {
+        if let Some(sender) = self
+            .0
+            .lock()
+            .expect("terminal reporter lock is not poisoned")
+            .take()
+        {
+            let _ = sender.send(terminal);
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -207,6 +233,22 @@ pub trait HarnessPlugin: Send + Sync {
         approvals: Arc<dyn HarnessApprovalBroker>,
         cancellation: HarnessCancellation,
     ) -> HarnessTerminal;
+
+    #[doc(hidden)]
+    async fn start_invocation_managed(
+        self: Arc<Self>,
+        request: HarnessRequestEnvelope,
+        events: HarnessEventSender,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        cancellation: HarnessCancellation,
+        reporter: HarnessTerminalReporter,
+    ) -> HarnessTerminal {
+        let terminal = self
+            .start_invocation(request, events, approvals, cancellation)
+            .await;
+        reporter.report(terminal.clone());
+        terminal
+    }
 }
 
 pub async fn emit_and_wait(

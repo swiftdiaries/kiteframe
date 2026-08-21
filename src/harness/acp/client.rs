@@ -158,12 +158,6 @@ impl AcpTestBarrier {
         .await;
     }
 
-    pub(crate) fn defers_adapter_shutdown(&self) -> bool {
-        self.active.load(Ordering::Acquire)
-            && self.method == "adapter/shutdown"
-            && self.point == AcpTestBarrierPoint::BeforeAdapterShutdown
-    }
-
     pub(crate) async fn pause_before_acceptance(&self) {
         self.pause("acceptance", AcpTestBarrierPoint::BeforeAcceptance)
             .await;
