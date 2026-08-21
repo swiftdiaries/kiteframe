@@ -1,0 +1,11 @@
+{
+  "id": "codex-acp-v1",
+  "transport": "acp_stdio",
+  "sourceRepository": "https://github.com/zed-industries/codex-acp.git",
+  "sourceRevision": "296069e841634cd4bb9bc4515602d836e49231ec",
+  "program": "codex-acp",
+  "args": [],
+  "required": ["fresh_session", "text_prompt", "permission_once", "cancel", "committed_output"],
+  "optional": ["session_load", "embedded_context", "image_prompt", "mcp_stdio", "mcp_http", "tool_presentation"],
+  "freshSessionsOnly": false
+}

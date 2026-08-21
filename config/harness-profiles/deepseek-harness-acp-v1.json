@@ -1,0 +1,11 @@
+{
+  "id": "deepseek-harness-acp-v1",
+  "transport": "acp_stdio",
+  "sourceRepository": "https://github.com/deepseek-ai/deepseek-harness.git",
+  "sourceRevision": "141eb6fef83422698aef7a981029e843e8161534",
+  "program": "pnpm",
+  "args": ["--dir", "vendor/deepseek-harness", "run", "demo:acp"],
+  "required": ["fresh_session", "text_prompt", "permission_once", "cancel", "committed_output"],
+  "optional": [],
+  "freshSessionsOnly": true
+}

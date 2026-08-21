@@ -6,6 +6,7 @@ pub mod domain;
 pub mod dsl;
 pub mod engine;
 pub mod goal;
+pub mod harness;
 pub mod hash;
 pub mod mcp;
 pub mod model;
@@ -33,6 +34,7 @@ pub use domain::{
     Capability, CatalogEpochId, FrameId, IdempotencyKey, PermissionRequestId, PolicyRevision,
     PrincipalId, RunId, Secret, SessionId, UserTaskId,
 };
+pub use dsl::ModelRole;
 pub use engine::{
     AgentCommandDispatcher, AnswerQuestion, CancelRun, DirectLoopHarnessExecutor, Engine,
     EngineConfig, EngineError, HarnessCommandExecutor, HarnessExecutionError,
