@@ -446,6 +446,8 @@ async fn cancellation_committed_with_acceptance_prevents_prompt_write() {
     assert_eq!(terminal, HarnessTerminal::Cancelled);
     let observation = run.observation();
     assert_eq!(observation["cancelCount"], 0);
+    assert_eq!(observation["mismatchedFrame"], Value::Null);
+    assert_eq!(observation["trailingFrame"], Value::Null);
     assert!(
         observation["methods"]
             .as_array()
@@ -479,6 +481,8 @@ async fn cancellation_after_prompt_admission_but_before_write_drops_it_permanent
     assert_eq!(terminal, HarnessTerminal::Cancelled);
     let observation = run.observation();
     assert_eq!(observation["cancelCount"], 0);
+    assert_eq!(observation["mismatchedFrame"], Value::Null);
+    assert_eq!(observation["trailingFrame"], Value::Null);
     assert!(
         observation["methods"]
             .as_array()
@@ -514,6 +518,8 @@ async fn cancellation_racing_prompt_write_ack_cancels_a_possibly_sent_prompt_onc
     assert_eq!(terminal, HarnessTerminal::Cancelled);
     let observation = run.observation();
     assert_eq!(observation["cancelCount"], 1);
+    assert_eq!(observation["mismatchedFrame"], Value::Null);
+    assert_eq!(observation["trailingFrame"], Value::Null);
     assert_eq!(
         observation["methods"]
             .as_array()
@@ -1084,17 +1090,47 @@ async fn completed_requires_zero_status_graceful_shutdown() {
 
 #[tokio::test]
 async fn completed_rejects_premature_zero_status_eof() {
+    let release = std::env::temp_dir().join(format!("kiteframe-acp-release-{}", Uuid::now_v7()));
     let script = json!([
         {"expect":{"method":"initialize"},"respond":stable_initialize()},
         {"expect":{"method":"session/new"},"respond":{"sessionId":"session-1"}},
         {"expect":{"method":"session/prompt"},"saveId":"prompt"},
         completion_notification(),
         {"respondTo":"prompt","respond":{"stopReason":"end_turn"}},
+        {"waitForFile":release.to_str().unwrap()},
         {"exitCode":0}
     ]);
-    let run = FixtureRun::new(write_script(&script)).await;
-    let terminal = run.invoke(HarnessApprovalDecision::AllowOnce).await;
+    let barrier = Arc::new(AcpTestBarrier::new_disarmed(
+        "stdout/eof",
+        AcpTestBarrierPoint::EofBeforeShutdownClaim,
+    ));
+    let run = Arc::new(FixtureRun::new_with_barrier(write_script(&script), barrier.clone()).await);
+    barrier.arm();
+    let invocation = tokio::spawn({
+        let run = run.clone();
+        async move { run.invoke(HarnessApprovalDecision::AllowOnce).await }
+    });
+    barrier.wait_until_preclaim_entered().await;
+    wait_for_observation_field(&run.observation, "waitingForFile").await;
+    std::fs::write(&release, b"exit").unwrap();
+    barrier.wait_until_entered().await;
+    barrier.release_preclaim();
+    barrier.wait_until_shutdown_claim_attempted().await;
+    barrier.release();
+    let terminal = invocation.await.unwrap();
     assert_eq!(terminal_code(&terminal), Some("harness_outcome_unknown"));
+    let _ = std::fs::remove_file(release);
+}
+
+#[tokio::test]
+async fn fake_records_mismatched_and_trailing_frames_before_failing() {
+    let mismatched = run_unexpected_fake_frame(json!([{"expect":{"method":"initialize"}}])).await;
+    assert_eq!(mismatched["mismatchedFrame"]["method"], "probe");
+    assert_eq!(mismatched["trailingFrame"], Value::Null);
+
+    let trailing = run_unexpected_fake_frame(json!([])).await;
+    assert_eq!(trailing["mismatchedFrame"], Value::Null);
+    assert_eq!(trailing["trailingFrame"]["method"], "probe");
 }
 
 #[tokio::test]
@@ -1136,15 +1172,57 @@ async fn protocol_mismatch_fails_before_prompt_acceptance() {
 
 #[tokio::test]
 async fn registration_rejects_agent_that_exits_after_initialize() {
+    let workspace = std::env::temp_dir().join(format!("kiteframe-acp-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let observation = workspace.join("observation.json");
+    let release = workspace.join("release-exit");
     let script = json!([
         {
             "expect":{"method":"initialize"},
             "respond":stable_initialize()
         },
+        {"waitForFile":release.to_str().unwrap()},
         {"exitCode":0}
     ]);
-    let error = registration_error(write_script(&script)).await;
+    let script = write_script(&script);
+    let barrier = Arc::new(AcpTestBarrier::new(
+        "stdout/eof",
+        AcpTestBarrierPoint::EofBeforeShutdownClaim,
+    ));
+    let plugin = AcpHarnessPlugin::with_environment(
+        profile(),
+        AcpCommand {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_kiteframe-fake-acp")),
+            args: vec![],
+            source_revision: SOURCE_REVISION.to_owned(),
+        },
+        limits(),
+        BTreeMap::from([
+            (
+                OsString::from("KITEFRAME_FAKE_ACP_SCRIPT"),
+                script.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("KITEFRAME_FAKE_ACP_OBSERVATION"),
+                observation.as_os_str().to_owned(),
+            ),
+        ]),
+    )
+    .with_test_barrier(barrier.clone());
+    let registration = tokio::spawn(async move {
+        let mut registry = HarnessRegistry::new();
+        registry.register(Arc::new(plugin)).await
+    });
+    barrier.wait_until_preclaim_entered().await;
+    wait_for_observation_field(&observation, "waitingForFile").await;
+    std::fs::write(&release, b"exit").unwrap();
+    barrier.wait_until_entered().await;
+    barrier.release_preclaim();
+    barrier.wait_until_shutdown_claim_attempted().await;
+    barrier.release();
+    let error = registration.await.unwrap().unwrap_err();
     assert_eq!(error.code, "harness_profile_unavailable");
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[tokio::test]
@@ -1356,6 +1434,65 @@ async fn wait_for_observed_method_count(path: &Path, count: usize) {
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+async fn wait_for_observation_field(path: &Path, field: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .is_some_and(|value| !value[field].is_null())
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake ACP did not record observation field {field}"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn run_unexpected_fake_frame(script: Value) -> Value {
+    let workspace = std::env::temp_dir().join(format!("kiteframe-acp-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let observation = workspace.join("observation.json");
+    let script = write_script(&script);
+    let client = AcpStdioClient::spawn(
+        &AcpCommand {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_kiteframe-fake-acp")),
+            args: vec![],
+            source_revision: SOURCE_REVISION.to_owned(),
+        },
+        &workspace,
+        limits(),
+        &BTreeMap::from([
+            (
+                OsString::from("KITEFRAME_FAKE_ACP_SCRIPT"),
+                script.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("KITEFRAME_FAKE_ACP_OBSERVATION"),
+                observation.as_os_str().to_owned(),
+            ),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert!(
+        client
+            .request::<_, Value>("probe", json!({}))
+            .await
+            .is_err()
+    );
+    client.kill().await;
+    let observed = std::fs::read(&observation)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    let _ = std::fs::remove_dir_all(workspace);
+    observed
 }
 
 async fn registration_error(script: impl AsRef<Path>) -> HarnessFailure {

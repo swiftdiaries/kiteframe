@@ -20,8 +20,9 @@ use super::super::{AcpCommand, AcpLimits, HarnessCapability};
 
 const MAX_PENDING_REQUESTS: usize = 32;
 const MAX_INBOUND_REQUESTS: usize = 32;
-const SHUTDOWN_RUNNING: u8 = 0;
-const SHUTDOWN_STDIN_CLOSED: u8 = 1;
+const SHUTDOWN_OPEN: u8 = 0;
+const SHUTDOWN_CLAIMED: u8 = 1;
+const EOF_BEFORE_SHUTDOWN: u8 = 2;
 const FRAME_QUEUED: u8 = 0;
 const FRAME_WRITING: u8 = 1;
 const FRAME_WRITTEN: u8 = 2;
@@ -33,6 +34,7 @@ pub enum AcpTestBarrierPoint {
     BeforeAdmission,
     BeforeWrite,
     BeforeAcknowledgement,
+    EofBeforeShutdownClaim,
 }
 
 #[cfg(feature = "test-support")]
@@ -43,6 +45,13 @@ pub struct AcpTestBarrier {
     released: AtomicBool,
     entered_notify: tokio::sync::Notify,
     release_notify: tokio::sync::Notify,
+    shutdown_claim_attempted: AtomicBool,
+    shutdown_claim_notify: tokio::sync::Notify,
+    preclaim_entered: AtomicBool,
+    preclaim_released: AtomicBool,
+    preclaim_entered_notify: tokio::sync::Notify,
+    preclaim_release_notify: tokio::sync::Notify,
+    active: AtomicBool,
 }
 
 #[cfg(feature = "test-support")]
@@ -56,7 +65,25 @@ impl AcpTestBarrier {
             released: AtomicBool::new(false),
             entered_notify: tokio::sync::Notify::new(),
             release_notify: tokio::sync::Notify::new(),
+            shutdown_claim_attempted: AtomicBool::new(false),
+            shutdown_claim_notify: tokio::sync::Notify::new(),
+            preclaim_entered: AtomicBool::new(false),
+            preclaim_released: AtomicBool::new(false),
+            preclaim_entered_notify: tokio::sync::Notify::new(),
+            preclaim_release_notify: tokio::sync::Notify::new(),
+            active: AtomicBool::new(true),
         }
+    }
+
+    #[must_use]
+    pub fn new_disarmed(method: &'static str, point: AcpTestBarrierPoint) -> Self {
+        let barrier = Self::new(method, point);
+        barrier.active.store(false, Ordering::Release);
+        barrier
+    }
+
+    pub fn arm(&self) {
+        self.active.store(true, Ordering::Release);
     }
 
     pub async fn wait_until_entered(&self) {
@@ -70,8 +97,48 @@ impl AcpTestBarrier {
         self.release_notify.notify_waiters();
     }
 
+    pub async fn wait_until_shutdown_claim_attempted(&self) {
+        while !self.shutdown_claim_attempted.load(Ordering::Acquire) {
+            self.shutdown_claim_notify.notified().await;
+        }
+    }
+
+    fn record_shutdown_claim_attempt(&self) {
+        if !self.active.load(Ordering::Acquire)
+            || self.point != AcpTestBarrierPoint::EofBeforeShutdownClaim
+        {
+            return;
+        }
+        self.shutdown_claim_attempted.store(true, Ordering::Release);
+        self.shutdown_claim_notify.notify_waiters();
+    }
+
+    pub async fn wait_until_preclaim_entered(&self) {
+        while !self.preclaim_entered.load(Ordering::Acquire) {
+            self.preclaim_entered_notify.notified().await;
+        }
+    }
+
+    pub fn release_preclaim(&self) {
+        self.preclaim_released.store(true, Ordering::Release);
+        self.preclaim_release_notify.notify_waiters();
+    }
+
+    async fn pause_before_shutdown_claim(&self) {
+        if !self.active.load(Ordering::Acquire)
+            || self.point != AcpTestBarrierPoint::EofBeforeShutdownClaim
+        {
+            return;
+        }
+        self.preclaim_entered.store(true, Ordering::Release);
+        self.preclaim_entered_notify.notify_waiters();
+        while !self.preclaim_released.load(Ordering::Acquire) {
+            self.preclaim_release_notify.notified().await;
+        }
+    }
+
     async fn pause(&self, method: &str, point: AcpTestBarrierPoint) {
-        if self.method != method || self.point != point {
+        if !self.active.load(Ordering::Acquire) || self.method != method || self.point != point {
             return;
         }
         self.entered.store(true, Ordering::Release);
@@ -114,7 +181,54 @@ enum WriterMessage {
         control: Arc<FrameControl>,
         written: oneshot::Sender<Result<(), AcpError>>,
     },
-    Close,
+    Close {
+        claimed: oneshot::Sender<Result<(), AcpError>>,
+        proceed: oneshot::Receiver<bool>,
+    },
+}
+
+#[derive(Default)]
+struct ShutdownClaim(AtomicU8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EofTiming {
+    BeforeClaim,
+    AfterClaim,
+}
+
+impl ShutdownClaim {
+    fn claim(&self) -> Result<(), AcpError> {
+        match self.0.compare_exchange(
+            SHUTDOWN_OPEN,
+            SHUTDOWN_CLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(EOF_BEFORE_SHUTDOWN) => Err(AcpError::ConnectionLost(
+                "ACP stdout reached EOF before graceful shutdown was claimed".to_owned(),
+            )),
+            Err(SHUTDOWN_CLAIMED) => Err(AcpError::Protocol(
+                "ACP graceful shutdown was already claimed".to_owned(),
+            )),
+            Err(state) => Err(AcpError::Protocol(format!(
+                "ACP shutdown claim entered unknown state {state}"
+            ))),
+        }
+    }
+
+    fn observe_eof(&self) -> EofTiming {
+        match self.0.compare_exchange(
+            SHUTDOWN_OPEN,
+            EOF_BEFORE_SHUTDOWN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(EOF_BEFORE_SHUTDOWN) => EofTiming::BeforeClaim,
+            Err(SHUTDOWN_CLAIMED) => EofTiming::AfterClaim,
+            Err(_) => EofTiming::BeforeClaim,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -366,7 +480,7 @@ impl AcpStdioClient {
         let requests = Arc::new(PendingRequests::default());
         let inbound_requests = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
         let connection_cancel = CancellationToken::new();
-        let shutdown_phase = Arc::new(AtomicU8::new(SHUTDOWN_RUNNING));
+        let shutdown_claim = Arc::new(ShutdownClaim::default());
         let connection = ConnectionState {
             requests: requests.clone(),
             inbound: inbound_tx,
@@ -377,7 +491,7 @@ impl AcpStdioClient {
             stdin,
             writer_rx,
             connection.clone(),
-            shutdown_phase.clone(),
+            shutdown_claim.clone(),
             #[cfg(feature = "test-support")]
             test_barrier.clone(),
         ));
@@ -386,7 +500,9 @@ impl AcpStdioClient {
             limits.max_frame_bytes,
             connection,
             inbound_requests.clone(),
-            shutdown_phase.clone(),
+            shutdown_claim.clone(),
+            #[cfg(feature = "test-support")]
+            test_barrier.clone(),
         ));
         let stderr_task = tokio::spawn(async move {
             let mut stderr = stderr;
@@ -554,30 +670,6 @@ impl AcpStdioClient {
         }
     }
 
-    pub(crate) async fn verify_alive_before_shutdown(&self) -> Result<(), AcpError> {
-        let settle = self.limits.shutdown_grace.min(Duration::from_millis(10));
-        tokio::select! {
-            biased;
-            _ = self.connection_cancel.cancelled() => {
-                return Err(self.classify_process_loss().await);
-            }
-            _ = tokio::time::sleep(settle) => {}
-        }
-        if let Some(error) = self.requests.failure() {
-            return Err(error);
-        }
-        let mut child = self.child.lock().await;
-        match child
-            .try_wait()
-            .map_err(|error| AcpError::ConnectionLost(error.to_string()))?
-        {
-            Some(status) => Err(AcpError::ConnectionLost(format!(
-                "ACP process exited before shutdown with status {status}"
-            ))),
-            None => Ok(()),
-        }
-    }
-
     pub async fn shutdown(&self) -> Result<(), AcpError> {
         let _shutdown = self.shutdown_lock.lock().await;
         let deadline = tokio::time::Instant::now() + self.limits.shutdown_grace;
@@ -667,10 +759,48 @@ impl AcpStdioClient {
         if let Some(error) = self.requests.failure() {
             return Err(error);
         }
-        tokio::time::timeout_at(deadline, self.writer.send(WriterMessage::Close))
+        let mut child = self.child.lock().await;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| AcpError::ConnectionLost(error.to_string()))?
+        {
+            return Err(AcpError::ConnectionLost(format!(
+                "ACP process exited before graceful shutdown claim with status {status}"
+            )));
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(barrier) = &self.test_barrier {
+            barrier.pause_before_shutdown_claim().await;
+        }
+        let (claimed, claim_acknowledgement) = oneshot::channel();
+        let (proceed, proceed_with_close) = oneshot::channel();
+        tokio::time::timeout_at(
+            deadline,
+            self.writer.send(WriterMessage::Close {
+                claimed,
+                proceed: proceed_with_close,
+            }),
+        )
+        .await
+        .map_err(|_| AcpError::Limit("ACP close enqueue exceeded shutdown grace".to_owned()))?
+        .map_err(|_| AcpError::ConnectionLost("ACP writer task closed".to_owned()))?;
+        tokio::time::timeout_at(deadline, claim_acknowledgement)
             .await
-            .map_err(|_| AcpError::Limit("ACP close enqueue exceeded shutdown grace".to_owned()))?
-            .map_err(|_| AcpError::ConnectionLost("ACP writer task closed".to_owned()))?;
+            .map_err(|_| AcpError::Limit("ACP shutdown claim exceeded shutdown grace".to_owned()))?
+            .map_err(|_| AcpError::ConnectionLost("ACP shutdown claim closed".to_owned()))??;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| AcpError::ConnectionLost(error.to_string()))?
+        {
+            let _ = proceed.send(false);
+            return Err(AcpError::ConnectionLost(format!(
+                "ACP process exited at graceful shutdown claim with status {status}"
+            )));
+        }
+        proceed
+            .send(true)
+            .map_err(|_| AcpError::ConnectionLost("ACP shutdown writer closed".to_owned()))?;
+        drop(child);
         join_before_deadline(&mut tasks.writer, deadline, "writer").await?;
 
         let status = {
@@ -792,7 +922,7 @@ async fn writer_task(
     mut stdin: tokio::process::ChildStdin,
     mut receiver: mpsc::Receiver<WriterMessage>,
     connection: ConnectionState,
-    shutdown_phase: Arc<AtomicU8>,
+    shutdown_claim: Arc<ShutdownClaim>,
     #[cfg(feature = "test-support")] test_barrier: Option<Arc<AcpTestBarrier>>,
 ) {
     loop {
@@ -850,10 +980,18 @@ async fn writer_task(
                 }
                 (result, Some(written))
             }
-            WriterMessage::Close => {
+            WriterMessage::Close { claimed, proceed } => {
+                let claim = shutdown_claim.claim();
+                #[cfg(feature = "test-support")]
+                if let Some(barrier) = &test_barrier {
+                    barrier.record_shutdown_claim_attempt();
+                }
+                let _ = claimed.send(claim.clone());
+                if claim.is_err() || proceed.await != Ok(true) {
+                    return;
+                }
                 let result = async {
                     stdin.flush().await?;
-                    shutdown_phase.store(SHUTDOWN_STDIN_CLOSED, Ordering::Release);
                     stdin.shutdown().await
                 }
                 .await;
@@ -883,7 +1021,8 @@ async fn reader_task(
     max_frame_bytes: usize,
     connection: ConnectionState,
     inbound_requests: Arc<std::sync::Mutex<BTreeMap<JsonRpcRequestId, InboundRequestState>>>,
-    shutdown_phase: Arc<AtomicU8>,
+    shutdown_claim: Arc<ShutdownClaim>,
+    #[cfg(feature = "test-support")] test_barrier: Option<Arc<AcpTestBarrier>>,
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
@@ -916,7 +1055,14 @@ async fn reader_task(
                 }
             },
             Ok(None) => {
-                if shutdown_phase.load(Ordering::Acquire) == SHUTDOWN_STDIN_CLOSED {
+                let timing = shutdown_claim.observe_eof();
+                #[cfg(feature = "test-support")]
+                if let Some(barrier) = &test_barrier {
+                    barrier
+                        .pause("stdout/eof", AcpTestBarrierPoint::EofBeforeShutdownClaim)
+                        .await;
+                }
+                if timing == EofTiming::AfterClaim {
                     return;
                 }
                 fail_connection(

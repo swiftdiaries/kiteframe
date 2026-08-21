@@ -37,6 +37,8 @@ fn run() -> Result<(), String> {
         "promptBlockCount": null,
         "promptText": null,
         "scriptComplete": false,
+        "mismatchedFrame": null,
+        "trailingFrame": null,
         "environmentKeys": std::env::vars_os()
             .filter_map(|(key, _)| key.into_string().ok())
             .collect::<Vec<_>>(),
@@ -49,6 +51,14 @@ fn run() -> Result<(), String> {
         }
         if let Some(millis) = entry.get("sleepMillis").and_then(Value::as_u64) {
             std::thread::sleep(Duration::from_millis(millis));
+            continue;
+        }
+        if let Some(path) = entry.get("waitForFile").and_then(Value::as_str) {
+            observation["waitingForFile"] = Value::String(path.to_owned());
+            save_observation(observation_path.as_ref(), &observation)?;
+            while !std::path::Path::new(path).exists() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             continue;
         }
         if let Some(raw) = entry.get("rawStdout").and_then(Value::as_str) {
@@ -103,7 +113,11 @@ fn run() -> Result<(), String> {
                 response = cancel_response;
             }
             if let Some(expected) = entry.get("expectResponse") {
-                assert_partial(expected, &response, "response")?;
+                if let Err(error) = assert_partial(expected, &response, "response") {
+                    observation["mismatchedFrame"] = response;
+                    save_observation(observation_path.as_ref(), &observation)?;
+                    return Err(error);
+                }
             }
             observation["permissionResponseCount"] =
                 json!(observation["permissionResponseCount"].as_u64().unwrap_or(0) + 1);
@@ -135,7 +149,11 @@ fn run() -> Result<(), String> {
         let Some(frame) = read_frame(&mut input, index, registration_eof)? else {
             return Ok(());
         };
-        assert_partial(expected, &frame, "request")?;
+        if let Err(error) = assert_partial(expected, &frame, "request") {
+            observation["mismatchedFrame"] = frame;
+            save_observation(observation_path.as_ref(), &observation)?;
+            return Err(error);
+        }
         if let Some(method) = frame.get("method").and_then(Value::as_str) {
             observation["methods"]
                 .as_array_mut()
@@ -199,6 +217,9 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("final EOF read failed: {error}"))?
         != 0
     {
+        observation["trailingFrame"] = serde_json::from_str(trailing.trim_end())
+            .unwrap_or_else(|_| Value::String(trailing.trim_end().to_owned()));
+        save_observation(observation_path.as_ref(), &observation)?;
         return Err("received JSON-RPC input after script completion".to_owned());
     }
     Ok(())

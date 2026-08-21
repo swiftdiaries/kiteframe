@@ -473,12 +473,6 @@ impl AcpHarnessPlugin {
                 }
             }
         };
-        if matches!(terminal, HarnessTerminal::Completed(_))
-            && let Err(error) = client.verify_alive_before_shutdown().await
-        {
-            let _ = client.shutdown().await;
-            return post_accept_error(error);
-        }
         let shutdown = client.shutdown().await;
         match (terminal, shutdown) {
             (HarnessTerminal::Completed(_), Err(error)) => post_accept_error(error),
@@ -557,10 +551,6 @@ impl HarnessPlugin for AcpHarnessPlugin {
                 return Err(error);
             }
         };
-        if let Err(error) = client.verify_alive_before_shutdown().await {
-            let _ = client.shutdown().await;
-            return Err(describe_error(error));
-        }
         client.shutdown().await.map_err(describe_error)?;
         Ok(capabilities)
     }
