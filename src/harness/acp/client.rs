@@ -676,6 +676,7 @@ impl AcpStdioClient {
         let mut tasks = self.take_io_tasks();
         let graceful = self.graceful_shutdown(deadline, &mut tasks).await;
         if let Err(error) = graceful {
+            let error = self.requests.failure().unwrap_or(error);
             self.force_cleanup(&mut tasks, error.clone()).await;
             return Err(error);
         }

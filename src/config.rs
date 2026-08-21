@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fmt,
     path::Path,
@@ -11,16 +11,58 @@ use crate::{
     harness::{AcpCommand, HarnessProfileId, HarnessRouteTable},
 };
 
-const BUILTIN_HARNESS_PROFILE_ID: &str = "builtin-v1";
 const CODEX_ACP_COMMAND: &str = "KITEFRAME_CODEX_ACP_COMMAND_JSON";
 const CODEX_ACP_SOURCE_REVISION: &str = "KITEFRAME_CODEX_ACP_SOURCE_REVISION";
+const CODEX_ACP_ENV: &str = "KITEFRAME_CODEX_ACP_ENV_JSON";
+const CODEX_ACP_REQUIRED_ENV: &str = "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON";
 const DEEPSEEK_ACP_COMMAND: &str = "KITEFRAME_DSH_ACP_COMMAND_JSON";
 const DEEPSEEK_ACP_SOURCE_REVISION: &str = "KITEFRAME_DSH_ACP_SOURCE_REVISION";
+const DEEPSEEK_ACP_ENV: &str = "KITEFRAME_DSH_ACP_ENV_JSON";
+const DEEPSEEK_ACP_REQUIRED_ENV: &str = "KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON";
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExternalHarnessCommands {
     pub codex: Option<AcpCommand>,
     pub deepseek: Option<AcpCommand>,
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct AcpChildEnvironment {
+    values: BTreeMap<OsString, OsString>,
+    required: BTreeSet<String>,
+}
+
+impl AcpChildEnvironment {
+    #[must_use]
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.values.contains_key(&OsString::from(key))
+    }
+
+    #[must_use]
+    pub fn required_values_present(&self) -> bool {
+        !self.required.is_empty() && self.required.iter().all(|key| self.contains_key(key))
+    }
+
+    #[must_use]
+    pub fn values(&self) -> BTreeMap<OsString, OsString> {
+        self.values.clone()
+    }
+}
+
+impl fmt::Debug for AcpChildEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AcpChildEnvironment")
+            .field("keys", &self.values.keys().collect::<Vec<_>>())
+            .field("required", &self.required)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExternalHarnessEnvironments {
+    pub codex: Option<AcpChildEnvironment>,
+    pub deepseek: Option<AcpChildEnvironment>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +105,9 @@ pub struct HarnessConfig {
     pub max_remote_connections: usize,
     pub store_limits: StoreLimits,
     external_harness_commands: ExternalHarnessCommands,
-    harness_routes: HarnessRouteTable,
+    external_harness_environments: ExternalHarnessEnvironments,
+    reasoning_harness_profile: Option<HarnessProfileId>,
+    coding_harness_profile: Option<HarnessProfileId>,
 }
 
 impl fmt::Debug for HarnessConfig {
@@ -79,7 +123,12 @@ impl fmt::Debug for HarnessConfig {
             .field("max_remote_connections", &self.max_remote_connections)
             .field("store_limits", &self.store_limits)
             .field("external_harness_commands", &"[REDACTED]")
-            .field("harness_routes", &self.harness_routes)
+            .field(
+                "external_harness_environments",
+                &self.external_harness_environments,
+            )
+            .field("reasoning_harness_profile", &self.reasoning_harness_profile)
+            .field("coding_harness_profile", &self.coding_harness_profile)
             .finish()
     }
 }
@@ -91,9 +140,13 @@ impl HarnessConfig {
 
     /// Builds a complete configuration with deterministic non-secret defaults for integration
     /// tests that only exercise deployment configuration parsing.
-    pub fn from_test_values(
-        values: impl IntoIterator<Item = (&'static str, &'static str)>,
-    ) -> Result<Self, ConfigError> {
+    pub fn from_test_values<K, V>(
+        values: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<Self, ConfigError>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
         let mut configured = HashMap::from([
             (
                 "KITEFRAME_DATABASE_URL".to_owned(),
@@ -119,7 +172,7 @@ impl HarnessConfig {
         configured.extend(
             values
                 .into_iter()
-                .map(|(key, value)| (key.to_owned(), value.to_owned())),
+                .map(|(key, value)| (key.into(), value.into())),
         );
         Self::from_values(|name| configured.get(name).cloned())
     }
@@ -130,8 +183,20 @@ impl HarnessConfig {
     }
 
     #[must_use]
-    pub fn harness_routes(&self) -> HarnessRouteTable {
-        self.harness_routes.clone()
+    pub fn external_harness_environments(&self) -> ExternalHarnessEnvironments {
+        self.external_harness_environments.clone()
+    }
+
+    #[must_use]
+    pub fn harness_routes(&self, builtin_profile: HarnessProfileId) -> HarnessRouteTable {
+        HarnessRouteTable::new(
+            self.reasoning_harness_profile
+                .clone()
+                .unwrap_or_else(|| builtin_profile.clone()),
+            self.coding_harness_profile
+                .clone()
+                .unwrap_or(builtin_profile),
+        )
     }
 
     fn from_values(mut value: impl FnMut(&str) -> Option<String>) -> Result<Self, ConfigError> {
@@ -246,24 +311,29 @@ impl HarnessConfig {
                 }
             },
         };
-        let external_harness_commands = ExternalHarnessCommands {
-            codex: parse_external_command(
-                value(CODEX_ACP_COMMAND),
-                value(CODEX_ACP_SOURCE_REVISION),
-                CODEX_ACP_COMMAND,
-                CODEX_ACP_SOURCE_REVISION,
-            )?,
-            deepseek: parse_external_command(
-                value(DEEPSEEK_ACP_COMMAND),
-                value(DEEPSEEK_ACP_SOURCE_REVISION),
-                DEEPSEEK_ACP_COMMAND,
-                DEEPSEEK_ACP_SOURCE_REVISION,
-            )?,
+        let (codex, codex_environment) = parse_external_harness(
+            value(CODEX_ACP_COMMAND),
+            value(CODEX_ACP_SOURCE_REVISION),
+            value(CODEX_ACP_ENV),
+            value(CODEX_ACP_REQUIRED_ENV),
+            CODEX_ACP_COMMAND,
+            CODEX_ACP_SOURCE_REVISION,
+        )?;
+        let (deepseek, deepseek_environment) = parse_external_harness(
+            value(DEEPSEEK_ACP_COMMAND),
+            value(DEEPSEEK_ACP_SOURCE_REVISION),
+            value(DEEPSEEK_ACP_ENV),
+            value(DEEPSEEK_ACP_REQUIRED_ENV),
+            DEEPSEEK_ACP_COMMAND,
+            DEEPSEEK_ACP_SOURCE_REVISION,
+        )?;
+        let external_harness_commands = ExternalHarnessCommands { codex, deepseek };
+        let external_harness_environments = ExternalHarnessEnvironments {
+            codex: codex_environment,
+            deepseek: deepseek_environment,
         };
-        let harness_routes = HarnessRouteTable::new(
-            parse_route(value("KITEFRAME_REASONING_HARNESS_PROFILE"))?,
-            parse_route(value("KITEFRAME_CODING_HARNESS_PROFILE"))?,
-        );
+        let reasoning_harness_profile = parse_route(value("KITEFRAME_REASONING_HARNESS_PROFILE"))?;
+        let coding_harness_profile = parse_route(value("KITEFRAME_CODING_HARNESS_PROFILE"))?;
 
         Ok(Self {
             database_url,
@@ -275,24 +345,35 @@ impl HarnessConfig {
             max_remote_connections,
             store_limits,
             external_harness_commands,
-            harness_routes,
+            external_harness_environments,
+            reasoning_harness_profile,
+            coding_harness_profile,
         })
     }
 }
 
-fn parse_route(value: Option<String>) -> Result<HarnessProfileId, ConfigError> {
-    HarnessProfileId::new(value.unwrap_or_else(|| BUILTIN_HARNESS_PROFILE_ID.to_owned()))
+fn parse_route(value: Option<String>) -> Result<Option<HarnessProfileId>, ConfigError> {
+    value
+        .map(HarnessProfileId::new)
+        .transpose()
         .map_err(|_| ConfigError::InvalidHarnessRoute)
 }
 
-fn parse_external_command(
+fn parse_external_harness(
     command: Option<String>,
     source_revision: Option<String>,
+    environment: Option<String>,
+    required_environment: Option<String>,
     command_name: &'static str,
     source_revision_name: &'static str,
-) -> Result<Option<AcpCommand>, ConfigError> {
+) -> Result<(Option<AcpCommand>, Option<AcpChildEnvironment>), ConfigError> {
     match (command, source_revision) {
-        (None, None) => Ok(None),
+        (None, None) => {
+            if environment.is_some() || required_environment.is_some() {
+                return Err(ConfigError::ExternalHarnessEnvironmentWithoutCommand { command_name });
+            }
+            Ok((None, None))
+        }
         (Some(_), None) | (None, Some(_)) => Err(ConfigError::IncompleteExternalHarnessCommand {
             command_name,
             source_revision_name,
@@ -308,16 +389,73 @@ fn parse_external_command(
             let (program, args) = command
                 .split_first()
                 .ok_or(ConfigError::InvalidExternalHarnessCommand { command_name })?;
-            if !valid_program(program) || !valid_literal_arguments(args) {
+            if !valid_program(program) || !valid_literal_arguments(program, args) {
                 return Err(ConfigError::InvalidExternalHarnessCommand { command_name });
             }
-            Ok(Some(AcpCommand {
-                program: program.into(),
-                args: args.iter().map(OsString::from).collect(),
-                source_revision,
-            }))
+            let environment =
+                parse_child_environment(environment, required_environment, command_name)?;
+            if is_bare_program(program)
+                && !environment
+                    .as_ref()
+                    .is_some_and(|environment| environment.contains_key("PATH"))
+            {
+                return Err(ConfigError::BareExternalHarnessCommandRequiresPath { command_name });
+            }
+            Ok((
+                Some(AcpCommand {
+                    program: program.into(),
+                    args: args.iter().map(OsString::from).collect(),
+                    source_revision,
+                }),
+                environment,
+            ))
         }
     }
+}
+
+fn parse_child_environment(
+    environment: Option<String>,
+    required_environment: Option<String>,
+    command_name: &'static str,
+) -> Result<Option<AcpChildEnvironment>, ConfigError> {
+    let Some(environment) = environment else {
+        if required_environment.is_some() {
+            return Err(ConfigError::InvalidExternalHarnessEnvironment { command_name });
+        }
+        return Ok(None);
+    };
+    let values: BTreeMap<String, String> = serde_json::from_str(&environment)
+        .map_err(|_| ConfigError::InvalidExternalHarnessEnvironment { command_name })?;
+    let required: Vec<String> = required_environment
+        .map(|required| serde_json::from_str(&required))
+        .transpose()
+        .map_err(|_| ConfigError::InvalidExternalHarnessEnvironment { command_name })?
+        .unwrap_or_default();
+    let values = values
+        .into_iter()
+        .map(|(key, value)| {
+            if !valid_environment_key(&key) || value.contains('\0') {
+                return Err(ConfigError::InvalidExternalHarnessEnvironment { command_name });
+            }
+            Ok((OsString::from(key), OsString::from(value)))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let required = required.into_iter().collect::<BTreeSet<_>>();
+    if required.iter().any(|key| !valid_environment_key(key))
+        || required
+            .iter()
+            .any(|key| !values.contains_key(&OsString::from(key)))
+    {
+        return Err(ConfigError::InvalidExternalHarnessEnvironment { command_name });
+    }
+    Ok(Some(AcpChildEnvironment { values, required }))
+}
+
+fn valid_environment_key(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn is_full_revision(value: &str) -> bool {
@@ -327,7 +465,7 @@ fn is_full_revision(value: &str) -> bool {
 }
 
 fn valid_program(value: &str) -> bool {
-    if !valid_literal(value) {
+    if !valid_literal(value) || is_shell_executable(value) {
         return false;
     }
     let path = Path::new(value);
@@ -337,16 +475,24 @@ fn valid_program(value: &str) -> bool {
     if path.components().count() != 1 {
         return false;
     }
-    !matches!(
-        value,
-        "sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell" | "pwsh"
+    true
+}
+
+fn is_bare_program(value: &str) -> bool {
+    !Path::new(value).is_absolute()
+}
+
+fn is_shell_executable(value: &str) -> bool {
+    matches!(
+        Path::new(value).file_name().and_then(|name| name.to_str()),
+        Some("sh" | "bash" | "zsh" | "fish" | "cmd" | "powershell" | "pwsh")
     )
 }
 
-fn valid_literal_arguments(arguments: &[String]) -> bool {
+fn valid_literal_arguments(program: &str, arguments: &[String]) -> bool {
     let mut workspace_override = false;
-    for argument in arguments {
-        if !valid_literal(argument) || contains_secret_flag(argument) {
+    for (index, argument) in arguments.iter().enumerate() {
+        if !valid_literal(argument) || contains_secret_argument(argument) {
             return false;
         }
         if workspace_override && !Path::new(argument).is_absolute() {
@@ -358,19 +504,31 @@ fn valid_literal_arguments(arguments: &[String]) -> bool {
                 return false;
             }
         }
+        if matches!(
+            Path::new(program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("env" | "command")
+        ) && is_shell_executable(argument)
+        {
+            return false;
+        }
+        if matches!(argument.as_str(), "-H" | "--header")
+            && arguments
+                .get(index + 1)
+                .is_some_and(|value| is_secret_header(value))
+        {
+            return false;
+        }
     }
     !workspace_override
 }
 
 fn valid_literal(value: &str) -> bool {
-    !value.is_empty()
-        && !value.contains('\0')
-        && !value.contains([
-            '\n', '\r', '|', '&', ';', '<', '>', '$', '`', '\'', '"', '*', '?',
-        ])
+    !value.is_empty() && !value.contains('\0')
 }
 
-fn contains_secret_flag(value: &str) -> bool {
+fn contains_secret_argument(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     [
         "token",
@@ -379,10 +537,25 @@ fn contains_secret_flag(value: &str) -> bool {
         "api-key",
         "api_key",
         "authorization",
-        "bearer",
     ]
     .iter()
-    .any(|name| normalized.starts_with(&format!("--{name}")))
+    .any(|name| normalized == format!("--{name}") || normalized.starts_with(&format!("--{name}=")))
+        || is_secret_header(value)
+        || has_url_userinfo(value)
+}
+
+fn is_secret_header(value: &str) -> bool {
+    let normalized = value.trim_start().to_ascii_lowercase();
+    normalized.starts_with("authorization:") || normalized.starts_with("proxy-authorization:")
+}
+
+fn has_url_userinfo(value: &str) -> bool {
+    value.find("://").is_some_and(|scheme| {
+        let authority = value[scheme + 3..]
+            .split_once('/')
+            .map_or(&value[scheme + 3..], |(authority, _)| authority);
+        authority.contains('@')
+    })
 }
 
 fn is_workspace_override(value: &str) -> bool {
@@ -501,6 +674,12 @@ pub enum ConfigError {
     InvalidExternalHarnessCommand { command_name: &'static str },
     #[error("{source_revision_name} must be a nonzero full 40-hex commit hash")]
     InvalidExternalHarnessSourceRevision { source_revision_name: &'static str },
+    #[error("{command_name} environment is configured without its command")]
+    ExternalHarnessEnvironmentWithoutCommand { command_name: &'static str },
+    #[error("{command_name} environment must be a safe JSON object with its required key list")]
+    InvalidExternalHarnessEnvironment { command_name: &'static str },
+    #[error("{command_name} is a bare executable and requires explicit PATH in its environment")]
+    BareExternalHarnessCommandRequiresPath { command_name: &'static str },
     #[error("configured harness route profile id is invalid")]
     InvalidHarnessRoute,
 }

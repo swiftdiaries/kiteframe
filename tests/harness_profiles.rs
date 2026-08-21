@@ -166,6 +166,7 @@ fn command_overrides_are_json_arrays_without_shell_interpolation() {
             "KITEFRAME_DSH_ACP_SOURCE_REVISION",
             "141eb6fef83422698aef7a981029e843e8161534",
         ),
+        ("KITEFRAME_DSH_ACP_ENV_JSON", r#"{"PATH":"/opt/bin"}"#),
     ])
     .unwrap();
 
@@ -232,6 +233,7 @@ fn external_commands_require_complete_attestation_and_safe_literal_arguments() {
 
 #[test]
 fn harness_routes_default_to_builtin_and_preserve_selected_unconfigured_profile() {
+    let current_builtin = profile_id("builtin-v1-0123456789abcdef0123456789abcdef01234567");
     let routes = HarnessConfig::from_test_values([
         ("KITEFRAME_REASONING_HARNESS_PROFILE", "codex-acp-v1"),
         (
@@ -240,13 +242,82 @@ fn harness_routes_default_to_builtin_and_preserve_selected_unconfigured_profile(
         ),
     ])
     .unwrap()
-    .harness_routes();
+    .harness_routes(current_builtin.clone());
     assert_eq!(routes.reasoning.as_str(), "codex-acp-v1");
     assert_eq!(routes.coding.as_str(), "deepseek-harness-acp-v1");
 
-    let defaults = HarnessConfig::from_test_values([])
+    let defaults = HarnessConfig::from_test_values(std::iter::empty::<(&str, &str)>())
         .unwrap()
-        .harness_routes();
-    assert_eq!(defaults.reasoning.as_str(), "builtin-v1");
-    assert_eq!(defaults.coding.as_str(), "builtin-v1");
+        .harness_routes(current_builtin.clone());
+    assert_eq!(defaults.reasoning, current_builtin);
+    assert_eq!(defaults.coding, defaults.reasoning);
+}
+
+#[test]
+fn external_environment_is_explicit_redacted_and_requires_path_for_bare_commands() {
+    let config = HarnessConfig::from_test_values([
+        ("KITEFRAME_CODEX_ACP_COMMAND_JSON", r#"["/opt/codex-acp"]"#),
+        (
+            "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+            "296069e841634cd4bb9bc4515602d836e49231ec",
+        ),
+        (
+            "KITEFRAME_CODEX_ACP_ENV_JSON",
+            r#"{"CODEX_TOKEN":"do-not-log","HOME":"/sealed/home"}"#,
+        ),
+        (
+            "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON",
+            r#"["CODEX_TOKEN"]"#,
+        ),
+    ])
+    .unwrap();
+    let environment = config.external_harness_environments().codex.unwrap();
+    assert!(environment.contains_key("CODEX_TOKEN"));
+    assert!(environment.required_values_present());
+    assert!(!format!("{environment:?}").contains("do-not-log"));
+
+    let bare_without_path = HarnessConfig::from_test_values([
+        (
+            "KITEFRAME_DSH_ACP_COMMAND_JSON",
+            r#"["pnpm","run","demo:acp"]"#,
+        ),
+        (
+            "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+            "141eb6fef83422698aef7a981029e843e8161534",
+        ),
+    ]);
+    assert!(bare_without_path.is_err());
+}
+
+#[test]
+fn literal_arguments_allow_metacharacters_but_reject_shell_and_precise_secret_forms() {
+    let safe = HarnessConfig::from_test_values([
+        (
+            "KITEFRAME_CODEX_ACP_COMMAND_JSON",
+            r#"["/opt/codex-acp","--label=a&b;$(literal)"]"#,
+        ),
+        (
+            "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+            "296069e841634cd4bb9bc4515602d836e49231ec",
+        ),
+    ]);
+    assert!(safe.is_ok());
+
+    for command in [
+        r#"["/bin/sh","-c","echo"]"#,
+        r#"["/usr/bin/env","bash","-c","echo"]"#,
+        r#"["curl","--header","Authorization: Bearer value"]"#,
+        r#"["curl","https://secret@example.test/acp"]"#,
+    ] {
+        assert!(
+            HarnessConfig::from_test_values([
+                ("KITEFRAME_CODEX_ACP_COMMAND_JSON", command),
+                (
+                    "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    "296069e841634cd4bb9bc4515602d836e49231ec",
+                ),
+            ])
+            .is_err()
+        );
+    }
 }

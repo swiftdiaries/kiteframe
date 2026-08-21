@@ -9,7 +9,7 @@ use std::{
 };
 
 use agent_client_protocol::{ConnectTo, Stdio};
-use kiteframe::config::ExternalHarnessCommands;
+use kiteframe::config::{ExternalHarnessCommands, ExternalHarnessEnvironments};
 use kiteframe::harness::{
     AcpHarnessPlugin, AcpLimits, DenyAllHarnessApprovals, HarnessProfile, HarnessRegistry,
     builtin_harness_profile,
@@ -59,8 +59,14 @@ fn external_profile(
     source_revision: &str,
     digest: &str,
 ) -> Result<HarnessProfile, io::Error> {
-    let profile = HarnessProfile::from_json(bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let profile = HarnessProfile::from_json(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "harness_protocol_incompatible: checked-in external profile is invalid: {error}"
+            ),
+        )
+    })?;
     if profile.id.as_str() != id
         || profile.source_repository != repository
         || profile.source_revision != source_revision
@@ -70,9 +76,14 @@ fn external_profile(
             "harness_protocol_incompatible: checked-in external profile attestation drifted",
         ));
     }
-    let observed_digest = profile
-        .digest()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+    let observed_digest = profile.digest().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "harness_protocol_incompatible: checked-in external profile digest failed: {error}"
+            ),
+        )
+    })?;
     if observed_digest != digest {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -131,6 +142,7 @@ async fn configured_harness_registry(
     model: Arc<dyn ModelClient>,
     builtin_profile: HarnessProfile,
     external_commands: ExternalHarnessCommands,
+    external_environments: ExternalHarnessEnvironments,
 ) -> Result<Arc<HarnessRegistry>, Box<dyn std::error::Error>> {
     let mut registry = HarnessRegistry::new();
     registry
@@ -142,14 +154,27 @@ async fn configured_harness_registry(
     register_profile(store.as_ref(), &builtin_profile).await?;
 
     let (codex_profile, deepseek_profile) = external_acp_profiles()?;
-    for (profile, command) in [
-        (codex_profile, external_commands.codex),
-        (deepseek_profile, external_commands.deepseek),
+    for (profile, command, environment) in [
+        (
+            codex_profile,
+            external_commands.codex,
+            external_environments.codex,
+        ),
+        (
+            deepseek_profile,
+            external_commands.deepseek,
+            external_environments.deepseek,
+        ),
     ] {
         let Some(command) = command else {
             continue;
         };
-        let plugin = AcpHarnessPlugin::new(profile.clone(), command, external_acp_limits());
+        let plugin = AcpHarnessPlugin::with_environment(
+            profile.clone(),
+            command,
+            external_acp_limits(),
+            environment.map_or_else(Default::default, |environment| environment.values()),
+        );
         let pre_accept_attempt_limit = plugin.pre_accept_attempt_limit();
         registry
             .register_with_pre_accept_attempt_limit(Arc::new(plugin), pre_accept_attempt_limit)
@@ -165,7 +190,14 @@ async fn configured_builtin_registry(
     model: Arc<dyn ModelClient>,
     profile: HarnessProfile,
 ) -> Result<Arc<HarnessRegistry>, Box<dyn std::error::Error>> {
-    configured_harness_registry(store, model, profile, ExternalHarnessCommands::default()).await
+    configured_harness_registry(
+        store,
+        model,
+        profile,
+        ExternalHarnessCommands::default(),
+        ExternalHarnessEnvironments::default(),
+    )
+    .await
 }
 
 #[tokio::main]
@@ -177,9 +209,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
     let config = HarnessConfig::from_env()?;
     let external_harness_commands = config.external_harness_commands();
-    let harness_routes = config.harness_routes();
+    let external_harness_environments = config.external_harness_environments();
     let builtin_profile =
         builtin_profile_from_attestation(option_env!("KITEFRAME_SOURCE_REVISION"))?;
+    let harness_routes = config.harness_routes(builtin_profile.id.clone());
     let store = Arc::new(
         PostgresStore::connect_with_limits(&config.database_url, config.store_limits).await?,
     );
@@ -218,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             model.clone(),
             builtin_profile,
             external_harness_commands,
+            external_harness_environments,
         )
         .await?;
         let agent_dispatcher = Arc::new(application.agent_kernel().with_harness_registry_routes(
@@ -661,6 +695,23 @@ mod tests {
         assert_eq!(
             profile.id.as_str(),
             "builtin-v1-0123456789abcdef0123456789abcdef01234567"
+        );
+    }
+
+    #[test]
+    fn checked_in_external_profile_drift_is_a_protocol_incompatibility() {
+        let error = external_profile(
+            br#"{"id":"codex-acp-v1","transport":"acp_stdio"}"#,
+            "codex-acp-v1",
+            CODEX_ACP_REPOSITORY,
+            CODEX_ACP_REVISION,
+            CODEX_ACP_DIGEST,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("harness_protocol_incompatible:")
         );
     }
 

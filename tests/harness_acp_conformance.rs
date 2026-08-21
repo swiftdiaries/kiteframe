@@ -322,12 +322,19 @@ async fn permission_answer_is_one_shot_and_correlated() {
     assert_eq!(observation["scriptComplete"], true);
     assert_eq!(observation["selectedPermissionOption"], "allow-once-id");
     assert_eq!(observation["permissionResponseCount"], 1);
-    let environment = observation["environmentKeys"].as_array().unwrap();
-    assert!(environment.iter().all(|key| key != "HOME" && key != "PATH"));
-    assert!(
-        environment
-            .iter()
-            .all(|key| !key.as_str().unwrap().contains("TOKEN"))
+    let environment = observation["environmentKeys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key.as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        environment,
+        BTreeSet::from([
+            "KITEFRAME_FAKE_ACP_ALLOW_REGISTRATION_EOF".to_owned(),
+            "KITEFRAME_FAKE_ACP_OBSERVATION".to_owned(),
+            "KITEFRAME_FAKE_ACP_SCRIPT".to_owned(),
+        ])
     );
     assert_eq!(observation["promptBlockCount"], 1);
     let prompt = observation["promptText"].as_str().unwrap();

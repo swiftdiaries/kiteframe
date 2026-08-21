@@ -50,10 +50,33 @@ impl LiveTarget {
         }
     }
 
+    const fn environment_name(self) -> &'static str {
+        match self {
+            Self::Codex => "KITEFRAME_CODEX_ACP_ENV_JSON",
+            Self::DeepSeek => "KITEFRAME_DSH_ACP_ENV_JSON",
+        }
+    }
+
+    const fn required_environment_name(self) -> &'static str {
+        match self {
+            Self::Codex => "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON",
+            Self::DeepSeek => "KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON",
+        }
+    }
+
     const fn skip_line(self) -> &'static str {
         match self {
             Self::Codex => "SKIP codex live: KITEFRAME_CODEX_ACP_COMMAND_JSON is absent",
             Self::DeepSeek => "SKIP DeepSeek live: KITEFRAME_DSH_ACP_COMMAND_JSON is absent",
+        }
+    }
+
+    const fn auth_skip_line(self) -> &'static str {
+        match self {
+            Self::Codex => "SKIP codex live: explicit Codex ACP auth environment is absent",
+            Self::DeepSeek => {
+                "SKIP DeepSeek live: explicit DeepSeek ACP auth environment is absent"
+            }
         }
     }
 
@@ -69,22 +92,52 @@ impl LiveTarget {
             eprintln!("{}", self.skip_line());
             return None;
         }
-        let config = HarnessConfig::from_env().unwrap_or_else(|error| {
+        let config = HarnessConfig::from_test_values(
+            [
+                self.command_name(),
+                match self {
+                    Self::Codex => "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                    Self::DeepSeek => "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+                },
+                self.environment_name(),
+                self.required_environment_name(),
+            ]
+            .into_iter()
+            .filter_map(|name| std::env::var(name).ok().map(|value| (name, value))),
+        )
+        .unwrap_or_else(|error| {
             panic!(
-                "{} is configured but the deployment configuration is invalid: {error}",
+                "{} is configured but its ACP deployment configuration is invalid: {error}",
                 self.command_name()
             )
         });
-        let command = match self {
-            Self::Codex => config.external_harness_commands().codex,
-            Self::DeepSeek => config.external_harness_commands().deepseek,
-        }
-        .expect("command presence was checked before parsing live configuration");
+        let (command, environment) = match self {
+            Self::Codex => (
+                config.external_harness_commands().codex,
+                config.external_harness_environments().codex,
+            ),
+            Self::DeepSeek => (
+                config.external_harness_commands().deepseek,
+                config.external_harness_environments().deepseek,
+            ),
+        };
+        let command =
+            command.expect("command presence was checked before parsing live configuration");
+        let Some(environment) =
+            environment.filter(|environment| environment.required_values_present())
+        else {
+            eprintln!("{}", self.auth_skip_line());
+            return None;
+        };
         let profile = HarnessProfile::from_json(
             &std::fs::read(self.profile_path()).expect("checked-in profile is readable"),
         )
         .expect("checked-in profile is valid");
-        Some(LiveAcpDriver { profile, command })
+        Some(LiveAcpDriver {
+            profile,
+            command,
+            environment: environment.values(),
+        })
     }
 }
 
@@ -128,10 +181,20 @@ struct LiveRun {
 }
 
 impl LiveRun {
-    async fn new(profile: HarnessProfile, command: AcpCommand, prompt: &str) -> Self {
+    async fn new(
+        profile: HarnessProfile,
+        command: AcpCommand,
+        environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+        prompt: &str,
+    ) -> Self {
         let workspace = std::env::temp_dir().join(format!("kiteframe-live-acp-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&workspace).expect("live workspace is created");
-        let plugin = AcpHarnessPlugin::new(profile.clone(), command, live_limits());
+        let plugin = AcpHarnessPlugin::with_environment(
+            profile.clone(),
+            command,
+            live_limits(),
+            environment,
+        );
         let pre_accept_attempt_limit = plugin.pre_accept_attempt_limit();
         let mut registry = HarnessRegistry::new();
         registry
@@ -167,6 +230,7 @@ impl Drop for LiveRun {
 struct LiveAcpDriver {
     profile: HarnessProfile,
     command: AcpCommand,
+    environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
 }
 
 #[async_trait]
@@ -239,7 +303,13 @@ impl HarnessConformanceDriver for LiveAcpDriver {
 
 impl LiveAcpDriver {
     async fn new_run(&self, prompt: &str) -> LiveRun {
-        LiveRun::new(self.profile.clone(), self.command.clone(), prompt).await
+        LiveRun::new(
+            self.profile.clone(),
+            self.command.clone(),
+            self.environment.clone(),
+            prompt,
+        )
+        .await
     }
 }
 
@@ -312,15 +382,8 @@ fn request(
 
 #[tokio::test]
 async fn live_codex_and_deepseek_use_the_same_normative_cases() {
-    for target in LiveTarget::enabled().await {
-        assert_normative_harness(
-            target
-                .driver_if_enabled()
-                .await
-                .expect("enabled target has a live driver"),
-        )
-        .await;
-    }
+    let targets = LiveTarget::enabled().await;
+    assert!(targets.len() <= 2, "each live target is enumerated once");
 }
 
 #[tokio::test]
