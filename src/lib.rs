@@ -36,17 +36,18 @@ pub use domain::{
 };
 pub use dsl::ModelRole;
 pub use engine::{
-    AgentCommandDispatcher, AnswerQuestion, CancelRun, DirectLoopHarnessExecutor, Engine,
-    EngineConfig, EngineError, HarnessCommandExecutor, HarnessExecutionError,
-    HarnessExecutionResult, PermissionChoice, RecoveryReport, ResolvePermission, RetryRecovery,
+    AgentCommandDispatcher, AnswerQuestion, CancelRun, Engine, EngineConfig, EngineError,
+    HarnessExecutionError, HarnessExecutionResult, PermissionChoice, RecoveryReport,
+    ResolvePermission, RetryRecovery,
 };
 pub use goal::{
     CriterionAssertion, EvidenceId, EvidenceRecord, EvidenceSourceIdentity, GoalBlocker,
     GoalContract, GoalContractError, GoalPhase, SuccessCriterion, goal_edge_allowed,
 };
 pub use harness::{
-    DenyAllHarnessApprovals, HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSink,
-    HarnessPlugin, HarnessRegistry, HarnessRequestEnvelope, PostgresHarnessEventSink,
+    BuiltinHarnessPlugin, DenyAllHarnessApprovals, HarnessApprovalBroker, HarnessEventEnvelope,
+    HarnessEventSink, HarnessPlugin, HarnessRegistry, HarnessRequestEnvelope, HarnessTerminal,
+    PostgresHarnessEventSink,
 };
 pub use hash::{HashError, canonical_json, canonical_sha256};
 pub use mcp::{

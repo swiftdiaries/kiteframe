@@ -103,6 +103,10 @@ impl AgentKernel {
         &self.store
     }
 
+    pub(crate) fn store_arc(&self) -> Arc<PostgresStore> {
+        self.store.clone()
+    }
+
     pub async fn start_agent(
         &self,
         principal: &PrincipalId,

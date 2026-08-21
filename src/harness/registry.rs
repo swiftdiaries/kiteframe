@@ -115,6 +115,23 @@ impl HarnessRegistry {
             .len()
     }
 
+    pub fn profile_digest(
+        &self,
+        profile_id: &super::HarnessProfileId,
+    ) -> Result<String, HarnessFailure> {
+        self.plugins
+            .lock()
+            .expect("harness registry lock is not poisoned")
+            .get(profile_id)
+            .map(|registered| registered.digest.clone())
+            .ok_or_else(|| {
+                HarnessFailure::new(
+                    "harness_profile_unavailable",
+                    "selected harness profile is not registered",
+                )
+            })
+    }
+
     pub async fn cancel(&self, invocation_id: &HarnessInvocationId) -> bool {
         let token = self
             .active

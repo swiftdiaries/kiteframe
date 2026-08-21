@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     ffi::OsStr,
     io,
     sync::{
@@ -9,11 +10,16 @@ use std::{
 };
 
 use agent_client_protocol::{ConnectTo, Stdio};
+use kiteframe::harness::{
+    DenyAllHarnessApprovals, HarnessCapability, HarnessProfile, HarnessProfileId, HarnessRegistry,
+    HarnessTransport,
+};
 use kiteframe::protocol::transport::{AcpService, BearerAuthenticator, RemoteService};
+use kiteframe::store::HarnessPluginRegistration;
 use kiteframe::{
-    AgentCommandDispatcher, Application, AuthenticatedConnection, DirectLoopHarnessExecutor,
-    Engine, EngineConfig, HarnessConfig, HarnessMode, McpLimits, McpManager, ModelClient,
-    ModelRequest, PersistedAuthorizer, PostgresStore, ResponsesClient, TransportKind,
+    AgentCommandDispatcher, Application, AuthenticatedConnection, BuiltinHarnessPlugin, Engine,
+    EngineConfig, HarnessConfig, HarnessMode, McpLimits, McpManager, ModelClient, ModelRequest,
+    PersistedAuthorizer, PostgresStore, ResponsesClient, TransportKind,
 };
 use tokio::sync::watch;
 
@@ -21,6 +27,47 @@ const PROCESS_LOCK_KEY: i64 = 0x4b_49_54_45_46_52_41_4d;
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MODEL_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+fn builtin_profile() -> HarnessProfile {
+    HarnessProfile {
+        id: HarnessProfileId::new("builtin-v1").expect("the built-in profile id is valid"),
+        transport: HarnessTransport::Builtin,
+        source_repository: "https://github.com/swiftdiaries/kiteframe".to_owned(),
+        source_revision: "0000000000000000000000000000000000000000".to_owned(),
+        program: "kiteframe-builtin".to_owned(),
+        args: vec![],
+        required: BTreeSet::from([
+            HarnessCapability::FreshSession,
+            HarnessCapability::TextPrompt,
+            HarnessCapability::PermissionOnce,
+            HarnessCapability::Cancel,
+            HarnessCapability::CommittedOutput,
+        ]),
+        optional: BTreeSet::new(),
+        fresh_sessions_only: true,
+    }
+}
+
+async fn configured_builtin_registry(
+    store: Arc<PostgresStore>,
+    model: Arc<dyn ModelClient>,
+) -> Result<Arc<HarnessRegistry>, Box<dyn std::error::Error>> {
+    let profile = builtin_profile();
+    let plugin = Arc::new(BuiltinHarnessPlugin::new(profile.clone(), model));
+    let mut registry = HarnessRegistry::new();
+    registry.register(plugin).await?;
+    store
+        .register_harness_plugin(HarnessPluginRegistration {
+            profile_id: profile.id.clone(),
+            profile_digest: profile.digest()?,
+            source_repository: profile.source_repository.clone(),
+            source_revision: profile.source_revision.clone(),
+            transport: profile.transport,
+            enabled: true,
+        })
+        .await?;
+    Ok(Arc::new(registry))
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,10 +110,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             claimed = agent_recovery.claimed,
             "agent command recovery complete"
         );
+        let harness_registry = configured_builtin_registry(store.clone(), model.clone()).await?;
         let agent_dispatcher = Arc::new(
             application
                 .agent_kernel()
-                .with_harness_executor(Arc::new(DirectLoopHarnessExecutor::new(model.clone()))),
+                .with_harness_registry(harness_registry, Arc::new(DenyAllHarnessApprovals)),
         );
         let application = Arc::new(application);
 
@@ -791,19 +839,22 @@ mod tests {
                 task_id: accepted.task_id.clone(),
                 command_id: pending.id.clone(),
                 expected_command_revision: pending.revision,
-                claimant: "builtin-direct-v1".to_owned(),
+                claimant: "harness-dispatcher-v1".to_owned(),
                 idempotency_key: IdempotencyKey::new(format!(
-                    "builtin-direct-v1:{}",
+                    "harness-dispatcher-v1:{}",
                     pending.id.as_uuid()
                 ))
                 .unwrap(),
             })
             .await
             .unwrap();
+        let harness_registry = configured_builtin_registry(store.clone(), model)
+            .await
+            .unwrap();
         let dispatcher = Arc::new(
             kernel
                 .clone()
-                .with_harness_executor(Arc::new(kiteframe::DirectLoopHarnessExecutor::new(model))),
+                .with_harness_registry(harness_registry, Arc::new(DenyAllHarnessApprovals)),
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let scheduler = tokio::spawn(run_scheduler(engine, dispatcher, shutdown_rx));
@@ -819,7 +870,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(persisted.0, "claimed");
-        assert_eq!(persisted.1, "builtin-direct-v1");
+        assert_eq!(persisted.1, "harness-dispatcher-v1");
         assert_eq!(persisted.2, i64::try_from(claimed.revision).unwrap());
 
         shutdown_tx.send_replace(true);

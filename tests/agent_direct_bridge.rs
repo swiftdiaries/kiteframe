@@ -5,16 +5,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kiteframe::dsl::{Limits, compile};
+use kiteframe::harness::{
+    DenyAllHarnessApprovals, HarnessCapability, HarnessProfile, HarnessProfileId, HarnessRegistry,
+    HarnessTransport,
+};
+use kiteframe::store::HarnessPluginRegistration;
 use kiteframe::{
     AgentCommandDispatcher, AgentCommandId, AgentCommandView, AgentExecutionView, AgentKernel,
-    AgentSelector, CancelUserTask, CatalogTool, ClaimAgentCommand, ClosedSchema,
-    CompleteAgentCommand, CreateSession, DirectLoopHarnessExecutor, EffectKind, EvidenceId,
-    EvidenceRecord, EvidenceSourceIdentity, GoalContract, GoalPhase, HarnessCommandExecutor,
-    HarnessExecutionError, IdempotencyKey, InvokeHarness, KernelCommandPayload, ModelClient,
-    ModelError, ModelRequest, ModelResponse, OperationalStatus, PauseUserTask, PostgresStore,
-    PrincipalId, RecoverySupport, RequestContext, RuntimeCeilings, RuntimeEvent, StartAgent,
-    StartRun, StoreError, SubmitUserTask, SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer,
-    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId, WaitForEvent, canonical_sha256,
+    AgentSelector, BuiltinHarnessPlugin, CancelUserTask, CatalogTool, ClaimAgentCommand,
+    ClosedSchema, CompleteAgentCommand, CreateSession, EffectKind, EvidenceId, EvidenceRecord,
+    EvidenceSourceIdentity, GoalContract, GoalPhase, HarnessExecutionError, IdempotencyKey,
+    InvokeHarness, KernelCommandPayload, ModelClient, ModelError, ModelRequest, ModelResponse,
+    OperationalStatus, PauseUserTask, PostgresStore, PrincipalId, RecoverySupport, RequestContext,
+    RuntimeCeilings, RuntimeEvent, StartAgent, StartRun, StoreError, SubmitUserTask,
+    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
+    ToolCatalogSnapshot, UserTaskId, WaitForEvent, canonical_sha256,
 };
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -24,6 +29,26 @@ use uuid::Uuid;
 type ModelFuture = Pin<Box<dyn Future<Output = Result<ModelResponse, ModelError>> + Send>>;
 type ModelHandler = dyn Fn(ModelRequest) -> ModelFuture + Send + Sync;
 static BRIDGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn builtin_profile() -> HarnessProfile {
+    HarnessProfile {
+        id: HarnessProfileId::new("builtin-v1").unwrap(),
+        transport: HarnessTransport::Builtin,
+        source_repository: "https://github.com/swiftdiaries/kiteframe".to_owned(),
+        source_revision: "0000000000000000000000000000000000000000".to_owned(),
+        program: "kiteframe-builtin".to_owned(),
+        args: vec![],
+        required: BTreeSet::from([
+            HarnessCapability::FreshSession,
+            HarnessCapability::TextPrompt,
+            HarnessCapability::PermissionOnce,
+            HarnessCapability::Cancel,
+            HarnessCapability::CommittedOutput,
+        ]),
+        optional: BTreeSet::new(),
+        fresh_sessions_only: true,
+    }
+}
 
 async fn non_command_fingerprint(pool: &PgPool, task_id: &UserTaskId) -> Value {
     sqlx::query_scalar(
@@ -298,8 +323,24 @@ impl BridgeFixture {
             .await
             .unwrap();
         let model = Arc::new(ScriptedModel::new());
-        let executor = Arc::new(DirectLoopHarnessExecutor::new(model.clone()));
-        let dispatcher = kernel.clone().with_harness_executor(executor);
+        let profile = builtin_profile();
+        let plugin = Arc::new(BuiltinHarnessPlugin::new(profile.clone(), model.clone()));
+        let mut registry = HarnessRegistry::new();
+        registry.register(plugin).await.unwrap();
+        store
+            .register_harness_plugin(HarnessPluginRegistration {
+                profile_id: profile.id.clone(),
+                profile_digest: profile.digest().unwrap(),
+                source_repository: profile.source_repository.clone(),
+                source_revision: profile.source_revision.clone(),
+                transport: profile.transport,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        let dispatcher = kernel
+            .clone()
+            .with_harness_registry(Arc::new(registry), Arc::new(DenyAllHarnessApprovals));
         Some(Self {
             dispatcher,
             kernel,
@@ -537,6 +578,18 @@ async fn invocation_is_persisted_and_claimed_before_model_call() {
                         .await
                         .unwrap();
                 assert_eq!(state, "claimed");
+                let invocation: (String, String, String, Option<String>) = sqlx::query_as(
+                    "SELECT profile_id, state, payload_digest, terminal_request_digest \
+                     FROM harness_invocations WHERE command_id = $1",
+                )
+                .bind(command_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(invocation.0, "builtin-v1");
+                assert_eq!(invocation.1, "started");
+                assert!(!invocation.2.is_empty());
+                assert!(invocation.3.is_none());
                 Ok(ModelResponse {
                     items: vec![json!({
                         "type": "function_call",
@@ -605,10 +658,10 @@ async fn actual_model_request_preserves_the_full_durable_goal_and_authority_boun
     };
     let invocation = fixture.pending_invocation().await;
     fixture.model.complete("ok", json!({"answer": "done"}));
-    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+    let executor = BuiltinHarnessPlugin::new(builtin_profile(), fixture.model.clone());
 
-    executor.execute(&invocation).await.unwrap();
-    executor.execute(&invocation).await.unwrap();
+    executor.execute_direct(&invocation).await.unwrap();
+    executor.execute_direct(&invocation).await.unwrap();
 
     let requests = fixture.model.requests();
     assert_eq!(requests.len(), 2);
@@ -653,8 +706,8 @@ async fn completion_tool_matches_the_nested_complete_task_arguments_contract() {
     };
     let invocation = fixture.pending_invocation().await;
     fixture.model.complete("ok", json!({"answer": "done"}));
-    DirectLoopHarnessExecutor::new(fixture.model.clone())
-        .execute(&invocation)
+    BuiltinHarnessPlugin::new(builtin_profile(), fixture.model.clone())
+        .execute_direct(&invocation)
         .await
         .unwrap();
 
@@ -698,7 +751,7 @@ async fn declared_model_tool_fails_closed_without_legacy_or_goal_authority() {
     assert_eq!(view.lifecycle, TaskLifecycle::Failed);
     assert_eq!(view.operational_status, OperationalStatus::Finished);
     assert_eq!(view.goal_phase, GoalPhase::Active);
-    assert_eq!(fixture.command_state(&command.id).await, "failed");
+    assert_eq!(fixture.command_state(&command.id).await, "completed");
     let requests = fixture.model.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].tools.len(), 2);
@@ -714,12 +767,12 @@ async fn declared_model_tool_fails_closed_without_legacy_or_goal_authority() {
             "additionalProperties":false
         })
     );
-    assert!(
-        fixture
-            .event_kinds()
-            .await
-            .contains(&"runtime.command_unavailable".to_owned())
-    );
+    let failure: Value = sqlx::query_scalar("SELECT failure FROM user_tasks WHERE id = $1")
+        .bind(fixture.task_id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(failure["code"], "harness_capability_unsupported");
     assert_eq!(fixture.legacy_run_count().await, 0);
     assert_eq!(fixture.legacy_frame_count().await, 0);
 }
@@ -731,13 +784,13 @@ async fn bounded_executor_rejects_missing_multiple_invalid_and_oversized_actions
         return;
     };
     let invocation = fixture.pending_invocation().await;
-    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+    let executor = BuiltinHarnessPlugin::new(builtin_profile(), fixture.model.clone());
 
     fixture
         .model
         .respond_with(json!({"type": "message", "text": "done"}));
     assert!(matches!(
-        executor.execute(&invocation).await,
+        executor.execute_direct(&invocation).await,
         Err(HarnessExecutionError::InvalidResult(message))
             if message.contains("exactly one")
     ));
@@ -747,7 +800,7 @@ async fn bounded_executor_rejects_missing_multiple_invalid_and_oversized_actions
         json!({"type":"function_call", "call_id":"done-2", "name":"complete_task", "arguments":{"outcome":"ok", "fields":{"answer":"two"}}}),
     ]);
     assert!(matches!(
-        executor.execute(&invocation).await,
+        executor.execute_direct(&invocation).await,
         Err(HarnessExecutionError::InvalidResult(message))
             if message.contains("exactly one")
     ));
@@ -757,26 +810,26 @@ async fn bounded_executor_rejects_missing_multiple_invalid_and_oversized_actions
         json!({"type":"function_call", "call_id":"tool-1", "name":"docs/search", "arguments":{}}),
     ]);
     assert!(matches!(
-        executor.execute(&invocation).await,
+        executor.execute_direct(&invocation).await,
         Err(HarnessExecutionError::InvalidResult(message))
             if message.contains("exactly one")
     ));
 
     fixture.model.complete("unknown", json!({"answer": "done"}));
     assert!(matches!(
-        executor.execute(&invocation).await,
+        executor.execute_direct(&invocation).await,
         Err(HarnessExecutionError::InvalidResult(_))
     ));
 
     fixture.model.complete("ok", json!({"answer": 7}));
     assert!(matches!(
-        executor.execute(&invocation).await,
+        executor.execute_direct(&invocation).await,
         Err(HarnessExecutionError::InvalidResult(_))
     ));
 
     fixture.model.complete("ok", json!({}));
     assert!(matches!(
-        executor.execute(&invocation).await,
+        executor.execute_direct(&invocation).await,
         Err(HarnessExecutionError::InvalidResult(message))
             if message.contains("do not match")
     ));
@@ -785,7 +838,7 @@ async fn bounded_executor_rejects_missing_multiple_invalid_and_oversized_actions
     tiny.limits.response_item_bytes = 1;
     fixture.model.complete("ok", json!({"answer": "done"}));
     assert_eq!(
-        executor.execute(&tiny).await,
+        executor.execute_direct(&tiny).await,
         Err(HarnessExecutionError::InvalidResult(
             "response_item_limit_exceeded".to_owned()
         ))
@@ -800,7 +853,7 @@ async fn multi_outcome_executor_rejects_missing_extra_and_cross_outcome_fields()
         return;
     };
     let invocation = fixture.pending_invocation().await;
-    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+    let executor = BuiltinHarnessPlugin::new(builtin_profile(), fixture.model.clone());
 
     for (outcome, fields) in [
         ("ok", json!({})),
@@ -810,7 +863,7 @@ async fn multi_outcome_executor_rejects_missing_extra_and_cross_outcome_fields()
     ] {
         fixture.model.complete(outcome, fields);
         assert!(matches!(
-            executor.execute(&invocation).await,
+            executor.execute_direct(&invocation).await,
             Err(HarnessExecutionError::InvalidResult(_))
         ));
     }
@@ -849,13 +902,13 @@ async fn bounded_executor_enforces_turn_tool_and_active_time_limits() {
         return;
     };
     let invocation = fixture.pending_invocation().await;
-    let executor = DirectLoopHarnessExecutor::new(fixture.model.clone());
+    let executor = BuiltinHarnessPlugin::new(builtin_profile(), fixture.model.clone());
 
     let calls = fixture.model.calls();
     let mut no_turns = invocation.clone();
     no_turns.limits.model_turns_remaining = 0;
     assert_eq!(
-        executor.execute(&no_turns).await,
+        executor.execute_direct(&no_turns).await,
         Err(HarnessExecutionError::Failed(
             "active_execution_limit_exceeded".to_owned()
         ))
@@ -868,7 +921,7 @@ async fn bounded_executor_enforces_turn_tool_and_active_time_limits() {
         "type":"function_call", "call_id":"tool-1", "name":"docs/search", "arguments":{}
     }));
     assert_eq!(
-        executor.execute(&no_tools).await,
+        executor.execute_direct(&no_tools).await,
         Err(HarnessExecutionError::InvalidResult(
             "tool_call_limit_exceeded".to_owned()
         ))
@@ -881,7 +934,7 @@ async fn bounded_executor_enforces_turn_tool_and_active_time_limits() {
         Ok(ModelResponse { items: vec![] })
     });
     assert_eq!(
-        executor.execute(&timed).await,
+        executor.execute_direct(&timed).await,
         Err(HarnessExecutionError::Failed(
             "active_execution_limit_exceeded".to_owned()
         ))
@@ -1027,7 +1080,7 @@ async fn restart_resumes_the_builtin_claim_with_the_same_key_and_one_result() {
         return;
     };
     let pending = fixture.pending_command().await;
-    let claim_key = format!("builtin-direct-v1:{}", pending.id.as_uuid());
+    let claim_key = format!("harness-dispatcher-v1:{}", pending.id.as_uuid());
     fixture
         .store
         .claim_agent_command(ClaimAgentCommand {
@@ -1035,7 +1088,7 @@ async fn restart_resumes_the_builtin_claim_with_the_same_key_and_one_result() {
             task_id: fixture.task_id.clone(),
             command_id: pending.id.clone(),
             expected_command_revision: pending.revision,
-            claimant: "builtin-direct-v1".to_owned(),
+            claimant: "harness-dispatcher-v1".to_owned(),
             idempotency_key: IdempotencyKey::new(claim_key.clone()).unwrap(),
         })
         .await
@@ -1046,9 +1099,15 @@ async fn restart_resumes_the_builtin_claim_with_the_same_key_and_one_result() {
         Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&fixture.store))),
     ));
     fixture.model.complete("ok", json!({"answer": "done"}));
-    let restarted = restarted_kernel.with_harness_executor(Arc::new(
-        DirectLoopHarnessExecutor::new(fixture.model.clone()),
+    let profile = builtin_profile();
+    let plugin = Arc::new(BuiltinHarnessPlugin::new(
+        profile.clone(),
+        fixture.model.clone(),
     ));
+    let mut registry = HarnessRegistry::new();
+    registry.register(plugin).await.unwrap();
+    let restarted = restarted_kernel
+        .with_harness_registry(Arc::new(registry), Arc::new(DenyAllHarnessApprovals));
 
     assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
     assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 0);
@@ -1061,7 +1120,7 @@ async fn restart_resumes_the_builtin_claim_with_the_same_key_and_one_result() {
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("state"), "completed");
-    assert_eq!(row.get::<String, _>("claimant"), "builtin-direct-v1");
+    assert_eq!(row.get::<String, _>("claimant"), "harness-dispatcher-v1");
     assert_eq!(row.get::<String, _>("claim_idempotency_key"), claim_key);
     assert_eq!(fixture.evidence().await.len(), 1);
     let committed_events: i64 = sqlx::query_scalar(

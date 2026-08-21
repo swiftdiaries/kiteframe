@@ -1,232 +1,41 @@
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use serde_json::{Map, Value, json};
-use thiserror::Error;
-
-use crate::dsl::{CompiledTask, CompiledType};
+use crate::harness::{
+    HarnessApprovalBroker, HarnessInvocationId, HarnessInvocationRequest, HarnessProfileId,
+    HarnessRegistry, HarnessRouteTable, HarnessTerminal, PostgresHarnessEventSink,
+};
+use crate::store::{HarnessInvocationState, PrepareHarnessInvocation};
 use crate::{
-    AgentCommandState, AgentKernel, ClaimAgentCommand, ClosedSchema, CompleteAgentCommand,
-    EvidenceId, FailAgentCommand, GoalPhase, HarnessStructuralLimits, HarnessTool, IdempotencyKey,
-    InvokeHarness, KernelCommandPayload, ModelClient, ModelRequest, OperationalStatus,
-    PrimitiveValue, PrincipalId, RuntimeEvent, RuntimeHistoryItem, RuntimeHistoryKind, SessionId,
-    StoreError, TaskLifecycle,
+    AgentCommandState, AgentKernel, ClaimAgentCommand, CompleteAgentCommand, EvidenceId,
+    FailAgentCommand, GoalPhase, IdempotencyKey, KernelCommandPayload, OperationalStatus,
+    PrincipalId, RuntimeEvent, SessionId, StoreError, TaskLifecycle,
 };
 
-const BUILTIN_CLAIMANT: &str = "builtin-direct-v1";
-const DURABLE_GOAL_DIRECTIVE: &str = "Treat the complete structured goal in the first input item as durable across this invocation and every repeated or recovered invocation. Preserve its objective, criterion ids, human success statements, required evidence types, constraints, and blocked conditions. The complete_task function completes only this bounded harness task and yields invocation evidence; it never completes or blocks the enclosing Kiteframe goal. Only the Rust kernel's CompleteGoal and BlockGoal authority may complete or block that goal.";
-#[derive(Clone, Debug, PartialEq)]
-pub struct HarnessExecutionResult {
-    pub outcome: String,
-    pub fields: Value,
-    pub history: Vec<RuntimeHistoryItem>,
-}
-
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum HarnessExecutionError {
-    #[error("harness command is unavailable: {0}")]
-    Unavailable(&'static str),
-    #[error("harness result is invalid: {0}")]
-    InvalidResult(String),
-    #[error("harness failed: {0}")]
-    Failed(String),
-}
-
-#[async_trait::async_trait]
-pub trait HarnessCommandExecutor: Send + Sync {
-    async fn execute(
-        &self,
-        invocation: &InvokeHarness,
-    ) -> Result<HarnessExecutionResult, HarnessExecutionError>;
-}
-
-pub struct DirectLoopHarnessExecutor {
-    model: Arc<dyn ModelClient>,
-}
-
-impl DirectLoopHarnessExecutor {
-    #[must_use]
-    pub fn new(model: Arc<dyn ModelClient>) -> Self {
-        Self { model }
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessCommandExecutor for DirectLoopHarnessExecutor {
-    async fn execute(
-        &self,
-        invocation: &InvokeHarness,
-    ) -> Result<HarnessExecutionResult, HarnessExecutionError> {
-        validate_invocation_limits(&invocation.limits)?;
-        let request = ModelRequest {
-            instructions: format!("{}\n\n{}", invocation.prompt, DURABLE_GOAL_DIRECTIVE),
-            input: std::iter::once(json!({
-                "role": invocation.role,
-                "goal": invocation.goal,
-                "input": invocation.input,
-            }))
-            .chain(
-                invocation
-                    .projected_history
-                    .iter()
-                    .map(|item| item.payload.clone()),
-            )
-            .collect(),
-            tools: std::iter::once(completion_tool_from_schema(&invocation.result_schema))
-                .chain(invocation.tools.iter().map(harness_tool_json))
-                .collect(),
-        };
-        let response = tokio::time::timeout(
-            Duration::from_millis(invocation.limits.active_execution_millis_remaining),
-            self.model.respond(request),
-        )
-        .await
-        .map_err(|_| HarnessExecutionError::Failed("active_execution_limit_exceeded".to_owned()))?
-        .map_err(|error| HarnessExecutionError::Failed(error.to_string()))?;
-
-        if response.items.iter().any(|item| {
-            serde_json::to_vec(item).map_or(true, |bytes| {
-                bytes.len() as u64 > invocation.limits.response_item_bytes
-            })
-        }) {
-            return Err(HarnessExecutionError::InvalidResult(
-                "response_item_limit_exceeded".to_owned(),
-            ));
-        }
-        let tool_calls = response
-            .items
-            .iter()
-            .filter(|item| non_completion_tool_call(item))
-            .count() as u64;
-        if tool_calls > invocation.limits.tool_calls_per_response {
-            return Err(HarnessExecutionError::InvalidResult(
-                "tool_call_limit_exceeded".to_owned(),
-            ));
-        }
-        let actions = response
-            .items
-            .iter()
-            .filter(|item| is_function_call(item))
-            .collect::<Vec<_>>();
-        let [action] = actions.as_slice() else {
-            return Err(HarnessExecutionError::InvalidResult(
-                "model response must contain exactly one completion or tool call".to_owned(),
-            ));
-        };
-        if non_completion_tool_call(action) {
-            return Err(HarnessExecutionError::Unavailable("model_tool_calls"));
-        }
-        let (outcome, fields) = parse_completion_item(action).ok_or_else(|| {
-            HarnessExecutionError::InvalidResult("completion item is malformed".to_owned())
-        })?;
-        validate_schema_completion(&invocation.result_schema, &outcome, &fields)?;
-        let history = response
-            .items
-            .into_iter()
-            .enumerate()
-            .map(|(sequence, payload)| RuntimeHistoryItem {
-                sequence: sequence as u64,
-                kind: RuntimeHistoryKind::HarnessOutput,
-                payload,
-            })
-            .collect();
-        Ok(HarnessExecutionResult {
-            outcome,
-            fields,
-            history,
-        })
-    }
-}
-
-fn validate_invocation_limits(
-    limits: &HarnessStructuralLimits,
-) -> Result<(), HarnessExecutionError> {
-    if limits.model_turns_remaining == 0 || limits.active_execution_millis_remaining == 0 {
-        return Err(HarnessExecutionError::Failed(
-            "active_execution_limit_exceeded".to_owned(),
-        ));
-    }
-    if limits.response_item_bytes == 0 {
-        return Err(HarnessExecutionError::InvalidResult(
-            "response_item_limit_exceeded".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn non_completion_tool_call(item: &Value) -> bool {
-    is_function_call(item) && item.get("name").and_then(Value::as_str) != Some("complete_task")
-}
-
-fn is_function_call(item: &Value) -> bool {
-    item.get("type").and_then(Value::as_str) == Some("function_call")
-}
-
-fn validate_schema_completion(
-    result_schema: &ClosedSchema,
-    outcome: &str,
-    fields: &Value,
-) -> Result<(), HarnessExecutionError> {
-    let (outcome_schema, outcome_fields) = completion_contract(result_schema)?;
-    outcome_schema
-        .validate(&Value::String(outcome.to_owned()))
-        .map_err(|error| HarnessExecutionError::InvalidResult(error.to_string()))?;
-    let fields_schema = outcome_fields.get(outcome).ok_or_else(|| {
-        HarnessExecutionError::InvalidResult("completion outcome schema is absent".to_owned())
-    })?;
-    fields_schema.validate(fields).map_err(|error| {
-        HarnessExecutionError::InvalidResult(format!(
-            "completion fields do not match selected outcome: {error}"
-        ))
-    })
-}
-
-fn completion_contract(
-    result_schema: &ClosedSchema,
-) -> Result<
-    (
-        &ClosedSchema,
-        &std::collections::BTreeMap<String, ClosedSchema>,
-    ),
-    HarnessExecutionError,
-> {
-    let ClosedSchema::Object { properties, .. } = result_schema else {
-        return Err(HarnessExecutionError::InvalidResult(
-            "completion result schema must be an object".to_owned(),
-        ));
-    };
-    let outcome_schema = properties.get("outcome").ok_or_else(|| {
-        HarnessExecutionError::InvalidResult("completion outcome schema is absent".to_owned())
-    })?;
-    let outcome_fields = properties.get("fields").ok_or_else(|| {
-        HarnessExecutionError::InvalidResult("completion fields schema is absent".to_owned())
-    })?;
-    let ClosedSchema::Object {
-        properties: outcome_fields,
-        ..
-    } = outcome_fields
-    else {
-        return Err(HarnessExecutionError::InvalidResult(
-            "completion fields schema must map outcomes".to_owned(),
-        ));
-    };
-    Ok((outcome_schema, outcome_fields))
-}
+const HARNESS_DISPATCHER_CLAIMANT: &str = "harness-dispatcher-v1";
+const MAX_PRE_ACCEPT_ATTEMPTS: u64 = 3;
 
 pub struct AgentCommandDispatcher {
     kernel: Arc<AgentKernel>,
-    executor: Arc<dyn HarnessCommandExecutor>,
+    registry: Arc<HarnessRegistry>,
+    approvals: Arc<dyn HarnessApprovalBroker>,
+    routes: HarnessRouteTable,
 }
 
 impl AgentKernel {
     #[must_use]
-    pub fn with_harness_executor(
+    pub fn with_harness_registry(
         self: Arc<Self>,
-        executor: Arc<dyn HarnessCommandExecutor>,
+        registry: Arc<HarnessRegistry>,
+        approvals: Arc<dyn HarnessApprovalBroker>,
     ) -> AgentCommandDispatcher {
+        let builtin =
+            HarnessProfileId::new("builtin-v1").expect("the built-in harness profile id is valid");
         AgentCommandDispatcher {
             kernel: self,
-            executor,
+            registry,
+            approvals,
+            routes: HarnessRouteTable::new(builtin.clone(), builtin),
         }
     }
 }
@@ -272,9 +81,9 @@ impl AgentCommandDispatcher {
                         task_id: listed.task_id.clone(),
                         command_id: listed.id.clone(),
                         expected_command_revision: listed.revision,
-                        claimant: BUILTIN_CLAIMANT.to_owned(),
+                        claimant: HARNESS_DISPATCHER_CLAIMANT.to_owned(),
                         idempotency_key: idempotency_key(format!(
-                            "{BUILTIN_CLAIMANT}:{}",
+                            "{HARNESS_DISPATCHER_CLAIMANT}:{}",
                             listed.id.as_uuid()
                         ))?,
                     };
@@ -285,7 +94,7 @@ impl AgentCommandDispatcher {
                     }
                 }
                 AgentCommandState::Claimed
-                    if listed.claimant.as_deref() == Some(BUILTIN_CLAIMANT) =>
+                    if listed.claimant.as_deref() == Some(HARNESS_DISPATCHER_CLAIMANT) =>
                 {
                     listed
                 }
@@ -306,87 +115,220 @@ impl AgentCommandDispatcher {
         claimed: crate::AgentCommandView,
     ) -> Result<(), StoreError> {
         match dispatch_route(&claimed.payload) {
-            DispatchRoute::Harness => {
-                let KernelCommandPayload::InvokeHarness(invocation) = &claimed.payload else {
-                    unreachable!("harness route must contain InvokeHarness")
-                };
-                match self.executor.execute(invocation).await {
-                    Ok(result) => {
-                        let completion = CompleteAgentCommand {
-                            session_id: execution.task.session_id.clone(),
-                            task_id: claimed.task_id.clone(),
-                            command_id: claimed.id.clone(),
-                            expected_command_revision: claimed.revision,
-                            idempotency_key: idempotency_key(format!(
-                                "builtin-result:{}:{}",
-                                claimed.id.as_uuid(),
-                                claimed.revision
-                            ))?,
-                            event: RuntimeEvent::HarnessResult {
-                                event_id: format!(
-                                    "builtin-harness-result:{}:{}",
-                                    claimed.id.as_uuid(),
-                                    claimed.revision
-                                ),
-                                command_key: claimed.key.clone(),
-                                outcome: result.outcome,
-                                fields: result.fields,
-                                evidence_id: EvidenceId::new(uuid::Uuid::now_v7()),
-                                history: result.history,
-                            },
-                        };
-                        complete_or_audit_late(
-                            &self.kernel,
-                            &execution.task.principal,
-                            &completion,
-                        )
-                        .await?;
-                    }
-                    Err(HarnessExecutionError::Unavailable(_)) => {
-                        let failure = failure_request(
-                            execution,
-                            &claimed,
-                            "builtin-unavailable",
-                            "runtime_command_unavailable",
-                        )?;
-                        unavailable_or_audit_late(
-                            &self.kernel,
-                            &execution.task.principal,
-                            &failure,
-                        )
-                        .await?;
-                    }
-                    Err(
-                        HarnessExecutionError::InvalidResult(_) | HarnessExecutionError::Failed(_),
-                    ) => {
-                        let failure = failure_request(
-                            execution,
-                            &claimed,
-                            "builtin-failure",
-                            "harness_failed",
-                        )?;
-                        failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
-                            .await?;
-                    }
-                }
-            }
+            DispatchRoute::Harness => self.dispatch_harness(execution, claimed).await,
             DispatchRoute::Unavailable => {
                 let failure = failure_request(
                     execution,
                     &claimed,
-                    "builtin-unavailable",
+                    "harness-unavailable",
                     "runtime_command_unavailable",
                 )?;
-                unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure)
-                    .await?;
+                unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
             }
-            DispatchRoute::InternalAuthority => {
-                return Err(StoreError::AgentTransitionInvalid(
-                    "internal authority command reached dispatcher".to_owned(),
-                ));
+            DispatchRoute::InternalAuthority => Err(StoreError::AgentTransitionInvalid(
+                "internal authority command reached dispatcher".to_owned(),
+            )),
+        }
+    }
+
+    async fn dispatch_harness(
+        &self,
+        execution: &crate::AgentExecutionView,
+        claimed: crate::AgentCommandView,
+    ) -> Result<(), StoreError> {
+        let KernelCommandPayload::InvokeHarness(payload) = &claimed.payload else {
+            unreachable!("harness route must contain InvokeHarness")
+        };
+        let profile_id = self
+            .routes
+            .select(execution.task.preferences.harness_role, payload.role)
+            .clone();
+        let profile_digest = self
+            .registry
+            .profile_digest(&profile_id)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let candidate = HarnessInvocationId::new(uuid::Uuid::now_v7());
+        let prepared = self
+            .kernel
+            .store()
+            .prepare_harness_invocation(PrepareHarnessInvocation {
+                invocation_id: &candidate,
+                command_id: &claimed.id,
+                command_revision: claimed.revision,
+                profile_id: &profile_id,
+                profile_digest: &profile_digest,
+                payload_digest: &claimed.payload_digest,
+            })
+            .await?;
+        if prepared.terminal {
+            return Ok(());
+        }
+        let prepared = match prepared.state {
+            HarnessInvocationState::Prepared => {
+                self.kernel
+                    .store()
+                    .mark_harness_invocation_started(&prepared.invocation_id, prepared.attempt)
+                    .await?
+            }
+            HarnessInvocationState::Started => prepared,
+            HarnessInvocationState::Accepted => {
+                return self
+                    .settle_outcome_unknown(
+                        execution,
+                        &claimed,
+                        &prepared.invocation_id,
+                        prepared.attempt,
+                    )
+                    .await;
+            }
+            HarnessInvocationState::Completed
+            | HarnessInvocationState::Cancelled
+            | HarnessInvocationState::Failed
+            | HarnessInvocationState::OutcomeUnknown => return Ok(()),
+        };
+        let workspace: String =
+            sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
+                .bind(execution.task.session_id.as_uuid())
+                .fetch_one(self.kernel.store().pool())
+                .await?;
+        let request = HarnessInvocationRequest {
+            invocation_id: prepared.invocation_id.clone(),
+            command_id: claimed.id.clone(),
+            command_revision: claimed.revision,
+            profile_id,
+            workspace: PathBuf::from(workspace),
+            payload: payload.clone(),
+            payload_digest: claimed.payload_digest.clone(),
+        };
+        let terminal = self
+            .registry
+            .invoke(
+                request,
+                self.approvals.clone(),
+                Arc::new(PostgresHarnessEventSink::new(self.kernel.store_arc())),
+            )
+            .await;
+        self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
+            .await
+    }
+
+    async fn settle_harness_terminal(
+        &self,
+        execution: &crate::AgentExecutionView,
+        claimed: &crate::AgentCommandView,
+        invocation: &crate::store::HarnessInvocationView,
+        terminal: HarnessTerminal,
+    ) -> Result<(), StoreError> {
+        let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+        match terminal {
+            HarnessTerminal::Completed(output) => {
+                self.kernel
+                    .store()
+                    .settle_harness_invocation(
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                        HarnessInvocationState::Completed,
+                        &terminal_key,
+                    )
+                    .await?;
+                let completion = CompleteAgentCommand {
+                    session_id: execution.task.session_id.clone(),
+                    task_id: claimed.task_id.clone(),
+                    command_id: claimed.id.clone(),
+                    expected_command_revision: claimed.revision,
+                    idempotency_key: idempotency_key(format!(
+                        "harness-result:{}",
+                        invocation.invocation_id.as_uuid()
+                    ))?,
+                    event: RuntimeEvent::HarnessResult {
+                        event_id: format!("harness-result:{}", invocation.invocation_id.as_uuid()),
+                        command_key: claimed.key.clone(),
+                        outcome: output.outcome,
+                        fields: output.fields,
+                        evidence_id: EvidenceId::new(invocation.invocation_id.as_uuid()),
+                        history: output.history,
+                    },
+                };
+                complete_or_audit_late(&self.kernel, &execution.task.principal, &completion).await
+            }
+            HarnessTerminal::Cancelled => {
+                self.kernel
+                    .store()
+                    .settle_harness_invocation(
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                        HarnessInvocationState::Cancelled,
+                        &terminal_key,
+                    )
+                    .await?;
+                let failure =
+                    failure_request(execution, claimed, &terminal_key, "harness_cancelled")?;
+                failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+            }
+            HarnessTerminal::Retryable(_) => {
+                let retry = self
+                    .kernel
+                    .store()
+                    .record_harness_retryable_failure(
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                        MAX_PRE_ACCEPT_ATTEMPTS,
+                        &terminal_key,
+                    )
+                    .await?;
+                if retry.terminal {
+                    let failure =
+                        failure_request(execution, claimed, &terminal_key, "harness_failed")?;
+                    failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                        .await?;
+                }
+                Ok(())
+            }
+            HarnessTerminal::Failed(failure) => {
+                self.kernel
+                    .store()
+                    .settle_harness_invocation(
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                        HarnessInvocationState::Failed,
+                        &terminal_key,
+                    )
+                    .await?;
+                let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
+                failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+            }
+            HarnessTerminal::OutcomeUnknown(_) => {
+                self.settle_outcome_unknown(
+                    execution,
+                    claimed,
+                    &invocation.invocation_id,
+                    invocation.attempt,
+                )
+                .await
             }
         }
-        Ok(())
+    }
+
+    async fn settle_outcome_unknown(
+        &self,
+        execution: &crate::AgentExecutionView,
+        claimed: &crate::AgentCommandView,
+        invocation_id: &HarnessInvocationId,
+        attempt: u64,
+    ) -> Result<(), StoreError> {
+        let terminal_key = format!("harness-terminal:{}", invocation_id.as_uuid());
+        self.kernel
+            .store()
+            .settle_harness_invocation(
+                invocation_id,
+                attempt,
+                HarnessInvocationState::OutcomeUnknown,
+                &terminal_key,
+            )
+            .await?;
+        let failure =
+            failure_request(execution, claimed, &terminal_key, "harness_outcome_unknown")?;
+        failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
     }
 }
 
@@ -400,8 +342,6 @@ enum DispatchRoute {
 fn dispatch_route(payload: &KernelCommandPayload) -> DispatchRoute {
     match payload {
         KernelCommandPayload::InvokeHarness(_) => DispatchRoute::Harness,
-        // RequestApproval has a canonical Slice 2 wait. Context and event requests remain
-        // defensive only until their canonical runtime states and resolution events exist.
         KernelCommandPayload::RequestContext(_)
         | KernelCommandPayload::WaitForEvent(_)
         | KernelCommandPayload::RequestApproval(_) => DispatchRoute::Unavailable,
@@ -422,11 +362,7 @@ fn failure_request(
         task_id: claimed.task_id.clone(),
         command_id: claimed.id.clone(),
         expected_command_revision: claimed.revision,
-        idempotency_key: idempotency_key(format!(
-            "{prefix}:{}:{}",
-            claimed.id.as_uuid(),
-            claimed.revision
-        ))?,
+        idempotency_key: idempotency_key(format!("{prefix}:{}", claimed.id.as_uuid()))?,
         code: code.to_owned(),
     })
 }
@@ -495,168 +431,6 @@ async fn failure_or_audit_late(
         }
         Err(error) => Err(error),
     }
-}
-
-pub(crate) fn completion_tool(task: &CompiledTask) -> Value {
-    json!({"type":"function", "name":"complete_task", "description":"Complete the current task with one declared outcome.", "parameters":{"type":"object", "additionalProperties":false, "properties":{"outcome":{"type":"string"}, "fields":{"type":"object"}}, "required":["outcome", "fields"]}, "outcomes": task.completion.outcomes})
-}
-
-pub(crate) fn completion_tool_from_schema(result_schema: &ClosedSchema) -> Value {
-    let (outcome, fields) = match completion_contract(result_schema) {
-        Ok((outcome, outcomes)) => {
-            let field_properties = outcomes
-                .values()
-                .filter_map(|schema| match schema {
-                    ClosedSchema::Object { properties, .. } => Some(properties),
-                    _ => None,
-                })
-                .flat_map(|properties| properties.iter())
-                .map(|(name, schema)| (name.clone(), model_schema_json(schema)))
-                .collect::<Map<_, _>>();
-            let required = if outcomes.len() == 1 {
-                field_properties.keys().cloned().collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            (
-                model_schema_json(outcome),
-                json!({
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": field_properties,
-                    "required": required,
-                }),
-            )
-        }
-        Err(_) => (
-            json!({"type": "string", "enum": []}),
-            json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {},
-                "required": [],
-            }),
-        ),
-    };
-    json!({
-        "type": "function",
-        "name": "complete_task",
-        "description": "Complete the current task with one declared outcome.",
-        "parameters": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "outcome": outcome,
-                "fields": fields,
-            },
-            "required": ["outcome", "fields"],
-        },
-    })
-}
-
-fn model_schema_json(schema: &ClosedSchema) -> Value {
-    match schema {
-        ClosedSchema::Boolean => json!({"type": "boolean"}),
-        ClosedSchema::Integer => json!({"type": "integer"}),
-        ClosedSchema::Number => json!({"type": "number"}),
-        ClosedSchema::String => json!({"type": "string"}),
-        ClosedSchema::Array(items) => {
-            json!({"type": "array", "items": model_schema_json(items)})
-        }
-        ClosedSchema::Object { properties, .. } => json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": properties.iter().map(|(name, schema)| {
-                (name.clone(), model_schema_json(schema))
-            }).collect::<Map<_, _>>(),
-            "required": properties.keys().collect::<Vec<_>>(),
-        }),
-        ClosedSchema::Enum(values) => {
-            let values = values
-                .iter()
-                .map(|value| match value {
-                    PrimitiveValue::Boolean(value) => Value::Bool(*value),
-                    PrimitiveValue::Integer(value) => Value::Number((*value).into()),
-                    PrimitiveValue::String(value) => Value::String(value.clone()),
-                })
-                .collect::<Vec<_>>();
-            let kind = match values.first() {
-                Some(Value::Bool(_)) => "boolean",
-                Some(Value::Number(_)) => "integer",
-                _ => "string",
-            };
-            json!({"type": kind, "enum": values})
-        }
-        ClosedSchema::Nullable(inner) => {
-            json!({"anyOf": [model_schema_json(inner), {"type": "null"}]})
-        }
-    }
-}
-
-pub(crate) fn parse_completion_item(item: &Value) -> Option<(String, Value)> {
-    if item.get("type")?.as_str()? != "function_call"
-        || item.get("name")?.as_str()? != "complete_task"
-    {
-        return None;
-    }
-    let arguments = item.get("arguments")?;
-    let arguments = arguments
-        .as_str()
-        .and_then(|text| serde_json::from_str(text).ok())
-        .unwrap_or_else(|| arguments.clone());
-    Some((
-        arguments.get("outcome")?.as_str()?.to_owned(),
-        arguments.get("fields")?.clone(),
-    ))
-}
-
-pub(crate) fn validate_completion(
-    task: &CompiledTask,
-    outcome: &str,
-    fields: &Value,
-) -> Result<(), StoreError> {
-    let expected = task.completion.outcomes.get(outcome).ok_or_else(|| {
-        StoreError::InvalidData("model selected an undeclared outcome".to_owned())
-    })?;
-    let actual = fields.as_object().ok_or_else(|| {
-        StoreError::InvalidData("model completion fields must be an object".to_owned())
-    })?;
-    if actual.len() != expected.len() || expected.keys().any(|field| !actual.contains_key(field)) {
-        return Err(StoreError::InvalidData(
-            "model completion fields do not match the selected outcome".to_owned(),
-        ));
-    }
-    for (name, ty) in expected {
-        if !matches_type(&actual[name], ty) {
-            return Err(StoreError::InvalidData(format!(
-                "model completion field has the wrong type: {name}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn matches_type(value: &Value, ty: &CompiledType) -> bool {
-    match ty {
-        CompiledType::String => value.is_string(),
-        CompiledType::Integer => value.as_i64().is_some() || value.as_u64().is_some(),
-        CompiledType::Number => value.is_number(),
-        CompiledType::Boolean => value.is_boolean(),
-        CompiledType::Optional(inner) => value.is_null() || matches_type(value, inner),
-        CompiledType::List(inner) => value
-            .as_array()
-            .is_some_and(|items| items.iter().all(|item| matches_type(item, inner))),
-        CompiledType::Record(_) => value.is_object(),
-    }
-}
-
-fn harness_tool_json(tool: &HarnessTool) -> Value {
-    json!({
-        "type": "function",
-        "name": tool.qualified_name,
-        "description": tool.descriptor.get("description").and_then(Value::as_str).unwrap_or(""),
-        "parameters": tool.descriptor.get("input").cloned().unwrap_or_else(|| json!({"type":"object", "properties":{}, "additionalProperties":false})),
-    })
 }
 
 #[cfg(test)]

@@ -2,10 +2,8 @@ mod harness;
 mod recovery;
 mod transition;
 
-pub use harness::{
-    AgentCommandDispatcher, DirectLoopHarnessExecutor, HarnessCommandExecutor,
-    HarnessExecutionError, HarnessExecutionResult,
-};
+pub use crate::harness::{HarnessExecutionError, HarnessExecutionResult};
+pub use harness::AgentCommandDispatcher;
 pub use recovery::RecoveryReport;
 pub use transition::{FrameSnapshot, TransitionError, next_command};
 
@@ -22,7 +20,7 @@ use crate::{
     ToolCall, ToolError, ToolResolver, ToolStatus, canonical_sha256,
 };
 
-use harness::{completion_tool, parse_completion_item, validate_completion};
+use crate::harness::{completion_tool, parse_completion_item, validate_completion};
 
 pub struct Engine {
     pub store: Arc<PostgresStore>,
