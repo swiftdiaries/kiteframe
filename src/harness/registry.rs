@@ -65,15 +65,25 @@ where
 
 #[derive(Clone)]
 pub struct HarnessRegistry {
-    plugins: Arc<Mutex<BTreeMap<super::HarnessProfileId, RegisteredPlugin>>>,
+    plugins: Arc<Mutex<BTreeMap<super::HarnessProfileId, HarnessRuntimeRegistration>>>,
     active: Arc<Mutex<ActiveInvocations>>,
 }
 
 #[derive(Clone)]
-struct RegisteredPlugin {
+pub(crate) struct HarnessRuntimeRegistration {
     digest: String,
     plugin: Arc<dyn HarnessPlugin>,
     max_pre_accept_attempts: u64,
+}
+
+impl HarnessRuntimeRegistration {
+    pub(crate) fn profile_digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub(crate) fn pre_accept_attempt_limit(&self) -> u64 {
+        self.max_pre_accept_attempts
+    }
 }
 
 struct ActiveInvocations {
@@ -246,7 +256,7 @@ impl HarnessRegistry {
         }
         plugins.insert(
             profile.id.clone(),
-            RegisteredPlugin {
+            HarnessRuntimeRegistration {
                 digest,
                 plugin,
                 max_pre_accept_attempts,
@@ -280,21 +290,15 @@ impl HarnessRegistry {
             })
     }
 
-    pub(crate) fn pre_accept_attempt_limit(
+    pub(crate) fn runtime_registration(
         &self,
         profile_id: &super::HarnessProfileId,
-    ) -> Result<u64, HarnessFailure> {
+    ) -> Option<HarnessRuntimeRegistration> {
         self.plugins
             .lock()
             .expect("harness registry lock is not poisoned")
             .get(profile_id)
-            .map(|registered| registered.max_pre_accept_attempts)
-            .ok_or_else(|| {
-                HarnessFailure::new(
-                    "harness_profile_unavailable",
-                    "selected harness profile is not registered",
-                )
-            })
+            .cloned()
     }
 
     pub(crate) fn sole_profile_id_for_transport(
@@ -397,15 +401,30 @@ impl HarnessRegistry {
         next_sequence: u64,
         acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
     ) -> ManagedHarnessInvocation {
-        let Some(plugin) = self
-            .plugins
-            .lock()
-            .expect("harness registry lock is not poisoned")
-            .get(&request.profile_id)
-            .map(|registered| registered.plugin.clone())
-        else {
+        let Some(registration) = self.runtime_registration(&request.profile_id) else {
             return ManagedHarnessInvocation::settled(canonical_profile_unavailable_terminal());
         };
+        self.invoke_registered_managed_from_sequence_with_acceptance_barrier(
+            registration,
+            request,
+            approvals,
+            sink,
+            next_sequence,
+            acceptance_barrier,
+        )
+        .await
+    }
+
+    pub(crate) async fn invoke_registered_managed_from_sequence_with_acceptance_barrier(
+        &self,
+        registration: HarnessRuntimeRegistration,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+        next_sequence: u64,
+        acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
+    ) -> ManagedHarnessInvocation {
+        let plugin = registration.plugin;
         let envelope = HarnessRequestEnvelope::new(request.clone());
         if let Err(error) = envelope.validate() {
             return ManagedHarnessInvocation::settled(HarnessTerminal::Failed(error));
@@ -699,14 +718,26 @@ mod tests {
             .register_with_pre_accept_attempt_limit(plugin(custom_id.as_str()), 1)
             .await
             .unwrap();
-        assert_eq!(registry.pre_accept_attempt_limit(&custom_id).unwrap(), 1);
+        assert_eq!(
+            registry
+                .runtime_registration(&custom_id)
+                .unwrap()
+                .pre_accept_attempt_limit(),
+            1
+        );
 
         let default_id = HarnessProfileId::new("default-limit-v1").unwrap();
         registry
             .register(plugin(default_id.as_str()))
             .await
             .unwrap();
-        assert_eq!(registry.pre_accept_attempt_limit(&default_id).unwrap(), 3);
+        assert_eq!(
+            registry
+                .runtime_registration(&default_id)
+                .unwrap()
+                .pre_accept_attempt_limit(),
+            3
+        );
     }
 
     #[tokio::test]

@@ -169,6 +169,13 @@ pub(crate) fn canonical_profile_unavailable_terminal() -> HarnessTerminal {
     ))
 }
 
+pub(crate) fn canonical_profile_digest_mismatch_terminal() -> HarnessTerminal {
+    HarnessTerminal::Failed(HarnessFailure::new(
+        "harness_protocol_incompatible",
+        "runtime harness profile digest does not match durable registration",
+    ))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HarnessInvocationRequest {

@@ -7,8 +7,9 @@ use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
     HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal, HarnessTransport,
     PostgresHarnessEventSink, canonical_builtin_unavailable_terminal_payload,
-    canonical_outcome_unknown_terminal_payload, canonical_profile_unavailable_terminal,
-    dispatch_with_terminal_journal, postgres_harness_acceptance_barrier, terminal_idempotency_key,
+    canonical_outcome_unknown_terminal_payload, canonical_profile_digest_mismatch_terminal,
+    canonical_profile_unavailable_terminal, dispatch_with_terminal_journal,
+    postgres_harness_acceptance_barrier, terminal_idempotency_key,
 };
 use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
 use crate::{
@@ -398,16 +399,17 @@ impl AgentCommandDispatcher {
         #[cfg(feature = "test-support")]
         self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::BeforeJournalInsert)
             .await;
-        let prepared = if let Some(stored) = self
+        let stored = self
             .kernel
             .store()
             .harness_invocation_for_command_revision(&claimed.id, claimed.revision)
-            .await?
-        {
+            .await?;
+        let (prepared, runtime_registration) = if let Some(stored) = stored {
             if stored.payload_digest != claimed.payload_digest {
                 return Err(StoreError::IdempotencyConflict);
             }
-            stored
+            let runtime_registration = self.registry.runtime_registration(&stored.profile_id);
+            (stored, runtime_registration)
         } else {
             let profile_id = self
                 .routes
@@ -428,12 +430,13 @@ impl AgentCommandDispatcher {
                 return failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
                     .await;
             };
-            let max_pre_accept_attempts = self
-                .registry
-                .pre_accept_attempt_limit(&profile_id)
-                .unwrap_or(1);
+            let runtime_registration = self.registry.runtime_registration(&profile_id);
+            let max_pre_accept_attempts = runtime_registration
+                .as_ref()
+                .map_or(1, |registration| registration.pre_accept_attempt_limit());
             let candidate = HarnessInvocationId::new(uuid::Uuid::now_v7());
-            self.kernel
+            let prepared = self
+                .kernel
                 .store()
                 .prepare_harness_invocation_with_attempt_limit(
                     PrepareHarnessInvocation {
@@ -446,7 +449,8 @@ impl AgentCommandDispatcher {
                     },
                     max_pre_accept_attempts,
                 )
-                .await?
+                .await?;
+            (prepared, runtime_registration)
         };
         #[cfg(feature = "test-support")]
         self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterPrepare)
@@ -461,13 +465,23 @@ impl AgentCommandDispatcher {
                     .await
             },
             || async {
-                if self.registry.profile_digest(&profile_id).is_err() {
+                let Some(runtime_registration) = runtime_registration else {
                     return self
                         .settle_harness_terminal(
                             execution,
                             &claimed,
                             &prepared,
                             canonical_profile_unavailable_terminal(),
+                        )
+                        .await;
+                };
+                if runtime_registration.profile_digest() != prepared.profile_digest {
+                    return self
+                        .settle_harness_terminal(
+                            execution,
+                            &claimed,
+                            &prepared,
+                            canonical_profile_digest_mismatch_terminal(),
                         )
                         .await;
                 }
@@ -565,7 +579,8 @@ impl AgentCommandDispatcher {
                 let store = self.kernel.store_arc();
                 let lifecycle = self
                     .registry
-                    .invoke_managed_from_sequence_with_acceptance_barrier(
+                    .invoke_registered_managed_from_sequence_with_acceptance_barrier(
+                        runtime_registration,
                         request,
                         self.approvals.clone(),
                         Arc::new(PostgresHarnessEventSink::new(store.clone())),

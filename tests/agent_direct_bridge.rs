@@ -620,8 +620,16 @@ impl BridgeFixture {
     }
 }
 
-async fn selected_unconfigured_dispatcher(
+#[derive(Clone, Copy)]
+enum SelectedRuntimeProfile {
+    Absent,
+    Matching,
+    Mismatched,
+}
+
+async fn selected_profile_dispatcher(
     fixture: &BridgeFixture,
+    runtime: SelectedRuntimeProfile,
     barrier: Option<Arc<HarnessDispatcherTestBarrier>>,
 ) -> (HarnessProfile, AgentCommandDispatcher) {
     let selected = HarnessProfile::from_json(include_bytes!(
@@ -649,6 +657,19 @@ async fn selected_unconfigured_dispatcher(
         )))
         .await
         .unwrap();
+    if !matches!(runtime, SelectedRuntimeProfile::Absent) {
+        let mut runtime_profile = selected.clone();
+        if matches!(runtime, SelectedRuntimeProfile::Mismatched) {
+            runtime_profile.source_repository.push_str("/digest-drift");
+        }
+        registry
+            .register(Arc::new(BuiltinHarnessPlugin::new(
+                runtime_profile,
+                fixture.model.clone(),
+            )))
+            .await
+            .unwrap();
+    }
     let routes = HarnessConfig::from_test_values([(
         "KITEFRAME_REASONING_HARNESS_PROFILE",
         selected.id.as_str(),
@@ -745,7 +766,8 @@ async fn selected_unconfigured_profile_settles_one_durable_failure_without_fallb
             .fetch_one(&fixture.pool)
             .await
             .unwrap();
-    let (selected, dispatcher) = selected_unconfigured_dispatcher(&fixture, None).await;
+    let (selected, dispatcher) =
+        selected_profile_dispatcher(&fixture, SelectedRuntimeProfile::Absent, None).await;
     let selected_digest = selected.digest().unwrap();
     fixture.dispatcher = dispatcher;
 
@@ -859,7 +881,12 @@ async fn cancellation_wins_over_selected_unconfigured_profile_failure() {
     let barrier = Arc::new(HarnessDispatcherTestBarrier::new(
         HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal,
     ));
-    let (_, dispatcher) = selected_unconfigured_dispatcher(&fixture, Some(barrier.clone())).await;
+    let (_, dispatcher) = selected_profile_dispatcher(
+        &fixture,
+        SelectedRuntimeProfile::Absent,
+        Some(barrier.clone()),
+    )
+    .await;
     let dispatch = tokio::spawn(async move { dispatcher.tick_agent_commands(8).await });
     if tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -942,7 +969,12 @@ async fn restart_reuses_unconfigured_profile_invocation_and_settles_it_once() {
     let barrier = Arc::new(HarnessDispatcherTestBarrier::new(
         HarnessDispatcherTestBarrierPoint::AfterPrepare,
     ));
-    let (_, first) = selected_unconfigured_dispatcher(&fixture, Some(barrier.clone())).await;
+    let (_, first) = selected_profile_dispatcher(
+        &fixture,
+        SelectedRuntimeProfile::Absent,
+        Some(barrier.clone()),
+    )
+    .await;
     let interrupted = tokio::spawn(async move { first.tick_agent_commands(8).await });
     barrier.wait_until_entered().await;
     let prepared = fixture
@@ -957,7 +989,8 @@ async fn restart_reuses_unconfigured_profile_invocation_and_settles_it_once() {
     barrier.release();
     assert!(interrupted.await.unwrap_err().is_cancelled());
 
-    let (_, restarted) = selected_unconfigured_dispatcher(&fixture, None).await;
+    let (_, restarted) =
+        selected_profile_dispatcher(&fixture, SelectedRuntimeProfile::Absent, None).await;
     assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
     let settled = fixture
         .store
@@ -991,6 +1024,118 @@ async fn restart_reuses_unconfigured_profile_invocation_and_settles_it_once() {
         restarted.recover_harness_invocations(8).await.unwrap(),
         kiteframe::HarnessRecoveryReport::default()
     );
+}
+
+#[tokio::test]
+async fn mismatched_runtime_profile_digest_fails_before_plugin_work_and_attests_durable_identity() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(mut fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    let goal_before: Value =
+        sqlx::query_scalar("SELECT to_jsonb(goal_states) FROM goal_states WHERE task_id = $1")
+            .bind(fixture.task_id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    fixture
+        .model
+        .complete("ok", json!({"answer":"must not execute"}));
+    let (durable, dispatcher) =
+        selected_profile_dispatcher(&fixture, SelectedRuntimeProfile::Mismatched, None).await;
+    let durable_digest = durable.digest().unwrap();
+    fixture.dispatcher = dispatcher;
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let invocation = fixture
+        .store
+        .harness_invocation_for_command_revision(&command.id, command.revision + 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM harness_invocation_events WHERE invocation_id = $1",
+    )
+    .bind(invocation.invocation_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let command_result: Value =
+        sqlx::query_scalar("SELECT result FROM agent_commands WHERE id = $1")
+            .bind(command.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    let goal_after: Value =
+        sqlx::query_scalar("SELECT to_jsonb(goal_states) FROM goal_states WHERE task_id = $1")
+            .bind(fixture.task_id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+
+    assert_eq!(invocation.profile_id, durable.id);
+    assert_eq!(invocation.profile_digest, durable_digest);
+    assert_eq!(invocation.state, HarnessInvocationState::Failed);
+    assert!(invocation.terminal);
+    assert_eq!(
+        invocation.terminal_payload,
+        Some(json!({
+            "type":"failed",
+            "code":"harness_protocol_incompatible",
+            "detail":"runtime harness profile digest does not match durable registration",
+        }))
+    );
+    assert_eq!(fixture.model.calls(), 0);
+    assert_eq!(event_count, 0);
+    assert!(fixture.evidence().await.is_empty());
+    assert_eq!(
+        command_result["payload"]["code"],
+        "harness_protocol_incompatible"
+    );
+    assert_eq!(goal_after, goal_before);
+    assert_eq!(fixture.current().await.goal_phase, GoalPhase::Active);
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 0);
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_harness_invocations(8)
+            .await
+            .unwrap(),
+        kiteframe::HarnessRecoveryReport::default()
+    );
+}
+
+#[tokio::test]
+async fn matching_runtime_profile_digest_executes_under_the_same_durable_identity() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(mut fixture) = BridgeFixture::started().await else {
+        return;
+    };
+    let command = fixture.pending_command().await;
+    fixture
+        .model
+        .complete("ok", json!({"answer":"exact identity"}));
+    let (durable, dispatcher) =
+        selected_profile_dispatcher(&fixture, SelectedRuntimeProfile::Matching, None).await;
+    let durable_digest = durable.digest().unwrap();
+    fixture.dispatcher = dispatcher;
+
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let invocation = fixture
+        .store
+        .harness_invocation_for_command_revision(&command.id, command.revision + 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(invocation.profile_id, durable.id);
+    assert_eq!(invocation.profile_digest, durable_digest);
+    assert_eq!(invocation.state, HarnessInvocationState::Completed);
+    assert!(invocation.terminal);
+    assert_eq!(fixture.model.calls(), 1);
+    assert_eq!(fixture.evidence().await.len(), 1);
+    assert_eq!(fixture.current().await.goal_phase, GoalPhase::Active);
 }
 
 #[tokio::test]
