@@ -99,3 +99,47 @@ Before considering a feature ready:
 durable integration evidence. A skipped or unconfigured database test is not
 evidence that migrations, transactions, recovery, or concurrency behavior is
 correct.
+
+## Slice 3 dual-harness release gate
+
+The built-in Responses harness, Codex ACP, and DeepSeek Harness ACP share one
+`HarnessPlugin` contract. Deterministic conformance proves the portable core:
+fresh session, text prompt, one-shot permission, cancellation, and committed
+output. Run these focused checks from the repository root before the broader
+release matrix:
+
+```bash
+cargo test --features test-support --test harness_acp_conformance --test harness_acp_recovery
+cargo test --test harness_profiles --test harness_plugin_protocol --test harness_builtin_conformance
+cargo test --test harness_store
+KITEFRAME_CODEX_ACP_COMMAND_JSON='["/absolute/codex-acp"]' KITEFRAME_CODEX_ACP_SOURCE_REVISION='296069e841634cd4bb9bc4515602d836e49231ec' cargo test --test harness_acp_live codex_acp_live_core -- --exact --nocapture
+KITEFRAME_DSH_ACP_COMMAND_JSON='["pnpm","--dir","/absolute/deepseek-harness","run","demo:acp"]' KITEFRAME_DSH_ACP_SOURCE_REVISION='141eb6fef83422698aef7a981029e843e8161534' cargo test --test harness_acp_live deepseek_harness_acp_live_core -- --exact --nocapture
+```
+
+Each configured executable and checkout must be built from the exact checked-in
+repository and full commit named by its profile. The source-revision environment
+value is a deployment attestation checked before process spawn. A different
+revision, or an incompatible observed ACP protocol or capability set, fails
+before invocation. Self-reported implementation names and versions are audit
+metadata only; they do not establish deployment identity.
+
+The two live commands are independent certification gates. If a provider command
+or its required explicit authentication environment is absent, record that
+provider's exact `SKIP` line. Do not convert a skip into live-adapter
+implementation evidence. Use an isolated disposable PostgreSQL instance for
+the database suites below, then remove it after the matrix.
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo check --all-targets --all-features
+cargo test --features test-support --test harness_profiles --test harness_plugin_protocol --test harness_builtin_conformance --test harness_acp_conformance --test harness_acp_recovery --test repository_shape
+cargo test --test harness_store --test postgres_lock_order
+cargo test --all-features --test agent_runtime_contract --test agent_lifecycle_store --test agent_start --test kite_agent_runtime --test agent_transition_store --test agent_goal_authority --test agent_direct_bridge --test agent_protocol --test e2e_agent_restart --test acp_conformance --test transports
+cargo test --all-features
+cargo check --no-default-features --lib --bin kiteframe-harness
+python -m pytest clients/python/tests
+bun --cwd clients/typescript test
+bun --cwd clients/typescript run typecheck
+git diff --check
+```

@@ -14,12 +14,13 @@ are implemented. Workflows can model typed tasks, model outcomes, MCP tools,
 questions, child calls, parallel work, limits, and terminal results. Start with
 the small [support workflow](examples/support.kite).
 
-Declarative-agent work is complete through the first two V1 slices:
+Declarative-agent work is complete through the first three V1 slices:
 
 | Completed slice | Available outcome |
 |---|---|
 | 1. Authoring and durable intent | Versioned `agent` definitions, immutable publication, canonical `UserTask` submission, and one frozen immutable `GoalContract` per accepted task. |
 | 2. Authoritative agent lifecycle | Exact-version agent start, the built-in `kite.v1` runtime, revisioned task/goal/snapshot transitions, command journaling, evidence-backed complete/block authority, pause/resume/cancel, recovery, and the bounded direct-loop harness executor. |
+| 3. Dual ACP harnesses | Built-in Responses, Codex ACP and DeepSeek Harness ACP implement one `HarnessPlugin` contract with deployment-owned profiles, portable ACP conformance, durable invocation recovery, and fail-closed capabilities. |
 
 For a practical overview, read the [developer guide](docs/guides/building-on-kiteframe.md).
 For feature work, use the [testing guide](docs/guides/testing-kiteframe.md).
@@ -78,9 +79,18 @@ The implemented Slice 2 path provides immutable exact-version start, a pure
 built-in `kite.v1` runtime, revisioned task/goal/snapshot transitions, an
 ordered command journal, evidence-backed complete/block authority,
 pause/resume/cancel, restart recovery, and a bounded direct-loop harness
-executor. The main process scheduler owns the durable agent dispatcher and
-builds it from the application's shared kernel and the same model client used
-by `Engine`.
+executor. Slice 3 places that built-in Responses path, Codex ACP, and DeepSeek
+Harness ACP behind the same versioned `HarnessPlugin` contract. The main
+process scheduler owns the durable agent dispatcher and builds it from the
+application's shared kernel and the same model client used by `Engine`.
+
+Codex ACP and DeepSeek Harness ACP share the portable required core: a fresh
+session, text prompt, one-shot permission, cancellation, and committed output.
+Richer Codex capabilities are optional and fail closed when a selected profile
+does not advertise them. DeepSeek uses fresh, connection-owned sessions; it
+does not promise resume, editor, MCP, or rich progress surfaces. A harness
+terminal supplies bounded invocation evidence only. The Rust kernel alone
+commits durable task and goal state.
 
 These ACP extensions are private application methods, not a public provider or
 plugin protocol:
@@ -105,12 +115,13 @@ mint only `harness.invocation_result` evidence. Only Rust-validated
 The GitHub-typed `babysit_pr` goal therefore cannot complete end to end until
 later context and connector slices provide authorized GitHub evidence.
 
-No stable plugin/provider surface, external runtime transport, semantic
-channel binding, context/event resolver, worker/lease system, hierarchical
-budget/profile system, provider connector, Codex or DeepSeek Harness
-integration, editor worker, or Cursor/VS Code extension is implemented. The
-example is a reviewed language/runtime fixture, not a claim that the product
-vertical is operational.
+Cordis auto-composability, dynamic package lifecycle, marketplaces, hot reload,
+and runtime-generated authority are deferred from V1. GitHub connectors, IDE
+delivery, guarded worker leases, Slice 4 context/event infrastructure, Slice 5
+work delivery, Slice 6 connector control plane, Slice 7 editor path, and Slice
+8 `babysit_pr` E2E completion are not implemented by Slice 3. The example is a
+reviewed language/runtime fixture, not a claim that the product vertical is
+operational.
 
 ## Planned V1 slices
 
@@ -119,7 +130,6 @@ surfaces:
 
 | Slice | Intended outcome |
 |---|---|
-| 3. Replaceable harness and plugin boundary | A built-in harness plus Codex and DeepSeek Harness profiles behind one versioned, capability-aware ACP/plugin protocol. |
 | 4. Context and event ingress | Provenance-bearing context, semantic events, bindings, deduplication, correlation, and durable waits. |
 | 5. Guarded local work delivery | Work items, approvals, IDE worker offers, leases, fencing, and uncertain-outcome recovery. |
 | 6. Governed connector control plane | Connector identity, secret references, data classification, profiles, and budget enforcement. |

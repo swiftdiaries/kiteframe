@@ -7,7 +7,6 @@ fn repository_contains_one_runtime() {
     for removed in [
         "crates",
         "python",
-        "fuzz",
         "openfga",
         "runtime-targets",
         "schemas",
@@ -99,5 +98,48 @@ fn private_control_plane_exposes_task_lifecycle_but_not_goal_authority() {
             !source.contains(forbidden),
             "unexpected command: {forbidden}"
         );
+    }
+}
+
+#[test]
+fn public_docs_name_both_v1_acp_profiles_and_exclude_dynamic_cordis() {
+    let readme = std::fs::read_to_string("README.md").unwrap();
+    let guide = std::fs::read_to_string("docs/guides/building-on-kiteframe.md").unwrap();
+    assert!(readme.contains("Codex ACP and DeepSeek Harness ACP"));
+    assert!(guide.contains("portable ACP core"));
+    assert!(guide.contains("Cordis auto-composability is deferred from V1"));
+}
+
+#[test]
+fn no_v1_runtime_surface_exposes_cordis_package_lifecycle() {
+    let mut sources = Vec::new();
+    collect_rust_sources(std::path::Path::new("src"), &mut sources);
+
+    for source in sources {
+        let text = std::fs::read_to_string(&source).unwrap();
+        for forbidden in [
+            "cordis_define",
+            "cordis_run",
+            "cordis_stop",
+            "CompositionProposed",
+            "PackageActivated",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{forbidden} leaked into {}",
+                source.display()
+            );
+        }
+    }
+}
+
+fn collect_rust_sources(directory: &std::path::Path, sources: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_rust_sources(&path, sources);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            sources.push(path);
+        }
     }
 }

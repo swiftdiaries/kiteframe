@@ -16,7 +16,7 @@ Choose the path that matches your work:
 
 ## Build with Kiteframe today
 
-The completed Slice 1–2 surface supports these durable building blocks:
+The completed Slice 1–3 surface supports these durable building blocks:
 
 1. Author a `workflow` or `agent` definition in `.kite`.
 2. Publish an immutable version of that definition.
@@ -26,6 +26,19 @@ The completed Slice 1–2 surface supports these durable building blocks:
    surface, using expected revisions and idempotency keys.
 5. Read the bounded lifecycle view or ordered task events from the same
    session-scoped authority.
+
+For bounded harness work, Built-in Responses, Codex ACP, and DeepSeek Harness
+ACP implement one versioned `HarnessPlugin` contract. Codex and DeepSeek share
+the portable ACP core: fresh session, text prompt, one-shot permission,
+cancellation, and committed output. Deployment-owned `HarnessProfile` IDs
+select the implementation; `.kite` source remains provider-free. Rich Codex
+features are optional and fail closed when requested from a profile that does
+not support them. DeepSeek uses fresh, connection-owned sessions and does not
+promise resume, editor, MCP, or rich progress surfaces.
+
+Harness output is bounded invocation evidence. Only the Rust kernel can commit
+durable task, goal, snapshot, command, policy, and evidence state. Cordis auto-composability is deferred from V1, as are dynamic package lifecycle,
+marketplaces, hot reload, and runtime-generated authority.
 
 The application currently exposes the following private ACP extension methods:
 
@@ -82,17 +95,18 @@ coverage.
 |---|---|---|
 | 1. Authoring and durable intent | Complete | Immutable agent definitions and accepted task/goal intent. |
 | 2. Authoritative lifecycle | Complete | Rust-owned transitions, commands, evidence, recovery, and bounded direct-loop execution. |
-| 3. Replaceable harness and plugins | Planned | One portable ACP core, capability-aware conformance, and built-in, Codex, and DeepSeek Harness profiles. |
+| 3. Replaceable harness and plugins | Complete | Built-in Responses plus Codex ACP and DeepSeek Harness ACP profiles behind one versioned `HarnessPlugin` contract and portable ACP core. |
 | 4. Context and events | Planned | Authenticated context/event ingress, correlation, and durable waits. |
 | 5. Guarded work delivery | Planned | Work items, approvals, leases, fencing, and uncertain-outcome reconciliation. |
 | 6. Connector control plane | Planned | Profiles, classification, secrets, connector policy, and budgets. |
 | 7. GitHub, coding harnesses, and editors | Planned | GitHub evidence, Codex- and DeepSeek-Harness-compatible ACP, VS Code, and a thin Cursor adapter. |
 | 8. `babysit_pr` release | Planned | The complete, evidence-backed review-and-repair product loop, verified once per V1 harness. |
 
-Do not add plugin registration, connector/provider identity, semantic-channel,
-worker/lease, budget/profile, secret, Codex, DeepSeek Harness, or editor fields
-to Slice 2 contracts. Those are later-slice design commitments, not incomplete
-fields waiting to be filled in.
+Do not add connector/provider identity to `.kite`, semantic-channel,
+worker/lease, budget/profile, secret, context/event, work-delivery, connector
+control-plane, editor, or Cordis package-lifecycle fields to the Slice 3
+contracts. Those are later-slice design commitments, not incomplete fields
+waiting to be filled in.
 
 ## Common mistakes
 

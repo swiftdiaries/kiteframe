@@ -4,7 +4,9 @@ This reference freezes the Slice 2 Rust contract between an agent runtime and
 the authoritative Kiteframe kernel. Slice 2 implements the pure built-in
 `KiteAgentRuntime` (`kite.v1`) and a bounded direct-loop harness executor. The
 kernel remains the only durable task, goal, snapshot, command, policy, and
-evidence authority; a harness cannot mutate those aggregates directly.
+evidence authority; a harness cannot mutate those aggregates directly. Slice 3
+adds a versioned `HarnessPlugin` boundary around built-in Responses, Codex ACP,
+and DeepSeek Harness ACP without weakening that authority.
 
 ## Authoritative state
 
@@ -332,7 +334,47 @@ boundary. Stable failures use fixed coarse transport codes/messages. Transport
 request logs contain only the allowlisted method, coarse error code, transport,
 and expected task revision when present; they do not record request content.
 
-This is not a public plugin/provider protocol. External runtime transports,
-registration and capability negotiation, connectors, semantic channels,
-workers/leases, budgets/profiles, secrets, Codex integration, and editor
-integrations remain later-slice work.
+## Slice 3 implementation evidence — 2026-08-22
+
+Slice 3 implements one versioned `HarnessPlugin` contract for built-in
+Responses, Codex ACP, and DeepSeek Harness ACP. The Codex and DeepSeek profiles
+require the same portable ACP core: fresh session, text prompt, permission once,
+cancellation, and committed output. Optional rich Codex features fail closed
+when a profile does not support them. DeepSeek sessions are fresh and
+connection-owned; this profile does not promise resume, editor, MCP, or rich
+progress surfaces.
+
+Harness results are bounded invocation evidence. The Rust kernel is the only
+authority that validates and commits durable task, goal, snapshot, command,
+policy, and evidence state. A harness terminal cannot complete or block a
+durable goal.
+
+- Implementation range: `ca09f321672f90da5acca6aa2abf7e69ce6a6694..d746ce5`.
+  Current Slice 3 production implementation commit: `d746ce5`. The separate
+  release-gating test stability prerequisite is `840b0fb`.
+- Review status: Tasks 1–7 received their cumulative Slice 3 review and strict
+  lint closure; this Task 8 publication is the evidence input to the remaining
+  cross-task release review.
+- Deterministic harness/profile/recovery matrix: rerun on 2026-08-22, including
+  strict `cargo clippy --all-targets --all-features -- -D warnings`, the full
+  `cargo test --all-features` suite, the portable harness/profile/recovery
+  suites, repository shape, no-default-features harness check, Python client
+  suite, TypeScript test suite, and TypeScript typecheck.
+- PostgreSQL matrix: rerun on 2026-08-22 against a disposable PostgreSQL 16
+  instance for the harness-store, lock-order, ACP recovery, agent lifecycle,
+  and full Rust suites; the container is removed after this publication gate.
+- Codex live result: `SKIP codex live: KITEFRAME_CODEX_ACP_COMMAND_JSON is absent`.
+- DeepSeek live result: `SKIP DeepSeek live: KITEFRAME_DSH_ACP_COMMAND_JSON is absent`.
+
+The two skips are not Codex or DeepSeek live-execution evidence. Each external
+deployment must attest its exact checked-in repository and full source revision
+before spawn; a revision mismatch, incompatible ACP protocol, or incompatible
+capability set fails before invocation. Self-reported implementation names and
+versions are audit metadata only.
+
+Cordis auto-composability, dynamic package lifecycle, marketplaces, hot reload,
+and runtime-generated authority are deferred from V1. GitHub connectors, IDE
+delivery, guarded worker leases, Slice 4 context/event infrastructure, Slice 5
+work delivery, Slice 6 connector control plane, Slice 7 editor path, and Slice
+8 `babysit_pr` E2E completion are not implemented by this evidence. Slices 4–8:
+not implemented by this evidence.
