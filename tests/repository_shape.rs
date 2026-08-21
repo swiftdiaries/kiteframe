@@ -592,6 +592,14 @@ fn ci_structural_guard_requires_remote_pid_capture_immediately_after_launch() {
             "./target/debug/kiteframe-harness &\n          harness_pid=$!",
             "harness_pid=$!\n          ./target/debug/kiteframe-harness &",
         ),
+        (
+            "curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null\n          (cd clients/typescript && bun test)",
+            "curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null\n          responses_pid=$!\n          (cd clients/typescript && bun test)",
+        ),
+        (
+            "curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null\n          (cd clients/typescript && bun test)",
+            "curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null\n          harness_pid=$!\n          (cd clients/typescript && bun test)",
+        ),
     ] {
         let mutated = workflow.replacen(expected, replacement, 1);
         assert!(assert_ci_isolation(&parse_ci_workflow(&mutated).unwrap()).is_err());
@@ -902,9 +910,9 @@ fn assert_remote_smoke_command(step: &CiStep) -> Result<(), String> {
     let fixture = line_position(&lines, "python3 tests/fixtures/responses_ready.py &")?;
     let harness = line_position(&lines, "./target/debug/kiteframe-harness &")?;
     let bun_test = line_position(&lines, "(cd clients/typescript && bun test)")?;
-    if lines.get(fixture + 1) != Some(&"responses_pid=$!")
-        || lines.get(harness + 1) != Some(&"harness_pid=$!")
-    {
+    let responses_pid = line_position(&lines, "responses_pid=$!")?;
+    let harness_pid = line_position(&lines, "harness_pid=$!")?;
+    if responses_pid != fixture + 1 || harness_pid != harness + 1 {
         return Err("remote smoke does not capture launched process PIDs immediately".to_owned());
     }
     if !(cleanup_prefix.len() - 1 < fixture && fixture < harness && harness < bun_test) {
