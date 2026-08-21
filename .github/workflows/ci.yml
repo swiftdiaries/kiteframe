@@ -83,17 +83,60 @@ jobs:
       - name: Install Bun for live TypeScript client smoke
         uses: oven-sh/setup-bun@v2
 
+      - name: Create isolated TypeScript local live-smoke database
+        id: typescript-local-smoke-database
+        shell: bash
+        env:
+          KITEFRAME_SMOKE_DATABASE_NAME: kiteframe_ci_typescript_local_${{ github.run_id }}_${{ github.run_attempt }}
+        run: |
+          python3 tests/ci/isolated_database.py create \
+            --database-url "$DATABASE_URL" \
+            --database-name "$KITEFRAME_SMOKE_DATABASE_NAME" \
+            --github-output "$GITHUB_OUTPUT"
+
       - name: Exercise TypeScript client against the compiled harness
         run: |
           (cd clients/typescript && bun install --frozen-lockfile)
           (cd clients/typescript && bun test)
         env:
-          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}
+          KITEFRAME_INTEGRATION_DATABASE_URL: ${{ steps.typescript-local-smoke-database.outputs.database_url }}
           KITEFRAME_HARNESS_PATH: ${{ github.workspace }}/target/debug/kiteframe-harness
+
+      - name: Drop isolated TypeScript local live-smoke database
+        if: ${{ always() }}
+        shell: bash
+        env:
+          KITEFRAME_SMOKE_DATABASE_NAME: kiteframe_ci_typescript_local_${{ github.run_id }}_${{ github.run_attempt }}
+        run: |
+          python3 tests/ci/isolated_database.py drop \
+            --database-url "$DATABASE_URL" \
+            --database-name "$KITEFRAME_SMOKE_DATABASE_NAME"
+
+      - name: Create isolated TypeScript remote live-smoke database
+        id: typescript-remote-smoke-database
+        shell: bash
+        env:
+          KITEFRAME_SMOKE_DATABASE_NAME: kiteframe_ci_typescript_remote_${{ github.run_id }}_${{ github.run_attempt }}
+        run: |
+          python3 tests/ci/isolated_database.py create \
+            --database-url "$DATABASE_URL" \
+            --database-name "$KITEFRAME_SMOKE_DATABASE_NAME" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Exercise TypeScript client against the remote harness
         shell: bash
         run: |
+          responses_pid=""
+          harness_pid=""
+          cleanup() {
+            for pid in "$harness_pid" "$responses_pid"; do
+              if [ -n "$pid" ]; then
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+              fi
+            done
+          }
+          trap cleanup EXIT
           python3 tests/fixtures/responses_ready.py &
           responses_pid=$!
           for _ in $(seq 1 50); do
@@ -104,13 +147,11 @@ jobs:
           KITEFRAME_BIND=127.0.0.1:38473 \
           KITEFRAME_TLS_TERMINATED=true \
           KITEFRAME_BEARER_BINDINGS='[{"secret":"remote-integration-token","principal":"typescript-remote"}]' \
-          KITEFRAME_DATABASE_URL="$DATABASE_URL" \
           KITEFRAME_RESPONSES_BASE_URL=http://127.0.0.1:38474/v1 \
           KITEFRAME_RESPONSES_API_KEY=integration-test \
           KITEFRAME_RESPONSES_MODEL=test-model \
           ./target/debug/kiteframe-harness &
           harness_pid=$!
-          trap 'kill "$harness_pid" "$responses_pid" 2>/dev/null || true; wait "$harness_pid" "$responses_pid" 2>/dev/null || true' EXIT
           for _ in $(seq 1 50); do
             if curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null; then break; fi
             sleep 0.1
@@ -118,8 +159,19 @@ jobs:
           curl --fail --silent http://127.0.0.1:38473/readyz >/dev/null
           (cd clients/typescript && bun test)
         env:
+          KITEFRAME_DATABASE_URL: ${{ steps.typescript-remote-smoke-database.outputs.database_url }}
           KITEFRAME_REMOTE_INTEGRATION_URL: ws://127.0.0.1:38473/acp
           KITEFRAME_REMOTE_INTEGRATION_TOKEN: remote-integration-token
+
+      - name: Drop isolated TypeScript remote live-smoke database
+        if: ${{ always() }}
+        shell: bash
+        env:
+          KITEFRAME_SMOKE_DATABASE_NAME: kiteframe_ci_typescript_remote_${{ github.run_id }}_${{ github.run_attempt }}
+        run: |
+          python3 tests/ci/isolated_database.py drop \
+            --database-url "$DATABASE_URL" \
+            --database-name "$KITEFRAME_SMOKE_DATABASE_NAME"
 
   python:
     runs-on: ubuntu-latest

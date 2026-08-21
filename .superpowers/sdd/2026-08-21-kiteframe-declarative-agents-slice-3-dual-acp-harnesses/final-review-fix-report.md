@@ -501,3 +501,66 @@ This fix changes only the public status/evidence documentation, its structural
 guard, and this append-only report. It launches no provider and does not change
 production behavior, migrations, or CI execution. Untracked `fuzz/` and
 `site/` remain untouched and unstaged.
+
+---
+
+# Final Review Fix Round 2: Isolate TypeScript Harness Smoke Databases
+
+Date: 2026-08-22
+
+Status: COMPLETE
+
+Review base: `c6c8fd6`
+
+Commit message: `ci: isolate TypeScript harness smoke databases`
+
+## Finding closed
+
+After Rust PostgreSQL tests, both TypeScript harness smoke paths still used
+the job-level `DATABASE_URL`. The compiled local client and the long-lived
+remote harness could therefore observe test-contaminated rows, reproducing the
+post-Rust `RuntimeStateInvalid` failure.
+
+## Resolution
+
+- Added distinct run-scoped databases for the TypeScript local compiled-harness
+  and remote-harness smoke paths, using the existing credential-safe helper.
+  Each create step produces a masked URL output, each smoke consumes only its
+  own output, and each matching force-drop cleanup step uses `always()`.
+- The local client receives its database through
+  `KITEFRAME_INTEGRATION_DATABASE_URL`, which the client passes to the compiled
+  harness. The remote server receives its distinct output directly through
+  `KITEFRAME_DATABASE_URL`; the old job-database fallback was removed.
+- The remote smoke now installs a cleanup trap before launching either the
+  readiness fixture or harness, with initialized PIDs and bounded kill/wait
+  handling for both processes.
+- Extended the parsed YAML repository guard to verify all Python, TypeScript
+  local, and TypeScript remote create/use/cleanup chains, their global order,
+  distinct database names, exact helper arguments, output wiring, and remote
+  cleanup boundary. Negative mutations reject both local and remote fallback
+  URLs, comment decoys, and non-`rust` job decoys.
+
+## TDD evidence
+
+The TypeScript fallback mutation first failed because the existing guard
+accepted it: it only validated the Python chain. The completed structural
+guard rejects that mutation for both TypeScript paths and verifies the new
+workflow mappings rather than raw text.
+
+## Verification
+
+- Parsed YAML structural guard passed, including TypeScript fallback and decoy
+  negative mutations.
+- Local compiled-harness TypeScript smoke against a fresh target: **10 passed**.
+- Remote-harness TypeScript smoke completed against a distinct fresh target;
+  the fixture and harness had no remaining processes afterward.
+- A PostgreSQL 16 simulation retained `ci_contamination_marker` only in the
+  poisoned baseline. Both TypeScript targets had no marker and acquired real
+  SQLx migrations. All three explicitly named disposable databases were then
+  deleted and their absence confirmed.
+
+## Scope
+
+This round changes only CI smoke database wiring, structural workflow tests,
+and this report. It does not change production Rust, client contracts,
+migrations, or the unrelated untracked `fuzz/` and `site/` paths.

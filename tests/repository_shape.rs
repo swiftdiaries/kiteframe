@@ -540,6 +540,24 @@ fn ci_structural_guard_rejects_decoy_comment_and_non_rust_job() {
     assert!(assert_ci_isolation(&parse_ci_workflow(&non_rust_job).unwrap()).is_err());
 }
 
+#[test]
+fn ci_structural_guard_rejects_typescript_database_fallback() {
+    let workflow = std::fs::read_to_string(".github/workflows/ci.yml").unwrap();
+    for (isolated, fallback) in [
+        (
+            "KITEFRAME_INTEGRATION_DATABASE_URL: ${{ steps.typescript-local-smoke-database.outputs.database_url }}",
+            "KITEFRAME_INTEGRATION_DATABASE_URL: ${{ env.DATABASE_URL }}",
+        ),
+        (
+            "KITEFRAME_DATABASE_URL: ${{ steps.typescript-remote-smoke-database.outputs.database_url }}",
+            "KITEFRAME_DATABASE_URL: ${{ env.DATABASE_URL }}",
+        ),
+    ] {
+        let mutated = workflow.replacen(isolated, fallback, 1);
+        assert!(assert_ci_isolation(&parse_ci_workflow(&mutated).unwrap()).is_err());
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CiWorkflow {
     jobs: BTreeMap<String, CiJob>,
@@ -617,6 +635,146 @@ fn assert_ci_isolation(workflow: &CiWorkflow) -> Result<(), String> {
         Some("${{ always() }}"),
     )?;
 
+    let local_create = required_step(
+        rust_steps,
+        "Create isolated TypeScript local live-smoke database",
+    )?;
+    let local_smoke = required_step(
+        rust_steps,
+        "Exercise TypeScript client against the compiled harness",
+    )?;
+    let local_cleanup = required_step(
+        rust_steps,
+        "Drop isolated TypeScript local live-smoke database",
+    )?;
+    let remote_create = required_step(
+        rust_steps,
+        "Create isolated TypeScript remote live-smoke database",
+    )?;
+    let remote_smoke = required_step(
+        rust_steps,
+        "Exercise TypeScript client against the remote harness",
+    )?;
+    let remote_cleanup = required_step(
+        rust_steps,
+        "Drop isolated TypeScript remote live-smoke database",
+    )?;
+    if !(position(cleanup) < position(local_create)
+        && position(local_create) < position(local_smoke)
+        && position(local_smoke) < position(local_cleanup)
+        && position(local_cleanup) < position(remote_create)
+        && position(remote_create) < position(remote_smoke)
+        && position(remote_smoke) < position(remote_cleanup))
+    {
+        return Err("TypeScript CI smoke chains are out of order".to_owned());
+    }
+
+    let local_database =
+        "kiteframe_ci_typescript_local_${{ github.run_id }}_${{ github.run_attempt }}";
+    let remote_database =
+        "kiteframe_ci_typescript_remote_${{ github.run_id }}_${{ github.run_attempt }}";
+    if local_database == database_name
+        || remote_database == database_name
+        || local_database == remote_database
+    {
+        return Err("CI smoke database names are not distinct".to_owned());
+    }
+    assert_step(
+        local_create,
+        Some("typescript-local-smoke-database"),
+        None,
+        Some(local_database),
+        None,
+    )?;
+    assert_run_lines(
+        local_create,
+        &[
+            "python3 tests/ci/isolated_database.py create \\",
+            "  --database-url \"$DATABASE_URL\" \\",
+            "  --database-name \"$KITEFRAME_SMOKE_DATABASE_NAME\" \\",
+            "  --github-output \"$GITHUB_OUTPUT\"",
+        ],
+    )?;
+    if local_smoke
+        .env
+        .get("KITEFRAME_INTEGRATION_DATABASE_URL")
+        .map(String::as_str)
+        != Some("${{ steps.typescript-local-smoke-database.outputs.database_url }}")
+    {
+        return Err("TypeScript local smoke does not consume its database output".to_owned());
+    }
+    assert_step(
+        local_cleanup,
+        None,
+        None,
+        Some(local_database),
+        Some("${{ always() }}"),
+    )?;
+    assert_run_lines(
+        local_cleanup,
+        &[
+            "python3 tests/ci/isolated_database.py drop \\",
+            "  --database-url \"$DATABASE_URL\" \\",
+            "  --database-name \"$KITEFRAME_SMOKE_DATABASE_NAME\"",
+        ],
+    )?;
+
+    assert_step(
+        remote_create,
+        Some("typescript-remote-smoke-database"),
+        None,
+        Some(remote_database),
+        None,
+    )?;
+    assert_run_lines(
+        remote_create,
+        &[
+            "python3 tests/ci/isolated_database.py create \\",
+            "  --database-url \"$DATABASE_URL\" \\",
+            "  --database-name \"$KITEFRAME_SMOKE_DATABASE_NAME\" \\",
+            "  --github-output \"$GITHUB_OUTPUT\"",
+        ],
+    )?;
+    if remote_smoke
+        .env
+        .get("KITEFRAME_DATABASE_URL")
+        .map(String::as_str)
+        != Some("${{ steps.typescript-remote-smoke-database.outputs.database_url }}")
+    {
+        return Err("TypeScript remote smoke does not consume its database output".to_owned());
+    }
+    let remote_run = remote_smoke
+        .run
+        .as_deref()
+        .ok_or("remote smoke has no command")?;
+    for required in [
+        "responses_pid=\"\"",
+        "harness_pid=\"\"",
+        "trap cleanup EXIT",
+    ] {
+        if !remote_run.contains(required) {
+            return Err(format!("remote smoke lacks process cleanup: {required}"));
+        }
+    }
+    if remote_run.contains("KITEFRAME_DATABASE_URL=\"$DATABASE_URL\"") {
+        return Err("remote smoke falls back to the job database URL".to_owned());
+    }
+    assert_step(
+        remote_cleanup,
+        None,
+        None,
+        Some(remote_database),
+        Some("${{ always() }}"),
+    )?;
+    assert_run_lines(
+        remote_cleanup,
+        &[
+            "python3 tests/ci/isolated_database.py drop \\",
+            "  --database-url \"$DATABASE_URL\" \\",
+            "  --database-name \"$KITEFRAME_SMOKE_DATABASE_NAME\"",
+        ],
+    )?;
+
     let python_steps = &workflow
         .jobs
         .get("python")
@@ -652,7 +810,7 @@ fn assert_step(
     condition: Option<&str>,
 ) -> Result<(), String> {
     if step.id.as_deref() != id
-        || step.run.as_deref().map(str::trim) != run
+        || run.is_some_and(|expected| step.run.as_deref().map(str::trim) != Some(expected))
         || step
             .env
             .get("KITEFRAME_SMOKE_DATABASE_NAME")
@@ -670,6 +828,18 @@ fn assert_step(
         ));
     }
     Ok(())
+}
+
+fn assert_run_lines(step: &CiStep, expected: &[&str]) -> Result<(), String> {
+    let actual = step.run.as_deref().ok_or("CI step has no command")?;
+    if actual.trim().lines().collect::<Vec<_>>() == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "incorrect CI command: {}",
+            step.name.as_deref().unwrap_or("unnamed")
+        ))
+    }
 }
 
 fn collect_rust_sources(directory: &std::path::Path, sources: &mut Vec<std::path::PathBuf>) {
