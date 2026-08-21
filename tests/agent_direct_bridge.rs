@@ -41,6 +41,7 @@ fn builtin_profile() -> HarnessProfile {
         required: BTreeSet::from([
             HarnessCapability::FreshSession,
             HarnessCapability::TextPrompt,
+            HarnessCapability::PermissionOnce,
             HarnessCapability::Cancel,
             HarnessCapability::CommittedOutput,
         ]),
@@ -1140,6 +1141,14 @@ async fn restart_resumes_the_builtin_claim_with_the_same_key_and_one_result() {
     assert_eq!(row.get::<String, _>("claimant"), "harness-dispatcher-v1");
     assert_eq!(row.get::<String, _>("claim_idempotency_key"), claim_key);
     assert_eq!(fixture.evidence().await.len(), 1);
+    let terminal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM harness_invocations WHERE command_id = $1 AND terminal = TRUE",
+    )
+    .bind(pending.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(terminal_count, 1);
     let committed_events: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_task_events WHERE task_id = $1 \
          AND kind = 'runtime.transition_committed'",
@@ -1277,10 +1286,13 @@ async fn cancellation_during_model_execution_audits_the_late_result_only_on_the_
     let completion_key = audited
         .get::<Option<String>, _>("completion_idempotency_key")
         .unwrap();
-    assert_eq!(
-        completion_key,
-        format!("builtin-result:{}:1", command.id.as_uuid())
-    );
+    let invocation_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT invocation_id FROM harness_invocations WHERE command_id = $1")
+            .bind(command.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(completion_key, format!("harness-result:{invocation_id}"));
     assert!(
         audited
             .get::<Option<String>, _>("completion_request_digest")

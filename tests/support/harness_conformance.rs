@@ -12,7 +12,6 @@ pub struct HarnessConformanceObservation {
     pub terminal: HarnessTerminal,
     pub terminal_count: u64,
     pub goal_phase: GoalPhase,
-    pub permission_supported: bool,
 }
 
 #[async_trait::async_trait]
@@ -36,16 +35,15 @@ pub async fn assert_normative_harness(mut harness: impl HarnessConformanceDriver
     assert_eq!(completed.goal_phase, GoalPhase::Active);
 
     let replay = harness.run(HarnessConformanceCase::Replay).await;
-    assert_eq!(replay.terminal_count, 1);
+    assert_eq!(
+        replay.terminal_count, 1,
+        "replay must keep one terminal/evidence"
+    );
 
     let rejected = harness.run(HarnessConformanceCase::RejectPermission).await;
     assert_eq!(
         terminal_code(&rejected.terminal),
-        Some(if rejected.permission_supported {
-            "harness_permission_rejected"
-        } else {
-            "harness_capability_unsupported"
-        })
+        Some("harness_permission_rejected")
     );
 
     let cancelled = harness.run(HarnessConformanceCase::CancelInFlight).await;

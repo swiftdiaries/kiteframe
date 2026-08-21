@@ -11,12 +11,14 @@ use crate::{
 };
 
 use super::{
-    HARNESS_PROTOCOL_VERSION, HarnessApprovalBroker, HarnessCancellation, HarnessCapabilities,
-    HarnessEventSender, HarnessFailure, HarnessInvocationEvent, HarnessInvocationOutput,
-    HarnessPlugin, HarnessProfile, HarnessRequestEnvelope, HarnessTerminal, emit_and_wait,
+    HARNESS_PROTOCOL_VERSION, HarnessApprovalBroker, HarnessApprovalDecision,
+    HarnessApprovalRequest, HarnessCancellation, HarnessCapabilities, HarnessEventSender,
+    HarnessFailure, HarnessInvocationEvent, HarnessInvocationOutput, HarnessPlugin, HarnessProfile,
+    HarnessRequestEnvelope, HarnessTerminal, emit_and_wait,
 };
 
 const DURABLE_GOAL_DIRECTIVE: &str = "Treat the complete structured goal in the first input item as durable across this invocation and every repeated or recovered invocation. Preserve its objective, criterion ids, human success statements, required evidence types, constraints, and blocked conditions. The complete_task function completes only this bounded harness task and yields invocation evidence; it never completes or blocks the enclosing Kiteframe goal. Only the Rust kernel's CompleteGoal and BlockGoal authority may complete or block that goal.";
+const BUILTIN_PERMISSION_REQUEST_TOOL: &str = "kiteframe/request_permission";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HarnessExecutionResult {
@@ -150,11 +152,56 @@ impl HarnessPlugin for BuiltinHarnessPlugin {
         &self,
         request: HarnessRequestEnvelope,
         events: HarnessEventSender,
-        _approvals: Arc<dyn HarnessApprovalBroker>,
+        approvals: Arc<dyn HarnessApprovalBroker>,
         cancellation: HarnessCancellation,
     ) -> HarnessTerminal {
         if let Err(error) = emit_and_wait(&events, HarnessInvocationEvent::Started).await {
             return HarnessTerminal::OutcomeUnknown(error);
+        }
+        if request
+            .invocation
+            .payload
+            .tools
+            .iter()
+            .any(|tool| tool.qualified_name == BUILTIN_PERMISSION_REQUEST_TOOL)
+        {
+            let approval = HarnessApprovalRequest {
+                invocation_id: request.invocation.invocation_id.clone(),
+                request_id: "builtin-permission-once".to_owned(),
+                title: "Allow the built-in harness permission request?".to_owned(),
+            };
+            if let Err(error) = emit_and_wait(
+                &events,
+                HarnessInvocationEvent::ApprovalRequested {
+                    request_id: approval.request_id.clone(),
+                    title: approval.title.clone(),
+                },
+            )
+            .await
+            {
+                return HarnessTerminal::OutcomeUnknown(error);
+            }
+            let decision = tokio::select! {
+                _ = cancellation.cancelled() => return HarnessTerminal::Cancelled,
+                decision = approvals.decide(approval.clone()) => decision,
+            };
+            if let Err(error) = emit_and_wait(
+                &events,
+                HarnessInvocationEvent::ApprovalResolved {
+                    request_id: approval.request_id,
+                    decision: decision.clone(),
+                },
+            )
+            .await
+            {
+                return HarnessTerminal::OutcomeUnknown(error);
+            }
+            if decision == HarnessApprovalDecision::RejectOnce {
+                return HarnessTerminal::Failed(HarnessFailure::new(
+                    "harness_permission_rejected",
+                    "built-in permission request was rejected",
+                ));
+            }
         }
         tokio::select! {
             _ = cancellation.cancelled() => HarnessTerminal::Cancelled,

@@ -4,6 +4,7 @@ use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 use crate::AgentCommandId;
 use crate::harness::{
     HarnessEventEnvelope, HarnessInvocationId, HarnessProfileId, HarnessTransport,
+    canonical_outcome_unknown_terminal_payload, terminal_idempotency_key,
 };
 
 use super::{
@@ -186,7 +187,9 @@ impl PostgresStore {
         let mut tx = self.pool().begin().await?;
         let view = lock_harness_invocation(&mut tx, invocation_id).await?;
         if view.state == HarnessInvocationState::Failed && view.attempt == expected_attempt {
-            if view.terminal_request_digest.as_deref() == Some(request_digest) {
+            if view.terminal_request_digest.as_deref() == Some(request_digest)
+                && view.terminal_payload.as_ref() == Some(terminal_payload)
+            {
                 tx.commit().await?;
                 return Ok(view);
             }
@@ -411,12 +414,8 @@ impl PostgresStore {
                     view.attempt,
                     true,
                     true,
-                    Some("harness-recovery-outcome-unknown"),
-                    Some(&serde_json::json!({
-                        "type":"outcome_unknown",
-                        "code":"harness_outcome_unknown",
-                        "detail":"harness recovery observed accepted work",
-                    })),
+                    Some(&terminal_idempotency_key(&view.invocation_id)),
+                    Some(&canonical_outcome_unknown_terminal_payload()),
                 )
                 .await?,
             );

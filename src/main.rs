@@ -39,6 +39,7 @@ fn builtin_profile() -> HarnessProfile {
         required: BTreeSet::from([
             HarnessCapability::FreshSession,
             HarnessCapability::TextPrompt,
+            HarnessCapability::PermissionOnce,
             HarnessCapability::Cancel,
             HarnessCapability::CommittedOutput,
         ]),

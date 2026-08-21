@@ -12,8 +12,8 @@ use kiteframe::harness::{
 };
 use kiteframe::{
     AgentCommandId, AgentKernel, ClosedSchema, GoalPhase, GoalProjection, HarnessPlugin,
-    HarnessStructuralLimits, InvokeHarness, ModelClient, ModelError, ModelResponse, ModelRole,
-    PrimitiveValue,
+    HarnessStructuralLimits, HarnessTool, InvokeHarness, ModelClient, ModelError, ModelResponse,
+    ModelRole, PrimitiveValue,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -72,6 +72,7 @@ fn profile() -> HarnessProfile {
         required: BTreeSet::from([
             HarnessCapability::FreshSession,
             HarnessCapability::TextPrompt,
+            HarnessCapability::PermissionOnce,
             HarnessCapability::Cancel,
             HarnessCapability::CommittedOutput,
         ]),
@@ -81,7 +82,7 @@ fn profile() -> HarnessProfile {
 }
 
 #[tokio::test]
-async fn builtin_profile_honestly_reports_permission_as_unsupported() {
+async fn builtin_profile_advertises_and_uses_permission_once() {
     let plugin = BuiltinHarnessPlugin::new(
         profile(),
         Arc::new(TestModel {
@@ -94,11 +95,30 @@ async fn builtin_profile_honestly_reports_permission_as_unsupported() {
         }),
     );
     assert!(
-        !plugin
+        plugin
             .profile()
             .required
             .contains(&HarnessCapability::PermissionOnce)
     );
+}
+
+#[test]
+fn builtin_v1_registration_digest_remains_upgrade_compatible() {
+    assert_eq!(
+        profile().digest().unwrap(),
+        "c5f8f5116ca8e338fc5e764e89e72aee0f657da519eb3e8f97395bc0a6373e5b",
+        "builtin-v1 registration must replay with its pre-fix profile digest"
+    );
+}
+
+fn permission_request() -> HarnessInvocationRequest {
+    let mut invocation = request();
+    invocation.payload.tools.push(HarnessTool {
+        qualified_name: "kiteframe/request_permission".to_owned(),
+        descriptor_digest: "sha256:permission-request".to_owned(),
+        descriptor: json!({"type":"permission_once"}),
+    });
+    invocation
 }
 
 fn request() -> HarnessInvocationRequest {
@@ -194,12 +214,45 @@ impl HarnessConformanceDriver for BuiltinConformanceDriver {
                 (result.2, result.3)
             }
             HarnessConformanceCase::RejectPermission => {
-                let result = invoke(
-                    json!({"type":"function_call","name":"docs/search","arguments":{}}),
-                    false,
-                )
-                .await;
-                (result.2, result.3)
+                let plugin = Arc::new(BuiltinHarnessPlugin::new(
+                    profile(),
+                    Arc::new(TestModel {
+                        response: json!({"type":"function_call","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"unused"}}}),
+                        delay: false,
+                    }),
+                ));
+                let mut registry = HarnessRegistry::new();
+                registry.register(plugin).await.unwrap();
+                let sink = Arc::new(RecordingSink(Mutex::new(vec![])));
+                let terminal = registry
+                    .invoke(
+                        permission_request(),
+                        Arc::new(DenyAllHarnessApprovals),
+                        sink.clone(),
+                    )
+                    .await;
+                let events = sink.0.lock().await;
+                assert!(matches!(
+                    events.as_slice(),
+                    [
+                        HarnessEventEnvelope {
+                            event: kiteframe::harness::HarnessInvocationEvent::Started,
+                            ..
+                        },
+                        HarnessEventEnvelope {
+                            event: kiteframe::harness::HarnessInvocationEvent::ApprovalRequested { .. },
+                            ..
+                        },
+                        HarnessEventEnvelope {
+                            event: kiteframe::harness::HarnessInvocationEvent::ApprovalResolved {
+                                decision: kiteframe::harness::HarnessApprovalDecision::RejectOnce,
+                                ..
+                            },
+                            ..
+                        }
+                    ]
+                ));
+                (terminal, events.len() as u64)
             }
             HarnessConformanceCase::InvalidCompletion => {
                 let result = invoke(json!({"type":"function_call","name":"complete_task","arguments":{"outcome":"ok","fields":{}}}), false).await;
@@ -218,28 +271,26 @@ impl HarnessConformanceDriver for BuiltinConformanceDriver {
                 let registry = Arc::new(registry);
                 let request = request();
                 let id = request.invocation_id.clone();
+                let sink = Arc::new(RecordingSink(Mutex::new(vec![])));
                 let task = tokio::spawn({
                     let registry = registry.clone();
+                    let sink = sink.clone();
                     async move {
                         registry
-                            .invoke(
-                                request,
-                                Arc::new(DenyAllHarnessApprovals),
-                                Arc::new(RecordingSink(Mutex::new(vec![]))),
-                            )
+                            .invoke(request, Arc::new(DenyAllHarnessApprovals), sink)
                             .await
                     }
                 });
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 assert!(registry.cancel(&id).await);
-                (task.await.unwrap(), 1)
+                let terminal = task.await.unwrap();
+                (terminal, sink.0.lock().await.len() as u64)
             }
         };
         HarnessConformanceObservation {
             terminal,
             terminal_count,
             goal_phase: GoalPhase::Active,
-            permission_supported: false,
         }
     }
 }

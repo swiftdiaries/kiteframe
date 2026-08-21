@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
     HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal,
-    PostgresHarnessEventSink,
+    PostgresHarnessEventSink, canonical_outcome_unknown_terminal_payload, terminal_idempotency_key,
 };
 use crate::store::{HarnessInvocationState, PrepareHarnessInvocation};
 use crate::{
@@ -240,7 +240,7 @@ impl AgentCommandDispatcher {
         invocation: &crate::store::HarnessInvocationView,
         terminal: HarnessTerminal,
     ) -> Result<(), StoreError> {
-        let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+        let terminal_key = terminal_idempotency_key(&invocation.invocation_id);
         let terminal_payload = terminal_payload(&terminal);
         match terminal {
             HarnessTerminal::Completed(output) => {
@@ -342,7 +342,7 @@ impl AgentCommandDispatcher {
         invocation_id: &HarnessInvocationId,
         attempt: u64,
     ) -> Result<(), StoreError> {
-        let terminal_key = format!("harness-terminal:{}", invocation_id.as_uuid());
+        let terminal_key = terminal_idempotency_key(invocation_id);
         self.kernel
             .store()
             .settle_harness_invocation(
@@ -350,11 +350,7 @@ impl AgentCommandDispatcher {
                 attempt,
                 HarnessInvocationState::OutcomeUnknown,
                 &terminal_key,
-                &serde_json::json!({
-                    "type":"outcome_unknown",
-                    "code":"harness_outcome_unknown",
-                    "detail":"harness terminal outcome is unknown",
-                }),
+                &canonical_outcome_unknown_terminal_payload(),
             )
             .await?;
         let failure =
@@ -601,7 +597,11 @@ async fn failure_or_audit_late(
 
 #[cfg(test)]
 mod tests {
-    use super::{DispatchRoute, dispatch_route};
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Mutex};
+
+    use super::{ActiveDispatchGuard, DispatchRoute, dispatch_route};
+    use crate::harness::HarnessInvocationId;
     use crate::{KernelCommandPayload, RequestContext, WaitForEvent};
     use serde_json::json;
 
@@ -619,5 +619,16 @@ mod tests {
         ] {
             assert_eq!(dispatch_route(&payload), DispatchRoute::Unavailable);
         }
+    }
+
+    #[test]
+    fn active_dispatch_guard_allows_exactly_one_concurrent_owner() {
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        let invocation = HarnessInvocationId::new(uuid::Uuid::now_v7());
+        let first = ActiveDispatchGuard::reserve(active.clone(), &invocation)
+            .expect("first dispatcher owns the invocation");
+        assert!(ActiveDispatchGuard::reserve(active.clone(), &invocation).is_none());
+        drop(first);
+        assert!(ActiveDispatchGuard::reserve(active, &invocation).is_some());
     }
 }

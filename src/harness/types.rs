@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -130,6 +131,18 @@ impl<'de> Deserialize<'de> for HarnessInvocationId {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Ok(Self(Uuid::deserialize(d)?))
     }
+}
+
+pub(crate) fn terminal_idempotency_key(invocation_id: &HarnessInvocationId) -> String {
+    format!("harness-terminal:{}", invocation_id.as_uuid())
+}
+
+pub(crate) fn canonical_outcome_unknown_terminal_payload() -> Value {
+    json!({
+        "type": "outcome_unknown",
+        "code": "harness_outcome_unknown",
+        "detail": "harness terminal outcome is unknown",
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

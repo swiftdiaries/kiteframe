@@ -229,6 +229,9 @@ fn terminal_replay_payload_is_immutable_journal_data() {
         .expect("Task 4 terminal replay migration exists");
     for required in [
         "terminal_payload JSONB",
+        "DISABLE TRIGGER harness_invocations_reject_invalid_update",
+        "UPDATE harness_invocations",
+        "harness-terminal:' || invocation_id::text",
         "terminal_payload IS NOT NULL",
         "terminal harness invocation is immutable",
     ] {
@@ -237,6 +240,13 @@ fn terminal_replay_payload_is_immutable_journal_data() {
             "missing terminal replay guard: {required}"
         );
     }
+    assert!(
+        sql.find("UPDATE harness_invocations").unwrap()
+            < sql
+                .find("ADD CONSTRAINT harness_invocations_terminal_payload_check")
+                .unwrap(),
+        "terminal payloads must be backfilled before the constraint is enabled"
+    );
 }
 
 #[tokio::test]
@@ -293,10 +303,24 @@ async fn accepted_process_death_is_recovered_as_outcome_unknown() {
         .await
         .unwrap();
     let recovered = fixture.store.recover_harness_invocations(16).await.unwrap();
-    assert!(recovered.iter().any(|view| {
-        view.invocation_id == invocation.invocation_id
-            && view.state == HarnessInvocationState::OutcomeUnknown
-    }));
+    let recovered = recovered
+        .into_iter()
+        .find(|view| view.invocation_id == invocation.invocation_id)
+        .expect("accepted invocation is recovered");
+    assert_eq!(recovered.state, HarnessInvocationState::OutcomeUnknown);
+    let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+    assert_eq!(
+        recovered.terminal_request_digest.as_deref(),
+        Some(terminal_key.as_str())
+    );
+    assert_eq!(
+        recovered.terminal_payload,
+        Some(json!({
+            "type":"outcome_unknown",
+            "code":"harness_outcome_unknown",
+            "detail":"harness terminal outcome is unknown",
+        }))
+    );
 }
 
 #[tokio::test]
@@ -491,6 +515,20 @@ async fn retryable_failure_retries_only_before_prompt_acceptance_and_then_fails(
         )
         .await
         .unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .record_harness_retryable_failure(
+                &invocation.invocation_id,
+                1,
+                1,
+                "sha256:retry-b",
+                &json!({"type":"failed","code":"harness_failed","detail":"drift"}),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::IdempotencyConflict,
+    ));
     assert!(matches!(
         fixture
             .store

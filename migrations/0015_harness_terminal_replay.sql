@@ -1,6 +1,33 @@
 ALTER TABLE harness_invocations
     ADD COLUMN terminal_payload JSONB;
 
+-- Earlier journal rows predate terminal payload persistence.  A completed row
+-- cannot safely recreate its evidence, so converge it to outcome_unknown; all
+-- backfilled rows then use the same canonical terminal identity as new rows.
+ALTER TABLE harness_invocations
+    DISABLE TRIGGER harness_invocations_reject_invalid_update;
+
+UPDATE harness_invocations
+SET state = CASE WHEN state = 'completed' THEN 'outcome_unknown' ELSE state END,
+    terminal_request_digest = 'harness-terminal:' || invocation_id::text,
+    terminal_payload = CASE
+        WHEN state = 'cancelled' THEN '{"type":"cancelled"}'::jsonb
+        WHEN state = 'completed' THEN jsonb_build_object(
+            'type', 'outcome_unknown',
+            'code', 'harness_outcome_unknown',
+            'detail', 'harness terminal outcome is unknown'
+        )
+        ELSE jsonb_build_object(
+            'type', 'failed',
+            'code', 'harness_failed',
+            'detail', 'legacy terminal payload was unavailable'
+        )
+    END
+WHERE terminal = TRUE AND terminal_payload IS NULL;
+
+ALTER TABLE harness_invocations
+    ENABLE TRIGGER harness_invocations_reject_invalid_update;
+
 ALTER TABLE harness_invocations
     ADD CONSTRAINT harness_invocations_terminal_payload_check CHECK (
         (terminal AND terminal_payload IS NOT NULL AND jsonb_typeof(terminal_payload) = 'object')
