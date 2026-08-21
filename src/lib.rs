@@ -40,6 +40,8 @@ pub use engine::{
     HarnessExecutionError, HarnessExecutionResult, HarnessRecoveryReport, PermissionChoice,
     RecoveryReport, ResolvePermission, RetryRecovery,
 };
+#[cfg(feature = "test-support")]
+pub use engine::{HarnessDispatcherTestBarrier, HarnessDispatcherTestBarrierPoint};
 pub use goal::{
     CriterionAssertion, EvidenceId, EvidenceRecord, EvidenceSourceIdentity, GoalBlocker,
     GoalContract, GoalContractError, GoalPhase, SuccessCriterion, goal_edge_allowed,

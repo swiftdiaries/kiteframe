@@ -238,7 +238,7 @@ impl AcpHarnessPlugin {
                     .active_execution_millis_remaining,
             );
         let client = match self.spawn_client(&request.invocation.workspace).await {
-            Ok(client) => client,
+            Ok(client) => Arc::new(client),
             Err(error) => return pre_accept_error(error),
         };
 
@@ -483,6 +483,15 @@ impl AcpHarnessPlugin {
         };
         #[cfg(feature = "test-support")]
         if let Some(barrier) = &self.test_barrier {
+            if barrier.defers_adapter_shutdown() {
+                let barrier = barrier.clone();
+                let client = client.clone();
+                tokio::spawn(async move {
+                    barrier.pause_before_adapter_shutdown().await;
+                    let _ = client.shutdown().await;
+                });
+                return terminal;
+            }
             barrier.pause_before_adapter_shutdown().await;
         }
         let shutdown = client.shutdown().await;

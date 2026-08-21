@@ -419,13 +419,21 @@ async fn terminal_prepare_replay_discards_a_fresh_candidate_and_returns_the_stor
         return;
     };
     let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
     fixture
         .store
         .settle_harness_invocation(
             &invocation.invocation_id,
             0,
             HarnessInvocationState::Cancelled,
-            "sha256:terminal-a",
+            &terminal_key,
             &json!({"type":"cancelled"}),
         )
         .await
@@ -1102,7 +1110,7 @@ async fn approval_request_and_one_shot_decision_are_durable_events() {
 }
 
 #[tokio::test]
-async fn retryable_failure_retries_only_before_prompt_acceptance_and_then_fails() {
+async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journaling() {
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
     };
@@ -1125,7 +1133,7 @@ async fn retryable_failure_retries_only_before_prompt_acceptance_and_then_fails(
         .unwrap();
     assert_eq!(retry.state, HarnessInvocationState::Started);
     assert_eq!(retry.attempt, 1);
-    let failed = fixture
+    let exhausted = fixture
         .store
         .record_harness_retryable_failure(
             &invocation.invocation_id,
@@ -1136,47 +1144,11 @@ async fn retryable_failure_retries_only_before_prompt_acceptance_and_then_fails(
         )
         .await
         .unwrap();
-    assert_eq!(failed.state, HarnessInvocationState::Failed);
-    assert!(failed.terminal);
-    fixture
-        .store
-        .record_harness_retryable_failure(
-            &invocation.invocation_id,
-            1,
-            1,
-            "sha256:retry-b",
-            &json!({"type":"failed","code":"harness_failed","detail":"retry"}),
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        fixture
-            .store
-            .record_harness_retryable_failure(
-                &invocation.invocation_id,
-                1,
-                1,
-                "sha256:retry-b",
-                &json!({"type":"failed","code":"harness_failed","detail":"drift"}),
-            )
-            .await
-            .unwrap_err(),
-        StoreError::IdempotencyConflict,
-    ));
-    assert!(matches!(
-        fixture
-            .store
-            .record_harness_retryable_failure(
-                &invocation.invocation_id,
-                1,
-                1,
-                "sha256:retry-c",
-                &json!({"type":"failed","code":"harness_failed","detail":"retry"})
-            )
-            .await
-            .unwrap_err(),
-        StoreError::IdempotencyConflict,
-    ));
+    assert_eq!(exhausted.state, HarnessInvocationState::Started);
+    assert_eq!(exhausted.attempt, 1);
+    assert!(!exhausted.terminal);
+    assert_eq!(exhausted.terminal_request_digest, None);
+    assert_eq!(exhausted.terminal_payload, None);
 }
 
 #[tokio::test]
@@ -1209,13 +1181,35 @@ async fn registration_replay_and_terminal_replay_require_the_same_digests() {
     ));
 
     let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+    assert!(matches!(
+        fixture
+            .store
+            .settle_harness_invocation(
+                &invocation.invocation_id,
+                0,
+                HarnessInvocationState::Cancelled,
+                &terminal_key,
+                &json!({"type":"cancelled"}),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::RevisionConflict,
+    ));
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
     fixture
         .store
         .settle_harness_invocation(
             &invocation.invocation_id,
             0,
             HarnessInvocationState::Cancelled,
-            "sha256:terminal-a",
+            &terminal_key,
             &json!({"type":"cancelled"}),
         )
         .await
@@ -1226,7 +1220,7 @@ async fn registration_replay_and_terminal_replay_require_the_same_digests() {
             &invocation.invocation_id,
             0,
             HarnessInvocationState::Cancelled,
-            "sha256:terminal-a",
+            &terminal_key,
             &json!({"type":"cancelled"}),
         )
         .await
@@ -1240,6 +1234,57 @@ async fn registration_replay_and_terminal_replay_require_the_same_digests() {
                 HarnessInvocationState::Cancelled,
                 "sha256:terminal-b",
                 &json!({"type":"cancelled"}),
+            )
+            .await
+            .unwrap_err(),
+        StoreError::IdempotencyConflict,
+    ));
+}
+
+#[tokio::test]
+async fn completed_command_receipt_must_match_the_exact_harness_terminal() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:receipt-identity").await.unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation.invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&invocation.invocation_id, 0)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'completed', revision = revision + 1, \
+         completion_idempotency_key = 'harness-result:wrong', \
+         completion_request_digest = 'sha256:wrong', \
+         result = $1 WHERE id = $2",
+    )
+    .bind(json!({
+        "type":"command_failed",
+        "payload":{
+            "event_id":"command-failed:wrong",
+            "command_key":"harness:store",
+            "code":"harness_failed"
+        }
+    }))
+    .bind(fixture.command_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        fixture
+            .store
+            .settle_harness_invocation(
+                &invocation.invocation_id,
+                0,
+                HarnessInvocationState::Completed,
+                &format!("harness-terminal:{}", invocation.invocation_id.as_uuid()),
+                &json!({"type":"completed","outcome":"ok","fields":{},"history":[]}),
             )
             .await
             .unwrap_err(),

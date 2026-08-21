@@ -24,7 +24,7 @@ mod postgres_recovery_boundaries {
     use kiteframe::store::{
         HarnessInvocationState, HarnessPluginRegistration, PrepareHarnessInvocation,
     };
-    use kiteframe::{AgentCommandId, CreateSession, PostgresStore, PrincipalId};
+    use kiteframe::{AgentCommandId, CreateSession, PostgresStore, PrincipalId, canonical_sha256};
     use serde_json::json;
     use sqlx::PgPool;
     use time::{Duration, OffsetDateTime};
@@ -234,16 +234,7 @@ mod postgres_recovery_boundaries {
             .mark_harness_prompt_accepted(&committed.invocation_id, 0)
             .await
             .unwrap();
-        sqlx::query(
-            "UPDATE agent_commands SET state = 'completed', revision = revision + 1, \
-             completion_idempotency_key = $1, completion_request_digest = 'sha256:completed', \
-             result = $2 WHERE id = $3",
-        )
-        .bind(format!(
-            "harness-result:{}",
-            committed.invocation_id.as_uuid()
-        ))
-        .bind(json!({
+        let result = json!({
             "type":"harness_result",
             "payload":{
                 "event_id":format!("harness-result:{}", committed.invocation_id.as_uuid()),
@@ -253,7 +244,32 @@ mod postgres_recovery_boundaries {
                 "evidence_id":committed.invocation_id.as_uuid(),
                 "history":[]
             }
+        });
+        let session_id: Uuid =
+            sqlx::query_scalar("SELECT session_id FROM user_tasks WHERE id = $1")
+                .bind(fixture.task_id)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        let completion_digest = canonical_sha256(&json!({
+            "sessionId":session_id,
+            "taskId":fixture.task_id,
+            "commandId":committed.command_id.as_uuid(),
+            "expectedCommandRevision":0,
+            "event":&result,
         }))
+        .unwrap();
+        sqlx::query(
+            "UPDATE agent_commands SET state = 'completed', revision = revision + 1, \
+             completion_idempotency_key = $1, completion_request_digest = $2, \
+             result = $3 WHERE id = $4",
+        )
+        .bind(format!(
+            "harness-result:{}",
+            committed.invocation_id.as_uuid()
+        ))
+        .bind(completion_digest)
+        .bind(result)
         .bind(committed.command_id.as_uuid())
         .execute(&fixture.pool)
         .await
@@ -358,7 +374,7 @@ mod fake_acp_boundaries {
         HarnessAcceptanceBarrier, HarnessApprovalBroker, HarnessApprovalDecision,
         HarnessApprovalRequest, HarnessCapability, HarnessEventEnvelope, HarnessEventSink,
         HarnessFailure, HarnessInvocationId, HarnessInvocationRequest, HarnessProfile,
-        HarnessProfileId, HarnessRegistry, HarnessTransport,
+        HarnessProfileId, HarnessRegistry, HarnessTerminal, HarnessTransport,
     };
     use kiteframe::{
         AgentCommandId, ClosedSchema, GoalProjection, HarnessStructuralLimits, InvokeHarness,
@@ -619,9 +635,12 @@ mod fake_acp_boundaries {
             event.event,
             kiteframe::harness::HarnessInvocationEvent::AssistantMessage { .. }
         )));
-        task.abort();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("the terminal is handed off before controlled shutdown")
+            .unwrap();
+        assert!(matches!(terminal, HarnessTerminal::Completed(_)));
         shutdown_barrier.release();
-        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     pub(super) fn fixture(name: &str) -> PathBuf {
@@ -729,17 +748,14 @@ mod integrated_postgres_fake_restart {
         AcpCommand, AcpHarnessPlugin, AcpTestBarrier, AcpTestBarrierPoint, DenyAllHarnessApprovals,
         HarnessRegistry, HarnessRouteTable,
     };
-    use kiteframe::store::{
-        HarnessInvocationState, HarnessPluginRegistration, PrepareHarnessInvocation,
-    };
+    use kiteframe::store::{HarnessInvocationState, HarnessPluginRegistration};
     use kiteframe::{
-        AgentCommandDispatcher, AgentCommandId, AgentKernel, AgentSelector, ClaimAgentCommand,
-        CompleteAgentCommand, CreateSession, EvidenceId, GoalContract, GoalPhase, IdempotencyKey,
-        PrincipalId, RuntimeCeilings, RuntimeCommandKey, RuntimeEvent, StartAgent, SubmitUserTask,
-        SuccessCriterion, TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot,
-        UserTaskId,
+        AgentCommandDispatcher, AgentCommandId, AgentKernel, AgentSelector, CreateSession,
+        GoalContract, GoalPhase, HarnessDispatcherTestBarrier, HarnessDispatcherTestBarrierPoint,
+        IdempotencyKey, PrincipalId, RuntimeCeilings, StartAgent, SubmitUserTask, SuccessCriterion,
+        TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
     };
-    use serde_json::{Value, json};
+    use serde_json::Value;
     use sqlx::postgres::PgPoolOptions;
     use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
@@ -933,10 +949,25 @@ mod integrated_postgres_fake_restart {
             script: &str,
             barrier: Arc<AcpTestBarrier>,
         ) -> (Arc<AgentCommandDispatcher>, PathBuf) {
+            self.dispatcher_with_barriers(script, None, barrier, None)
+                .await
+        }
+
+        async fn dispatcher_with_barriers(
+            &mut self,
+            registration_script: &str,
+            invocation_script: Option<&str>,
+            acp_barrier: Arc<AcpTestBarrier>,
+            dispatcher_barrier: Option<Arc<HarnessDispatcherTestBarrier>>,
+        ) -> (Arc<AgentCommandDispatcher>, PathBuf) {
             self.observation_index += 1;
             let observation = self
                 .workspace
                 .join(format!("observation-{}.json", self.observation_index));
+            let script = self
+                .workspace
+                .join(format!("script-{}.json", self.observation_index));
+            std::fs::copy(fixture(registration_script), &script).unwrap();
             let store = Arc::new(
                 kiteframe::PostgresStore::connect(&self.database_url)
                     .await
@@ -959,7 +990,7 @@ mod integrated_postgres_fake_restart {
                 BTreeMap::from([
                     (
                         OsString::from("KITEFRAME_FAKE_ACP_SCRIPT"),
-                        fixture(script).as_os_str().to_owned(),
+                        script.as_os_str().to_owned(),
                     ),
                     (
                         OsString::from("KITEFRAME_FAKE_ACP_OBSERVATION"),
@@ -971,13 +1002,16 @@ mod integrated_postgres_fake_restart {
                     ),
                 ]),
             )
-            .with_test_barrier(barrier);
+            .with_test_barrier(acp_barrier);
             let pre_accept_limit = plugin.pre_accept_attempt_limit();
             let mut registry = HarnessRegistry::new();
             registry
                 .register_with_pre_accept_attempt_limit(Arc::new(plugin), pre_accept_limit)
                 .await
                 .unwrap();
+            if let Some(invocation_script) = invocation_script {
+                std::fs::copy(fixture(invocation_script), &script).unwrap();
+            }
             store
                 .register_harness_plugin(HarnessPluginRegistration {
                     profile_id: harness_profile.id.clone(),
@@ -991,14 +1025,17 @@ mod integrated_postgres_fake_restart {
                 .unwrap();
             let routes =
                 HarnessRouteTable::new(harness_profile.id.clone(), harness_profile.id.clone());
-            (
-                Arc::new(kernel.with_harness_registry_routes(
-                    Arc::new(registry),
-                    Arc::new(DenyAllHarnessApprovals),
-                    routes,
-                )),
-                observation,
-            )
+            let dispatcher = kernel.with_harness_registry_routes(
+                Arc::new(registry),
+                Arc::new(DenyAllHarnessApprovals),
+                routes,
+            );
+            let dispatcher = if let Some(barrier) = dispatcher_barrier {
+                dispatcher.with_test_barrier(barrier)
+            } else {
+                dispatcher
+            };
+            (Arc::new(dispatcher), observation)
         }
 
         async fn invocation(&self) -> Option<kiteframe::store::HarnessInvocationView> {
@@ -1078,9 +1115,27 @@ mod integrated_postgres_fake_restart {
             "unused",
             AcpTestBarrierPoint::BeforeWrite,
         ));
-        let (first_dispatcher, _) = before_insert.dispatcher("core-success.json", barrier).await;
+        let journal_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::BeforeJournalInsert,
+        ));
+        let (first_dispatcher, _) = before_insert
+            .dispatcher_with_barriers(
+                "core-success.json",
+                None,
+                barrier,
+                Some(journal_barrier.clone()),
+            )
+            .await;
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        journal_barrier.wait_until_entered().await;
         assert!(before_insert.invocation().await.is_none());
-        drop(first_dispatcher);
+        assert_eq!(
+            before_insert.pending_or_owned_command().await.state,
+            kiteframe::AgentCommandState::Claimed
+        );
+        first.abort();
+        journal_barrier.release();
+        assert!(first.await.unwrap_err().is_cancelled());
         let restart_barrier = Arc::new(AcpTestBarrier::new_disarmed(
             "unused",
             AcpTestBarrierPoint::BeforeWrite,
@@ -1104,41 +1159,24 @@ mod integrated_postgres_fake_restart {
             "unused",
             AcpTestBarrierPoint::BeforeWrite,
         ));
+        let prepare_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterPrepare,
+        ));
         let (first_dispatcher, _) = after_prepare
-            .dispatcher("core-success.json", registration_barrier)
+            .dispatcher_with_barriers(
+                "core-success.json",
+                None,
+                registration_barrier,
+                Some(prepare_barrier.clone()),
+            )
             .await;
-        let pending = after_prepare.pending_or_owned_command().await;
-        let claimed = after_prepare
-            .store
-            .claim_agent_command(ClaimAgentCommand {
-                session_id: after_prepare.session_id.clone(),
-                task_id: after_prepare.task_id.clone(),
-                command_id: pending.id.clone(),
-                expected_command_revision: pending.revision,
-                claimant: "harness-dispatcher-v1".to_owned(),
-                idempotency_key: IdempotencyKey::new(format!(
-                    "harness-dispatcher-v1:{}",
-                    pending.id.as_uuid()
-                ))
-                .unwrap(),
-            })
-            .await
-            .unwrap();
-        let harness_profile = profile();
-        let prepared_id = kiteframe::harness::HarnessInvocationId::new(Uuid::now_v7());
-        let prepared = after_prepare
-            .store
-            .prepare_harness_invocation(PrepareHarnessInvocation {
-                invocation_id: &prepared_id,
-                command_id: &claimed.id,
-                command_revision: claimed.revision,
-                profile_id: &harness_profile.id,
-                profile_digest: &harness_profile.digest().unwrap(),
-                payload_digest: &claimed.payload_digest,
-            })
-            .await
-            .unwrap();
-        drop(first_dispatcher);
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        prepare_barrier.wait_until_entered().await;
+        let prepared = after_prepare.invocation().await.unwrap();
+        assert_eq!(prepared.state, HarnessInvocationState::Prepared);
+        first.abort();
+        prepare_barrier.release();
+        assert!(first.await.unwrap_err().is_cancelled());
         let restart_barrier = Arc::new(AcpTestBarrier::new_disarmed(
             "unused",
             AcpTestBarrierPoint::BeforeWrite,
@@ -1165,30 +1203,26 @@ mod integrated_postgres_fake_restart {
             return;
         };
         let first_barrier = Arc::new(AcpTestBarrier::new_disarmed(
-            "initialize",
+            "unused",
             AcpTestBarrierPoint::BeforeWrite,
         ));
+        let retry_commit_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterRetryCommit,
+        ));
         let (first_dispatcher, first_observation) = retryable_loss
-            .dispatcher("core-success.json", first_barrier.clone())
-            .await;
-        first_barrier.arm();
-        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
-        first_barrier.wait_until_entered().await;
-        let crashed = retryable_loss.invocation().await.unwrap();
-        first.abort();
-        first_barrier.release();
-        assert!(first.await.unwrap_err().is_cancelled());
-        let failed_once = retryable_loss
-            .store
-            .record_harness_retryable_failure(
-                &crashed.invocation_id,
-                crashed.attempt,
-                1,
-                "sha256:integrated-process-loss",
-                &json!({"type":"failed","code":"harness_failed","detail":"process lost before acceptance"}),
+            .dispatcher_with_barriers(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                first_barrier,
+                Some(retry_commit_barrier.clone()),
             )
-            .await
-            .unwrap();
+            .await;
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        retry_commit_barrier.wait_until_entered().await;
+        let failed_once = retryable_loss.invocation().await.unwrap();
+        first.abort();
+        retry_commit_barrier.release();
+        assert!(first.await.unwrap_err().is_cancelled());
         assert_eq!(failed_once.state, HarnessInvocationState::Started);
         assert_eq!(failed_once.attempt, 1);
         assert_eq!(prompt_count(&first_observation), 0);
@@ -1199,40 +1233,147 @@ mod integrated_postgres_fake_restart {
         let (restarted, second_observation) = retryable_loss
             .dispatcher("core-success.json", restart_barrier)
             .await;
+        let first_page = restarted.recover_harness_invocations(1).await.unwrap();
+        assert_eq!(first_page.retryable_pre_accept, 1);
         assert_eq!(
-            restarted
-                .recover_harness_invocations(1)
-                .await
-                .unwrap()
-                .retryable_pre_accept,
-            1
+            restarted.recover_harness_invocations(1).await.unwrap(),
+            kiteframe::HarnessRecoveryReport::default(),
+            "the committed retry increment is counted only once"
         );
         assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
         let completed = retryable_loss.invocation().await.unwrap();
         assert_eq!(completed.invocation_id, failed_once.invocation_id);
         assert_eq!(completed.attempt, 1, "retry increments exactly once");
         assert_eq!(prompt_count(&second_observation), 1);
+
+        let Some(mut exhausted_cancel) = RecoveryFixture::new().await else {
+            return;
+        };
+        let first_retry_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterRetryCommit,
+        ));
+        let (first_retry, first_observation) = exhausted_cancel
+            .dispatcher_with_barriers(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(first_retry_barrier.clone()),
+            )
+            .await;
+        let first_retry = tokio::spawn(async move { first_retry.tick_agent_commands(8).await });
+        first_retry_barrier.wait_until_entered().await;
+        let incremented = exhausted_cancel.invocation().await.unwrap();
+        assert_eq!(incremented.attempt, 1);
+        assert!(!incremented.terminal);
+        assert_eq!(prompt_count(&first_observation), 0);
+        first_retry_barrier.release();
+        first_retry.await.unwrap().unwrap();
+
+        let exhausted_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterRetryCommit,
+        ));
+        let (exhausted, second_observation) = exhausted_cancel
+            .dispatcher_with_barriers(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(exhausted_barrier.clone()),
+            )
+            .await;
+        let exhausted = tokio::spawn(async move { exhausted.tick_agent_commands(8).await });
+        exhausted_barrier.wait_until_entered().await;
+        let waiting_for_authority = exhausted_cancel.invocation().await.unwrap();
+        assert_eq!(waiting_for_authority.attempt, 1);
+        assert!(!waiting_for_authority.terminal);
+        let authority = exhausted_cancel
+            .store
+            .get_agent_execution(
+                exhausted_cancel.session_id.clone(),
+                exhausted_cancel.task_id.clone(),
+            )
+            .await
+            .unwrap();
+        exhausted_cancel
+            .kernel
+            .cancel_task(
+                &exhausted_cancel.principal,
+                kiteframe::CancelUserTask {
+                    session_id: exhausted_cancel.session_id.clone(),
+                    task_id: exhausted_cancel.task_id.clone(),
+                    expected_task_revision: authority.task_revision,
+                    expected_goal_revision: authority.goal_revision,
+                    reason: Some("Cancellation wins exhausted retry.".to_owned()),
+                    idempotency_key: IdempotencyKey::new(format!(
+                        "cancel-exhausted-{}",
+                        exhausted_cancel.task_id.as_uuid()
+                    ))
+                    .unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        exhausted_barrier.release();
+        exhausted.await.unwrap().unwrap();
+        let cancelled = exhausted_cancel.invocation().await.unwrap();
+        assert_eq!(cancelled.state, HarnessInvocationState::Cancelled);
+        assert_ne!(cancelled.state, HarnessInvocationState::Failed);
+        assert_eq!(prompt_count(&second_observation), 0);
         before_insert.cleanup().await;
         after_prepare.cleanup().await;
         retryable_loss.cleanup().await;
+        exhausted_cancel.cleanup().await;
     }
 
     #[tokio::test]
     async fn dispatcher_process_restart_reuses_preaccept_and_never_reprompts_postaccept() {
         let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
-        for (method, point, post_accept) in [
-            ("initialize", AcpTestBarrierPoint::BeforeWrite, false),
-            ("session/new", AcpTestBarrierPoint::BeforeWrite, false),
-            ("acceptance", AcpTestBarrierPoint::BeforeAcceptance, false),
-            ("session/prompt", AcpTestBarrierPoint::BeforeWrite, true),
+        for (method, point, post_accept, first_prompts, defer_shutdown) in [
+            (
+                "initialize",
+                AcpTestBarrierPoint::BeforeWrite,
+                false,
+                0,
+                false,
+            ),
+            (
+                "session/new",
+                AcpTestBarrierPoint::BeforeWrite,
+                false,
+                0,
+                false,
+            ),
+            (
+                "acceptance",
+                AcpTestBarrierPoint::BeforeAcceptance,
+                false,
+                0,
+                false,
+            ),
+            (
+                "session/prompt",
+                AcpTestBarrierPoint::BeforeWrite,
+                true,
+                0,
+                false,
+            ),
             (
                 "session/prompt",
                 AcpTestBarrierPoint::BeforeAcknowledgement,
                 true,
+                1,
+                false,
             ),
             (
                 "adapter/shutdown",
                 AcpTestBarrierPoint::BeforeAdapterShutdown,
+                true,
+                1,
                 true,
             ),
         ] {
@@ -1241,15 +1382,31 @@ mod integrated_postgres_fake_restart {
             };
             let authority_before = recovery.authority().await;
             let barrier = Arc::new(AcpTestBarrier::new_disarmed(method, point));
+            let dispatcher_barrier = defer_shutdown.then(|| {
+                Arc::new(HarnessDispatcherTestBarrier::new(
+                    HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal,
+                ))
+            });
             let (dispatcher, first_observation) = recovery
-                .dispatcher("core-success.json", barrier.clone())
+                .dispatcher_with_barriers(
+                    "core-success.json",
+                    None,
+                    barrier.clone(),
+                    dispatcher_barrier.clone(),
+                )
                 .await;
             barrier.arm();
             let first = tokio::spawn(async move { dispatcher.tick_agent_commands(8).await });
             barrier.wait_until_entered().await;
+            if let Some(dispatcher_barrier) = &dispatcher_barrier {
+                dispatcher_barrier.wait_until_entered().await;
+            }
             let crashed = recovery.invocation().await.unwrap();
             first.abort();
             barrier.release();
+            if let Some(dispatcher_barrier) = &dispatcher_barrier {
+                dispatcher_barrier.release();
+            }
             assert!(first.await.unwrap_err().is_cancelled());
 
             let restart_barrier = Arc::new(AcpTestBarrier::new_disarmed(
@@ -1276,7 +1433,7 @@ mod integrated_postgres_fake_restart {
                 assert_eq!(completed.attempt, crashed.attempt);
                 assert_eq!(prompt_count(&second_observation), 1);
             }
-            assert!(prompt_count(&first_observation) <= 1);
+            assert_eq!(prompt_count(&first_observation), first_prompts);
             recovery.cleanup().await;
         }
     }
@@ -1291,43 +1448,46 @@ mod integrated_postgres_fake_restart {
             "adapter/shutdown",
             AcpTestBarrierPoint::BeforeAdapterShutdown,
         ));
+        let command_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterCommandTerminal,
+        ));
         let (dispatcher, first_observation) = recovery
-            .dispatcher("core-success.json", barrier.clone())
+            .dispatcher_with_barriers(
+                "core-success.json",
+                None,
+                barrier.clone(),
+                Some(command_barrier.clone()),
+            )
             .await;
         barrier.arm();
         let first = tokio::spawn(async move { dispatcher.tick_agent_commands(8).await });
         barrier.wait_until_entered().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            command_barrier.wait_until_entered(),
+        )
+        .await
+        .expect("the real ACP terminal must reach dispatcher command completion before shutdown");
         let invocation = recovery.invocation().await.unwrap();
         let command = recovery.pending_or_owned_command().await;
-        recovery
-            .kernel
-            .complete_command(
-                &recovery.principal,
-                CompleteAgentCommand {
-                    session_id: recovery.session_id.clone(),
-                    task_id: recovery.task_id.clone(),
-                    command_id: command.id.clone(),
-                    expected_command_revision: command.revision,
-                    idempotency_key: IdempotencyKey::new(format!(
-                        "harness-result:{}",
-                        invocation.invocation_id.as_uuid()
-                    ))
-                    .unwrap(),
-                    event: RuntimeEvent::HarnessResult {
-                        event_id: format!("harness-result:{}", invocation.invocation_id.as_uuid()),
-                        command_key: RuntimeCommandKey::new(command.key.as_str()).unwrap(),
-                        outcome: "ok".to_owned(),
-                        fields: json!({"answer":"stable"}),
-                        evidence_id: EvidenceId::new(invocation.invocation_id.as_uuid()),
-                        history: vec![],
-                    },
-                },
-            )
-            .await
-            .unwrap();
         assert_eq!(recovery.authority().await, (GoalPhase::Active, 1));
+        let receipt_before: Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object('state', state, 'key', completion_idempotency_key, \
+             'digest', completion_request_digest, 'result', result) \
+             FROM agent_commands WHERE id = $1",
+        )
+        .bind(command.id.as_uuid())
+        .fetch_one(recovery.store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt_before["state"], "completed");
+        assert_eq!(
+            receipt_before["result"]["payload"]["fields"]["answer"],
+            "done"
+        );
         first.abort();
         barrier.release();
+        command_barrier.release();
         assert!(first.await.unwrap_err().is_cancelled());
 
         let restart_barrier = Arc::new(AcpTestBarrier::new_disarmed(
@@ -1342,6 +1502,11 @@ mod integrated_postgres_fake_restart {
         let settled = recovery.invocation().await.unwrap();
         assert_eq!(settled.state, HarnessInvocationState::Completed);
         assert_eq!(settled.invocation_id, invocation.invocation_id);
+        assert_eq!(settled.profile_id, invocation.profile_id);
+        assert_eq!(
+            settled.terminal_payload.as_ref().unwrap()["fields"]["answer"],
+            "done"
+        );
         assert_eq!(recovery.authority().await, (GoalPhase::Active, 1));
         assert_eq!(prompt_count(&first_observation), 1);
         assert_eq!(prompt_count(&second_observation), 0);
@@ -1349,6 +1514,16 @@ mod integrated_postgres_fake_restart {
             restarted.recover_harness_invocations(1).await.unwrap(),
             kiteframe::HarnessRecoveryReport::default()
         );
+        let receipt_after: Value = sqlx::query_scalar(
+            "SELECT jsonb_build_object('state', state, 'key', completion_idempotency_key, \
+             'digest', completion_request_digest, 'result', result) \
+             FROM agent_commands WHERE id = $1",
+        )
+        .bind(command.id.as_uuid())
+        .fetch_one(recovery.store.pool())
+        .await
+        .unwrap();
+        assert_eq!(receipt_after, receipt_before);
         recovery.cleanup().await;
     }
 }

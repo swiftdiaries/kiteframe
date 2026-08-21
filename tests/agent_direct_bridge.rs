@@ -16,12 +16,13 @@ use kiteframe::{
     AgentCommandDispatcher, AgentCommandId, AgentCommandView, AgentExecutionView, AgentKernel,
     AgentSelector, BuiltinHarnessPlugin, CancelUserTask, CatalogTool, ClaimAgentCommand,
     ClosedSchema, CompleteAgentCommand, CreateSession, EffectKind, EvidenceId, EvidenceRecord,
-    EvidenceSourceIdentity, GoalContract, GoalPhase, HarnessExecutionError, IdempotencyKey,
-    InvokeHarness, KernelCommandPayload, ModelClient, ModelError, ModelRequest, ModelResponse,
-    OperationalStatus, PauseUserTask, PostgresStore, PrincipalId, RecoverySupport, RequestContext,
-    RuntimeCeilings, RuntimeEvent, StartAgent, StartRun, StoreError, SubmitUserTask,
-    SuccessCriterion, TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget,
-    ToolCatalogSnapshot, UserTaskId, WaitForEvent, canonical_sha256,
+    EvidenceSourceIdentity, GoalContract, GoalPhase, HarnessDispatcherTestBarrier,
+    HarnessDispatcherTestBarrierPoint, HarnessExecutionError, IdempotencyKey, InvokeHarness,
+    KernelCommandPayload, ModelClient, ModelError, ModelRequest, ModelResponse, OperationalStatus,
+    PauseUserTask, PostgresStore, PrincipalId, RecoverySupport, RequestContext, RuntimeCeilings,
+    RuntimeEvent, StartAgent, StartRun, StoreError, SubmitUserTask, SuccessCriterion,
+    TaskLifecycle, TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot,
+    UserTaskId, WaitForEvent, canonical_sha256,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -1057,6 +1058,102 @@ async fn declared_model_tool_fails_closed_without_legacy_or_goal_authority() {
     );
     assert_eq!(fixture.legacy_run_count().await, 0);
     assert_eq!(fixture.legacy_frame_count().await, 0);
+}
+
+#[tokio::test]
+async fn restart_after_builtin_command_failure_reconstructs_the_exact_terminal_once() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started_with_declared_tool().await else {
+        eprintln!("SKIP built-in failed-command recovery: DATABASE_URL is absent");
+        return;
+    };
+    let command = fixture.pending_command().await;
+    fixture.model.respond_with(json!({
+        "type": "function_call",
+        "call_id": "tool-1",
+        "name": "docs/search",
+        "arguments": {},
+    }));
+    let barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+        HarnessDispatcherTestBarrierPoint::AfterCommandTerminal,
+    ));
+    let dispatcher = Arc::new(fixture.dispatcher.with_test_barrier(barrier.clone()));
+    let first = tokio::spawn({
+        let dispatcher = dispatcher.clone();
+        async move { dispatcher.tick_agent_commands(8).await }
+    });
+    barrier.wait_until_entered().await;
+    let before_restart: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object('state', state, 'key', completion_idempotency_key, \
+         'digest', completion_request_digest, 'result', result, 'failure', failure) \
+         FROM agent_commands WHERE id = $1",
+    )
+    .bind(command.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(before_restart["state"], "failed");
+    assert_eq!(
+        before_restart["failure"]["code"],
+        "runtime_command_unavailable"
+    );
+    let invocation = fixture
+        .store
+        .harness_invocation_for_command_revision(&command.id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!invocation.terminal);
+    first.abort();
+    barrier.release();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let profile = builtin_profile();
+    let mut registry = HarnessRegistry::new();
+    registry
+        .register(Arc::new(BuiltinHarnessPlugin::new(
+            profile,
+            fixture.model.clone(),
+        )))
+        .await
+        .unwrap();
+    let restarted = fixture
+        .kernel
+        .clone()
+        .with_harness_registry(Arc::new(registry), Arc::new(DenyAllHarnessApprovals));
+    let report = restarted.recover_harness_invocations(1).await.unwrap();
+    assert_eq!(report.terminal, 1);
+    assert_eq!(report.retryable_pre_accept, 0);
+    assert_eq!(report.outcome_unknown, 0);
+    let recovered = fixture
+        .store
+        .harness_invocation_for_command_revision(&command.id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state, HarnessInvocationState::Failed);
+    assert_eq!(
+        recovered.terminal_payload,
+        Some(json!({
+            "type":"failed",
+            "code":"harness_capability_unsupported",
+            "detail":"built-in harness capability is unavailable",
+        }))
+    );
+    let after_restart: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object('state', state, 'key', completion_idempotency_key, \
+         'digest', completion_request_digest, 'result', result, 'failure', failure) \
+         FROM agent_commands WHERE id = $1",
+    )
+    .bind(command.id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(after_restart, before_restart);
+    assert_eq!(
+        restarted.recover_harness_invocations(1).await.unwrap(),
+        kiteframe::HarnessRecoveryReport::default()
+    );
 }
 
 #[tokio::test]

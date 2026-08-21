@@ -28,6 +28,63 @@ pub struct HarnessRecoveryReport {
     pub terminal: u64,
 }
 
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarnessDispatcherTestBarrierPoint {
+    BeforeJournalInsert,
+    AfterPrepare,
+    AfterRetryCommit,
+    BeforeCommandTerminal,
+    AfterCommandTerminal,
+}
+
+#[cfg(feature = "test-support")]
+pub struct HarnessDispatcherTestBarrier {
+    point: HarnessDispatcherTestBarrierPoint,
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    entered_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl HarnessDispatcherTestBarrier {
+    #[must_use]
+    pub fn new(point: HarnessDispatcherTestBarrierPoint) -> Self {
+        Self {
+            point,
+            entered: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::atomic::AtomicBool::new(false),
+            entered_notify: tokio::sync::Notify::new(),
+            release_notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    pub async fn wait_until_entered(&self) {
+        while !self.entered.load(std::sync::atomic::Ordering::Acquire) {
+            self.entered_notify.notified().await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+
+    async fn pause(&self, point: HarnessDispatcherTestBarrierPoint) {
+        if self.point != point {
+            return;
+        }
+        self.entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.entered_notify.notify_waiters();
+        while !self.released.load(std::sync::atomic::Ordering::Acquire) {
+            self.release_notify.notified().await;
+        }
+    }
+}
+
 pub struct AgentCommandDispatcher {
     kernel: Arc<AgentKernel>,
     registry: Arc<HarnessRegistry>,
@@ -36,6 +93,8 @@ pub struct AgentCommandDispatcher {
     active: Arc<Mutex<BTreeSet<HarnessInvocationId>>>,
     recovery_seen: Arc<Mutex<BTreeSet<HarnessInvocationId>>>,
     recovery_lock: tokio::sync::Mutex<()>,
+    #[cfg(feature = "test-support")]
+    test_barrier: Option<Arc<HarnessDispatcherTestBarrier>>,
 }
 
 impl AgentKernel {
@@ -70,11 +129,27 @@ impl AgentKernel {
             active: Arc::new(Mutex::new(BTreeSet::new())),
             recovery_seen: Arc::new(Mutex::new(BTreeSet::new())),
             recovery_lock: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "test-support")]
+            test_barrier: None,
         }
     }
 }
 
 impl AgentCommandDispatcher {
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_test_barrier(mut self, barrier: Arc<HarnessDispatcherTestBarrier>) -> Self {
+        self.test_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn pause_test_barrier(&self, point: HarnessDispatcherTestBarrierPoint) {
+        if let Some(barrier) = &self.test_barrier {
+            barrier.pause(point).await;
+        }
+    }
+
     pub async fn recover_harness_invocations(
         &self,
         limit: i64,
@@ -277,6 +352,9 @@ impl AgentCommandDispatcher {
         let KernelCommandPayload::InvokeHarness(payload) = &claimed.payload else {
             unreachable!("harness route must contain InvokeHarness")
         };
+        #[cfg(feature = "test-support")]
+        self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::BeforeJournalInsert)
+            .await;
         let prepared = if let Some(stored) = self
             .kernel
             .store()
@@ -309,6 +387,9 @@ impl AgentCommandDispatcher {
                 })
                 .await?
         };
+        #[cfg(feature = "test-support")]
+        self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterPrepare)
+            .await;
         let profile_id = prepared.profile_id.clone();
         let journal = PreparedHarnessTerminalJournal::new(&prepared);
         dispatch_with_terminal_journal(
@@ -449,8 +530,14 @@ impl AgentCommandDispatcher {
                         history: output.history,
                     },
                 };
+                #[cfg(feature = "test-support")]
+                self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal)
+                    .await;
                 complete_or_audit_late(&self.kernel, &execution.task.principal, &completion)
                     .await?;
+                #[cfg(feature = "test-support")]
+                self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterCommandTerminal)
+                    .await;
                 self.kernel
                     .store()
                     .settle_harness_invocation(
@@ -466,7 +553,13 @@ impl AgentCommandDispatcher {
             HarnessTerminal::Cancelled => {
                 let failure =
                     failure_request(execution, claimed, &terminal_key, "harness_cancelled")?;
+                #[cfg(feature = "test-support")]
+                self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal)
+                    .await;
                 failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await?;
+                #[cfg(feature = "test-support")]
+                self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterCommandTerminal)
+                    .await;
                 self.kernel
                     .store()
                     .settle_harness_invocation(
@@ -493,14 +586,43 @@ impl AgentCommandDispatcher {
                         &terminal_payload,
                     )
                     .await?;
-                if retry.terminal {
-                    let code = if retry.state == HarnessInvocationState::Cancelled {
-                        "harness_cancelled"
-                    } else {
-                        "harness_failed"
-                    };
+                #[cfg(feature = "test-support")]
+                self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterRetryCommit)
+                    .await;
+                if retry.state == HarnessInvocationState::Cancelled {
+                    let code = "harness_cancelled";
                     let failure = failure_request(execution, claimed, &terminal_key, code)?;
                     failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                        .await?;
+                    #[cfg(feature = "test-support")]
+                    self.pause_test_barrier(
+                        HarnessDispatcherTestBarrierPoint::AfterCommandTerminal,
+                    )
+                    .await;
+                } else if invocation.attempt >= max_pre_accept_attempts {
+                    let failure =
+                        failure_request(execution, claimed, &terminal_key, "harness_failed")?;
+                    #[cfg(feature = "test-support")]
+                    self.pause_test_barrier(
+                        HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal,
+                    )
+                    .await;
+                    failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
+                        .await?;
+                    #[cfg(feature = "test-support")]
+                    self.pause_test_barrier(
+                        HarnessDispatcherTestBarrierPoint::AfterCommandTerminal,
+                    )
+                    .await;
+                    self.kernel
+                        .store()
+                        .settle_harness_invocation(
+                            &invocation.invocation_id,
+                            invocation.attempt,
+                            HarnessInvocationState::Failed,
+                            &terminal_key,
+                            &terminal_payload,
+                        )
                         .await?;
                 }
                 Ok(())
@@ -518,13 +640,26 @@ impl AgentCommandDispatcher {
                         &terminal_key,
                         "runtime_command_unavailable",
                     )?;
+                    #[cfg(feature = "test-support")]
+                    self.pause_test_barrier(
+                        HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal,
+                    )
+                    .await;
                     unavailable_or_audit_late(&self.kernel, &execution.task.principal, &failure)
                         .await?;
                 } else {
                     let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
+                    #[cfg(feature = "test-support")]
+                    self.pause_test_barrier(
+                        HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal,
+                    )
+                    .await;
                     failure_or_audit_late(&self.kernel, &execution.task.principal, &failure)
                         .await?;
                 }
+                #[cfg(feature = "test-support")]
+                self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterCommandTerminal)
+                    .await;
                 self.kernel
                     .store()
                     .settle_harness_invocation(
@@ -657,7 +792,13 @@ impl AgentCommandDispatcher {
         let terminal_key = terminal_idempotency_key(invocation_id);
         let failure =
             failure_request(execution, claimed, &terminal_key, "harness_outcome_unknown")?;
+        #[cfg(feature = "test-support")]
+        self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::BeforeCommandTerminal)
+            .await;
         failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await?;
+        #[cfg(feature = "test-support")]
+        self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterCommandTerminal)
+            .await;
         self.kernel
             .store()
             .settle_harness_invocation(
