@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::PathBuf;
 
 use kiteframe::harness::{HarnessCapability, HarnessProfile, HarnessRouteTable};
 use kiteframe::{ConfigError, HarnessConfig, HarnessRole, ModelRole};
 use serde_json::Value;
+use uuid::Uuid;
 
 fn profile(path: &str) -> HarnessProfile {
     HarnessProfile::from_json(&fs::read(path).expect("profile file")).expect("valid profile")
@@ -11,6 +13,27 @@ fn profile(path: &str) -> HarnessProfile {
 
 fn profile_id(value: &str) -> kiteframe::harness::HarnessProfileId {
     kiteframe::harness::HarnessProfileId::new(value).expect("profile id")
+}
+
+struct TemporaryDirectory(PathBuf);
+
+impl TemporaryDirectory {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("kiteframe-harness-profiles-{}", Uuid::now_v7()));
+        fs::create_dir_all(&path).expect("temporary test directory");
+        Self(path)
+    }
+
+    fn join(&self, value: &str) -> PathBuf {
+        self.0.join(value)
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -175,7 +198,77 @@ fn command_overrides_are_json_arrays_without_shell_interpolation() {
         commands.codex.unwrap().program.to_string_lossy(),
         "/opt/codex-acp/bin/codex-acp"
     );
-    assert_eq!(commands.deepseek.unwrap().program.to_string_lossy(), "echo");
+    assert!(commands.deepseek.unwrap().program.is_absolute());
+}
+
+#[test]
+fn resolved_executable_identity_is_absolute_and_immune_to_workspace_shadowing() {
+    let temporary = TemporaryDirectory::new();
+    let trusted = temporary.join("trusted");
+    let workspace = temporary.join("workspace");
+    fs::create_dir_all(&trusted).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    let trusted_program = trusted.join("pnpm");
+    fs::write(&trusted_program, "trusted").unwrap();
+    fs::write(workspace.join("pnpm"), "workspace shadow").unwrap();
+
+    let path = trusted.to_string_lossy().into_owned();
+    let environment = format!(r#"{{"PATH":"{path}"}}"#);
+    let config = HarnessConfig::from_test_values([
+        ("KITEFRAME_DSH_ACP_COMMAND_JSON", r#"["pnpm","run","demo"]"#),
+        (
+            "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+            "141eb6fef83422698aef7a981029e843e8161534",
+        ),
+        ("KITEFRAME_DSH_ACP_ENV_JSON", environment.as_str()),
+    ])
+    .unwrap();
+    assert_eq!(
+        config.external_harness_commands().deepseek.unwrap().program,
+        fs::canonicalize(&trusted_program).unwrap()
+    );
+
+    for invalid_path in [
+        format!("relative:{path}"),
+        format!(":{path}"),
+        format!("{path}:"),
+    ] {
+        let invalid_environment = format!(r#"{{"PATH":"{invalid_path}"}}"#);
+        assert!(
+            HarnessConfig::from_test_values([
+                ("KITEFRAME_DSH_ACP_COMMAND_JSON", r#"["pnpm"]"#),
+                (
+                    "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+                    "141eb6fef83422698aef7a981029e843e8161534",
+                ),
+                ("KITEFRAME_DSH_ACP_ENV_JSON", invalid_environment.as_str()),
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resolved_absolute_symlink_identity_is_checked_by_target_basename() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TemporaryDirectory::new();
+    let target = temporary.join("ash");
+    let link = temporary.join("configured-acp");
+    fs::write(&target, "not a real interpreter").unwrap();
+    symlink(&target, &link).unwrap();
+    let command = serde_json::json!([link.to_string_lossy()]).to_string();
+    assert!(
+        HarnessConfig::from_test_values([
+            ("KITEFRAME_CODEX_ACP_COMMAND_JSON", command.as_str()),
+            (
+                "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+                "296069e841634cd4bb9bc4515602d836e49231ec",
+            ),
+        ])
+        .is_err()
+    );
 }
 
 #[test]
@@ -310,18 +403,31 @@ fn literal_arguments_allow_metacharacters_but_reject_shell_and_precise_secret_fo
         r#"["/bin/csh","-c","echo"]"#,
         r#"["/bin/tcsh","-c","echo"]"#,
         r#"["/bin/fish","-c","echo"]"#,
+        r#"["/bin/ash","-c","echo"]"#,
+        r#"["/bin/hush","-c","echo"]"#,
         r#"["/bin/busybox","sh","-c","echo"]"#,
+        r#"["/bin/busybox","ash","-c","echo"]"#,
+        r#"["/bin/busybox","hush","-c","echo"]"#,
+        r#"["/bin/busybox","--install","/tmp/bin"]"#,
         r#"["/usr/bin/env","bash","-c","echo"]"#,
         r#"["/usr/bin/env","printenv"]"#,
         r#"["/usr/bin/command","dash","-c","echo"]"#,
         r#"["curl","--header","Authorization: Bearer value"]"#,
         r#"["curl","--header=Authorization: Bearer value"]"#,
         r#"["curl","-HAuthorization: Bearer value"]"#,
+        r#"["curl","--header","Proxy-Authorization: Bearer value"]"#,
+        r#"["curl","--header=Proxy-Authorization: Bearer value"]"#,
+        r#"["curl","-HProxy-Authorization: Bearer value"]"#,
         r#"["curl","--user=person:password"]"#,
         r#"["curl","-uperson:password"]"#,
         r#"["curl","--token:value"]"#,
         r#"["curl","https://secret@example.test/acp"]"#,
         r#"["curl","https://example.test/acp?api_key=secret"]"#,
+        r#"["curl","https://example.test/acp?%74oken=secret"]"#,
+        r#"["curl","https://example.test/acp?%6bey=secret"]"#,
+        r#"["curl","https://example.test/acp?%70assword=secret"]"#,
+        r#"["curl","https://example.test/acp?%61uth=secret"]"#,
+        r#"["curl","https://example.test/acp?%ZZ=ambiguous"]"#,
     ] {
         assert!(
             HarnessConfig::from_test_values([
@@ -346,6 +452,18 @@ fn literal_arguments_allow_metacharacters_but_reject_shell_and_precise_secret_fo
         ),
     ]);
     assert!(benign.is_ok());
+
+    let email_query = HarnessConfig::from_test_values([
+        (
+            "KITEFRAME_CODEX_ACP_COMMAND_JSON",
+            r#"["/opt/codex-acp","https://example.test?email=user@example.com"]"#,
+        ),
+        (
+            "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+            "296069e841634cd4bb9bc4515602d836e49231ec",
+        ),
+    ]);
+    assert!(email_query.is_ok());
 }
 
 #[test]
@@ -405,4 +523,21 @@ fn required_environment_values_and_json_keys_are_unique_and_nonempty() {
         ])
         .is_err()
     );
+    for environment in [
+        r#"{"AUTH":"ok"} trailing"#,
+        r#"{"AUTH":"ok"}{"LEAK":"value"}"#,
+    ] {
+        assert!(
+            HarnessConfig::from_test_values([
+                ("KITEFRAME_DSH_ACP_COMMAND_JSON", r#"["/opt/dsh"]"#),
+                (
+                    "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+                    "141eb6fef83422698aef7a981029e843e8161534",
+                ),
+                ("KITEFRAME_DSH_ACP_ENV_JSON", environment),
+                ("KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON", r#"["AUTH"]"#),
+            ])
+            .is_err()
+        );
+    }
 }

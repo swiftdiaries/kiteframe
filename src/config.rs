@@ -396,14 +396,15 @@ fn parse_external_harness(
             if is_bare_program(program) && !environment.as_ref().is_some_and(has_nonempty_path) {
                 return Err(ConfigError::BareExternalHarnessCommandRequiresPath { command_name });
             }
-            if !valid_program(program, args, environment.as_ref())
-                || !valid_literal_arguments(program, args)
-            {
+            let Some(program) = resolve_program(program, args, environment.as_ref()) else {
+                return Err(ConfigError::InvalidExternalHarnessCommand { command_name });
+            };
+            if !valid_literal_arguments(program.as_path(), args) {
                 return Err(ConfigError::InvalidExternalHarnessCommand { command_name });
             }
             Ok((
                 Some(AcpCommand {
-                    program: program.into(),
+                    program,
                     args: args.iter().map(OsString::from).collect(),
                     source_revision,
                 }),
@@ -480,10 +481,10 @@ fn parse_environment_object(value: &str) -> Result<BTreeMap<String, String>, ser
         }
     }
 
-    serde::de::Deserializer::deserialize_map(
-        &mut serde_json::Deserializer::from_str(value),
-        NoDuplicateObject,
-    )
+    let mut deserializer = serde_json::Deserializer::from_str(value);
+    let values = serde::de::Deserializer::deserialize_map(&mut deserializer, NoDuplicateObject)?;
+    deserializer.end()?;
+    Ok(values)
 }
 
 fn valid_environment_key(value: &str) -> bool {
@@ -499,30 +500,26 @@ fn is_full_revision(value: &str) -> bool {
         && !value.bytes().all(|byte| byte == b'0')
 }
 
-fn valid_program(
+fn resolve_program(
     value: &str,
     arguments: &[String],
     environment: Option<&AcpChildEnvironment>,
-) -> bool {
+) -> Option<PathBuf> {
     if !valid_literal(value) {
-        return false;
+        return None;
     }
     let path = Path::new(value);
     let resolved = if path.is_absolute() {
         canonical_or_original(path)
     } else {
-        let Some(environment) = environment else {
-            return false;
-        };
-        let Some(path) = resolve_bare_program(value, environment) else {
-            return false;
-        };
+        let environment = environment?;
+        let path = resolve_bare_program(value, environment)?;
         path
     };
     if !resolved.is_absolute() || (!path.is_absolute() && path.components().count() != 1) {
-        return false;
+        return None;
     }
-    !is_recognized_shell(&resolved, arguments)
+    (!is_recognized_shell(&resolved, arguments)).then_some(resolved)
 }
 
 fn is_bare_program(value: &str) -> bool {
@@ -535,17 +532,29 @@ fn canonical_or_original(value: &Path) -> PathBuf {
 
 fn resolve_bare_program(value: &str, environment: &AcpChildEnvironment) -> Option<PathBuf> {
     let path = environment.values.get(&OsString::from("PATH"))?;
-    std::env::split_paths(path)
+    let components = std::env::split_paths(path).collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| component.as_os_str().is_empty() || !component.is_absolute())
+    {
+        return None;
+    }
+    components
+        .into_iter()
         .map(|directory| directory.join(value))
         .find(|candidate| candidate.is_file())
         .map(|candidate| canonical_or_original(&candidate))
 }
 
 fn has_nonempty_path(environment: &AcpChildEnvironment) -> bool {
-    environment
-        .values
-        .get(&OsString::from("PATH"))
-        .is_some_and(|value| !value.is_empty() && !value.to_string_lossy().trim().is_empty())
+    let Some(path) = environment.values.get(&OsString::from("PATH")) else {
+        return false;
+    };
+    !path.is_empty()
+        && !path.to_string_lossy().trim().is_empty()
+        && std::env::split_paths(path)
+            .all(|component| component.is_absolute() && !component.as_os_str().is_empty())
 }
 
 fn is_shell_executable(value: &Path) -> bool {
@@ -559,6 +568,8 @@ fn is_shell_executable(value: &Path) -> bool {
                 | "ksh"
                 | "csh"
                 | "tcsh"
+                | "ash"
+                | "hush"
                 | "cmd"
                 | "powershell"
                 | "pwsh"
@@ -576,14 +587,16 @@ fn is_recognized_shell(program: &Path, arguments: &[String]) -> bool {
     match basename {
         // These launch another executable. Do not try to infer the wrapped command or source.
         Some("env" | "command") => true,
-        Some("busybox") => arguments
-            .first()
-            .is_some_and(|argument| is_shell_executable(Path::new(argument)) || argument == "sh"),
+        Some("busybox") => arguments.iter().any(|argument| {
+            argument == "--install"
+                || argument.starts_with("--install=")
+                || is_shell_executable(Path::new(argument))
+        }),
         _ => false,
     }
 }
 
-fn valid_literal_arguments(program: &str, arguments: &[String]) -> bool {
+fn valid_literal_arguments(program: &Path, arguments: &[String]) -> bool {
     let mut workspace_override = false;
     for (index, argument) in arguments.iter().enumerate() {
         if !valid_literal(argument) || contains_secret_argument(argument) {
@@ -613,7 +626,7 @@ fn valid_literal_arguments(program: &str, arguments: &[String]) -> bool {
             return false;
         }
     }
-    !workspace_override && !is_recognized_shell(Path::new(program), arguments)
+    !workspace_override && !is_recognized_shell(program, arguments)
 }
 
 fn valid_literal(value: &str) -> bool {
@@ -639,7 +652,9 @@ fn contains_secret_argument(value: &str) -> bool {
             || normalized.starts_with(&format!("--{name}:"))
     }) || normalized.starts_with("-u") && normalized.len() > 2
         || normalized.starts_with("-hauthorization:")
+        || normalized.starts_with("-hproxy-authorization:")
         || normalized.starts_with("--header=authorization:")
+        || normalized.starts_with("--header=proxy-authorization:")
         || is_secret_header(value)
         || has_url_userinfo(value)
         || has_secret_query_name(value)
@@ -653,18 +668,23 @@ fn is_secret_header(value: &str) -> bool {
 fn has_url_userinfo(value: &str) -> bool {
     value.find("://").is_some_and(|scheme| {
         let authority = value[scheme + 3..]
-            .split_once('/')
-            .map_or(&value[scheme + 3..], |(authority, _)| authority);
+            .split(['/', '?', '#'])
+            .next()
+            .expect("split always yields an authority");
         authority.contains('@')
     })
 }
 
 fn has_secret_query_name(value: &str) -> bool {
-    let Some((_, query)) = value.split_once('?') else {
+    let before_fragment = value.split('#').next().unwrap_or(value);
+    let Some((_, query)) = before_fragment.split_once('?') else {
         return false;
     };
     query.split('&').any(|pair| {
         let key = pair.split_once('=').map_or(pair, |(key, _)| key);
+        let Some(key) = percent_decode(key) else {
+            return true;
+        };
         matches!(
             key.to_ascii_lowercase().as_str(),
             "token"
@@ -677,6 +697,26 @@ fn has_secret_query_name(value: &str) -> bool {
                 | "authorization"
         )
     })
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = *bytes.get(index + 1)?;
+        let low = *bytes.get(index + 2)?;
+        let high = (high as char).to_digit(16)?;
+        let low = (low as char).to_digit(16)?;
+        decoded.push((high * 16 + low) as u8);
+        index += 3;
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn is_workspace_override(value: &str) -> bool {
