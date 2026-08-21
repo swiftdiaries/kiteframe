@@ -112,9 +112,53 @@ release matrix:
 cargo test --features test-support --test harness_acp_conformance --test harness_acp_recovery
 cargo test --test harness_profiles --test harness_plugin_protocol --test harness_builtin_conformance
 cargo test --test harness_store
+```
+
+### Live ACP certification setup
+
+The process environment passed to an ACP child is deliberately explicit: it is
+not inherited from the shell. Production deployments may validly configure an
+empty child environment, but the normative live-certification tests require an
+explicit, nonempty authentication readiness declaration. This prevents an
+accidentally logged-in developer session from being counted as live-provider
+evidence.
+
+Obtain the credentials in the current session from the deployment's secret
+manager or other approved session injection. Do not put them in a checked-in
+`.env` file, command history, test output, or debug log; do not enable `set
+-x` while setting these variables. The maps below use placeholders only, not
+real credentials.
+
+For Codex ACP, pass the selected authentication variable in the JSON object
+and name exactly that nonempty key in the required-key list. This profile uses
+an absolute executable path, so `PATH` is not needed for the command shown.
+
+```bash
+export KITEFRAME_CODEX_ACP_ENV_JSON='{"OPENAI_API_KEY":"<obtain-from-secret-manager-or-session>"}'
+export KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON='["OPENAI_API_KEY"]'
 KITEFRAME_CODEX_ACP_COMMAND_JSON='["/absolute/codex-acp"]' KITEFRAME_CODEX_ACP_SOURCE_REVISION='296069e841634cd4bb9bc4515602d836e49231ec' cargo test --test harness_acp_live codex_acp_live_core -- --exact --nocapture
+```
+
+For DeepSeek Harness ACP, pass its authentication key in the map and list it
+as the required key. The checked-in command starts with the bare `pnpm`
+executable, so its explicit map must also include a nonempty absolute `PATH`.
+Replace `/absolute/bin` with the trusted directory that contains the intended
+`pnpm`, preserving any additional required absolute directories.
+
+```bash
+export KITEFRAME_DSH_ACP_ENV_JSON='{"DEEPSEEK_API_KEY":"<obtain-from-secret-manager-or-session>","PATH":"/absolute/bin"}'
+export KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON='["DEEPSEEK_API_KEY"]'
 KITEFRAME_DSH_ACP_COMMAND_JSON='["pnpm","--dir","/absolute/deepseek-harness","run","demo:acp"]' KITEFRAME_DSH_ACP_SOURCE_REVISION='141eb6fef83422698aef7a981029e843e8161534' cargo test --test harness_acp_live deepseek_harness_acp_live_core -- --exact --nocapture
 ```
+
+`*_ACP_ENV_JSON` must be a JSON object whose keys and values are strings;
+`*_ACP_REQUIRED_ENV_JSON` must be a JSON array of unique, nonempty key names.
+Every listed key must occur in the map with a nonempty value. The example
+authentication key names are the expected keys for these checked-out provider
+commands; if a pinned provider revision documents different names, update both
+the map and the required-key list together. Values are redacted by Kiteframe's
+configuration debug output, but operators must still avoid printing either
+JSON variable.
 
 Each configured executable and checkout must be built from the exact checked-in
 repository and full commit named by its profile. The source-revision environment

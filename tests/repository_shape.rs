@@ -111,6 +111,22 @@ fn public_docs_name_both_v1_acp_profiles_and_exclude_dynamic_cordis() {
 }
 
 #[test]
+fn public_testing_guide_names_both_live_acp_auth_environment_gates() {
+    let guide = std::fs::read_to_string("docs/guides/testing-kiteframe.md").unwrap();
+    for name in [
+        "KITEFRAME_CODEX_ACP_ENV_JSON",
+        "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON",
+        "KITEFRAME_DSH_ACP_ENV_JSON",
+        "KITEFRAME_DSH_ACP_REQUIRED_ENV_JSON",
+    ] {
+        assert!(
+            guide.contains(name),
+            "missing live ACP auth variable: {name}"
+        );
+    }
+}
+
+#[test]
 fn no_v1_runtime_surface_exposes_cordis_package_lifecycle() {
     let mut sources = Vec::new();
     collect_rust_sources(std::path::Path::new("src"), &mut sources);

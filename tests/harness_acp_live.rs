@@ -35,6 +35,14 @@ enum LiveTarget {
     DeepSeek,
 }
 
+enum LiveReadiness {
+    Skip(&'static str),
+    Ready {
+        command: AcpCommand,
+        environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    },
+}
+
 impl LiveTarget {
     const fn command_name(self) -> &'static str {
         match self {
@@ -64,6 +72,13 @@ impl LiveTarget {
         }
     }
 
+    const fn source_revision_name(self) -> &'static str {
+        match self {
+            Self::Codex => "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
+            Self::DeepSeek => "KITEFRAME_DSH_ACP_SOURCE_REVISION",
+        }
+    }
+
     const fn skip_line(self) -> &'static str {
         match self {
             Self::Codex => "SKIP codex live: KITEFRAME_CODEX_ACP_COMMAND_JSON is absent",
@@ -80,30 +95,30 @@ impl LiveTarget {
         }
     }
 
-    async fn driver_if_enabled(self) -> Option<LiveAcpDriver> {
-        if std::env::var_os(self.command_name()).is_none() {
-            eprintln!("{}", self.skip_line());
-            return None;
-        }
+    fn readiness(
+        self,
+        mut value: impl FnMut(&str) -> Option<String>,
+    ) -> Result<LiveReadiness, kiteframe::ConfigError> {
+        let command = value(self.command_name());
+        let Some(command) = command else {
+            return Ok(LiveReadiness::Skip(self.skip_line()));
+        };
         let config = HarnessConfig::from_test_values(
             [
-                self.command_name(),
-                match self {
-                    Self::Codex => "KITEFRAME_CODEX_ACP_SOURCE_REVISION",
-                    Self::DeepSeek => "KITEFRAME_DSH_ACP_SOURCE_REVISION",
-                },
-                self.environment_name(),
-                self.required_environment_name(),
+                (self.command_name(), Some(command)),
+                (
+                    self.source_revision_name(),
+                    value(self.source_revision_name()),
+                ),
+                (self.environment_name(), value(self.environment_name())),
+                (
+                    self.required_environment_name(),
+                    value(self.required_environment_name()),
+                ),
             ]
             .into_iter()
-            .filter_map(|name| std::env::var(name).ok().map(|value| (name, value))),
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "{} is configured but its ACP deployment configuration is invalid: {error}",
-                self.command_name()
-            )
-        });
+            .filter_map(|(name, value)| value.map(|value| (name, value))),
+        )?;
         let (command, environment) = match self {
             Self::Codex => (
                 config.external_harness_commands().codex,
@@ -114,13 +129,36 @@ impl LiveTarget {
                 config.external_harness_environments().deepseek,
             ),
         };
-        let command =
-            command.expect("command presence was checked before parsing live configuration");
+        let command = command.expect("a configured live target has a parsed command");
         let Some(environment) =
             environment.filter(|environment| environment.required_values_present())
         else {
-            eprintln!("{}", self.auth_skip_line());
-            return None;
+            return Ok(LiveReadiness::Skip(self.auth_skip_line()));
+        };
+        Ok(LiveReadiness::Ready {
+            command,
+            environment: environment.values(),
+        })
+    }
+
+    async fn driver_if_enabled(self) -> Option<LiveAcpDriver> {
+        let readiness = self
+            .readiness(|name| std::env::var(name).ok())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} is configured but its ACP deployment configuration is invalid: {error}",
+                    self.command_name()
+                )
+            });
+        let (command, environment) = match readiness {
+            LiveReadiness::Skip(line) => {
+                eprintln!("{line}");
+                return None;
+            }
+            LiveReadiness::Ready {
+                command,
+                environment,
+            } => (command, environment),
         };
         let profile = HarnessProfile::from_json(
             &std::fs::read(self.profile_path()).expect("checked-in profile is readable"),
@@ -129,7 +167,7 @@ impl LiveTarget {
         Some(LiveAcpDriver {
             profile,
             command,
-            environment: environment.values(),
+            environment,
         })
     }
 }
@@ -387,4 +425,50 @@ async fn deepseek_harness_acp_live_core() {
         return;
     };
     assert_normative_harness(driver).await;
+}
+
+#[test]
+fn live_target_readiness_requires_explicit_auth_and_reports_honest_skips() {
+    assert!(matches!(
+        LiveTarget::Codex.readiness(|_| None).unwrap(),
+        LiveReadiness::Skip(line)
+            if line == "SKIP codex live: KITEFRAME_CODEX_ACP_COMMAND_JSON is absent"
+    ));
+
+    assert!(matches!(
+        LiveTarget::DeepSeek
+            .readiness(|name| match name {
+                "KITEFRAME_DSH_ACP_COMMAND_JSON" => {
+                    Some(r#"["/opt/deepseek-harness-acp"]"#.to_owned())
+                }
+                "KITEFRAME_DSH_ACP_SOURCE_REVISION" => {
+                    Some("141eb6fef83422698aef7a981029e843e8161534".to_owned())
+                }
+                _ => None,
+            })
+            .unwrap(),
+        LiveReadiness::Skip(line)
+            if line == "SKIP DeepSeek live: explicit DeepSeek ACP auth environment is absent"
+    ));
+
+    assert!(matches!(
+        LiveTarget::Codex
+            .readiness(|name| match name {
+                "KITEFRAME_CODEX_ACP_COMMAND_JSON" => {
+                    Some(r#"["/opt/codex-acp"]"#.to_owned())
+                }
+                "KITEFRAME_CODEX_ACP_SOURCE_REVISION" => {
+                    Some("296069e841634cd4bb9bc4515602d836e49231ec".to_owned())
+                }
+                "KITEFRAME_CODEX_ACP_ENV_JSON" => {
+                    Some(r#"{"CODEX_API_KEY":"placeholder-not-a-secret"}"#.to_owned())
+                }
+                "KITEFRAME_CODEX_ACP_REQUIRED_ENV_JSON" => {
+                    Some(r#"["CODEX_API_KEY"]"#.to_owned())
+                }
+                _ => None,
+            })
+            .unwrap(),
+        LiveReadiness::Ready { .. }
+    ));
 }

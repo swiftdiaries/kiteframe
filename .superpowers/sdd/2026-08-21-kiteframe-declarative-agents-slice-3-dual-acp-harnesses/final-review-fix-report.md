@@ -310,3 +310,70 @@ This round changes only the CI smoke helper/tests, the structural workflow
 test and its test-only YAML dependency, and this report. Production Rust,
 client behavior, migrations, TypeScript smoke paths, and untracked `fuzz/`
 and `site/` remain untouched.
+
+---
+
+# Final Review Fix: Reproducible ACP Live Authentication Gates
+
+Date: 2026-08-22
+
+Status: COMPLETE
+
+Review base: `817f65e`
+
+Commit message: `docs: make ACP live gates reproducible`
+
+## Finding closed
+
+The public live-certification commands set only each ACP command and source
+revision. The live harness intentionally requires both an explicit child
+environment map and a nonempty required-key list before it may count a
+provider as authentication-ready, so copied commands always emitted the
+authentication skip line instead of exercising the provider.
+
+## Resolution
+
+- Documented complete, secret-safe Codex and DeepSeek Harness setup with the
+  exact command/revision attestations retained verbatim.
+- Named both environment-map and required-key variables for both providers;
+  showed string-to-string JSON maps, unique required-key lists, placeholder
+  values only, and the DeepSeek bare-`pnpm` absolute `PATH` requirement.
+- Explicitly distinguished valid production empty child environments from the
+  normative live-certification readiness requirement, and directed operators
+  to approved secret/session injection without committing, printing, or
+  tracing values.
+- Extracted the live test's skip-versus-ready decision into a non-spawning
+  readiness function. Its regression proves the exact missing-command and
+  missing-auth skip lines, while a complete placeholder configuration reaches
+  the authenticated runnable branch without launching a provider.
+- Added a repository-shape guard requiring the public testing guide to name
+  all four live authentication configuration variables. Existing profile
+  coverage continues to prove explicit environments are redacted, required
+  values are nonempty, and bare executables require `PATH`.
+
+## TDD evidence
+
+The readiness test was first run without the extracted gate and failed at
+compile time because `LiveTarget::readiness` and `LiveReadiness` did not yet
+exist. The documentation guard then failed with the expected missing
+`KITEFRAME_CODEX_ACP_ENV_JSON` assertion. Both passed after the minimal gate
+extraction and complete setup guide.
+
+## Verification
+
+- `cargo test --test repository_shape`: 9 passed.
+- `cargo test --test harness_profiles`: 15 passed.
+- `cargo test --test harness_acp_live -- --nocapture`: 3 passed; current
+  unconfigured provider targets emitted their exact honest command-absent
+  `SKIP` lines.
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `cargo build --all-targets --all-features`: passed.
+- `git diff --check`: passed.
+
+## Scope
+
+This fix changes only the public testing guide, its structural guard, the
+live-test readiness seam and regression, and this append-only report. No
+provider process was spawned; no secret values were supplied or logged.
+Untracked `fuzz/` and `site/` remain untouched and unstaged.
