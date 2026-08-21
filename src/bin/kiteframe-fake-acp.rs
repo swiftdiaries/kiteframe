@@ -18,12 +18,23 @@ fn run() -> Result<(), String> {
             .ok_or("KITEFRAME_FAKE_ACP_SCRIPT is required")?,
     );
     let observation_path = std::env::var_os("KITEFRAME_FAKE_ACP_OBSERVATION").map(PathBuf::from);
+    let process_log_path = std::env::var_os("KITEFRAME_FAKE_ACP_PROCESS_LOG").map(PathBuf::from);
     let allow_registration_eof =
         std::env::var_os("KITEFRAME_FAKE_ACP_ALLOW_REGISTRATION_EOF").is_some();
     let script: Vec<Value> = serde_json::from_slice(
         &std::fs::read(&script_path).map_err(|error| format!("could not read script: {error}"))?,
     )
     .map_err(|error| format!("invalid script: {error}"))?;
+    append_process_log(
+        process_log_path.as_ref(),
+        &json!({
+            "event": "start",
+            "firstExitAfterRead": script
+                .first()
+                .and_then(|entry| entry.get("exitAfterRead"))
+                .is_some(),
+        }),
+    )?;
     let stdin = std::io::stdin();
     let mut input = stdin.lock();
     let stdout = std::io::stdout();
@@ -155,6 +166,10 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
         if let Some(method) = frame.get("method").and_then(Value::as_str) {
+            append_process_log(
+                process_log_path.as_ref(),
+                &json!({"event": "method", "method": method}),
+            )?;
             observation["methods"]
                 .as_array_mut()
                 .unwrap()
@@ -290,4 +305,18 @@ fn save_observation(path: Option<&PathBuf>, observation: &Value) -> Result<(), S
             .map_err(|error| format!("could not write observation: {error}"))?;
     }
     Ok(())
+}
+
+fn append_process_log(path: Option<&PathBuf>, event: &Value) -> Result<(), String> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("could not open process log: {error}"))?;
+    serde_json::to_writer(&mut file, event)
+        .map_err(|error| format!("could not write process log: {error}"))?;
+    writeln!(file).map_err(|error| format!("could not finish process log event: {error}"))
 }

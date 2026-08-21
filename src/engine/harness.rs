@@ -212,6 +212,28 @@ impl AgentCommandDispatcher {
                     .insert(invocation.invocation_id);
                 continue;
             }
+            if invocation.state == HarnessInvocationState::Started {
+                if let Some(closed) = self
+                    .close_consumed_pre_accept_attempt_budget(&invocation)
+                    .await?
+                {
+                    report.terminal += 1;
+                    if closed.state != HarnessInvocationState::Cancelled {
+                        let context = self.recovered_command_context(&closed).await?;
+                        self.settle_pre_accept_exhausted(
+                            &context.execution,
+                            &context.command,
+                            &closed,
+                        )
+                        .await?;
+                    }
+                    self.recovery_seen
+                        .lock()
+                        .expect("dispatcher recovery lock is not poisoned")
+                        .insert(closed.invocation_id);
+                    continue;
+                }
+            }
             match invocation.state {
                 HarnessInvocationState::Prepared | HarnessInvocationState::Started => {
                     report.retryable_pre_accept += 1;
@@ -471,6 +493,17 @@ impl AgentCommandDispatcher {
                         .settle_pre_accept_exhausted(execution, &claimed, &prepared)
                         .await;
                 }
+                if let Some(closed) = self
+                    .close_consumed_pre_accept_attempt_budget(&prepared)
+                    .await?
+                {
+                    if closed.state == HarnessInvocationState::Cancelled {
+                        return Ok(());
+                    }
+                    return self
+                        .settle_pre_accept_exhausted(execution, &claimed, &closed)
+                        .await;
+                }
                 let workspace: String =
                     sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
                         .bind(execution.task.session_id.as_uuid())
@@ -649,6 +682,12 @@ impl AgentCommandDispatcher {
                         &terminal_payload,
                     )
                     .await?;
+                let exhausted = self
+                    .kernel
+                    .store()
+                    .harness_pre_accept_exhaustion(&invocation.invocation_id)
+                    .await?
+                    .is_some();
                 #[cfg(feature = "test-support")]
                 self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterRetryCommit)
                     .await;
@@ -662,7 +701,7 @@ impl AgentCommandDispatcher {
                         HarnessDispatcherTestBarrierPoint::AfterCommandTerminal,
                     )
                     .await;
-                } else if invocation.attempt >= max_pre_accept_attempts {
+                } else if exhausted {
                     let failure =
                         failure_request(execution, claimed, &terminal_key, "harness_failed")?;
                     #[cfg(feature = "test-support")]
@@ -681,7 +720,7 @@ impl AgentCommandDispatcher {
                         .store()
                         .settle_harness_invocation(
                             &invocation.invocation_id,
-                            invocation.attempt,
+                            retry.attempt,
                             HarnessInvocationState::Failed,
                             &terminal_key,
                             &terminal_payload,
@@ -899,6 +938,34 @@ impl AgentCommandDispatcher {
             failed_terminal_from_payload(&payload)?,
         )
         .await
+    }
+
+    async fn close_consumed_pre_accept_attempt_budget(
+        &self,
+        invocation: &HarnessInvocationView,
+    ) -> Result<Option<HarnessInvocationView>, StoreError> {
+        let max_pre_accept_attempts =
+            registered_pre_accept_attempt_limit(&self.registry, &invocation.profile_id)?;
+        if invocation.attempt < max_pre_accept_attempts {
+            return Ok(None);
+        }
+        let terminal = HarnessTerminal::Failed(HarnessFailure::new(
+            "harness_failed",
+            "harness pre-accept attempt budget was already consumed before dispatch",
+        ));
+        let terminal_key = terminal_idempotency_key(&invocation.invocation_id);
+        let terminal_payload = terminal_payload(&terminal);
+        self.kernel
+            .store()
+            .record_harness_retryable_failure(
+                &invocation.invocation_id,
+                invocation.attempt,
+                max_pre_accept_attempts,
+                &terminal_key,
+                &terminal_payload,
+            )
+            .await
+            .map(Some)
     }
 }
 

@@ -157,15 +157,25 @@ impl HarnessStoreFixture {
 
     async fn additional_command(&self) -> AgentCommandId {
         let command_id = AgentCommandId::new(Uuid::now_v7());
+        let ordinal: i32 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM agent_commands WHERE transition_id = $1",
+        )
+        .bind(self.transition_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap();
+        let runtime_key = format!("harness:store:{}", command_id.as_uuid());
         sqlx::query(
             "INSERT INTO agent_commands \
              (id, task_id, transition_id, ordinal, schema_version, runtime_key, command_kind, payload, payload_digest) \
-             SELECT $1, task_id, $2, 1, 1, 'harness:store:second', 'invoke_harness', \
-                    $3, 'sha256:command-second' \
-             FROM agent_commands WHERE id = $4",
+             SELECT $1, task_id, $2, $3, 1, $4, 'invoke_harness', \
+                    $5, 'sha256:command-second' \
+             FROM agent_commands WHERE id = $6",
         )
         .bind(command_id.as_uuid())
         .bind(self.transition_id)
+        .bind(ordinal)
+        .bind(runtime_key)
         .bind(json!({"type": "invoke_harness", "payload": {}}))
         .bind(self.command_id.as_uuid())
         .execute(&self.pool)
@@ -1132,20 +1142,10 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
         .await
         .unwrap();
     assert_eq!(retry.state, HarnessInvocationState::Started);
-    assert_eq!(retry.attempt, 1);
-    let exhausted = fixture
-        .store
-        .record_harness_retryable_failure(
-            &invocation.invocation_id,
-            1,
-            1,
-            "sha256:retry-b",
-            &json!({"type":"failed","code":"harness_failed","detail":"retry"}),
-        )
-        .await
-        .unwrap();
+    assert_eq!(retry.attempt, 0);
+    let exhausted = retry;
     assert_eq!(exhausted.state, HarnessInvocationState::Started);
-    assert_eq!(exhausted.attempt, 1);
+    assert_eq!(exhausted.attempt, 0);
     assert!(!exhausted.terminal);
     assert_eq!(exhausted.terminal_request_digest, None);
     assert_eq!(exhausted.terminal_payload, None);
@@ -1160,7 +1160,7 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
     assert!(sqlx::Row::get::<bool, _>(&closure, "pre_accept_exhausted"));
     assert_eq!(
         sqlx::Row::get::<String, _>(&closure, "exhaustion_request_digest"),
-        "sha256:retry-b"
+        "sha256:retry-a"
     );
     assert_eq!(
         sqlx::Row::get::<serde_json::Value, _>(&closure, "exhaustion_payload"),
@@ -1171,7 +1171,7 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
             .store
             .record_harness_retryable_failure(
                 &invocation.invocation_id,
-                1,
+                0,
                 1,
                 "sha256:retry-drift",
                 &json!({"type":"failed","code":"harness_failed","detail":"drift"}),
@@ -1179,6 +1179,129 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
             .await,
         Err(StoreError::IdempotencyConflict)
     ));
+}
+
+async fn cancelled_terminal_fixture() -> Option<(HarnessStoreFixture, HarnessInvocationView)> {
+    let fixture = HarnessStoreFixture::new().await?;
+    let invocation = fixture.prepare("sha256:terminal-freeze").await.unwrap();
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+    let terminal = fixture
+        .store
+        .settle_harness_invocation(
+            &invocation.invocation_id,
+            0,
+            HarnessInvocationState::Cancelled,
+            &terminal_key,
+            &json!({"type":"cancelled"}),
+        )
+        .await
+        .unwrap();
+    Some((fixture, terminal))
+}
+
+#[tokio::test]
+async fn terminal_attempt_is_immutable_in_the_database() {
+    let Some((fixture, terminal)) = cancelled_terminal_fixture().await else {
+        return;
+    };
+    let error = sqlx::query(
+        "UPDATE harness_invocations SET attempt = attempt + 1 WHERE invocation_id = $1",
+    )
+    .bind(terminal.invocation_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55000")
+    );
+}
+
+#[tokio::test]
+async fn terminal_prompt_acceptance_is_immutable_in_the_database() {
+    let Some((fixture, terminal)) = cancelled_terminal_fixture().await else {
+        return;
+    };
+    let error = sqlx::query(
+        "UPDATE harness_invocations SET prompt_accepted = TRUE WHERE invocation_id = $1",
+    )
+    .bind(terminal.invocation_id.as_uuid())
+    .execute(&fixture.pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("55000")
+    );
+}
+
+#[tokio::test]
+async fn exhausted_terminal_rows_reject_mismatched_digest_payload_and_state() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let exhaustion_payload = json!({
+        "type": "failed",
+        "code": "harness_failed",
+        "detail": "retry budget exhausted"
+    });
+    for (suffix, state, terminal_digest, terminal_payload) in [
+        (
+            "digest",
+            "failed",
+            "harness-terminal:wrong",
+            exhaustion_payload.clone(),
+        ),
+        (
+            "payload",
+            "failed",
+            "exhaustion-digest",
+            json!({"type":"failed","code":"harness_failed","detail":"contradictory"}),
+        ),
+        (
+            "state",
+            "cancelled",
+            "exhaustion-digest",
+            exhaustion_payload.clone(),
+        ),
+    ] {
+        let command_id = fixture.additional_command().await;
+        let invocation_id = Uuid::now_v7();
+        let mut tx = fixture.pool.begin().await.unwrap();
+        let result = sqlx::query(
+            "INSERT INTO harness_invocations \
+             (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
+              state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
+              pre_accept_exhausted, exhaustion_request_digest, exhaustion_payload) \
+             VALUES ($1, $2, 0, $3, $4, $5, $6, 0, FALSE, TRUE, $7, $8, TRUE, \
+                     'exhaustion-digest', $9)",
+        )
+        .bind(invocation_id)
+        .bind(command_id.as_uuid())
+        .bind(fixture.profile_id.as_str())
+        .bind(&fixture.profile_digest)
+        .bind(format!("sha256:exhaustion-{suffix}"))
+        .bind(state)
+        .bind(terminal_digest)
+        .bind(terminal_payload)
+        .bind(&exhaustion_payload)
+        .execute(&mut *tx)
+        .await;
+        tx.rollback().await.unwrap();
+        let error = result.expect_err("contradictory exhausted terminal row must be rejected");
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("23514"),
+            "unexpected rejection for {suffix}"
+        );
+    }
 }
 
 #[tokio::test]

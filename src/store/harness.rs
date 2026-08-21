@@ -306,7 +306,10 @@ impl PostgresStore {
         {
             return Err(StoreError::RevisionConflict);
         }
-        if expected_attempt >= max_pre_accept_attempts {
+        let next_attempt = expected_attempt
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidData("harness attempt is malformed".to_owned()))?;
+        if next_attempt >= max_pre_accept_attempts {
             let view = mark_harness_pre_accept_exhausted(
                 &mut tx,
                 invocation_id,
@@ -318,14 +321,11 @@ impl PostgresStore {
             tx.commit().await?;
             return Ok(view);
         }
-        let attempt = expected_attempt
-            .checked_add(1)
-            .ok_or_else(|| StoreError::InvalidData("harness attempt is malformed".to_owned()))?;
         let view = update_invocation_state(
             &mut tx,
             invocation_id,
             HarnessInvocationState::Started,
-            attempt,
+            next_attempt,
             false,
             false,
             None,
