@@ -54,6 +54,7 @@ uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]
 async-tungstenite = { version = "0.34", features = ["tokio-runtime"] }
+yaml_serde = "0.10.7"
 
 [lints.rust]
 unsafe_code = "forbid"

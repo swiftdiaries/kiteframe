@@ -137,30 +137,155 @@ fn no_v1_runtime_surface_exposes_cordis_package_lifecycle() {
 fn ci_runs_the_python_live_smoke_in_a_disposable_database_after_rust_tests() {
     let workflow = std::fs::read_to_string(".github/workflows/ci.yml").unwrap();
 
-    let rust_tests = workflow.find("- name: Test all targets").unwrap();
-    let create = workflow
-        .find("- name: Create isolated Python live-smoke database")
-        .unwrap();
-    let smoke = workflow
-        .find("- name: Exercise Python client against the compiled harness")
-        .unwrap();
-    let drop = workflow
-        .find("- name: Drop isolated Python live-smoke database")
-        .unwrap();
+    assert_ci_isolation(&parse_ci_workflow(&workflow).unwrap()).unwrap();
+}
 
-    assert!(rust_tests < create && create < smoke && smoke < drop);
-    for required in [
-        "tests/ci/isolated_database.py create",
-        "tests/ci/isolated_database.py drop",
-        "if: ${{ always() }}",
-        "KITEFRAME_INTEGRATION_DATABASE_URL: ${{ steps.python-live-smoke-database.outputs.database_url }}",
-        "working-directory: clients/python\n        run: uv run pyright",
-    ] {
-        assert!(
-            workflow.contains(required),
-            "CI workflow is missing: {required}"
-        );
+#[test]
+fn ci_structural_guard_rejects_decoy_comment_and_non_rust_job() {
+    let workflow = std::fs::read_to_string(".github/workflows/ci.yml").unwrap();
+    let missing_create = workflow.replacen(
+        "- name: Create isolated Python live-smoke database",
+        "- name: Decoy create step",
+        1,
+    );
+    let decoy_comment =
+        format!("# - name: Create isolated Python live-smoke database\n{missing_create}");
+    assert!(assert_ci_isolation(&parse_ci_workflow(&decoy_comment).unwrap()).is_err());
+
+    let non_rust_job = workflow.replacen("  rust:\n", "  decoy:\n", 1);
+    assert!(assert_ci_isolation(&parse_ci_workflow(&non_rust_job).unwrap()).is_err());
+}
+
+#[derive(Debug, Deserialize)]
+struct CiWorkflow {
+    jobs: BTreeMap<String, CiJob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CiJob {
+    steps: Vec<CiStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CiStep {
+    id: Option<String>,
+    name: Option<String>,
+    run: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(rename = "if")]
+    condition: Option<String>,
+    #[serde(rename = "working-directory")]
+    working_directory: Option<String>,
+}
+
+fn parse_ci_workflow(workflow: &str) -> Result<CiWorkflow, yaml_serde::Error> {
+    yaml_serde::from_str(workflow)
+}
+
+fn assert_ci_isolation(workflow: &CiWorkflow) -> Result<(), String> {
+    let rust_steps = &workflow.jobs.get("rust").ok_or("missing rust job")?.steps;
+    let rust_tests = required_step(rust_steps, "Test all targets")?;
+    let create = required_step(rust_steps, "Create isolated Python live-smoke database")?;
+    let smoke = required_step(
+        rust_steps,
+        "Exercise Python client against the compiled harness",
+    )?;
+    let cleanup = required_step(rust_steps, "Drop isolated Python live-smoke database")?;
+    let position = |step: &CiStep| {
+        rust_steps
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, step))
+            .expect("step originates from rust job")
+    };
+    if !(position(rust_tests) < position(create)
+        && position(create) < position(smoke)
+        && position(smoke) < position(cleanup))
+    {
+        return Err("Rust CI steps are out of order".to_owned());
     }
+
+    let database_name = "kiteframe_ci_python_live_${{ github.run_id }}_${{ github.run_attempt }}";
+    assert_step(
+        create,
+        Some("python-live-smoke-database"),
+        Some(
+            "python3 tests/ci/isolated_database.py create \\\n  --database-url \"$DATABASE_URL\" \\\n  --database-name \"$KITEFRAME_SMOKE_DATABASE_NAME\" \\\n  --github-output \"$GITHUB_OUTPUT\"",
+        ),
+        Some(database_name),
+        None,
+    )?;
+    if smoke
+        .env
+        .get("KITEFRAME_INTEGRATION_DATABASE_URL")
+        .map(String::as_str)
+        != Some("${{ steps.python-live-smoke-database.outputs.database_url }}")
+    {
+        return Err("Python smoke does not consume the isolated database output".to_owned());
+    }
+    assert_step(
+        cleanup,
+        None,
+        Some(
+            "python3 tests/ci/isolated_database.py drop \\\n  --database-url \"$DATABASE_URL\" \\\n  --database-name \"$KITEFRAME_SMOKE_DATABASE_NAME\"",
+        ),
+        Some(database_name),
+        Some("${{ always() }}"),
+    )?;
+
+    let python_steps = &workflow
+        .jobs
+        .get("python")
+        .ok_or("missing python job")?
+        .steps;
+    let pyright = required_step(python_steps, "Type-check Python client")?;
+    if pyright.working_directory.as_deref() != Some("clients/python")
+        || pyright.run.as_deref() != Some("uv run pyright")
+    {
+        return Err("Pyright does not run from the Python client directory".to_owned());
+    }
+    Ok(())
+}
+
+fn required_step<'a>(steps: &'a [CiStep], name: &str) -> Result<&'a CiStep, String> {
+    let mut matching = steps
+        .iter()
+        .filter(|step| step.name.as_deref() == Some(name));
+    let step = matching
+        .next()
+        .ok_or_else(|| format!("missing step: {name}"))?;
+    if matching.next().is_some() {
+        return Err(format!("duplicate step: {name}"));
+    }
+    Ok(step)
+}
+
+fn assert_step(
+    step: &CiStep,
+    id: Option<&str>,
+    run: Option<&str>,
+    database_name: Option<&str>,
+    condition: Option<&str>,
+) -> Result<(), String> {
+    if step.id.as_deref() != id
+        || step.run.as_deref().map(str::trim) != run
+        || step
+            .env
+            .get("KITEFRAME_SMOKE_DATABASE_NAME")
+            .map(String::as_str)
+            != database_name
+        || step.condition.as_deref() != condition
+    {
+        return Err(format!(
+            "incorrect CI step: {}; id={:?}; run={:?}; env={:?}; condition={:?}",
+            step.name.as_deref().unwrap_or("unnamed"),
+            step.id,
+            step.run,
+            step.env,
+            step.condition
+        ));
+    }
+    Ok(())
 }
 
 fn collect_rust_sources(directory: &std::path::Path, sources: &mut Vec<std::path::PathBuf>) {
@@ -173,3 +298,5 @@ fn collect_rust_sources(directory: &std::path::Path, sources: &mut Vec<std::path
         }
     }
 }
+use serde::Deserialize;
+use std::collections::BTreeMap;

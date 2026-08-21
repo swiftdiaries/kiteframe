@@ -241,3 +241,72 @@ This fix changes only CI isolation/typecheck wiring, its small PostgreSQL
 helper and checks, and this report. It does not change production Rust, client
 behavior, migrations, or the TypeScript smoke paths. Untracked `fuzz/` and
 `site/` remain untouched and unstaged.
+
+---
+
+# Final Review Fix Round 1: Harden Isolated Database Verification
+
+Date: 2026-08-22
+
+Status: COMPLETE
+
+Review base: `fa07acd`
+
+Commit message: `ci: harden isolated database verification`
+
+## Findings closed
+
+The initial helper supplied `createdb` and `dropdb` with a PostgreSQL URL in
+argv. A process failure could then include credentials in a
+`CalledProcessError` traceback. The initial repository-shape guard also
+searched raw workflow text, so a comment or unrelated job could accidentally
+satisfy its checks.
+
+## Resolution
+
+- The helper now parses PostgreSQL URLs and invokes libpq tools with only the
+  non-secret maintenance database in argv. Host, port, user, decoded password,
+  and recognised connection options are supplied through `PG*` environment
+  variables; credential-bearing subprocess stdout/stderr are discarded and
+  failures raise only a fixed public error.
+- The derived smoke URL preserves the original scheme, percent encoding, IPv6
+  authority, and query options. It is emitted as a GitHub `add-mask` command
+  immediately before being written to `GITHUB_OUTPUT`.
+- The helper test now covers encoded credentials, IPv6, query options,
+  secret-free argv, output masking, and a failing command whose stdout,
+  stderr, and exception all omit its credential sentinel.
+- Replaced raw text matching with a `yaml_serde` test-only parser. The guard
+  validates ordered mappings in `jobs.rust`, exact create/cleanup names, ids,
+  command arguments, shared target environment, smoke output consumption,
+  `always()` cleanup, and the exact Python Pyright working-directory command.
+  Negative mutations prove comments and a non-`rust` decoy job cannot pass.
+
+## TDD evidence
+
+The new helper regressions first failed because the existing command had no
+libpq environment and embedded the credential-bearing URL in argv; the
+failure-sentinel case also had no sanitised command error. The structural test
+first failed with its missing parser/guard contracts. Both suites passed after
+the minimal helper, parser, and structural assertions were added.
+
+## Verification
+
+- Helper regression suite: 4 passed.
+- Parsed CI structural guard: 8 repository-shape tests passed, including both
+  negative mutations.
+- CI YAML parsed successfully.
+- `cargo fmt --all --check` and strict
+  `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- Python client Ruff and Pyright passed with zero diagnostics.
+- A live PostgreSQL 16 simulation seeded a contaminated baseline and started
+  the compiled harness against a separate fresh target. The target contained
+  no contamination marker, received real migrations, and ran all Python
+  client tests: **25 passed**. Both explicitly named disposable databases were
+  deleted and confirmed absent afterward.
+
+## Scope
+
+This round changes only the CI smoke helper/tests, the structural workflow
+test and its test-only YAML dependency, and this report. Production Rust,
+client behavior, migrations, TypeScript smoke paths, and untracked `fuzz/`
+and `site/` remain untouched.
