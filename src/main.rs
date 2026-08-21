@@ -259,6 +259,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::new(DenyAllHarnessApprovals),
             harness_routes,
         ));
+        let harness_recovery = agent_dispatcher
+            .recover_harness_invocations(engine.config.scheduler_batch_size)
+            .await?;
+        tracing::info!(
+            retryable_pre_accept = harness_recovery.retryable_pre_accept,
+            outcome_unknown = harness_recovery.outcome_unknown,
+            terminal = harness_recovery.terminal,
+            "harness invocation recovery complete"
+        );
         let application = Arc::new(application);
 
         match config.mode {

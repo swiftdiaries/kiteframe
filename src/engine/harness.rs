@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
@@ -16,6 +17,13 @@ use crate::{
 };
 
 const HARNESS_DISPATCHER_CLAIMANT: &str = "harness-dispatcher-v1";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HarnessRecoveryReport {
+    pub retryable_pre_accept: u64,
+    pub outcome_unknown: u64,
+    pub terminal: u64,
+}
 
 pub struct AgentCommandDispatcher {
     kernel: Arc<AgentKernel>,
@@ -60,6 +68,79 @@ impl AgentKernel {
 }
 
 impl AgentCommandDispatcher {
+    pub async fn recover_harness_invocations(
+        &self,
+        limit: i64,
+    ) -> Result<HarnessRecoveryReport, StoreError> {
+        if limit <= 0 {
+            return Ok(HarnessRecoveryReport::default());
+        }
+        let recovered = self
+            .kernel
+            .store()
+            .recover_harness_invocations(limit)
+            .await?;
+        let mut seen = BTreeSet::new();
+        let mut report = HarnessRecoveryReport::default();
+        for invocation in recovered {
+            if !seen.insert(invocation.invocation_id.clone()) {
+                continue;
+            }
+            match invocation.state {
+                HarnessInvocationState::Prepared | HarnessInvocationState::Started => {
+                    report.retryable_pre_accept += 1;
+                }
+                HarnessInvocationState::Accepted | HarnessInvocationState::OutcomeUnknown => {
+                    report.outcome_unknown += 1;
+                    let context = self.recovered_command_context(&invocation).await?;
+                    self.settle_outcome_unknown(
+                        &context.execution,
+                        &context.command,
+                        &invocation.invocation_id,
+                        invocation.attempt,
+                    )
+                    .await?;
+                }
+                HarnessInvocationState::Completed
+                | HarnessInvocationState::Cancelled
+                | HarnessInvocationState::Failed => {
+                    report.terminal += 1;
+                    let context = self.recovered_command_context(&invocation).await?;
+                    self.settle_harness_terminal(
+                        &context.execution,
+                        &context.command,
+                        &invocation,
+                        terminal_from_record(&invocation)?,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn recovered_command_context(
+        &self,
+        invocation: &HarnessInvocationView,
+    ) -> Result<crate::AgentCommandContext, StoreError> {
+        let (session_id, task_id): (uuid::Uuid, uuid::Uuid) = sqlx::query_as(
+            "SELECT tasks.session_id, commands.task_id FROM agent_commands commands \
+             JOIN user_tasks tasks ON tasks.id = commands.task_id \
+             WHERE commands.id = $1",
+        )
+        .bind(invocation.command_id.as_uuid())
+        .fetch_one(self.kernel.store().pool())
+        .await?;
+        self.kernel
+            .store()
+            .load_agent_command_context(
+                SessionId::new(session_id),
+                crate::UserTaskId::new(task_id),
+                invocation.command_id.clone(),
+            )
+            .await
+    }
+
     pub async fn tick_agent_commands(&self, limit: i64) -> Result<usize, StoreError> {
         if limit <= 0 {
             return Ok(0);
@@ -256,20 +337,29 @@ impl AgentCommandDispatcher {
                     StoreError::InvalidData("harness event sequence is malformed".to_owned())
                 })?;
                 let store = self.kernel.store_arc();
-                let terminal = self
-                    .registry
-                    .invoke_from_sequence_with_acceptance_barrier(
-                        request,
-                        self.approvals.clone(),
-                        Arc::new(PostgresHarnessEventSink::new(store.clone())),
-                        next_sequence,
-                        postgres_harness_acceptance_barrier(
-                            store,
-                            prepared.invocation_id.clone(),
-                            prepared.attempt,
-                        ),
-                    )
-                    .await;
+                let invocation = self.registry.invoke_from_sequence_with_acceptance_barrier(
+                    request,
+                    self.approvals.clone(),
+                    Arc::new(PostgresHarnessEventSink::new(store.clone())),
+                    next_sequence,
+                    postgres_harness_acceptance_barrier(
+                        store,
+                        prepared.invocation_id.clone(),
+                        prepared.attempt,
+                    ),
+                );
+                tokio::pin!(invocation);
+                let cancellation = self.wait_for_command_cancellation(&claimed.id);
+                tokio::pin!(cancellation);
+                let terminal = tokio::select! {
+                    biased;
+                    terminal = &mut invocation => terminal,
+                    cancelled = &mut cancellation => {
+                        cancelled?;
+                        let _ = self.registry.cancel(&prepared.invocation_id).await;
+                        invocation.await
+                    }
+                };
                 self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
                     .await
             },
@@ -284,6 +374,11 @@ impl AgentCommandDispatcher {
         invocation: &crate::store::HarnessInvocationView,
         terminal: HarnessTerminal,
     ) -> Result<(), StoreError> {
+        if self.command_is_cancelled(&claimed.id).await? {
+            return self
+                .settle_late_terminal_after_cancel(execution, claimed, invocation, terminal)
+                .await;
+        }
         let terminal_key = terminal_idempotency_key(&invocation.invocation_id);
         let terminal_payload = terminal_payload(&terminal);
         match terminal {
@@ -393,6 +488,94 @@ impl AgentCommandDispatcher {
                     invocation.attempt,
                 )
                 .await
+            }
+        }
+    }
+
+    async fn wait_for_command_cancellation(
+        &self,
+        command_id: &crate::AgentCommandId,
+    ) -> Result<(), StoreError> {
+        loop {
+            if self.command_is_cancelled(command_id).await? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn command_is_cancelled(
+        &self,
+        command_id: &crate::AgentCommandId,
+    ) -> Result<bool, StoreError> {
+        let state: String = sqlx::query_scalar("SELECT state FROM agent_commands WHERE id = $1")
+            .bind(command_id.as_uuid())
+            .fetch_one(self.kernel.store().pool())
+            .await?;
+        Ok(state == "cancelled")
+    }
+
+    async fn settle_late_terminal_after_cancel(
+        &self,
+        execution: &crate::AgentExecutionView,
+        claimed: &crate::AgentCommandView,
+        invocation: &HarnessInvocationView,
+        terminal: HarnessTerminal,
+    ) -> Result<(), StoreError> {
+        let terminal_key = terminal_idempotency_key(&invocation.invocation_id);
+        if !invocation.terminal {
+            self.kernel
+                .store()
+                .settle_harness_invocation(
+                    &invocation.invocation_id,
+                    invocation.attempt,
+                    HarnessInvocationState::Cancelled,
+                    &terminal_key,
+                    &serde_json::json!({"type": "cancelled"}),
+                )
+                .await?;
+        }
+        match terminal {
+            HarnessTerminal::Completed(output) => {
+                let completion = CompleteAgentCommand {
+                    session_id: execution.task.session_id.clone(),
+                    task_id: claimed.task_id.clone(),
+                    command_id: claimed.id.clone(),
+                    expected_command_revision: claimed.revision,
+                    idempotency_key: idempotency_key(format!(
+                        "harness-result:{}",
+                        invocation.invocation_id.as_uuid()
+                    ))?,
+                    event: RuntimeEvent::HarnessResult {
+                        event_id: format!("harness-result:{}", invocation.invocation_id.as_uuid()),
+                        command_key: claimed.key.clone(),
+                        outcome: output.outcome,
+                        fields: output.fields,
+                        evidence_id: EvidenceId::new(invocation.invocation_id.as_uuid()),
+                        history: output.history,
+                    },
+                };
+                self.kernel
+                    .store()
+                    .audit_late_agent_command_completion(&execution.task.principal, &completion)
+                    .await
+            }
+            HarnessTerminal::Cancelled => {
+                let failure =
+                    failure_request(execution, claimed, &terminal_key, "harness_cancelled")?;
+                self.kernel
+                    .store()
+                    .audit_late_agent_command_failure(&execution.task.principal, &failure)
+                    .await
+            }
+            HarnessTerminal::Retryable(failure)
+            | HarnessTerminal::Failed(failure)
+            | HarnessTerminal::OutcomeUnknown(failure) => {
+                let failure = failure_request(execution, claimed, &terminal_key, failure.code)?;
+                self.kernel
+                    .store()
+                    .audit_late_agent_command_failure(&execution.task.principal, &failure)
+                    .await
             }
         }
     }

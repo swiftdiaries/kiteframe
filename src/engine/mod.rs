@@ -3,7 +3,7 @@ mod recovery;
 mod transition;
 
 pub use crate::harness::{HarnessExecutionError, HarnessExecutionResult};
-pub use harness::AgentCommandDispatcher;
+pub use harness::{AgentCommandDispatcher, HarnessRecoveryReport};
 pub use recovery::RecoveryReport;
 pub use transition::{FrameSnapshot, TransitionError, next_command};
 

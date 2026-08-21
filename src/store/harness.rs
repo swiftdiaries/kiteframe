@@ -442,6 +442,22 @@ impl PostgresStore {
         limit: i64,
     ) -> Result<Vec<HarnessInvocationView>, StoreError> {
         let mut tx = self.pool().begin().await?;
+        let work_rows = sqlx::query(
+            "SELECT invocations.invocation_id, invocations.command_id, invocations.command_revision, \
+                    invocations.profile_id, invocations.profile_digest, invocations.payload_digest, \
+                    invocations.state, invocations.attempt, invocations.prompt_accepted, \
+                    invocations.terminal, invocations.terminal_request_digest, invocations.terminal_payload \
+             FROM harness_invocations invocations \
+             JOIN agent_commands commands ON commands.id = invocations.command_id \
+             WHERE invocations.state = 'prepared' \
+                OR (invocations.state = 'started' AND invocations.prompt_accepted = FALSE) \
+                OR (invocations.terminal = TRUE AND commands.completion_idempotency_key IS NULL) \
+             ORDER BY invocations.created_at, invocations.invocation_id LIMIT $1 \
+             FOR UPDATE OF invocations",
+        )
+        .bind(limit.clamp(1, 256))
+        .fetch_all(&mut *tx)
+        .await?;
         let accepted_rows = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
                     state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
@@ -450,7 +466,7 @@ impl PostgresStore {
         )
         .fetch_all(&mut *tx)
         .await?;
-        let mut recovered = Vec::with_capacity(accepted_rows.len() + limit.clamp(1, 256) as usize);
+        let mut recovered = Vec::with_capacity(accepted_rows.len() + work_rows.len());
         for row in accepted_rows {
             let view = harness_invocation_from_row(&row)?;
             recovered.push(
@@ -467,17 +483,7 @@ impl PostgresStore {
                 .await?,
             );
         }
-        let retryable_rows = sqlx::query(
-            "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
-             FROM harness_invocations \
-             WHERE state = 'prepared' OR (state = 'started' AND prompt_accepted = FALSE) \
-             ORDER BY created_at, invocation_id LIMIT $1 FOR UPDATE",
-        )
-        .bind(limit.clamp(1, 256))
-        .fetch_all(&mut *tx)
-        .await?;
-        for row in retryable_rows {
+        for row in work_rows {
             recovered.push(harness_invocation_from_row(&row)?);
         }
         tx.commit().await?;

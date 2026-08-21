@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
 use kiteframe::dsl::{Limits, compile};
+use kiteframe::harness::{
+    DenyAllHarnessApprovals, HarnessInvocationId, HarnessRegistry, builtin_harness_profile,
+};
+use kiteframe::store::{HarnessPluginRegistration, PrepareHarnessInvocation};
 use kiteframe::{
     AgentCommandContext, AgentCommandId, AgentKernel, AgentRecoveryReport, AgentSelector,
-    ClaimAgentCommand, CompleteAgentCommand, CreateSession, EvidenceId, GoalContract, GoalPhase,
-    IdempotencyKey, KiteAgentRuntime, KiteFrameState, OperationalStatus, PostgresStore,
-    PrincipalId, ResumeUserTask, RuntimeCeilings, RuntimeCommandKey, RuntimeEvent,
-    RuntimeStateSnapshot, SessionView, StartAgent, StoreError, SubmitUserTask, SuccessCriterion,
-    TaskOwnerAuthorizer, TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
+    BuiltinHarnessPlugin, ClaimAgentCommand, CompleteAgentCommand, CreateSession, EvidenceId,
+    GoalContract, GoalPhase, IdempotencyKey, KiteAgentRuntime, KiteFrameState, ModelClient,
+    ModelError, ModelRequest, ModelResponse, OperationalStatus, PostgresStore, PrincipalId,
+    ResumeUserTask, RuntimeCeilings, RuntimeCommandKey, RuntimeEvent, RuntimeStateSnapshot,
+    SessionView, StartAgent, StoreError, SubmitUserTask, SuccessCriterion, TaskOwnerAuthorizer,
+    TaskPreferences, TaskTarget, ToolCatalogSnapshot, UserTaskId,
 };
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -15,6 +20,15 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 static RESTART_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct NeverModel;
+
+#[async_trait::async_trait]
+impl ModelClient for NeverModel {
+    async fn respond(&self, _request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        panic!("restart recovery must not invoke the model")
+    }
+}
 
 #[derive(Clone)]
 struct IsolatedDatabase {
@@ -426,6 +440,115 @@ async fn restart_preserves_claim_and_excludes_completed_commands() {
     drop(reopened);
     drop(fixture.kernel);
     drop(fixture.store);
+    database.drop().await;
+}
+
+#[tokio::test]
+async fn restart_recovers_kernel_before_marking_accepted_harness_work_unknown() {
+    let _guard = RESTART_TEST_LOCK.lock().await;
+    let Some(fixture) = RestartAgentFixture::started_fork().await else {
+        eprintln!("SKIP ordered harness restart recovery: DATABASE_URL is absent");
+        return;
+    };
+    let pending = fixture.first_pending_context().await.command;
+    let claimed = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session.id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: pending.id.clone(),
+            expected_command_revision: pending.revision,
+            claimant: "harness-dispatcher-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new(format!(
+                "harness-dispatcher-v1:{}",
+                pending.id.as_uuid()
+            ))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    let profile = builtin_harness_profile("0123456789abcdef0123456789abcdef01234567").unwrap();
+    let profile_digest = profile.digest().unwrap();
+    fixture
+        .store
+        .register_harness_plugin(HarnessPluginRegistration {
+            profile_id: profile.id.clone(),
+            profile_digest: profile_digest.clone(),
+            source_repository: profile.source_repository.clone(),
+            source_revision: profile.source_revision.clone(),
+            transport: profile.transport,
+            enabled: true,
+        })
+        .await
+        .unwrap();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &invocation_id,
+            command_id: &claimed.id,
+            command_revision: claimed.revision,
+            profile_id: &profile.id,
+            profile_digest: &profile_digest,
+            payload_digest: &claimed.payload_digest,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&invocation_id, 0)
+        .await
+        .unwrap();
+
+    let database = fixture.database.clone();
+    let database_url = fixture.database_url.clone();
+    let session_id = fixture.session.id.clone();
+    let task_id = fixture.task_id.clone();
+    drop(fixture.kernel);
+    drop(fixture.store);
+
+    let reopened = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+    let kernel = Arc::new(AgentKernel::new(
+        Arc::clone(&reopened),
+        Arc::new(KiteAgentRuntime::new(RuntimeCeilings::default())),
+        Arc::new(TaskOwnerAuthorizer::new(Arc::clone(&reopened))),
+    ));
+    assert_eq!(
+        kernel.recover(32).await.unwrap(),
+        AgentRecoveryReport {
+            pending: 0,
+            claimed: 1,
+        }
+    );
+    let mut registry = HarnessRegistry::new();
+    registry
+        .register(Arc::new(BuiltinHarnessPlugin::new(
+            profile,
+            Arc::new(NeverModel),
+        )))
+        .await
+        .unwrap();
+    let dispatcher = kernel
+        .clone()
+        .with_harness_registry(Arc::new(registry), Arc::new(DenyAllHarnessApprovals));
+    let report = dispatcher.recover_harness_invocations(32).await.unwrap();
+    assert_eq!(report.outcome_unknown, 1);
+    assert_eq!(report.retryable_pre_accept, 0);
+    assert_eq!(report.terminal, 0);
+    let context = reopened
+        .load_agent_command_context(session_id, task_id, claimed.id)
+        .await
+        .unwrap();
+    assert_eq!(context.command.state, kiteframe::AgentCommandState::Failed);
+    assert_eq!(context.execution.goal_phase, GoalPhase::Active);
+    drop(dispatcher);
+    drop(kernel);
+    drop(reopened);
     database.drop().await;
 }
 

@@ -1462,6 +1462,13 @@ async fn cancellation_during_model_execution_audits_the_late_result_only_on_the_
     assert_eq!(after.lifecycle, TaskLifecycle::Cancelled);
     assert_eq!(after.goal_phase, GoalPhase::Active);
     assert_eq!(fixture.command_state(&command.id).await, "cancelled");
+    let harness_state: String =
+        sqlx::query_scalar("SELECT state FROM harness_invocations WHERE command_id = $1")
+            .bind(command.id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(harness_state, "cancelled");
     assert_eq!(fixture.evidence().await.len(), 0);
     assert_eq!(fixture.snapshot_fingerprint().await, before_snapshot);
     let after_cancel = after_cancel_fingerprint.lock().unwrap().clone().unwrap();
@@ -1651,6 +1658,249 @@ async fn cancellation_during_model_or_tool_failure_audits_only_command_failure_m
             after_cancel_fingerprint.lock().unwrap().clone().unwrap()
         );
     }
+}
+
+#[tokio::test]
+async fn harness_restart_reuses_pre_accept_invocation_without_incrementing_attempt() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        eprintln!("SKIP harness restart recovery: DATABASE_URL is absent");
+        return;
+    };
+    let pending = fixture.pending_command().await;
+    let claimed = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session_id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: pending.id.clone(),
+            expected_command_revision: pending.revision,
+            claimant: "harness-dispatcher-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new(format!(
+                "harness-dispatcher-v1:{}",
+                pending.id.as_uuid()
+            ))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    let profile = builtin_profile();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let prepared = fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &invocation_id,
+            command_id: &claimed.id,
+            command_revision: claimed.revision,
+            profile_id: &profile.id,
+            profile_digest: &profile.digest().unwrap(),
+            payload_digest: &claimed.payload_digest,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation_id, prepared.attempt)
+        .await
+        .unwrap();
+
+    let report = fixture
+        .dispatcher
+        .recover_harness_invocations(8)
+        .await
+        .unwrap();
+    assert_eq!(report.retryable_pre_accept, 1);
+    assert_eq!(report.outcome_unknown, 0);
+    assert_eq!(report.terminal, 0);
+    let recovered = fixture
+        .store
+        .harness_invocation_for_command_revision(&claimed.id, claimed.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.invocation_id, invocation_id);
+    assert_eq!(
+        recovered.attempt, 0,
+        "recovery does not own retry increments"
+    );
+
+    fixture.model.complete("ok", json!({"answer": "recovered"}));
+    assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
+    let completed = fixture
+        .store
+        .harness_invocation_for_command_revision(&claimed.id, claimed.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.invocation_id, invocation_id);
+    assert_eq!(fixture.model.calls(), 1);
+}
+
+#[tokio::test]
+async fn harness_restart_marks_accepted_unknown_and_fails_only_the_bounded_command() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        eprintln!("SKIP accepted harness restart recovery: DATABASE_URL is absent");
+        return;
+    };
+    let pending = fixture.pending_command().await;
+    let claimed = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session_id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: pending.id.clone(),
+            expected_command_revision: pending.revision,
+            claimant: "harness-dispatcher-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new(format!(
+                "harness-dispatcher-v1:{}",
+                pending.id.as_uuid()
+            ))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    let profile = builtin_profile();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let prepared = fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &invocation_id,
+            command_id: &claimed.id,
+            command_revision: claimed.revision,
+            profile_id: &profile.id,
+            profile_digest: &profile.digest().unwrap(),
+            payload_digest: &claimed.payload_digest,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation_id, prepared.attempt)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&invocation_id, prepared.attempt)
+        .await
+        .unwrap();
+
+    let report = fixture
+        .dispatcher
+        .recover_harness_invocations(8)
+        .await
+        .unwrap();
+    assert_eq!(report.retryable_pre_accept, 0);
+    assert_eq!(report.outcome_unknown, 1);
+    assert_eq!(report.terminal, 0);
+    assert_eq!(fixture.command_state(&claimed.id).await, "failed");
+    assert_eq!(fixture.model.calls(), 0);
+    assert!(fixture.evidence().await.is_empty());
+    let execution = fixture.current().await;
+    assert_eq!(execution.goal_phase, GoalPhase::Active);
+    let recovered = fixture
+        .store
+        .harness_invocation_for_command_revision(&claimed.id, claimed.revision)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.state, HarnessInvocationState::OutcomeUnknown);
+    assert_eq!(
+        recovered.terminal_payload,
+        Some(json!({
+            "type":"outcome_unknown",
+            "code":"harness_outcome_unknown",
+            "detail":"harness terminal outcome is unknown",
+        }))
+    );
+}
+
+#[tokio::test]
+async fn harness_restart_replays_committed_terminal_into_kernel_exactly_once() {
+    let _guard = BRIDGE_TEST_LOCK.lock().await;
+    let Some(fixture) = BridgeFixture::started().await else {
+        eprintln!("SKIP committed harness terminal recovery: DATABASE_URL is absent");
+        return;
+    };
+    let pending = fixture.pending_command().await;
+    let claimed = fixture
+        .store
+        .claim_agent_command(ClaimAgentCommand {
+            session_id: fixture.session_id.clone(),
+            task_id: fixture.task_id.clone(),
+            command_id: pending.id.clone(),
+            expected_command_revision: pending.revision,
+            claimant: "harness-dispatcher-v1".to_owned(),
+            idempotency_key: IdempotencyKey::new(format!(
+                "harness-dispatcher-v1:{}",
+                pending.id.as_uuid()
+            ))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    let profile = builtin_profile();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    fixture
+        .store
+        .prepare_harness_invocation(PrepareHarnessInvocation {
+            invocation_id: &invocation_id,
+            command_id: &claimed.id,
+            command_revision: claimed.revision,
+            profile_id: &profile.id,
+            profile_digest: &profile.digest().unwrap(),
+            payload_digest: &claimed.payload_digest,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .mark_harness_prompt_accepted(&invocation_id, 0)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .settle_harness_invocation(
+            &invocation_id,
+            0,
+            HarnessInvocationState::Completed,
+            &format!("harness-terminal:{}", invocation_id.as_uuid()),
+            &json!({
+                "type":"completed",
+                "outcome":"ok",
+                "fields":{"answer":"committed-before-crash"},
+                "history":[],
+            }),
+        )
+        .await
+        .unwrap();
+
+    let report = fixture
+        .dispatcher
+        .recover_harness_invocations(8)
+        .await
+        .unwrap();
+    assert_eq!(report.terminal, 1);
+    assert_eq!(report.retryable_pre_accept, 0);
+    assert_eq!(report.outcome_unknown, 0);
+    assert_eq!(fixture.command_state(&claimed.id).await, "completed");
+    assert_eq!(fixture.evidence().await.len(), 1);
+    assert_eq!(fixture.model.calls(), 0);
+
+    assert_eq!(
+        fixture
+            .dispatcher
+            .recover_harness_invocations(8)
+            .await
+            .unwrap(),
+        kiteframe::HarnessRecoveryReport::default()
+    );
+    assert_eq!(fixture.evidence().await.len(), 1);
 }
 
 #[tokio::test]

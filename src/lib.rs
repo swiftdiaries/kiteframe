@@ -37,8 +37,8 @@ pub use domain::{
 pub use dsl::ModelRole;
 pub use engine::{
     AgentCommandDispatcher, AnswerQuestion, CancelRun, Engine, EngineConfig, EngineError,
-    HarnessExecutionError, HarnessExecutionResult, PermissionChoice, RecoveryReport,
-    ResolvePermission, RetryRecovery,
+    HarnessExecutionError, HarnessExecutionResult, HarnessRecoveryReport, PermissionChoice,
+    RecoveryReport, ResolvePermission, RetryRecovery,
 };
 pub use goal::{
     CriterionAssertion, EvidenceId, EvidenceRecord, EvidenceSourceIdentity, GoalBlocker,
