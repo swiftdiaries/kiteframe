@@ -4,11 +4,15 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::dsl::{CompiledDefinition, DefinitionKind};
+use crate::harness::{
+    HarnessApprovalDecision, HarnessInvocationEvent, HarnessInvocationId, HarnessProfileId,
+    HarnessTransport,
+};
 use crate::{
     AgentCommandId, AgentExecutionView, AgentPolicyDecision, CatalogEpochId, FrameId, GoalContract,
     IdempotencyKey, KernelCommandPayload, PolicyRevision, PrincipalId, RunId, RuntimeCeilings,
     RuntimeCommandKey, RuntimeTransition, SessionId, StartAgent, TaskPreferences, TaskTarget,
-    UserTaskId,
+    UserTaskId, canonical_sha256,
 };
 
 #[derive(Clone, Debug)]
@@ -35,6 +39,178 @@ impl Default for StoreLimits {
             max_open_permission_requests_per_session: usize::MAX,
             agent_runtime: RuntimeCeilings::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessPluginRegistration {
+    pub profile_id: HarnessProfileId,
+    pub profile_digest: String,
+    pub source_repository: String,
+    pub source_revision: String,
+    pub transport: HarnessTransport,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HarnessInvocationState {
+    Prepared,
+    Started,
+    Accepted,
+    Completed,
+    Cancelled,
+    Failed,
+    OutcomeUnknown,
+}
+
+impl HarnessInvocationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Started => "started",
+            Self::Accepted => "accepted",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+            Self::OutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, StoreError> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "started" => Ok(Self::Started),
+            "accepted" => Ok(Self::Accepted),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            "failed" => Ok(Self::Failed),
+            "outcome_unknown" => Ok(Self::OutcomeUnknown),
+            _ => Err(StoreError::InvalidData(
+                "harness invocation state is malformed".to_owned(),
+            )),
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Cancelled | Self::Failed | Self::OutcomeUnknown
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessInvocationView {
+    pub invocation_id: HarnessInvocationId,
+    pub command_id: AgentCommandId,
+    pub command_revision: u64,
+    pub profile_id: HarnessProfileId,
+    pub profile_digest: String,
+    pub payload_digest: String,
+    pub state: HarnessInvocationState,
+    pub attempt: u64,
+    pub prompt_accepted: bool,
+    pub terminal: bool,
+    pub terminal_request_digest: Option<String>,
+}
+
+pub struct PrepareHarnessInvocation<'a> {
+    pub invocation_id: &'a HarnessInvocationId,
+    pub command_id: &'a AgentCommandId,
+    pub command_revision: u64,
+    pub profile_id: &'a HarnessProfileId,
+    pub profile_digest: &'a str,
+    pub payload_digest: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessInvocationEventRecord {
+    pub invocation_id: HarnessInvocationId,
+    pub sequence: u64,
+    pub event_digest: String,
+    pub event: HarnessInvocationEvent,
+}
+
+impl HarnessInvocationEventRecord {
+    pub fn new(
+        invocation_id: HarnessInvocationId,
+        sequence: u64,
+        event: HarnessInvocationEvent,
+    ) -> Result<Self, StoreError> {
+        let event_digest =
+            canonical_sha256(&event).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        Ok(Self {
+            invocation_id,
+            sequence,
+            event_digest,
+            event,
+        })
+    }
+
+    pub fn validate_digest(&self) -> Result<(), StoreError> {
+        let digest = canonical_sha256(&self.event)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        if digest == self.event_digest {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidData(
+                "harness invocation event digest is malformed".to_owned(),
+            ))
+        }
+    }
+}
+
+pub(crate) fn harness_event_from_value(value: Value) -> Result<HarnessInvocationEvent, StoreError> {
+    let object = value.as_object().ok_or_else(|| {
+        StoreError::InvalidData("harness invocation event is malformed".to_owned())
+    })?;
+    let only = |keys: &[&str]| {
+        object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key))
+    };
+    let text = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                StoreError::InvalidData("harness invocation event is malformed".to_owned())
+            })
+    };
+    match object.get("type").and_then(Value::as_str) {
+        Some("started") if only(&["type"]) => Ok(HarnessInvocationEvent::Started),
+        Some("cancelled") if only(&["type"]) => Ok(HarnessInvocationEvent::Cancelled),
+        Some("progress") if only(&["type", "message"]) => Ok(HarnessInvocationEvent::Progress {
+            message: text("message")?,
+        }),
+        Some("assistant_message") if only(&["type", "text"]) => {
+            Ok(HarnessInvocationEvent::AssistantMessage {
+                text: text("text")?,
+            })
+        }
+        Some("approval_requested") if only(&["type", "request_id", "title"]) => {
+            Ok(HarnessInvocationEvent::ApprovalRequested {
+                request_id: text("request_id")?,
+                title: text("title")?,
+            })
+        }
+        Some("approval_resolved") if only(&["type", "request_id", "decision"]) => {
+            let decision = match text("decision")?.as_str() {
+                "allow_once" => HarnessApprovalDecision::AllowOnce,
+                "reject_once" => HarnessApprovalDecision::RejectOnce,
+                _ => {
+                    return Err(StoreError::InvalidData(
+                        "harness invocation event is malformed".to_owned(),
+                    ));
+                }
+            };
+            Ok(HarnessInvocationEvent::ApprovalResolved {
+                request_id: text("request_id")?,
+                decision,
+            })
+        }
+        _ => Err(StoreError::InvalidData(
+            "harness invocation event is malformed".to_owned(),
+        )),
     }
 }
 
