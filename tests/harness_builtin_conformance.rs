@@ -9,7 +9,7 @@ use std::time::Duration;
 use kiteframe::harness::{
     BuiltinHarnessPlugin, DenyAllHarnessApprovals, HarnessAcceptanceBarrier, HarnessCapability,
     HarnessEventEnvelope, HarnessEventSink, HarnessFailure, HarnessInvocationId,
-    HarnessInvocationRequest, HarnessProfile, HarnessRegistry, HarnessTerminal,
+    HarnessInvocationRequest, HarnessProfile, HarnessRegistry, HarnessRouteTable, HarnessTerminal,
     builtin_harness_profile, dispatch_with_terminal_journal,
 };
 use kiteframe::{
@@ -31,23 +31,9 @@ const TEST_SOURCE_REVISION: &str = "0123456789abcdef0123456789abcdef01234567";
 
 struct RecordingSink(Mutex<Vec<HarnessEventEnvelope>>);
 
-struct ImmediateAcceptanceBarrier;
-
 struct ObservedAcceptanceBarrier(Arc<AtomicUsize>);
 
-struct ObservedAcceptanceSink {
-    events: Mutex<Vec<HarnessEventEnvelope>>,
-    commits: Arc<AtomicUsize>,
-}
-
 struct AcceptanceAssertingModel(Arc<AtomicUsize>);
-
-#[async_trait::async_trait]
-impl HarnessAcceptanceBarrier for ImmediateAcceptanceBarrier {
-    async fn commit(&self) -> Result<(), HarnessFailure> {
-        Ok(())
-    }
-}
 
 #[async_trait::async_trait]
 impl HarnessAcceptanceBarrier for ObservedAcceptanceBarrier {
@@ -59,30 +45,8 @@ impl HarnessAcceptanceBarrier for ObservedAcceptanceBarrier {
 
 #[async_trait::async_trait]
 impl HarnessEventSink for RecordingSink {
-    fn acceptance_barrier(
-        &self,
-        _invocation_id: &HarnessInvocationId,
-    ) -> Arc<dyn HarnessAcceptanceBarrier> {
-        Arc::new(ImmediateAcceptanceBarrier)
-    }
-
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         self.0.lock().await.push(event);
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessEventSink for ObservedAcceptanceSink {
-    fn acceptance_barrier(
-        &self,
-        _invocation_id: &HarnessInvocationId,
-    ) -> Arc<dyn HarnessAcceptanceBarrier> {
-        Arc::new(ObservedAcceptanceBarrier(self.commits.clone()))
-    }
-
-    async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
-        self.events.lock().await.push(event);
         Ok(())
     }
 }
@@ -190,7 +154,53 @@ fn builtin_registration_requires_exact_nonzero_source_attestation() {
     let first = profile();
     let second = builtin_harness_profile("1123456789abcdef0123456789abcdef01234567").unwrap();
     assert_eq!(first.source_revision, TEST_SOURCE_REVISION);
+    assert_eq!(
+        first.id.as_str(),
+        "builtin-v1-0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(
+        second.id.as_str(),
+        "builtin-v1-1123456789abcdef0123456789abcdef01234567"
+    );
+    assert_ne!(first.id, second.id);
     assert_ne!(first.digest().unwrap(), second.digest().unwrap());
+}
+
+#[tokio::test]
+async fn builtin_revisions_coexist_and_routes_select_the_current_deployment() {
+    let old = profile();
+    let current = builtin_harness_profile("1123456789abcdef0123456789abcdef01234567").unwrap();
+    let model = Arc::new(TestModel {
+        response: json!({
+            "type":"function_call",
+            "name":"complete_task",
+            "arguments":{"outcome":"ok","fields":{"answer":"done"}}
+        }),
+        delay: false,
+    });
+    let mut registry = HarnessRegistry::new();
+    registry
+        .register(Arc::new(BuiltinHarnessPlugin::new(
+            old.clone(),
+            model.clone(),
+        )))
+        .await
+        .unwrap();
+    registry
+        .register(Arc::new(BuiltinHarnessPlugin::new(current.clone(), model)))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        registry.profile_digest(&old.id).unwrap(),
+        old.digest().unwrap()
+    );
+    assert_eq!(
+        registry.profile_digest(&current.id).unwrap(),
+        current.digest().unwrap()
+    );
+    let routes = HarnessRouteTable::new(current.id.clone(), current.id.clone());
+    assert_eq!(routes.select(None, ModelRole::Reasoning), &current.id);
 }
 
 #[tokio::test]
@@ -202,13 +212,15 @@ async fn builtin_commits_the_injected_acceptance_barrier_before_model_dispatch()
     ));
     let mut registry = HarnessRegistry::new();
     registry.register(plugin).await.unwrap();
-    let sink = Arc::new(ObservedAcceptanceSink {
-        events: Mutex::new(vec![]),
-        commits: commits.clone(),
-    });
+    let sink = Arc::new(RecordingSink(Mutex::new(vec![])));
 
     let terminal = registry
-        .invoke(request(), Arc::new(DenyAllHarnessApprovals), sink)
+        .invoke_with_acceptance_barrier(
+            request(),
+            Arc::new(DenyAllHarnessApprovals),
+            sink,
+            Arc::new(ObservedAcceptanceBarrier(commits.clone())),
+        )
         .await;
 
     assert!(matches!(terminal, HarnessTerminal::Completed(_)));

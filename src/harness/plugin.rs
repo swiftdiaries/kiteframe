@@ -191,18 +191,6 @@ impl HarnessApprovalBroker for DenyAllHarnessApprovals {
 
 #[async_trait]
 pub trait HarnessEventSink: Send + Sync {
-    fn acceptance_barrier(
-        &self,
-        invocation_id: &HarnessInvocationId,
-    ) -> Arc<dyn HarnessAcceptanceBarrier>;
-
-    async fn next_sequence(
-        &self,
-        _invocation_id: &HarnessInvocationId,
-    ) -> Result<u64, HarnessFailure> {
-        Ok(0)
-    }
-
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure>;
 }
 
@@ -243,15 +231,11 @@ pub async fn emit_and_wait(
 #[derive(Clone)]
 pub struct PostgresHarnessEventSink {
     store: Arc<PostgresStore>,
-    expected_attempt: u64,
 }
 
 impl PostgresHarnessEventSink {
-    pub fn new(store: Arc<PostgresStore>, expected_attempt: u64) -> Self {
-        Self {
-            store,
-            expected_attempt,
-        }
+    pub fn new(store: Arc<PostgresStore>) -> Self {
+        Self { store }
     }
 }
 
@@ -272,38 +256,20 @@ impl HarnessAcceptanceBarrier for PostgresHarnessAcceptanceBarrier {
     }
 }
 
+pub(crate) fn postgres_harness_acceptance_barrier(
+    store: Arc<PostgresStore>,
+    invocation_id: HarnessInvocationId,
+    expected_attempt: u64,
+) -> Arc<dyn HarnessAcceptanceBarrier> {
+    Arc::new(PostgresHarnessAcceptanceBarrier {
+        store,
+        invocation_id,
+        expected_attempt,
+    })
+}
+
 #[async_trait]
 impl HarnessEventSink for PostgresHarnessEventSink {
-    fn acceptance_barrier(
-        &self,
-        invocation_id: &HarnessInvocationId,
-    ) -> Arc<dyn HarnessAcceptanceBarrier> {
-        Arc::new(PostgresHarnessAcceptanceBarrier {
-            store: self.store.clone(),
-            invocation_id: invocation_id.clone(),
-            expected_attempt: self.expected_attempt,
-        })
-    }
-
-    async fn next_sequence(
-        &self,
-        invocation_id: &HarnessInvocationId,
-    ) -> Result<u64, HarnessFailure> {
-        let next: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence), -1) + 1 FROM harness_invocation_events WHERE invocation_id = $1",
-        )
-        .bind(invocation_id.as_uuid())
-        .fetch_one(self.store.pool())
-        .await
-        .map_err(|error| HarnessFailure::new("harness_outcome_unknown", error.to_string()))?;
-        u64::try_from(next).map_err(|_| {
-            HarnessFailure::new(
-                "harness_outcome_unknown",
-                "harness event sequence is malformed",
-            )
-        })
-    }
-
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         self.store
             .append_harness_event_envelope(&event)

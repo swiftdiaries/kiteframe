@@ -43,6 +43,11 @@ CREATE FUNCTION harness_event_envelope_digest_v1(
     )
 $$ LANGUAGE SQL IMMUTABLE STRICT;
 
+-- Runtime registration/prepare acquires registration before invocation state.
+-- Hold the migration's eventual registration ALTER/DELETE lock first so an
+-- older dispatcher can never wait on registration while this migration holds
+-- invocation or event locks.
+LOCK TABLE harness_plugin_registrations IN ACCESS EXCLUSIVE MODE;
 LOCK TABLE harness_invocations IN SHARE ROW EXCLUSIVE MODE;
 LOCK TABLE harness_invocation_events IN ACCESS EXCLUSIVE MODE;
 

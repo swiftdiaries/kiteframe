@@ -150,3 +150,86 @@ The one repository-shape/global-order test passed. All 15 live lock-order cases 
 - Confirmed production source provenance is supplied by deployment input, with no fabricated runtime fallback, and invalid/missing attestation fails closed.
 - Confirmed `fuzz/` and `site/` remain untouched and untracked.
 - Remaining concern is environmental only: PostgreSQL execution must run in CI or another checkout with `DATABASE_URL` before Gate A can be accepted as live-database green.
+
+---
+
+## Gate A re-review fix wave — round 2
+
+### Outcome
+
+Round 2 closes the re-review API, attestation-lifecycle, migration lock-order, and barrier-race findings without changing either frozen `HarnessRegistry::invoke` or `HarnessPlugin::start_invocation`. The only outstanding verification limitation remains live PostgreSQL execution in this environment.
+
+### 1. Frozen event-sink API restored
+
+- `HarnessEventSink` is append-only again; the round-1 acceptance and sequence methods were removed from the public trait.
+- `PostgresHarnessEventSink::new(store)` is restored to its frozen one-argument constructor.
+- The unchanged frozen `HarnessRegistry::invoke(request, approvals, events)` remains available and uses an internal immediate barrier for non-production/frozen callers.
+- A separate `HarnessRegistry::invoke_with_acceptance_barrier` control path supports deterministic adapters/tests, while the crate-internal production path additionally receives the recovered event sequence.
+- The dispatcher constructs the PostgreSQL barrier separately and injects it immediately before invocation. `HarnessEventSender` still carries the barrier internally, so the plugin start signature remains unchanged.
+- A compile-time compatibility test implements an append-only sink and binds the exact one-argument PostgreSQL constructor type.
+
+### 2. Built-in registrations now coexist immutably across builds
+
+- A validated built-in profile now has identity `builtin-v1-<normalized-full-40-hex-source-revision>`; the exact source revision remains part of the immutable profile and digest.
+- Different revisions register under different profile IDs and coexist in the in-memory registry and durable registration table. Uppercase input is normalized to the same lowercase commit identity.
+- Production startup passes the current attested profile ID explicitly through `HarnessRouteTable`; the frozen two-argument `with_harness_registry` remains for the one-built-in compatibility case.
+- Built-in unavailable-command translation no longer recognizes a hard-coded profile ID. It reads the immutable registration transport and translates only `transport = builtin` plus `harness_capability_unsupported`.
+- Before selecting a current route for new work, the dispatcher checks for an existing `(command_id, command_revision)` invocation. An existing invocation retains its immutable stored profile and digest (validated against its durable registration) and reaches terminal replay without requiring the current plugin profile. New work selects the current deployment-owned route.
+- The migration still removes only the old all-zero `builtin-v1` development row when it is unreferenced. A referenced legacy row stops migration for explicit operator reconciliation; no referenced provenance is deleted or relabeled.
+
+Coverage proves two built-in revisions coexist, a route selects the current revision, startup derives the versioned current ID, and the database-gated direct bridge replays an old terminal invocation without a model call or profile rewrite after the current build changes.
+
+### 3. Migration lock order matches runtime order
+
+Migration 0016 now acquires `harness_plugin_registrations` in `ACCESS EXCLUSIVE` mode before taking the invocation and event table locks. This matches the runtime registration/prepare prefix and prevents the migration from holding invocation state while waiting on registration. A repository-shape assertion requires the explicit order:
+
+```text
+harness_plugin_registrations -> harness_invocations -> harness_invocation_events
+```
+
+### 4. Deterministic cloned-barrier race coverage
+
+Three direct `HarnessEventSender` tests exercise the real shared `tokio::sync::OnceCell` behavior:
+
+- concurrent cloned callers observe one in-flight durable call and share its successful result;
+- a barrier error is cached and returned identically to every clone without another call;
+- cancellation/drop of the initializing future releases initialization, allowing a later clone to retry successfully.
+
+The PostgreSQL acceptance transition itself remains idempotent for the same invocation/attempt, so a retry after cancellation cannot create a second accepted state transition.
+
+### Round-2 RED evidence
+
+- `cargo test --test harness_plugin_protocol --test harness_builtin_conformance --no-run` failed because an append-only sink was missing the round-1 required `acceptance_barrier`, the constructor had two arguments, and `invoke_with_acceptance_barrier` did not exist.
+- `cargo test --test harness_store gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation -- --exact --nocapture` failed with `registration table lock is explicit` because 0016 locked invocation/events before ever locking registrations.
+- The three promoted barrier tests passed against the existing shared `OnceCell`, characterizing and preserving the already-correct cancellation/cache/concurrency semantics before the API refactor.
+
+### Round-2 GREEN evidence
+
+- `cargo test --test harness_profiles --test harness_plugin_protocol --test harness_builtin_conformance -- --nocapture` — 7 + 18 + 5 passed.
+- `cargo test --lib harness::types::tests -- --nocapture` — 3 passed.
+- `cargo test --lib -- --nocapture` — 30 passed.
+- `cargo test --bin kiteframe-harness -- --nocapture` — 4 passed; the database scheduler body remains environment-gated.
+- `cargo test --test agent_direct_bridge -- --nocapture` — target compiled and 21 functions reported `ok`; database-backed bodies returned at their absent-`DATABASE_URL` gate.
+- `cargo test --test harness_store -- --nocapture` — target compiled and 17 functions reported `ok`; live bodies emitted `SKIP harness_store: DATABASE_URL is not set`; repository-shape tests executed.
+- `cargo test --test agent_goal_authority --test agent_transition_store -- --nocapture` — 15 + 16 passed.
+- `cargo test --test sequential_runtime --test structured_runtime --test recovery -- --nocapture` — 9 + 5 + 6 passed.
+- `cargo check --all-targets --all-features` — passed.
+- `cargo check --no-default-features --lib --bin kiteframe-harness` — passed.
+- `cargo fmt --all -- --check` — passed.
+- `git diff --check` — passed.
+
+### Round-2 PostgreSQL limitation
+
+The required `cargo test --test postgres_lock_order -- --nocapture` was rerun. The result remains exactly `1 passed; 15 failed`: the repository-shape/global-order test passed, and all 15 live cases failed immediately with `DATABASE_URL is required for PostgreSQL lock-order tests: NotPresent`. The new migration, registration coexistence, and old-profile terminal replay paths compiled but could not execute against PostgreSQL locally. CI with its PostgreSQL service remains the live database gate.
+
+### Round-2 files and self-review
+
+Changed paths are limited to migration 0016, the harness plugin/registry/types/built-in and dispatcher/store/startup implementation, the four focused test files, and this report. CI/build attestation configuration remains unchanged and continues to pass `${{ github.sha }}` as the full build revision.
+
+- Confirmed frozen `HarnessEventSink`, `PostgresHarnessEventSink::new`, `HarnessRegistry::invoke`, and `HarnessPlugin::start_invocation` signatures.
+- Confirmed the production barrier is separate from the event sink and still commits immediately before built-in model dispatch.
+- Confirmed production contains no fixed `builtin-v1` routing or translation assumption; remaining exact `builtin-v1` strings are legacy-migration handling or isolated test fixtures.
+- Confirmed versioned profile selection applies only to new work, while an existing command/revision uses its stored profile and validates its digest against durable registration.
+- Confirmed migration lock acquisition cannot wait on registration after acquiring invocation/event locks.
+- Confirmed `fuzz/` and `site/` remain untouched and untracked.
+- Remaining concern is environmental only: live PostgreSQL migration/store/replay/lock-order execution is still required before final Gate A approval.

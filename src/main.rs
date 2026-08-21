@@ -10,7 +10,8 @@ use std::{
 
 use agent_client_protocol::{ConnectTo, Stdio};
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessProfile, HarnessRegistry, builtin_harness_profile,
+    DenyAllHarnessApprovals, HarnessProfile, HarnessRegistry, HarnessRouteTable,
+    builtin_harness_profile,
 };
 use kiteframe::protocol::transport::{AcpService, BearerAuthenticator, RemoteService};
 use kiteframe::store::HarnessPluginRegistration;
@@ -103,13 +104,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             claimed = agent_recovery.claimed,
             "agent command recovery complete"
         );
+        let builtin_profile_id = builtin_profile.id.clone();
         let harness_registry =
             configured_builtin_registry(store.clone(), model.clone(), builtin_profile).await?;
-        let agent_dispatcher = Arc::new(
-            application
-                .agent_kernel()
-                .with_harness_registry(harness_registry, Arc::new(DenyAllHarnessApprovals)),
-        );
+        let agent_dispatcher = Arc::new(application.agent_kernel().with_harness_registry_routes(
+            harness_registry,
+            Arc::new(DenyAllHarnessApprovals),
+            HarnessRouteTable::new(builtin_profile_id.clone(), builtin_profile_id),
+        ));
         let application = Arc::new(application);
 
         match config.mode {
@@ -542,6 +544,10 @@ mod tests {
         assert_eq!(
             profile.source_revision,
             "0123456789abcdef0123456789abcdef01234567"
+        );
+        assert_eq!(
+            profile.id.as_str(),
+            "builtin-v1-0123456789abcdef0123456789abcdef01234567"
         );
     }
 

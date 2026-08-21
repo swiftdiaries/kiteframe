@@ -10,6 +10,7 @@ pub use builtin::{
 pub(crate) use builtin::{
     completion_tool, parse_completion_item_legacy as parse_completion_item, validate_completion,
 };
+pub(crate) use plugin::postgres_harness_acceptance_barrier;
 pub use plugin::*;
 pub use profile::HarnessProfile;
 pub use registry::{HarnessRegistry, HarnessTerminalJournal, dispatch_with_terminal_journal};

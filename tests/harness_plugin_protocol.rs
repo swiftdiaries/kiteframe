@@ -4,16 +4,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kiteframe::harness::{
-    DenyAllHarnessApprovals, HarnessAcceptanceBarrier, HarnessApprovalBroker,
-    HarnessApprovalDecision, HarnessApprovalRequest, HarnessCapabilities, HarnessCapability,
-    HarnessEventEnvelope, HarnessEventSender, HarnessEventSink, HarnessFailure,
-    HarnessInvocationEvent, HarnessInvocationId, HarnessInvocationOutput, HarnessInvocationRequest,
-    HarnessPlugin, HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessRequestEnvelope,
-    HarnessTerminal, HarnessTransport, emit_and_wait,
+    DenyAllHarnessApprovals, HarnessApprovalBroker, HarnessApprovalDecision,
+    HarnessApprovalRequest, HarnessCapabilities, HarnessCapability, HarnessEventEnvelope,
+    HarnessEventSender, HarnessEventSink, HarnessFailure, HarnessInvocationEvent,
+    HarnessInvocationId, HarnessInvocationOutput, HarnessInvocationRequest, HarnessPlugin,
+    HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessRequestEnvelope, HarnessTerminal,
+    HarnessTransport, PostgresHarnessEventSink, emit_and_wait,
 };
 use kiteframe::store::HarnessInvocationEventRecord;
 use kiteframe::{
-    AgentCommandId, ClosedSchema, GoalProjection, HarnessStructuralLimits, InvokeHarness, ModelRole,
+    AgentCommandId, ClosedSchema, GoalProjection, HarnessStructuralLimits, InvokeHarness,
+    ModelRole, PostgresStore,
 };
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
@@ -75,17 +76,20 @@ fn request() -> HarnessInvocationRequest {
 #[derive(Default)]
 struct RecordingHarnessEventSink(Mutex<Vec<HarnessEventEnvelope>>);
 
-struct ImmediateAcceptanceBarrier;
+struct AppendOnlyHarnessEventSink;
 
 #[async_trait]
-impl HarnessAcceptanceBarrier for ImmediateAcceptanceBarrier {
-    async fn commit(&self) -> Result<(), HarnessFailure> {
+impl HarnessEventSink for AppendOnlyHarnessEventSink {
+    async fn append(&self, _event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         Ok(())
     }
 }
 
-fn immediate_acceptance_barrier() -> Arc<dyn HarnessAcceptanceBarrier> {
-    Arc::new(ImmediateAcceptanceBarrier)
+#[test]
+fn frozen_event_sink_is_append_only_and_postgres_constructor_takes_only_the_store() {
+    let _sink: Arc<dyn HarnessEventSink> = Arc::new(AppendOnlyHarnessEventSink);
+    let _constructor: fn(Arc<PostgresStore>) -> PostgresHarnessEventSink =
+        PostgresHarnessEventSink::new;
 }
 
 impl RecordingHarnessEventSink {
@@ -101,13 +105,6 @@ impl RecordingHarnessEventSink {
 
 #[async_trait]
 impl HarnessEventSink for RecordingHarnessEventSink {
-    fn acceptance_barrier(
-        &self,
-        _invocation_id: &HarnessInvocationId,
-    ) -> Arc<dyn HarnessAcceptanceBarrier> {
-        immediate_acceptance_barrier()
-    }
-
     async fn append(&self, event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         self.0.lock().unwrap().push(event);
         Ok(())
@@ -118,13 +115,6 @@ struct FailingHarnessEventSink;
 
 #[async_trait]
 impl HarnessEventSink for FailingHarnessEventSink {
-    fn acceptance_barrier(
-        &self,
-        _invocation_id: &HarnessInvocationId,
-    ) -> Arc<dyn HarnessAcceptanceBarrier> {
-        immediate_acceptance_barrier()
-    }
-
     async fn append(&self, _event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         Err(HarnessFailure::new(
             "harness_event_persistence_failed",
@@ -137,13 +127,6 @@ struct FailAfterOneHarnessEventSink(Mutex<usize>);
 
 #[async_trait]
 impl HarnessEventSink for FailAfterOneHarnessEventSink {
-    fn acceptance_barrier(
-        &self,
-        _invocation_id: &HarnessInvocationId,
-    ) -> Arc<dyn HarnessAcceptanceBarrier> {
-        immediate_acceptance_barrier()
-    }
-
     async fn append(&self, _event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
         let mut calls = self.0.lock().unwrap();
         *calls += 1;

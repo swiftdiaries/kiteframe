@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
-    HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal,
+    HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal, HarnessTransport,
     PostgresHarnessEventSink, canonical_outcome_unknown_terminal_payload,
-    dispatch_with_terminal_journal, terminal_idempotency_key,
+    dispatch_with_terminal_journal, postgres_harness_acceptance_barrier, terminal_idempotency_key,
 };
 use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
 use crate::{
@@ -33,13 +33,28 @@ impl AgentKernel {
         registry: Arc<HarnessRegistry>,
         approvals: Arc<dyn HarnessApprovalBroker>,
     ) -> AgentCommandDispatcher {
-        let builtin =
-            HarnessProfileId::new("builtin-v1").expect("the built-in harness profile id is valid");
+        let builtin = registry
+            .sole_profile_id_for_transport(HarnessTransport::Builtin)
+            .expect("one built-in harness profile must be registered");
+        self.with_harness_registry_routes(
+            registry,
+            approvals,
+            HarnessRouteTable::new(builtin.clone(), builtin),
+        )
+    }
+
+    #[must_use]
+    pub fn with_harness_registry_routes(
+        self: Arc<Self>,
+        registry: Arc<HarnessRegistry>,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        routes: HarnessRouteTable,
+    ) -> AgentCommandDispatcher {
         AgentCommandDispatcher {
             kernel: self,
             registry,
             approvals,
-            routes: HarnessRouteTable::new(builtin.clone(), builtin),
+            routes,
             active: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -144,27 +159,39 @@ impl AgentCommandDispatcher {
         let KernelCommandPayload::InvokeHarness(payload) = &claimed.payload else {
             unreachable!("harness route must contain InvokeHarness")
         };
-        let profile_id = self
-            .routes
-            .select(execution.task.preferences.harness_role, payload.role)
-            .clone();
-        let profile_digest = self
-            .registry
-            .profile_digest(&profile_id)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        let candidate = HarnessInvocationId::new(uuid::Uuid::now_v7());
-        let prepared = self
+        let prepared = if let Some(stored) = self
             .kernel
             .store()
-            .prepare_harness_invocation(PrepareHarnessInvocation {
-                invocation_id: &candidate,
-                command_id: &claimed.id,
-                command_revision: claimed.revision,
-                profile_id: &profile_id,
-                profile_digest: &profile_digest,
-                payload_digest: &claimed.payload_digest,
-            })
-            .await?;
+            .harness_invocation_for_command_revision(&claimed.id, claimed.revision)
+            .await?
+        {
+            if stored.payload_digest != claimed.payload_digest {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            stored
+        } else {
+            let profile_id = self
+                .routes
+                .select(execution.task.preferences.harness_role, payload.role)
+                .clone();
+            let profile_digest = self
+                .registry
+                .profile_digest(&profile_id)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            let candidate = HarnessInvocationId::new(uuid::Uuid::now_v7());
+            self.kernel
+                .store()
+                .prepare_harness_invocation(PrepareHarnessInvocation {
+                    invocation_id: &candidate,
+                    command_id: &claimed.id,
+                    command_revision: claimed.revision,
+                    profile_id: &profile_id,
+                    profile_digest: &profile_digest,
+                    payload_digest: &claimed.payload_digest,
+                })
+                .await?
+        };
+        let profile_id = prepared.profile_id.clone();
         let journal = PreparedHarnessTerminalJournal::new(&prepared);
         dispatch_with_terminal_journal(
             &journal,
@@ -219,15 +246,29 @@ impl AgentCommandDispatcher {
                     payload: payload.clone(),
                     payload_digest: claimed.payload_digest.clone(),
                 };
+                let next_sequence = u64::try_from(
+                    self.kernel
+                        .store()
+                        .harness_invocation_events(&prepared.invocation_id)
+                        .await?
+                        .len(),
+                )
+                .map_err(|_| {
+                    StoreError::InvalidData("harness event sequence is malformed".to_owned())
+                })?;
+                let store = self.kernel.store_arc();
                 let terminal = self
                     .registry
-                    .invoke(
+                    .invoke_from_sequence_with_acceptance_barrier(
                         request,
                         self.approvals.clone(),
-                        Arc::new(PostgresHarnessEventSink::new(
-                            self.kernel.store_arc(),
+                        Arc::new(PostgresHarnessEventSink::new(store.clone())),
+                        next_sequence,
+                        postgres_harness_acceptance_barrier(
+                            store,
+                            prepared.invocation_id.clone(),
                             prepared.attempt,
-                        )),
+                        ),
                     )
                     .await;
                 self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
@@ -324,7 +365,12 @@ impl AgentCommandDispatcher {
                         &terminal_payload,
                     )
                     .await?;
-                if is_builtin_command_unavailable(&invocation.profile_id, &failure) {
+                let transport = self
+                    .kernel
+                    .store()
+                    .harness_plugin_transport(&invocation.profile_id)
+                    .await?;
+                if is_builtin_command_unavailable(transport, &failure) {
                     let failure = failure_request(
                         execution,
                         claimed,
@@ -374,8 +420,8 @@ impl AgentCommandDispatcher {
     }
 }
 
-fn is_builtin_command_unavailable(profile_id: &HarnessProfileId, failure: &HarnessFailure) -> bool {
-    profile_id.as_str() == "builtin-v1" && failure.code == "harness_capability_unsupported"
+fn is_builtin_command_unavailable(transport: HarnessTransport, failure: &HarnessFailure) -> bool {
+    transport == HarnessTransport::Builtin && failure.code == "harness_capability_unsupported"
 }
 
 struct PreparedHarnessTerminalJournal<'a> {
@@ -653,7 +699,9 @@ mod tests {
         ActiveDispatchGuard, DispatchRoute, dispatch_route, is_builtin_command_unavailable,
         terminal_from_record,
     };
-    use crate::harness::{HarnessFailure, HarnessInvocationId, HarnessProfileId, HarnessTerminal};
+    use crate::harness::{
+        HarnessFailure, HarnessInvocationId, HarnessProfileId, HarnessTerminal, HarnessTransport,
+    };
     use crate::store::{HarnessInvocationState, HarnessInvocationView};
     use crate::{AgentCommandId, KernelCommandPayload, RequestContext, WaitForEvent};
     use serde_json::json;
@@ -678,15 +726,15 @@ mod tests {
     fn only_builtin_capability_failure_restores_the_slice_two_unavailable_command_contract() {
         let unsupported = HarnessFailure::new("harness_capability_unsupported", "model_tool_calls");
         assert!(is_builtin_command_unavailable(
-            &HarnessProfileId::new("builtin-v1").unwrap(),
+            HarnessTransport::Builtin,
             &unsupported,
         ));
         assert!(!is_builtin_command_unavailable(
-            &HarnessProfileId::new("codex-acp-v1").unwrap(),
+            HarnessTransport::AcpStdio,
             &unsupported,
         ));
         assert!(!is_builtin_command_unavailable(
-            &HarnessProfileId::new("builtin-v1").unwrap(),
+            HarnessTransport::Builtin,
             &HarnessFailure::new("harness_failed", "definitive failure"),
         ));
     }

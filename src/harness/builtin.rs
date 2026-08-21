@@ -31,11 +31,12 @@ pub fn builtin_harness_profile(source_revision: &str) -> Result<HarnessProfile, 
             "built-in harness source revision must be a nonzero full 40-hex commit",
         ));
     }
+    let source_revision = source_revision.to_ascii_lowercase();
     Ok(HarnessProfile {
-        id: super::HarnessProfileId::new("builtin-v1")?,
+        id: super::HarnessProfileId::new(format!("builtin-v1-{source_revision}"))?,
         transport: super::HarnessTransport::Builtin,
         source_repository: "https://github.com/swiftdiaries/kiteframe".to_owned(),
-        source_revision: source_revision.to_owned(),
+        source_revision,
         program: "kiteframe-builtin".to_owned(),
         args: vec![],
         required: BTreeSet::from([

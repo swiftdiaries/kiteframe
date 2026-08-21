@@ -572,7 +572,7 @@ async fn invocation_is_persisted_and_claimed_before_model_call() {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-                assert_eq!(invocation.0, "builtin-v1");
+                assert_eq!(invocation.0, builtin_profile().id.as_str());
                 assert_eq!(invocation.1, "accepted");
                 assert!(!invocation.2.is_empty());
                 assert!(invocation.3.is_none());
@@ -611,7 +611,7 @@ async fn invocation_is_persisted_and_claimed_before_model_call() {
 }
 
 #[tokio::test]
-async fn terminal_journal_replay_converges_a_crash_between_settle_and_kernel_completion() {
+async fn terminal_journal_replay_keeps_the_old_profile_after_a_builtin_upgrade() {
     let _guard = BRIDGE_TEST_LOCK.lock().await;
     let Some(fixture) = BridgeFixture::started().await else {
         return;
@@ -633,8 +633,20 @@ async fn terminal_journal_replay_converges_a_crash_between_settle_and_kernel_com
         })
         .await
         .unwrap();
-    let profile = builtin_profile();
+    let profile = builtin_harness_profile("1123456789abcdef0123456789abcdef01234567").unwrap();
     let profile_digest = profile.digest().unwrap();
+    fixture
+        .store
+        .register_harness_plugin(HarnessPluginRegistration {
+            profile_id: profile.id.clone(),
+            profile_digest: profile_digest.clone(),
+            source_repository: profile.source_repository.clone(),
+            source_revision: profile.source_revision.clone(),
+            transport: profile.transport,
+            enabled: true,
+        })
+        .await
+        .unwrap();
     let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
     let invocation = fixture
         .store
@@ -686,6 +698,14 @@ async fn terminal_journal_replay_converges_a_crash_between_settle_and_kernel_com
     assert_eq!(fixture.current().await.goal_phase, GoalPhase::Active);
     assert_eq!(fixture.command_state(&command.id).await, "completed");
     assert_eq!(fixture.evidence().await.len(), 1);
+    let replayed_profile_id: String =
+        sqlx::query_scalar("SELECT profile_id FROM harness_invocations WHERE invocation_id = $1")
+            .bind(invocation_id.as_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(replayed_profile_id, profile.id.as_str());
+    assert_ne!(replayed_profile_id, builtin_profile().id.as_str());
     let terminal_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM harness_invocations WHERE command_id = $1 AND terminal = TRUE",
     )

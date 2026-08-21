@@ -68,6 +68,53 @@ impl PostgresStore {
         Ok(stored)
     }
 
+    pub async fn harness_plugin_transport(
+        &self,
+        profile_id: &HarnessProfileId,
+    ) -> Result<HarnessTransport, StoreError> {
+        let transport: String = sqlx::query_scalar(
+            "SELECT transport FROM harness_plugin_registrations WHERE profile_id = $1",
+        )
+        .bind(profile_id.as_str())
+        .fetch_optional(self.pool())
+        .await?
+        .ok_or_else(|| {
+            StoreError::InvalidData("harness plugin registration is absent".to_owned())
+        })?;
+        transport_from_row(&transport)
+    }
+
+    pub async fn harness_invocation_for_command_revision(
+        &self,
+        command_id: &AgentCommandId,
+        command_revision: u64,
+    ) -> Result<Option<HarnessInvocationView>, StoreError> {
+        let command_revision =
+            harness_i64(command_revision, "harness command revision is malformed")?;
+        let row = sqlx::query(
+            "SELECT invocations.invocation_id, invocations.command_id, invocations.command_revision, \
+                    invocations.profile_id, invocations.profile_digest, invocations.payload_digest, \
+                    invocations.state, invocations.attempt, invocations.prompt_accepted, \
+                    invocations.terminal, invocations.terminal_request_digest, invocations.terminal_payload, \
+                    registrations.profile_digest AS registered_profile_digest \
+             FROM harness_invocations invocations \
+             JOIN harness_plugin_registrations registrations USING (profile_id) \
+             WHERE invocations.command_id = $1 AND invocations.command_revision = $2",
+        )
+        .bind(command_id.as_uuid())
+        .bind(command_revision)
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let view = harness_invocation_from_row(&row)?;
+        if view.profile_digest != row.get::<String, _>("registered_profile_digest") {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        Ok(Some(view))
+    }
+
     pub async fn prepare_harness_invocation(
         &self,
         request: PrepareHarnessInvocation<'_>,

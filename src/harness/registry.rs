@@ -6,9 +6,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSender, HarnessEventSink,
-    HarnessFailure, HarnessInvocationId, HarnessInvocationRequest, HarnessPlugin,
-    HarnessRequestEnvelope, HarnessTerminal,
+    HarnessAcceptanceBarrier, HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSender,
+    HarnessEventSink, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest, HarnessPlugin,
+    HarnessRequestEnvelope, HarnessTerminal, HarnessTransport,
 };
 
 const STABLE_FAILURE_CODES: [&str; 7] = [
@@ -88,6 +88,15 @@ struct ActiveInvocationGuard {
     active: Arc<Mutex<ActiveInvocations>>,
     invocation_id: HarnessInvocationId,
     generation: u64,
+}
+
+struct ImmediateAcceptanceBarrier;
+
+#[async_trait::async_trait]
+impl HarnessAcceptanceBarrier for ImmediateAcceptanceBarrier {
+    async fn commit(&self) -> Result<(), HarnessFailure> {
+        Ok(())
+    }
 }
 
 impl Drop for ActiveInvocationGuard {
@@ -173,6 +182,33 @@ impl HarnessRegistry {
             })
     }
 
+    pub(crate) fn sole_profile_id_for_transport(
+        &self,
+        transport: HarnessTransport,
+    ) -> Result<super::HarnessProfileId, HarnessFailure> {
+        let plugins = self
+            .plugins
+            .lock()
+            .expect("harness registry lock is not poisoned");
+        let mut matching = plugins.values().filter_map(|registered| {
+            (registered.plugin.profile().transport == transport)
+                .then(|| registered.plugin.profile().id.clone())
+        });
+        let profile_id = matching.next().ok_or_else(|| {
+            HarnessFailure::new(
+                "harness_profile_unavailable",
+                "no harness profile is registered for the selected transport",
+            )
+        })?;
+        if matching.next().is_some() {
+            return Err(HarnessFailure::new(
+                "harness_profile_unavailable",
+                "multiple harness profiles require an explicit deployment route",
+            ));
+        }
+        Ok(profile_id)
+    }
+
     pub async fn cancel(&self, invocation_id: &HarnessInvocationId) -> bool {
         let token = self
             .active
@@ -194,6 +230,41 @@ impl HarnessRegistry {
         request: HarnessInvocationRequest,
         approvals: Arc<dyn HarnessApprovalBroker>,
         sink: Arc<dyn HarnessEventSink>,
+    ) -> HarnessTerminal {
+        self.invoke_from_sequence_with_acceptance_barrier(
+            request,
+            approvals,
+            sink,
+            0,
+            Arc::new(ImmediateAcceptanceBarrier),
+        )
+        .await
+    }
+
+    pub async fn invoke_with_acceptance_barrier(
+        &self,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+        acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
+    ) -> HarnessTerminal {
+        self.invoke_from_sequence_with_acceptance_barrier(
+            request,
+            approvals,
+            sink,
+            0,
+            acceptance_barrier,
+        )
+        .await
+    }
+
+    pub(crate) async fn invoke_from_sequence_with_acceptance_barrier(
+        &self,
+        request: HarnessInvocationRequest,
+        approvals: Arc<dyn HarnessApprovalBroker>,
+        sink: Arc<dyn HarnessEventSink>,
+        next_sequence: u64,
+        acceptance_barrier: Arc<dyn HarnessAcceptanceBarrier>,
     ) -> HarnessTerminal {
         let Some(plugin) = self
             .plugins
@@ -217,17 +288,12 @@ impl HarnessRegistry {
                 "harness invocation id is already active",
             ));
         };
-        let sequence = match sink.next_sequence(&request.invocation_id).await {
-            Ok(sequence) => sequence,
-            Err(error) => return HarnessTerminal::OutcomeUnknown(error),
-        };
         let (raw_events_tx, mut events_rx) = mpsc::channel(64);
-        let acceptance_barrier = sink.acceptance_barrier(&request.invocation_id);
         let events_tx = HarnessEventSender::new(raw_events_tx, acceptance_barrier);
         let invocation = plugin.start_invocation(envelope, events_tx.clone(), approvals, token);
         tokio::pin!(invocation);
-        let mut sequence = sequence;
-        let mut started = sequence > 0;
+        let mut sequence = next_sequence;
+        let mut started = next_sequence > 0;
         let mut terminal = None;
         let mut persistence_failure = None;
 

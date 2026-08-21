@@ -273,6 +273,19 @@ fn gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation() {
     ] {
         assert!(sql.contains(required), "missing Gate A guard: {required}");
     }
+    let registrations_lock = sql
+        .find("LOCK TABLE harness_plugin_registrations")
+        .expect("registration table lock is explicit");
+    let invocations_lock = sql
+        .find("LOCK TABLE harness_invocations")
+        .expect("invocation table lock is explicit");
+    let events_lock = sql
+        .find("LOCK TABLE harness_invocation_events")
+        .expect("event table lock is explicit");
+    assert!(
+        registrations_lock < invocations_lock && invocations_lock < events_lock,
+        "migration lock order must be registrations, invocations, then events"
+    );
 }
 
 #[tokio::test]

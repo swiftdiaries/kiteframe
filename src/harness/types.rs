@@ -312,3 +312,142 @@ impl std::fmt::Debug for HarnessEventSender {
 
 #[allow(dead_code)]
 pub type HarnessCancellation = CancellationToken;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::{Notify, Semaphore, mpsc};
+
+    use super::{HarnessAcceptanceBarrier, HarnessEventSender, HarnessFailure};
+
+    struct BlockingSuccessBarrier {
+        calls: Arc<AtomicUsize>,
+        entered: Arc<Notify>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl HarnessAcceptanceBarrier for BlockingSuccessBarrier {
+        async fn commit(&self) -> Result<(), HarnessFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release
+                .acquire()
+                .await
+                .expect("test barrier remains open")
+                .forget();
+            Ok(())
+        }
+    }
+
+    struct CountingErrorBarrier(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl HarnessAcceptanceBarrier for CountingErrorBarrier {
+        async fn commit(&self) -> Result<(), HarnessFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(HarnessFailure::new(
+                "harness_outcome_unknown",
+                "durable acceptance failed",
+            ))
+        }
+    }
+
+    struct CancelThenSucceedBarrier {
+        calls: Arc<AtomicUsize>,
+        first_entered: Arc<Notify>,
+        hold_first: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl HarnessAcceptanceBarrier for CancelThenSucceedBarrier {
+        async fn commit(&self) -> Result<(), HarnessFailure> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_entered.notify_one();
+                self.hold_first
+                    .acquire()
+                    .await
+                    .expect("test barrier remains open")
+                    .forget();
+            }
+            Ok(())
+        }
+    }
+
+    fn sender(barrier: Arc<dyn HarnessAcceptanceBarrier>) -> HarnessEventSender {
+        let (events, _receiver) = mpsc::channel(1);
+        HarnessEventSender::new(events, barrier)
+    }
+
+    #[tokio::test]
+    async fn concurrent_clones_share_one_durable_acceptance_call_and_result() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let sender = sender(Arc::new(BlockingSuccessBarrier {
+            calls: calls.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let entered_wait = entered.notified();
+        let first = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.commit_acceptance().await }
+        });
+        entered_wait.await;
+        let second = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.commit_acceptance().await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.add_permits(1);
+
+        assert_eq!(first.await.unwrap(), Ok(()));
+        assert_eq!(second.await.unwrap(), Ok(()));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn acceptance_error_is_cached_for_every_clone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let sender = sender(Arc::new(CountingErrorBarrier(calls.clone())));
+
+        let first = sender.commit_acceptance().await.unwrap_err();
+        let second = sender.clone().commit_acceptance().await.unwrap_err();
+
+        assert_eq!(first.code, "harness_outcome_unknown");
+        assert_eq!(second, first);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_initializer_does_not_poison_a_later_acceptance_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_entered = Arc::new(Notify::new());
+        let sender = sender(Arc::new(CancelThenSucceedBarrier {
+            calls: calls.clone(),
+            first_entered: first_entered.clone(),
+            hold_first: Arc::new(Semaphore::new(0)),
+        }));
+        let entered_wait = first_entered.notified();
+        let initializing = tokio::spawn({
+            let sender = sender.clone();
+            async move { sender.commit_acceptance().await }
+        });
+        entered_wait.await;
+        initializing.abort();
+        assert!(initializing.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sender.commit_acceptance(),
+        )
+        .await
+        .expect("a cancelled initializer releases the once-cell")
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+}
