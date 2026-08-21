@@ -3,12 +3,14 @@ mod harness_conformance;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use kiteframe::harness::{
     BuiltinHarnessPlugin, DenyAllHarnessApprovals, HarnessCapability, HarnessEventEnvelope,
     HarnessEventSink, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
     HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessTerminal, HarnessTransport,
+    dispatch_with_terminal_journal,
 };
 use kiteframe::{
     AgentCommandId, AgentKernel, ClosedSchema, GoalPhase, GoalProjection, HarnessPlugin,
@@ -38,6 +40,30 @@ impl HarnessEventSink for RecordingSink {
 struct TestModel {
     response: Value,
     delay: bool,
+}
+
+struct CountingTestModel {
+    response: Value,
+    calls: AtomicUsize,
+}
+
+impl CountingTestModel {
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelClient for CountingTestModel {
+    async fn respond(
+        &self,
+        _request: kiteframe::ModelRequest,
+    ) -> Result<ModelResponse, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ModelResponse {
+            items: vec![self.response.clone()],
+        })
+    }
 }
 
 #[async_trait::async_trait]
@@ -214,35 +240,55 @@ impl HarnessConformanceDriver for BuiltinConformanceDriver {
                 (result.2, result.3)
             }
             HarnessConformanceCase::Replay => {
-                let plugin = Arc::new(BuiltinHarnessPlugin::new(
-                    profile(),
-                    Arc::new(TestModel {
-                        response: json!({"type":"function_call","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"done"}}}),
-                        delay: false,
-                    }),
-                ));
+                let model = Arc::new(CountingTestModel {
+                    response: json!({"type":"function_call","name":"complete_task","arguments":{"outcome":"ok","fields":{"answer":"done"}}}),
+                    calls: AtomicUsize::new(0),
+                });
+                let plugin = Arc::new(BuiltinHarnessPlugin::new(profile(), model.clone()));
                 let mut registry = HarnessRegistry::new();
                 registry.register(plugin).await.unwrap();
                 let request = request();
                 let invocation_id = request.invocation_id.clone();
                 let journal = RecordingTerminalJournal::default();
-                let first = registry
-                    .invoke(
-                        request.clone(),
-                        Arc::new(DenyAllHarnessApprovals),
-                        Arc::new(RecordingSink(Mutex::new(vec![]))),
-                    )
-                    .await;
-                journal.record(invocation_id.clone(), first.clone()).await;
-                let second = registry
-                    .invoke(
-                        request,
-                        Arc::new(DenyAllHarnessApprovals),
-                        Arc::new(RecordingSink(Mutex::new(vec![]))),
-                    )
-                    .await;
-                journal.record(invocation_id, second.clone()).await;
+                let sink = Arc::new(RecordingSink(Mutex::new(vec![])));
+                let first = dispatch_with_terminal_journal(
+                    &journal,
+                    &invocation_id,
+                    |terminal| async move { Ok(terminal) },
+                    || async {
+                        let terminal = registry
+                            .invoke(
+                                request.clone(),
+                                Arc::new(DenyAllHarnessApprovals),
+                                sink.clone(),
+                            )
+                            .await;
+                        journal
+                            .record(invocation_id.clone(), terminal.clone())
+                            .await;
+                        Ok(terminal)
+                    },
+                )
+                .await
+                .unwrap();
+                let second = dispatch_with_terminal_journal(
+                    &journal,
+                    &invocation_id,
+                    |terminal| async move { Ok(terminal) },
+                    || async {
+                        let terminal = registry
+                            .invoke(request, Arc::new(DenyAllHarnessApprovals), sink.clone())
+                            .await;
+                        journal
+                            .record(invocation_id.clone(), terminal.clone())
+                            .await;
+                        Ok(terminal)
+                    },
+                )
+                .await
+                .unwrap();
                 assert_eq!(first, second);
+                assert_eq!(model.calls(), 1, "terminal replay must not call the model");
                 (second, journal.terminal_count().await)
             }
             HarnessConformanceCase::RejectPermission => {

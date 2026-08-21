@@ -4,10 +4,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::harness::{
     HarnessApprovalBroker, HarnessFailure, HarnessInvocationId, HarnessInvocationRequest,
-    HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal,
-    PostgresHarnessEventSink, canonical_outcome_unknown_terminal_payload, terminal_idempotency_key,
+    HarnessProfileId, HarnessRegistry, HarnessRouteTable, HarnessTerminal, HarnessTerminalJournal,
+    PostgresHarnessEventSink, canonical_outcome_unknown_terminal_payload,
+    dispatch_with_terminal_journal, terminal_idempotency_key,
 };
-use crate::store::{HarnessInvocationState, PrepareHarnessInvocation};
+use crate::store::{HarnessInvocationState, HarnessInvocationView, PrepareHarnessInvocation};
 use crate::{
     AgentCommandState, AgentKernel, ClaimAgentCommand, CompleteAgentCommand, EvidenceId,
     FailAgentCommand, GoalPhase, IdempotencyKey, KernelCommandPayload, OperationalStatus,
@@ -164,73 +165,78 @@ impl AgentCommandDispatcher {
                 payload_digest: &claimed.payload_digest,
             })
             .await?;
-        if prepared.terminal {
-            return self
-                .settle_harness_terminal(
-                    execution,
-                    &claimed,
-                    &prepared,
-                    terminal_from_record(&prepared)?,
-                )
-                .await;
-        }
-        let Some(_active) =
-            ActiveDispatchGuard::reserve(self.active.clone(), &prepared.invocation_id)
-        else {
-            return Ok(());
-        };
-        let prepared = match prepared.state {
-            HarnessInvocationState::Prepared => {
-                self.kernel
+        let journal = PreparedHarnessTerminalJournal::new(&prepared);
+        dispatch_with_terminal_journal(
+            &journal,
+            &prepared.invocation_id,
+            |terminal| async {
+                self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
+                    .await
+            },
+            || async {
+                let Some(_active) =
+                    ActiveDispatchGuard::reserve(self.active.clone(), &prepared.invocation_id)
+                else {
+                    return Ok(());
+                };
+                let prepared = match prepared.state {
+                    HarnessInvocationState::Prepared => {
+                        self.kernel
+                            .store()
+                            .mark_harness_invocation_started(
+                                &prepared.invocation_id,
+                                prepared.attempt,
+                            )
+                            .await?
+                    }
+                    HarnessInvocationState::Started => prepared.clone(),
+                    HarnessInvocationState::Accepted => {
+                        return self
+                            .settle_outcome_unknown(
+                                execution,
+                                &claimed,
+                                &prepared.invocation_id,
+                                prepared.attempt,
+                            )
+                            .await;
+                    }
+                    HarnessInvocationState::Completed
+                    | HarnessInvocationState::Cancelled
+                    | HarnessInvocationState::Failed
+                    | HarnessInvocationState::OutcomeUnknown => return Ok(()),
+                };
+                let prepared = self
+                    .kernel
                     .store()
-                    .mark_harness_invocation_started(&prepared.invocation_id, prepared.attempt)
-                    .await?
-            }
-            HarnessInvocationState::Started => prepared,
-            HarnessInvocationState::Accepted => {
-                return self
-                    .settle_outcome_unknown(
-                        execution,
-                        &claimed,
-                        &prepared.invocation_id,
-                        prepared.attempt,
+                    .mark_harness_prompt_accepted(&prepared.invocation_id, prepared.attempt)
+                    .await?;
+                let workspace: String =
+                    sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
+                        .bind(execution.task.session_id.as_uuid())
+                        .fetch_one(self.kernel.store().pool())
+                        .await?;
+                let request = HarnessInvocationRequest {
+                    invocation_id: prepared.invocation_id.clone(),
+                    command_id: claimed.id.clone(),
+                    command_revision: claimed.revision,
+                    profile_id,
+                    workspace: PathBuf::from(workspace),
+                    payload: payload.clone(),
+                    payload_digest: claimed.payload_digest.clone(),
+                };
+                let terminal = self
+                    .registry
+                    .invoke(
+                        request,
+                        self.approvals.clone(),
+                        Arc::new(PostgresHarnessEventSink::new(self.kernel.store_arc())),
                     )
                     .await;
-            }
-            HarnessInvocationState::Completed
-            | HarnessInvocationState::Cancelled
-            | HarnessInvocationState::Failed
-            | HarnessInvocationState::OutcomeUnknown => return Ok(()),
-        };
-        let prepared = self
-            .kernel
-            .store()
-            .mark_harness_prompt_accepted(&prepared.invocation_id, prepared.attempt)
-            .await?;
-        let workspace: String =
-            sqlx::query_scalar("SELECT working_directory FROM sessions WHERE id = $1")
-                .bind(execution.task.session_id.as_uuid())
-                .fetch_one(self.kernel.store().pool())
-                .await?;
-        let request = HarnessInvocationRequest {
-            invocation_id: prepared.invocation_id.clone(),
-            command_id: claimed.id.clone(),
-            command_revision: claimed.revision,
-            profile_id,
-            workspace: PathBuf::from(workspace),
-            payload: payload.clone(),
-            payload_digest: claimed.payload_digest.clone(),
-        };
-        let terminal = self
-            .registry
-            .invoke(
-                request,
-                self.approvals.clone(),
-                Arc::new(PostgresHarnessEventSink::new(self.kernel.store_arc())),
-            )
-            .await;
-        self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
-            .await
+                self.settle_harness_terminal(execution, &claimed, &prepared, terminal)
+                    .await
+            },
+        )
+        .await
     }
 
     async fn settle_harness_terminal(
@@ -356,6 +362,36 @@ impl AgentCommandDispatcher {
         let failure =
             failure_request(execution, claimed, &terminal_key, "harness_outcome_unknown")?;
         failure_or_audit_late(&self.kernel, &execution.task.principal, &failure).await
+    }
+}
+
+struct PreparedHarnessTerminalJournal<'a> {
+    invocation: &'a HarnessInvocationView,
+}
+
+impl<'a> PreparedHarnessTerminalJournal<'a> {
+    fn new(invocation: &'a HarnessInvocationView) -> Self {
+        Self { invocation }
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTerminalJournal for PreparedHarnessTerminalJournal<'_> {
+    type Error = StoreError;
+
+    async fn terminal(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<Option<HarnessTerminal>, Self::Error> {
+        if self.invocation.invocation_id != *invocation_id {
+            return Err(StoreError::InvalidData(
+                "terminal journal invocation identity drifted".to_owned(),
+            ));
+        }
+        self.invocation
+            .terminal
+            .then(|| terminal_from_record(self.invocation))
+            .transpose()
     }
 }
 

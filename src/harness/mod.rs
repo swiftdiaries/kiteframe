@@ -10,5 +10,5 @@ pub(crate) use builtin::{
 };
 pub use plugin::*;
 pub use profile::HarnessProfile;
-pub use registry::HarnessRegistry;
+pub use registry::{HarnessRegistry, HarnessTerminalJournal, dispatch_with_terminal_journal};
 pub use types::*;

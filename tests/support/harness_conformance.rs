@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use kiteframe::harness::HarnessInvocationId;
+use kiteframe::harness::{HarnessInvocationId, HarnessTerminalJournal};
 use kiteframe::{GoalPhase, HarnessTerminal};
 use tokio::sync::Mutex;
 
@@ -38,6 +38,18 @@ impl RecordingTerminalJournal {
 
     pub async fn terminal_count(&self) -> u64 {
         self.terminals.lock().await.len() as u64
+    }
+}
+
+#[async_trait::async_trait]
+impl HarnessTerminalJournal for RecordingTerminalJournal {
+    type Error = std::convert::Infallible;
+
+    async fn terminal(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<Option<HarnessTerminal>, Self::Error> {
+        Ok(self.terminals.lock().await.get(invocation_id).cloned())
     }
 }
 

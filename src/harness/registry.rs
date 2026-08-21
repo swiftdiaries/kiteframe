@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
@@ -19,6 +20,46 @@ const STABLE_FAILURE_CODES: [&str; 7] = [
     "harness_failed",
     "harness_outcome_unknown",
 ];
+
+/// Terminal-journal read boundary that must run before adapter work is admitted.
+#[async_trait::async_trait]
+pub trait HarnessTerminalJournal: Send + Sync {
+    type Error: Send;
+
+    async fn terminal(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<Option<HarnessTerminal>, Self::Error>;
+}
+
+/// Run the replay branch when a durable terminal exists; only otherwise invoke the adapter branch.
+///
+/// The invocation branch owns settlement of a newly returned terminal before it completes.
+pub async fn dispatch_with_terminal_journal<
+    Journal,
+    Replay,
+    ReplayFuture,
+    Invoke,
+    InvokeFuture,
+    Output,
+>(
+    journal: &Journal,
+    invocation_id: &HarnessInvocationId,
+    replay: Replay,
+    invoke: Invoke,
+) -> Result<Output, Journal::Error>
+where
+    Journal: HarnessTerminalJournal,
+    Replay: FnOnce(HarnessTerminal) -> ReplayFuture,
+    ReplayFuture: Future<Output = Result<Output, Journal::Error>>,
+    Invoke: FnOnce() -> InvokeFuture,
+    InvokeFuture: Future<Output = Result<Output, Journal::Error>>,
+{
+    if let Some(terminal) = journal.terminal(invocation_id).await? {
+        return replay(terminal).await;
+    }
+    invoke().await
+}
 
 #[derive(Clone)]
 pub struct HarnessRegistry {
