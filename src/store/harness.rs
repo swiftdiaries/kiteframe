@@ -2,7 +2,9 @@ use serde_json::Value;
 use sqlx::{Postgres, Row, Transaction, postgres::PgRow};
 
 use crate::AgentCommandId;
-use crate::harness::{HarnessInvocationId, HarnessProfileId, HarnessTransport};
+use crate::harness::{
+    HarnessEventEnvelope, HarnessInvocationId, HarnessProfileId, HarnessTransport,
+};
 
 use super::{
     HarnessInvocationEventRecord, HarnessInvocationState, HarnessInvocationView,
@@ -11,6 +13,21 @@ use super::{
 };
 
 impl PostgresStore {
+    pub async fn append_harness_event_envelope(
+        &self,
+        event: &HarnessEventEnvelope,
+    ) -> Result<(), StoreError> {
+        event
+            .validate()
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let record = HarnessInvocationEventRecord::new(
+            event.invocation_id.clone(),
+            event.sequence,
+            event.event.clone(),
+        )?;
+        self.append_harness_invocation_event(&record).await
+    }
+
     pub async fn register_harness_plugin(
         &self,
         registration: HarnessPluginRegistration,

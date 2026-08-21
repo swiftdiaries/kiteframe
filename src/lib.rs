@@ -44,6 +44,10 @@ pub use goal::{
     CriterionAssertion, EvidenceId, EvidenceRecord, EvidenceSourceIdentity, GoalBlocker,
     GoalContract, GoalContractError, GoalPhase, SuccessCriterion, goal_edge_allowed,
 };
+pub use harness::{
+    DenyAllHarnessApprovals, HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSink,
+    HarnessPlugin, HarnessRegistry, HarnessRequestEnvelope, PostgresHarnessEventSink,
+};
 pub use hash::{HashError, canonical_json, canonical_sha256};
 pub use mcp::{
     AuthenticatedMcpPeer, CatalogRefresh, McpError, McpLimits, McpManager, McpServerConfig,

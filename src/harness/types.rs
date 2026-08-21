@@ -35,6 +35,12 @@ impl HarnessProfileId {
     }
 }
 
+impl<'de> Deserialize<'de> for HarnessProfileId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessTransport {
@@ -105,7 +111,7 @@ pub struct PermissionOption {
 }
 pub type PermissionOptionId = String;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HarnessInvocationId(Uuid);
 impl HarnessInvocationId {
     pub fn new(value: Uuid) -> Self {
@@ -126,7 +132,8 @@ impl<'de> Deserialize<'de> for HarnessInvocationId {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HarnessInvocationRequest {
     pub invocation_id: HarnessInvocationId,
     pub command_id: AgentCommandId,
@@ -143,7 +150,7 @@ pub struct HarnessPendingEvent {
     pub persisted: oneshot::Sender<Result<(), HarnessFailure>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "type", deny_unknown_fields)]
 pub enum HarnessInvocationEvent {
     Started,
@@ -164,7 +171,7 @@ pub enum HarnessInvocationEvent {
     Cancelled,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HarnessApprovalDecision {
     AllowOnce,
