@@ -130,7 +130,7 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
 
     let contradictory_design = design.replacen(
         "\n## Normative language",
-        "\nSlices 4–8 are implemented and delivered.\n\n## Normative language",
+        "\nSlices 4–8 remain prospective but are implemented and delivered.\n\n## Normative language",
         1,
     );
     assert!(
@@ -138,14 +138,14 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
         "status guard accepted a delivered later-slice claim in the design status"
     );
 
-    let contradictory_reference = reference.replacen(
-        "\nCordis auto-composability",
-        "\nSlices 4–8 are implemented and delivered.\n\nCordis auto-composability",
+    let additional_stale_range = reference.replacen(
+        "Initial Tasks 1–7",
+        "Historical range `ca09f321672f90da5acca6aa2abf7e69ce6a6694..d746ce5`. Initial Tasks 1–7",
         1,
     );
     assert!(
-        assert_status_evidence(&design, &contradictory_reference, &migrations).is_err(),
-        "status guard accepted a delivered later-slice claim in the evidence"
+        assert_status_evidence(&design, &additional_stale_range, &migrations).is_err(),
+        "status guard accepted an additional stale evidence range"
     );
 }
 
@@ -198,6 +198,7 @@ fn assert_status_evidence(
     ] {
         require_text(evidence, required, "Slice 3 evidence is stale")?;
     }
+    assert_exact_evidence_range(evidence)?;
 
     let expected_versions = (1..=migration_versions.len() as u32).collect::<Vec<_>>();
     if migration_versions != expected_versions {
@@ -256,25 +257,42 @@ fn assert_no_later_slice_delivery_claim(section: &str) -> Result<(), String> {
     for statement in normalized.split(['.', '\n']) {
         let mentions_later_slice = statement.contains("slices 4-8")
             || (4..=8).any(|slice| statement.contains(&format!("slice {slice}")));
-        let claims_delivery = ["implemented", "delivered", "operational"]
-            .iter()
-            .any(|claim| statement.contains(claim));
-        let preserves_prospective_status = [
-            "not implemented",
-            "unimplemented",
-            "prospective",
-            "deferred",
-            "planned",
-        ]
-        .iter()
-        .any(|status| statement.contains(status));
-        if mentions_later_slice && claims_delivery && !preserves_prospective_status {
+        if mentions_later_slice && contains_positive_delivery_word(statement) {
             return Err(format!(
                 "contradictory later-slice delivery claim: {statement}"
             ));
         }
     }
     Ok(())
+}
+
+fn contains_positive_delivery_word(statement: &str) -> bool {
+    let words = statement
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    words.iter().enumerate().any(|(index, word)| {
+        matches!(*word, "implemented" | "delivered" | "operational")
+            && !matches!(
+                index.checked_sub(1).map(|previous| words[previous]),
+                Some("not" | "never")
+            )
+    })
+}
+
+fn assert_exact_evidence_range(evidence: &str) -> Result<(), String> {
+    let canonical_range = "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c";
+    let ranges = evidence
+        .split('`')
+        .filter(|fragment| fragment.contains(".."))
+        .collect::<Vec<_>>();
+    if ranges.len() == 1 && ranges[0] == canonical_range {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected exactly one canonical Slice 3 implementation range, found {ranges:?}"
+        ))
+    }
 }
 
 fn embedded_migration_versions() -> Result<Vec<u32>, String> {
