@@ -216,6 +216,34 @@ impl HarnessStoreFixture {
             .await
     }
 
+    async fn prepare_with_persisted_limit_for_test(
+        &self,
+        invocation_id: &HarnessInvocationId,
+        payload_digest: &str,
+        max_pre_accept_attempts: i64,
+    ) -> HarnessInvocationView {
+        sqlx::query(
+            "INSERT INTO harness_invocations \
+             (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
+              state, attempt, prompt_accepted, max_pre_accept_attempts) \
+             VALUES ($1, $2, 0, $3, $4, $5, 'prepared', 0, FALSE, $6)",
+        )
+        .bind(invocation_id.as_uuid())
+        .bind(self.command_id.as_uuid())
+        .bind(self.profile_id.as_str())
+        .bind(&self.profile_digest)
+        .bind(payload_digest)
+        .bind(max_pre_accept_attempts)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        self.store
+            .harness_invocation_for_command_revision(&self.command_id, 0)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     async fn additional_command(&self) -> AgentCommandId {
         let command_id = AgentCommandId::new(Uuid::now_v7());
         let ordinal: i32 = sqlx::query_scalar(
@@ -412,7 +440,7 @@ fn gate_a_migration_backfills_v1_event_identity_and_removes_zero_attestation() {
 }
 
 #[tokio::test]
-async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
+async fn harness_receipt_closure_migrates_fresh_and_upgrades_through_0019() {
     let Some(fresh) = IsolatedMigrationDatabase::new().await else {
         eprintln!("SKIP harness receipt closure migration: DATABASE_URL is not set");
         return;
@@ -420,13 +448,13 @@ async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
     MIGRATOR
         .run(&fresh.pool)
         .await
-        .expect("fresh migrations through 0018 succeed");
+        .expect("fresh migrations through 0019 succeed");
     let fresh_versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&fresh.pool)
             .await
             .unwrap();
-    assert_eq!(fresh_versions, (1..=18).collect::<Vec<_>>());
+    assert_eq!(fresh_versions, (1..=19).collect::<Vec<_>>());
     fresh.drop().await;
 
     let Some(upgrade) = IsolatedMigrationDatabase::new().await else {
@@ -580,16 +608,36 @@ async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
         .unwrap();
         invocation_ids.push(invocation_id);
     }
-    MIGRATOR
+    let through_0018 = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 18)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    through_0018
         .run(&upgrade.pool)
         .await
         .expect("upgrade from 0017 through 0018 succeeds");
+    let through_0018_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&upgrade.pool)
+            .await
+            .unwrap();
+    assert_eq!(through_0018_versions, (1..=18).collect::<Vec<_>>());
+    MIGRATOR
+        .run(&upgrade.pool)
+        .await
+        .expect("upgrade from populated 0018 through 0019 succeeds");
     let upgraded_versions: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&upgrade.pool)
             .await
             .unwrap();
-    assert_eq!(upgraded_versions, (1..=18).collect::<Vec<_>>());
+    assert_eq!(upgraded_versions, (1..=19).collect::<Vec<_>>());
     let upgraded_rows: Vec<(String, bool, Option<String>, Option<serde_json::Value>, String, serde_json::Value)> = sqlx::query_as(
         "SELECT state, terminal, terminal_request_digest, terminal_payload, exhaustion_request_digest, exhaustion_payload \
          FROM harness_invocations WHERE invocation_id = ANY($1) ORDER BY state",
@@ -627,6 +675,14 @@ async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
     }
     let store = PostgresStore::connect(&upgrade.database_url).await.unwrap();
     for invocation_id in invocation_ids {
+        let stored_limit: i64 = sqlx::query_scalar(
+            "SELECT max_pre_accept_attempts FROM harness_invocations WHERE invocation_id = $1",
+        )
+        .bind(invocation_id)
+        .fetch_one(&upgrade.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_limit, 3, "0019 backfills the compatibility limit");
         let result = store
             .mark_harness_prompt_accepted(&HarnessInvocationId::new(invocation_id), 0)
             .await;
@@ -641,6 +697,271 @@ async fn harness_receipt_closure_migrates_fresh_and_upgrades_from_0017() {
             .contains("kiteframe_harness_migration_")
     );
     upgrade.drop().await;
+}
+
+#[tokio::test]
+async fn default_attempt_limit_has_exact_prepared_started_retry_sequence() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture
+        .prepare("sha256:default-limit-sequence")
+        .await
+        .unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+    let retry_payload = json!({
+        "type":"failed",
+        "code":"harness_failed",
+        "detail":"process exited before acceptance"
+    });
+    let mut sequence = vec![(invocation.state, invocation.attempt, false)];
+
+    for attempt in 0..3 {
+        let started = fixture
+            .store
+            .mark_harness_invocation_started(&invocation.invocation_id, attempt)
+            .await
+            .unwrap();
+        sequence.push((started.state, started.attempt, false));
+        let retry = fixture
+            .store
+            .record_harness_retryable_failure(
+                &invocation.invocation_id,
+                attempt,
+                3,
+                &terminal_key,
+                &retry_payload,
+            )
+            .await
+            .unwrap();
+        let exhausted: bool = sqlx::query_scalar(
+            "SELECT pre_accept_exhausted FROM harness_invocations WHERE invocation_id = $1",
+        )
+        .bind(invocation.invocation_id.as_uuid())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        sequence.push((retry.state, retry.attempt, exhausted));
+    }
+
+    assert_eq!(
+        sequence,
+        vec![
+            (HarnessInvocationState::Prepared, 0, false),
+            (HarnessInvocationState::Started, 0, false),
+            (HarnessInvocationState::Prepared, 1, false),
+            (HarnessInvocationState::Started, 1, false),
+            (HarnessInvocationState::Prepared, 2, false),
+            (HarnessInvocationState::Started, 2, false),
+            (HarnessInvocationState::Started, 2, true),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn one_attempt_limit_has_exact_prepared_started_exhausted_sequence() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let prepared = fixture
+        .prepare_with_persisted_limit_for_test(&invocation_id, "sha256:one-attempt-sequence", 1)
+        .await;
+    let started = fixture
+        .store
+        .mark_harness_invocation_started(&invocation_id, 0)
+        .await
+        .unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation_id.as_uuid());
+    let exhausted = fixture
+        .store
+        .record_harness_retryable_failure(
+            &invocation_id,
+            0,
+            1,
+            &terminal_key,
+            &json!({
+                "type":"failed",
+                "code":"process_exit",
+                "detail":"driver-specific process failure"
+            }),
+        )
+        .await
+        .unwrap();
+    let (is_exhausted, payload): (bool, serde_json::Value) = sqlx::query_as(
+        "SELECT pre_accept_exhausted, exhaustion_payload \
+         FROM harness_invocations WHERE invocation_id = $1",
+    )
+    .bind(invocation_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        [
+            (prepared.state, prepared.attempt),
+            (started.state, started.attempt),
+            (exhausted.state, exhausted.attempt),
+        ],
+        [
+            (HarnessInvocationState::Prepared, 0),
+            (HarnessInvocationState::Started, 0),
+            (HarnessInvocationState::Started, 0),
+        ]
+    );
+    assert!(is_exhausted);
+    assert_eq!(
+        payload,
+        json!({
+            "type":"failed",
+            "code":"harness_failed",
+            "detail":"harness pre-accept attempt budget exhausted"
+        })
+    );
+}
+
+#[tokio::test]
+async fn concurrent_attempt_reservation_has_exactly_one_launch_winner() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture.prepare("sha256:reservation-race").await.unwrap();
+    let first_store = fixture.store.clone();
+    let second_store = fixture.store.clone();
+    let first_id = invocation.invocation_id.clone();
+    let second_id = invocation.invocation_id.clone();
+
+    let (first, second) = tokio::join!(
+        async move {
+            first_store
+                .mark_harness_invocation_started(&first_id, 0)
+                .await
+        },
+        async move {
+            second_store
+                .mark_harness_invocation_started(&second_id, 0)
+                .await
+        }
+    );
+    let winners = [&first, &second]
+        .into_iter()
+        .filter(|result| {
+            matches!(
+                result,
+                Ok(view) if view.state == HarnessInvocationState::Started && view.attempt == 0
+            )
+        })
+        .count();
+    let conflicts = [&first, &second]
+        .into_iter()
+        .filter(|result| matches!(result, Err(StoreError::RevisionConflict)))
+        .count();
+    assert_eq!(winners, 1, "only the Prepared-to-Started CAS owns launch");
+    assert_eq!(conflicts, 1, "a Started replay has no launch authority");
+}
+
+#[tokio::test]
+async fn cancellation_command_lock_wins_against_attempt_reservation() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture
+        .prepare("sha256:reservation-cancel-race")
+        .await
+        .unwrap();
+    let mut cancellation = fixture.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM agent_commands WHERE id = $1 FOR UPDATE")
+        .bind(fixture.command_id.as_uuid())
+        .execute(&mut *cancellation)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'cancelled', revision = revision + 1 WHERE id = $1",
+    )
+    .bind(fixture.command_id.as_uuid())
+    .execute(&mut *cancellation)
+    .await
+    .unwrap();
+
+    let store = fixture.store.clone();
+    let invocation_id = invocation.invocation_id.clone();
+    let reservation = tokio::spawn(async move {
+        store
+            .mark_harness_invocation_started(&invocation_id, 0)
+            .await
+    });
+    tokio::task::yield_now().await;
+    cancellation.commit().await.unwrap();
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(5), reservation)
+        .await
+        .expect("reservation and cancellation do not deadlock")
+        .unwrap()
+        .unwrap();
+    assert_eq!(settled.state, HarnessInvocationState::Cancelled);
+    assert_eq!(settled.attempt, 0);
+    assert!(settled.terminal);
+}
+
+#[tokio::test]
+async fn persisted_attempt_limit_is_positive_defaulted_and_immutable() {
+    let Some(fixture) = HarnessStoreFixture::new().await else {
+        return;
+    };
+    let invocation = fixture
+        .prepare("sha256:immutable-attempt-limit")
+        .await
+        .unwrap();
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT max_pre_accept_attempts FROM harness_invocations WHERE invocation_id = $1",
+    )
+    .bind(invocation.invocation_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, 3);
+
+    for candidate in [0_i64, 4] {
+        let error = sqlx::query(
+            "UPDATE harness_invocations SET max_pre_accept_attempts = $1 WHERE invocation_id = $2",
+        )
+        .bind(candidate)
+        .bind(invocation.invocation_id.as_uuid())
+        .execute(&fixture.pool)
+        .await
+        .expect_err("the invocation-owned attempt limit is frozen");
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("55000")
+        );
+    }
+
+    fixture
+        .store
+        .mark_harness_invocation_started(&invocation.invocation_id, 0)
+        .await
+        .unwrap();
+    let terminal_key = format!("harness-terminal:{}", invocation.invocation_id.as_uuid());
+    let raised = fixture
+        .store
+        .record_harness_retryable_failure(
+            &invocation.invocation_id,
+            0,
+            4,
+            &terminal_key,
+            &json!({"type":"failed","code":"harness_failed","detail":"retry"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(raised, StoreError::IdempotencyConflict));
+    let unchanged: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, attempt, max_pre_accept_attempts \
+         FROM harness_invocations WHERE invocation_id = $1",
+    )
+    .bind(invocation.invocation_id.as_uuid())
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, ("started".to_owned(), 0, 3));
 }
 
 #[tokio::test]
@@ -866,7 +1187,7 @@ async fn cancelled_command_atomically_settles_pre_accept_and_late_terminals_as_c
         .record_harness_retryable_failure(
             &prepared.invocation_id,
             0,
-            3,
+            4,
             &format!("harness-terminal:{}", prepared.invocation_id.as_uuid()),
             &json!({"type":"failed","code":"harness_failed","detail":"late retry"}),
         )
@@ -1417,7 +1738,10 @@ async fn exhausted_retry_waits_for_the_command_authority_before_terminal_journal
     let Some(fixture) = HarnessStoreFixture::new().await else {
         return;
     };
-    let invocation = fixture.prepare("sha256:payload-a").await.unwrap();
+    let invocation_id = HarnessInvocationId::new(Uuid::now_v7());
+    let invocation = fixture
+        .prepare_with_persisted_limit_for_test(&invocation_id, "sha256:payload-a", 1)
+        .await;
     fixture
         .store
         .mark_harness_invocation_started(&invocation.invocation_id, 0)

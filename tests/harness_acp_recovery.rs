@@ -316,7 +316,7 @@ mod postgres_recovery_boundaries {
             .iter()
             .find(|row| row.invocation_id == retryable.invocation_id)
             .unwrap();
-        assert_eq!(retry.state, HarnessInvocationState::Started);
+        assert_eq!(retry.state, HarnessInvocationState::Prepared);
         assert_eq!(retry.attempt, 1, "recovery does not increment retry count");
         let terminal = recovered
             .iter()
@@ -1244,6 +1244,72 @@ mod integrated_postgres_fake_restart {
     }
 
     #[tokio::test]
+    async fn restart_configuration_cannot_raise_the_persisted_attempt_limit() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let prepare_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterPrepare,
+        ));
+        let (first_dispatcher, _) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(prepare_barrier.clone()),
+                1,
+                None,
+            )
+            .await;
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        prepare_barrier.wait_until_entered().await;
+        let prepared = recovery.invocation().await.unwrap();
+        first.abort();
+        prepare_barrier.release();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let stored_limit: i64 = sqlx::query_scalar(
+            "SELECT max_pre_accept_attempts FROM harness_invocations WHERE invocation_id = $1",
+        )
+        .bind(prepared.invocation_id.as_uuid())
+        .fetch_one(recovery.store.pool())
+        .await
+        .unwrap();
+        assert_eq!(stored_limit, 1);
+
+        let process_log = recovery.workspace.join("immutable-limit-processes.jsonl");
+        let (restarted, _) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                None,
+                3,
+                Some(&process_log),
+            )
+            .await;
+        let report = restarted.recover_harness_invocations(1).await.unwrap();
+        let admitted = restarted.tick_agent_commands(8).await.unwrap();
+        let after_budget = restarted.tick_agent_commands(8).await.unwrap();
+        let terminal = recovery.invocation().await.unwrap();
+        let process_counts = process_log_counts(&process_log);
+        recovery.cleanup().await;
+
+        assert_eq!(report.retryable_pre_accept, 1);
+        assert_eq!(admitted, 1);
+        assert_eq!(after_budget, 0);
+        assert_eq!(terminal.state, HarnessInvocationState::Failed);
+        assert_eq!(terminal.attempt, 0);
+        assert_eq!(process_counts, (1, 0));
+    }
+
+    #[tokio::test]
     async fn restart_before_insert_after_prepare_and_after_retryable_loss_keeps_one_identity() {
         let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
         let Some(mut before_insert) = RecoveryFixture::new().await else {
@@ -1365,7 +1431,7 @@ mod integrated_postgres_fake_restart {
         first.abort();
         retry_commit_barrier.release();
         assert!(first.await.unwrap_err().is_cancelled());
-        assert_eq!(failed_once.state, HarnessInvocationState::Started);
+        assert_eq!(failed_once.state, HarnessInvocationState::Prepared);
         assert_eq!(failed_once.attempt, 1);
         assert_eq!(prompt_count(&first_observation), 0);
         let restart_barrier = Arc::new(AcpTestBarrier::new_disarmed(
@@ -1568,7 +1634,7 @@ mod integrated_postgres_fake_restart {
     }
 
     #[tokio::test]
-    async fn recovery_preflight_terminalizes_an_already_consumed_attempt_without_launching() {
+    async fn stale_started_has_no_replay_authority_before_recovery_advances_it() {
         let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
         let Some(mut recovery) = RecoveryFixture::new().await else {
             return;
@@ -1600,11 +1666,6 @@ mod integrated_postgres_fake_restart {
             .mark_harness_invocation_started(&prepared.invocation_id, 0)
             .await
             .unwrap();
-        sqlx::query("UPDATE harness_invocations SET attempt = 1 WHERE invocation_id = $1")
-            .bind(prepared.invocation_id.as_uuid())
-            .execute(recovery.store.pool())
-            .await
-            .unwrap();
 
         let process_log = recovery.workspace.join("preflight-processes.jsonl");
         let (restarted, _) = recovery
@@ -1626,12 +1687,12 @@ mod integrated_postgres_fake_restart {
         let process_counts = process_log_counts(&process_log);
         recovery.cleanup().await;
 
-        assert_eq!(report.terminal, 1);
-        assert_eq!(report.retryable_pre_accept, 0);
+        assert_eq!(report.terminal, 0);
+        assert_eq!(report.retryable_pre_accept, 1);
         assert_eq!(report.outcome_unknown, 0);
-        assert_eq!(recovered_tick, 0);
-        assert_eq!(terminal.state, HarnessInvocationState::Failed);
-        assert_eq!(terminal.attempt, 1);
+        assert_eq!(recovered_tick, 1);
+        assert_eq!(terminal.state, HarnessInvocationState::Started);
+        assert_eq!(terminal.attempt, 0);
         assert_eq!(process_counts, (0, 0));
     }
 
@@ -1733,10 +1794,11 @@ mod integrated_postgres_fake_restart {
             } else {
                 assert_eq!(report.retryable_pre_accept, 1, "{method:?} {point:?}");
                 assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
-                let completed = recovery.invocation().await.unwrap();
-                assert_eq!(completed.invocation_id, crashed.invocation_id);
-                assert_eq!(completed.attempt, crashed.attempt);
-                assert_eq!(prompt_count(&second_observation), 1);
+                let still_started = recovery.invocation().await.unwrap();
+                assert_eq!(still_started.invocation_id, crashed.invocation_id);
+                assert_eq!(still_started.attempt, crashed.attempt);
+                assert_eq!(still_started.state, HarnessInvocationState::Started);
+                assert_eq!(prompt_count(&second_observation), 0);
             }
             assert_eq!(prompt_count(&first_observation), first_prompts);
             recovery.cleanup().await;

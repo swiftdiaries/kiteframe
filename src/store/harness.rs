@@ -14,6 +14,8 @@ use super::{
     models::harness_event_from_value,
 };
 
+const DEFAULT_MAX_PRE_ACCEPT_ATTEMPTS: u64 = 3;
+
 impl PostgresStore {
     pub async fn append_harness_event_envelope(
         &self,
@@ -120,10 +122,28 @@ impl PostgresStore {
         &self,
         request: PrepareHarnessInvocation<'_>,
     ) -> Result<HarnessInvocationView, StoreError> {
+        self.prepare_harness_invocation_with_attempt_limit(request, DEFAULT_MAX_PRE_ACCEPT_ATTEMPTS)
+            .await
+    }
+
+    pub(crate) async fn prepare_harness_invocation_with_attempt_limit(
+        &self,
+        request: PrepareHarnessInvocation<'_>,
+        max_pre_accept_attempts: u64,
+    ) -> Result<HarnessInvocationView, StoreError> {
         let command_revision = harness_i64(
             request.command_revision,
             "harness command revision is malformed",
         )?;
+        let max_pre_accept_attempts = harness_i64(
+            max_pre_accept_attempts,
+            "harness pre-accept attempt limit is malformed",
+        )?;
+        if max_pre_accept_attempts == 0 {
+            return Err(StoreError::InvalidData(
+                "harness pre-accept attempt limit is malformed".to_owned(),
+            ));
+        }
         let mut tx = self.pool().begin().await?;
         let command =
             sqlx::query("SELECT state, revision FROM agent_commands WHERE id = $1 FOR UPDATE")
@@ -150,7 +170,8 @@ impl PostgresStore {
         }
         if let Some(row) = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
+                    max_pre_accept_attempts \
              FROM harness_invocations WHERE invocation_id = $1 FOR UPDATE",
         )
         .bind(request.invocation_id.as_uuid())
@@ -159,12 +180,14 @@ impl PostgresStore {
         {
             let view = harness_invocation_from_row(&row)?;
             validate_invocation_identity_replay(&view, &request)?;
+            validate_stored_attempt_limit(&row, max_pre_accept_attempts)?;
             tx.commit().await?;
             return Ok(view);
         }
         if let Some(row) = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
+                    max_pre_accept_attempts \
              FROM harness_invocations \
              WHERE command_id = $1 AND command_revision = $2 FOR UPDATE",
         )
@@ -175,6 +198,7 @@ impl PostgresStore {
         {
             let view = harness_invocation_from_row(&row)?;
             validate_command_revision_replay(&view, &request)?;
+            validate_stored_attempt_limit(&row, max_pre_accept_attempts)?;
             tx.commit().await?;
             return Ok(view);
         }
@@ -184,8 +208,8 @@ impl PostgresStore {
         let insert = sqlx::query(
             "INSERT INTO harness_invocations \
              (invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-              state, attempt, prompt_accepted) \
-             VALUES ($1, $2, $3, $4, $5, $6, 'prepared', 0, FALSE) \
+              state, attempt, prompt_accepted, max_pre_accept_attempts) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'prepared', 0, FALSE, $7) \
              ON CONFLICT (command_id, command_revision) DO NOTHING",
         )
         .bind(request.invocation_id.as_uuid())
@@ -194,6 +218,7 @@ impl PostgresStore {
         .bind(request.profile_id.as_str())
         .bind(request.profile_digest)
         .bind(request.payload_digest)
+        .bind(max_pre_accept_attempts)
         .execute(&mut *tx)
         .await;
         if let Err(error) = insert {
@@ -204,7 +229,8 @@ impl PostgresStore {
         }
         let row = sqlx::query(
             "SELECT invocation_id, command_id, command_revision, profile_id, profile_digest, payload_digest, \
-                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload \
+                    state, attempt, prompt_accepted, terminal, terminal_request_digest, terminal_payload, \
+                    max_pre_accept_attempts \
              FROM harness_invocations WHERE command_id = $1 AND command_revision = $2 FOR UPDATE",
         )
         .bind(request.command_id.as_uuid())
@@ -213,6 +239,7 @@ impl PostgresStore {
         .await?;
         let view = harness_invocation_from_row(&row)?;
         validate_command_revision_replay(&view, &request)?;
+        validate_stored_attempt_limit(&row, max_pre_accept_attempts)?;
         tx.commit().await?;
         Ok(view)
     }
@@ -233,10 +260,6 @@ impl PostgresStore {
         }
         if command_state == "cancelled" {
             let view = settle_harness_cancelled(&mut tx, &view).await?;
-            tx.commit().await?;
-            return Ok(view);
-        }
-        if view.state == HarnessInvocationState::Started && view.attempt == expected_attempt {
             tx.commit().await?;
             return Ok(view);
         }
@@ -266,7 +289,42 @@ impl PostgresStore {
         request_digest: &str,
         terminal_payload: &Value,
     ) -> Result<HarnessInvocationView, StoreError> {
-        if max_pre_accept_attempts == 0 || request_digest.is_empty() {
+        self.record_harness_retryable_failure_with_limit(
+            invocation_id,
+            expected_attempt,
+            Some(max_pre_accept_attempts),
+            request_digest,
+            terminal_payload,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_harness_retryable_failure_with_stored_limit(
+        &self,
+        invocation_id: &HarnessInvocationId,
+        expected_attempt: u64,
+        request_digest: &str,
+        terminal_payload: &Value,
+    ) -> Result<HarnessInvocationView, StoreError> {
+        self.record_harness_retryable_failure_with_limit(
+            invocation_id,
+            expected_attempt,
+            None,
+            request_digest,
+            terminal_payload,
+        )
+        .await
+    }
+
+    async fn record_harness_retryable_failure_with_limit(
+        &self,
+        invocation_id: &HarnessInvocationId,
+        expected_attempt: u64,
+        expected_max_pre_accept_attempts: Option<u64>,
+        request_digest: &str,
+        terminal_payload: &Value,
+    ) -> Result<HarnessInvocationView, StoreError> {
+        if expected_max_pre_accept_attempts == Some(0) || request_digest.is_empty() {
             return Err(StoreError::InvalidData(
                 "harness retryable failure request is malformed".to_owned(),
             ));
@@ -281,6 +339,18 @@ impl PostgresStore {
         let mut tx = self.pool().begin().await?;
         let (command_state, view) =
             lock_harness_invocation_with_command(&mut tx, invocation_id).await?;
+        if command_state == "cancelled" {
+            let view = settle_harness_cancelled(&mut tx, &view).await?;
+            tx.commit().await?;
+            return Ok(view);
+        }
+        let max_pre_accept_attempts =
+            harness_attempt_limit_for_update(&mut tx, invocation_id).await?;
+        if expected_max_pre_accept_attempts
+            .is_some_and(|expected| expected != max_pre_accept_attempts)
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
         if let Some((stored_digest, stored_payload)) =
             harness_exhaustion_for_update(&mut tx, invocation_id).await?
         {
@@ -289,11 +359,6 @@ impl PostgresStore {
                 return Ok(view);
             }
             return Err(StoreError::IdempotencyConflict);
-        }
-        if command_state == "cancelled" {
-            let view = settle_harness_cancelled(&mut tx, &view).await?;
-            tx.commit().await?;
-            return Ok(view);
         }
         if view.state == HarnessInvocationState::Failed && view.attempt == expected_attempt {
             if view.terminal_request_digest.as_deref() == Some(&canonical_key)
@@ -328,7 +393,7 @@ impl PostgresStore {
         let view = update_invocation_state(
             &mut tx,
             invocation_id,
-            HarnessInvocationState::Started,
+            HarnessInvocationState::Prepared,
             next_attempt,
             false,
             false,
@@ -338,6 +403,21 @@ impl PostgresStore {
         .await?;
         tx.commit().await?;
         Ok(view)
+    }
+
+    pub(crate) async fn harness_pre_accept_attempt_limit(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Result<u64, StoreError> {
+        let value: i64 = sqlx::query_scalar(
+            "SELECT max_pre_accept_attempts FROM harness_invocations WHERE invocation_id = $1",
+        )
+        .bind(invocation_id.as_uuid())
+        .fetch_one(self.pool())
+        .await?;
+        u64::try_from(value).map_err(|_| {
+            StoreError::InvalidData("harness pre-accept attempt limit is malformed".to_owned())
+        })
     }
 
     /// Commit this barrier immediately before the adapter writes the prompt bytes.
@@ -1128,6 +1208,19 @@ fn harness_invocation_from_row(row: &PgRow) -> Result<HarnessInvocationView, Sto
     })
 }
 
+fn validate_stored_attempt_limit(row: &PgRow, expected: i64) -> Result<(), StoreError> {
+    let stored: i64 = row.get("max_pre_accept_attempts");
+    if stored <= 0 {
+        return Err(StoreError::InvalidData(
+            "harness pre-accept attempt limit is malformed".to_owned(),
+        ));
+    }
+    if stored != expected {
+        return Err(StoreError::IdempotencyConflict);
+    }
+    Ok(())
+}
+
 fn harness_event_record_from_row(row: &PgRow) -> Result<HarnessInvocationEventRecord, StoreError> {
     let record = HarnessInvocationEventRecord {
         invocation_id: HarnessInvocationId::new(row.get("invocation_id")),
@@ -1258,6 +1351,21 @@ async fn harness_exhaustion_for_update(
     .fetch_one(&mut **tx)
     .await?;
     exhaustion_from_row(&row)
+}
+
+async fn harness_attempt_limit_for_update(
+    tx: &mut Transaction<'_, Postgres>,
+    invocation_id: &HarnessInvocationId,
+) -> Result<u64, StoreError> {
+    let value: i64 = sqlx::query_scalar(
+        "SELECT max_pre_accept_attempts FROM harness_invocations WHERE invocation_id = $1 FOR UPDATE",
+    )
+    .bind(invocation_id.as_uuid())
+    .fetch_one(&mut **tx)
+    .await?;
+    u64::try_from(value).map_err(|_| {
+        StoreError::InvalidData("harness pre-accept attempt limit is malformed".to_owned())
+    })
 }
 
 async fn mark_harness_pre_accept_exhausted(

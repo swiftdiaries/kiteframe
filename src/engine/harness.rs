@@ -415,17 +415,22 @@ impl AgentCommandDispatcher {
                 .registry
                 .profile_digest(&profile_id)
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            let max_pre_accept_attempts =
+                registered_pre_accept_attempt_limit(&self.registry, &profile_id)?;
             let candidate = HarnessInvocationId::new(uuid::Uuid::now_v7());
             self.kernel
                 .store()
-                .prepare_harness_invocation(PrepareHarnessInvocation {
-                    invocation_id: &candidate,
-                    command_id: &claimed.id,
-                    command_revision: claimed.revision,
-                    profile_id: &profile_id,
-                    profile_digest: &profile_digest,
-                    payload_digest: &claimed.payload_digest,
-                })
+                .prepare_harness_invocation_with_attempt_limit(
+                    PrepareHarnessInvocation {
+                        invocation_id: &candidate,
+                        command_id: &claimed.id,
+                        command_revision: claimed.revision,
+                        profile_id: &profile_id,
+                        profile_digest: &profile_digest,
+                        payload_digest: &claimed.payload_digest,
+                    },
+                    max_pre_accept_attempts,
+                )
                 .await?
         };
         #[cfg(feature = "test-support")]
@@ -456,7 +461,7 @@ impl AgentCommandDispatcher {
                             )
                             .await?
                     }
-                    HarnessInvocationState::Started => prepared.clone(),
+                    HarnessInvocationState::Started => return Ok(()),
                     HarnessInvocationState::Accepted => {
                         return self
                             .settle_outcome_unknown(
@@ -669,15 +674,12 @@ impl AgentCommandDispatcher {
                 Ok(())
             }
             HarnessTerminal::Retryable(_) => {
-                let max_pre_accept_attempts =
-                    registered_pre_accept_attempt_limit(&self.registry, &invocation.profile_id)?;
                 let retry = self
                     .kernel
                     .store()
-                    .record_harness_retryable_failure(
+                    .record_harness_retryable_failure_with_stored_limit(
                         &invocation.invocation_id,
                         invocation.attempt,
-                        max_pre_accept_attempts,
                         &terminal_key,
                         &terminal_payload,
                     )
@@ -944,8 +946,11 @@ impl AgentCommandDispatcher {
         &self,
         invocation: &HarnessInvocationView,
     ) -> Result<Option<HarnessInvocationView>, StoreError> {
-        let max_pre_accept_attempts =
-            registered_pre_accept_attempt_limit(&self.registry, &invocation.profile_id)?;
+        let max_pre_accept_attempts = self
+            .kernel
+            .store()
+            .harness_pre_accept_attempt_limit(&invocation.invocation_id)
+            .await?;
         if invocation.attempt < max_pre_accept_attempts {
             return Ok(None);
         }
@@ -957,10 +962,9 @@ impl AgentCommandDispatcher {
         let terminal_payload = terminal_payload(&terminal);
         self.kernel
             .store()
-            .record_harness_retryable_failure(
+            .record_harness_retryable_failure_with_stored_limit(
                 &invocation.invocation_id,
                 invocation.attempt,
-                max_pre_accept_attempts,
                 &terminal_key,
                 &terminal_payload,
             )
