@@ -578,6 +578,26 @@ fn ci_structural_guard_rejects_weakened_remote_cleanup_commands() {
     }
 }
 
+#[test]
+fn ci_structural_guard_requires_remote_pid_capture_immediately_after_launch() {
+    let workflow = std::fs::read_to_string(".github/workflows/ci.yml").unwrap();
+    for (expected, replacement) in [
+        ("responses_pid=$!", ""),
+        ("harness_pid=$!", ""),
+        (
+            "python3 tests/fixtures/responses_ready.py &\n          responses_pid=$!",
+            "responses_pid=$!\n          python3 tests/fixtures/responses_ready.py &",
+        ),
+        (
+            "./target/debug/kiteframe-harness &\n          harness_pid=$!",
+            "harness_pid=$!\n          ./target/debug/kiteframe-harness &",
+        ),
+    ] {
+        let mutated = workflow.replacen(expected, replacement, 1);
+        assert!(assert_ci_isolation(&parse_ci_workflow(&mutated).unwrap()).is_err());
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct CiWorkflow {
     jobs: BTreeMap<String, CiJob>,
@@ -882,6 +902,11 @@ fn assert_remote_smoke_command(step: &CiStep) -> Result<(), String> {
     let fixture = line_position(&lines, "python3 tests/fixtures/responses_ready.py &")?;
     let harness = line_position(&lines, "./target/debug/kiteframe-harness &")?;
     let bun_test = line_position(&lines, "(cd clients/typescript && bun test)")?;
+    if lines.get(fixture + 1) != Some(&"responses_pid=$!")
+        || lines.get(harness + 1) != Some(&"harness_pid=$!")
+    {
+        return Err("remote smoke does not capture launched process PIDs immediately".to_owned());
+    }
     if !(cleanup_prefix.len() - 1 < fixture && fixture < harness && harness < bun_test) {
         return Err("remote smoke launch/test order is incorrect".to_owned());
     }
