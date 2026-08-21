@@ -442,7 +442,7 @@ Add a trigger that rejects changes to `invocation_id`, `command_id`, `command_re
 
 ```text
 prepared -> started | cancelled | failed
-started -> started only to increment an attempt after a pre-accept retryable failure
+started -> prepared only to advance from consumed ordinal n to n+1 after pre-accept loss
 started -> accepted | cancelled | failed
 accepted -> completed | cancelled | failed | outcome_unknown
 terminal -> same terminal state only when request digest matches
@@ -526,7 +526,7 @@ sqlx::query(
 
 After the insert, select `event_digest FOR UPDATE`; equality is idempotent replay and inequality is `StoreError::IdempotencyConflict`. This exact query path also persists `ApprovalRequested` and `ApprovalResolved` events.
 
-`attempt` is the zero-based ACP process/invocation ordinal, while `max_pre_accept_attempts` is the total attempt budget. Dispatch is permitted only while `attempt < max_pre_accept_attempts`. After a retryable result, `record_harness_retryable_failure` may advance to the next ordinal and retain `started` only while `prompt_accepted = false` and `attempt + 1 < max_pre_accept_attempts`; otherwise it durably marks the same row exhausted before command-authority settlement. `mark_harness_prompt_accepted` is the persist-before-dispatch barrier: commit it immediately before the adapter writes `session/prompt`, not after the write. `recover_harness_invocations` must atomically mark every nonterminal `accepted` row `outcome_unknown`, return `prepared` rows as retryable, return `started` rows as retryable only when `prompt_accepted = false` and `attempt < max_pre_accept_attempts`, close over-budget started rows without another plugin launch, and never convert an accepted attempt back to prepared. A crash after the accepted commit but before the prompt bytes reach the child is conservatively uncertain; this is preferable to duplicating work that may mutate the workspace.
+`attempt` is the zero-based ACP process/invocation ordinal, while `max_pre_accept_attempts` is the total attempt budget. Only `Prepared(n)` is launchable, and only the successful strict `Prepared(n) -> Started(n)` compare-and-set owns that launch. `Started(n)` is already consumed and is never relaunched: direct dispatch or recovery first calls `record_harness_retryable_failure`, which advances to `Prepared(n+1)` only when `n + 1 < max_pre_accept_attempts`; otherwise it durably marks the same row exhausted before command-authority settlement. `mark_harness_prompt_accepted` is the persist-before-dispatch barrier: commit it immediately before the adapter writes `session/prompt`, not after the write. `recover_harness_invocations` must atomically mark every nonterminal `accepted` row `outcome_unknown`, return `prepared` rows as retryable, advance or exhaust every unaccepted `started` row through the stored-limit transaction before dispatch, and never convert an accepted attempt back to prepared. A crash after the accepted commit but before the prompt bytes reach the child is conservatively uncertain; this is preferable to duplicating work that may mutate the workspace.
 
 - [ ] **Step 5: Run database and migration tests**
 
@@ -1154,7 +1154,7 @@ Expected: FAIL to compile because `HarnessRecoveryReport` and dispatcher recover
 
 - [ ] **Step 3: Recover durable attempts before dispatch starts**
 
-At startup, call `recover_harness_invocations` after Slice 2 `agent_kernel().recover` and before spawning dispatcher loops. For `prepared` and unaccepted `started`, keep the same invocation ID and permit bounded replay through the same selected profile; `record_harness_retryable_failure` owns attempt increments, so recovery never increments twice. Exhausted pre-accept attempts settle `harness_failed`. For `accepted`—including a crash after the barrier but before the prompt write completes—atomically mark `outcome_unknown`, fail the bounded command with `harness_outcome_unknown`, and leave the durable goal active. Terminal rows require no work.
+At startup, call `recover_harness_invocations` after Slice 2 `agent_kernel().recover` and before spawning dispatcher loops. Keep the same invocation identity throughout. `Prepared(n)` remains eligible for one strict reservation CAS; recovered `Started(n)` first consumes that stale reservation through `record_harness_retryable_failure`, becoming `Prepared(n+1)` when the stored limit permits or canonical exhaustion otherwise. Recovery never launches or replays ordinal `n`, and a reservation `RevisionConflict` means another dispatcher owns the launch. Exhausted pre-accept attempts settle `harness_failed`. For `accepted`—including a crash after the barrier but before the prompt write completes—atomically mark `outcome_unknown`, fail the bounded command with `harness_outcome_unknown`, and leave the durable goal active. Terminal rows require no work.
 
 ```rust
 let harness_recovery = dispatcher

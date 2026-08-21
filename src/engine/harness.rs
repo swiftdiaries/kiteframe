@@ -34,6 +34,7 @@ pub struct HarnessRecoveryReport {
 pub enum HarnessDispatcherTestBarrierPoint {
     BeforeJournalInsert,
     AfterPrepare,
+    AfterAttemptReservation,
     AfterRetryCommit,
     BeforeCommandTerminal,
     AfterCommandTerminal,
@@ -194,6 +195,29 @@ impl AgentCommandDispatcher {
             if !seen.insert(invocation.invocation_id.clone()) {
                 continue;
             }
+            let invocation = if invocation.state == HarnessInvocationState::Started
+                && !invocation.terminal
+                && self
+                    .kernel
+                    .store()
+                    .harness_pre_accept_exhaustion(&invocation.invocation_id)
+                    .await?
+                    .is_none()
+            {
+                match self.advance_stale_pre_accept_attempt(&invocation).await {
+                    Ok(invocation) => invocation,
+                    Err(StoreError::RevisionConflict) => {
+                        self.recovery_seen
+                            .lock()
+                            .expect("dispatcher recovery lock is not poisoned")
+                            .insert(invocation.invocation_id);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                invocation
+            };
             if !invocation.terminal
                 && self
                     .kernel
@@ -211,28 +235,6 @@ impl AgentCommandDispatcher {
                     .expect("dispatcher recovery lock is not poisoned")
                     .insert(invocation.invocation_id);
                 continue;
-            }
-            if invocation.state == HarnessInvocationState::Started {
-                if let Some(closed) = self
-                    .close_consumed_pre_accept_attempt_budget(&invocation)
-                    .await?
-                {
-                    report.terminal += 1;
-                    if closed.state != HarnessInvocationState::Cancelled {
-                        let context = self.recovered_command_context(&closed).await?;
-                        self.settle_pre_accept_exhausted(
-                            &context.execution,
-                            &context.command,
-                            &closed,
-                        )
-                        .await?;
-                    }
-                    self.recovery_seen
-                        .lock()
-                        .expect("dispatcher recovery lock is not poisoned")
-                        .insert(closed.invocation_id);
-                    continue;
-                }
             }
             match invocation.state {
                 HarnessInvocationState::Prepared | HarnessInvocationState::Started => {
@@ -436,6 +438,27 @@ impl AgentCommandDispatcher {
         #[cfg(feature = "test-support")]
         self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterPrepare)
             .await;
+        let prepared = if prepared.state == HarnessInvocationState::Started && !prepared.terminal {
+            match self.advance_stale_pre_accept_attempt(&prepared).await {
+                Ok(prepared) => prepared,
+                Err(StoreError::RevisionConflict) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        } else {
+            prepared
+        };
+        if !prepared.terminal
+            && self
+                .kernel
+                .store()
+                .harness_pre_accept_exhaustion(&prepared.invocation_id)
+                .await?
+                .is_some()
+        {
+            return self
+                .settle_pre_accept_exhausted(execution, &claimed, &prepared)
+                .await;
+        }
         let profile_id = prepared.profile_id.clone();
         let journal = PreparedHarnessTerminalJournal::new(&prepared);
         dispatch_with_terminal_journal(
@@ -453,13 +476,19 @@ impl AgentCommandDispatcher {
                 };
                 let prepared = match prepared.state {
                     HarnessInvocationState::Prepared => {
-                        self.kernel
+                        match self
+                            .kernel
                             .store()
                             .mark_harness_invocation_started(
                                 &prepared.invocation_id,
                                 prepared.attempt,
                             )
-                            .await?
+                            .await
+                        {
+                            Ok(prepared) => prepared,
+                            Err(StoreError::RevisionConflict) => return Ok(()),
+                            Err(error) => return Err(error),
+                        }
                     }
                     HarnessInvocationState::Started => return Ok(()),
                     HarnessInvocationState::Accepted => {
@@ -477,6 +506,13 @@ impl AgentCommandDispatcher {
                     | HarnessInvocationState::Failed
                     | HarnessInvocationState::OutcomeUnknown => return Ok(()),
                 };
+                #[cfg(feature = "test-support")]
+                if prepared.state == HarnessInvocationState::Started {
+                    self.pause_test_barrier(
+                        HarnessDispatcherTestBarrierPoint::AfterAttemptReservation,
+                    )
+                    .await;
+                }
                 if prepared.terminal {
                     return self
                         .settle_harness_terminal(
@@ -485,28 +521,6 @@ impl AgentCommandDispatcher {
                             &prepared,
                             terminal_from_record(&prepared)?,
                         )
-                        .await;
-                }
-                if self
-                    .kernel
-                    .store()
-                    .harness_pre_accept_exhaustion(&prepared.invocation_id)
-                    .await?
-                    .is_some()
-                {
-                    return self
-                        .settle_pre_accept_exhausted(execution, &claimed, &prepared)
-                        .await;
-                }
-                if let Some(closed) = self
-                    .close_consumed_pre_accept_attempt_budget(&prepared)
-                    .await?
-                {
-                    if closed.state == HarnessInvocationState::Cancelled {
-                        return Ok(());
-                    }
-                    return self
-                        .settle_pre_accept_exhausted(execution, &claimed, &closed)
                         .await;
                 }
                 let workspace: String =
@@ -942,21 +956,13 @@ impl AgentCommandDispatcher {
         .await
     }
 
-    async fn close_consumed_pre_accept_attempt_budget(
+    async fn advance_stale_pre_accept_attempt(
         &self,
         invocation: &HarnessInvocationView,
-    ) -> Result<Option<HarnessInvocationView>, StoreError> {
-        let max_pre_accept_attempts = self
-            .kernel
-            .store()
-            .harness_pre_accept_attempt_limit(&invocation.invocation_id)
-            .await?;
-        if invocation.attempt < max_pre_accept_attempts {
-            return Ok(None);
-        }
+    ) -> Result<HarnessInvocationView, StoreError> {
         let terminal = HarnessTerminal::Failed(HarnessFailure::new(
             "harness_failed",
-            "harness pre-accept attempt budget was already consumed before dispatch",
+            "stale harness process reservation was consumed before recovery",
         ));
         let terminal_key = terminal_idempotency_key(&invocation.invocation_id);
         let terminal_payload = terminal_payload(&terminal);
@@ -969,7 +975,6 @@ impl AgentCommandDispatcher {
                 &terminal_payload,
             )
             .await
-            .map(Some)
     }
 }
 

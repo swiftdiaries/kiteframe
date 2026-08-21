@@ -1962,7 +1962,7 @@ async fn cancellation_during_model_or_tool_failure_audits_only_command_failure_m
 }
 
 #[tokio::test]
-async fn harness_restart_reuses_pre_accept_invocation_without_incrementing_attempt() {
+async fn harness_restart_reuses_pre_accept_invocation_at_the_next_ordinal() {
     let _guard = BRIDGE_TEST_LOCK.lock().await;
     let Some(fixture) = BridgeFixture::started().await else {
         eprintln!("SKIP harness restart recovery: DATABASE_URL is absent");
@@ -2020,10 +2020,8 @@ async fn harness_restart_reuses_pre_accept_invocation_without_incrementing_attem
         .unwrap()
         .unwrap();
     assert_eq!(recovered.invocation_id, invocation_id);
-    assert_eq!(
-        recovered.attempt, 0,
-        "recovery does not own retry increments"
-    );
+    assert_eq!(recovered.state, HarnessInvocationState::Prepared);
+    assert_eq!(recovered.attempt, 1, "Started(0) is durably consumed");
 
     fixture.model.complete("ok", json!({"answer": "recovered"}));
     assert_eq!(fixture.dispatcher.tick_agent_commands(8).await.unwrap(), 1);
@@ -2034,6 +2032,7 @@ async fn harness_restart_reuses_pre_accept_invocation_without_incrementing_attem
         .unwrap()
         .unwrap();
     assert_eq!(completed.invocation_id, invocation_id);
+    assert_eq!(completed.attempt, 1);
     assert_eq!(fixture.model.calls(), 1);
 }
 

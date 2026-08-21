@@ -405,21 +405,6 @@ impl PostgresStore {
         Ok(view)
     }
 
-    pub(crate) async fn harness_pre_accept_attempt_limit(
-        &self,
-        invocation_id: &HarnessInvocationId,
-    ) -> Result<u64, StoreError> {
-        let value: i64 = sqlx::query_scalar(
-            "SELECT max_pre_accept_attempts FROM harness_invocations WHERE invocation_id = $1",
-        )
-        .bind(invocation_id.as_uuid())
-        .fetch_one(self.pool())
-        .await?;
-        u64::try_from(value).map_err(|_| {
-            StoreError::InvalidData("harness pre-accept attempt limit is malformed".to_owned())
-        })
-    }
-
     /// Commit this barrier immediately before the adapter writes the prompt bytes.
     pub async fn mark_harness_prompt_accepted(
         &self,

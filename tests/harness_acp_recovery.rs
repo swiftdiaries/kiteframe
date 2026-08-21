@@ -1634,7 +1634,7 @@ mod integrated_postgres_fake_restart {
     }
 
     #[tokio::test]
-    async fn stale_started_has_no_replay_authority_before_recovery_advances_it() {
+    async fn recovery_exhausts_stale_started_at_limit_without_launching() {
         let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
         let Some(mut recovery) = RecoveryFixture::new().await else {
             return;
@@ -1687,13 +1687,390 @@ mod integrated_postgres_fake_restart {
         let process_counts = process_log_counts(&process_log);
         recovery.cleanup().await;
 
-        assert_eq!(report.terminal, 0);
-        assert_eq!(report.retryable_pre_accept, 1);
+        assert_eq!(report.terminal, 1);
+        assert_eq!(report.retryable_pre_accept, 0);
         assert_eq!(report.outcome_unknown, 0);
-        assert_eq!(recovered_tick, 1);
-        assert_eq!(terminal.state, HarnessInvocationState::Started);
+        assert_eq!(recovered_tick, 0);
+        assert_eq!(terminal.state, HarnessInvocationState::Failed);
         assert_eq!(terminal.attempt, 0);
         assert_eq!(process_counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn crash_after_reservation_before_spawn_consumes_the_only_slot() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let process_log = recovery
+            .workspace
+            .join("reserved-before-spawn-processes.jsonl");
+        let reservation_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterAttemptReservation,
+        ));
+        let (first_dispatcher, _) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(reservation_barrier.clone()),
+                1,
+                Some(&process_log),
+            )
+            .await;
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        reservation_barrier.wait_until_entered().await;
+        let reserved = recovery.invocation().await.unwrap();
+        assert_eq!(reserved.state, HarnessInvocationState::Started);
+        assert_eq!(reserved.attempt, 0);
+        assert_eq!(process_log_counts(&process_log), (0, 0));
+        first.abort();
+        reservation_barrier.release();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let (restarted, _) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                None,
+                1,
+                Some(&process_log),
+            )
+            .await;
+        let report = restarted.recover_harness_invocations(1).await.unwrap();
+        assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 0);
+        let terminal = recovery.invocation().await.unwrap();
+        let process_counts = process_log_counts(&process_log);
+        recovery.cleanup().await;
+
+        assert_eq!(report.terminal, 1);
+        assert_eq!(report.retryable_pre_accept, 0);
+        assert_eq!(terminal.state, HarnessInvocationState::Failed);
+        assert_eq!(terminal.attempt, 0);
+        assert_eq!(process_counts, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn direct_dispatch_consumes_stale_started_before_launching_ordinal_one() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let process_log = recovery.workspace.join("direct-stale-processes.jsonl");
+        let crash_barrier = Arc::new(AcpTestBarrier::new_disarmed(
+            "initialize",
+            AcpTestBarrierPoint::BeforeWrite,
+        ));
+        let (first_dispatcher, first_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                crash_barrier.clone(),
+                None,
+                3,
+                Some(&process_log),
+            )
+            .await;
+        crash_barrier.arm();
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        crash_barrier.wait_until_entered().await;
+        let crashed = recovery.invocation().await.unwrap();
+        assert_eq!(crashed.state, HarnessInvocationState::Started);
+        assert_eq!(crashed.attempt, 0);
+        first.abort();
+        crash_barrier.release();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let (restarted, second_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                None,
+                3,
+                Some(&process_log),
+            )
+            .await;
+        assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
+        let completed = recovery.invocation().await.unwrap();
+        let process_counts = process_log_counts(&process_log);
+        let first_prompts = prompt_count(&first_observation);
+        let second_prompts = prompt_count(&second_observation);
+        recovery.cleanup().await;
+
+        assert_same_request_identity(&crashed, &completed);
+        assert_eq!(completed.state, HarnessInvocationState::Completed);
+        assert_eq!(completed.attempt, 1);
+        assert_eq!(first_prompts, 0);
+        assert_eq!(second_prompts, 1);
+        assert_eq!(process_counts, (2, 1));
+    }
+
+    #[tokio::test]
+    async fn repeated_spawn_crashes_consume_exactly_the_persisted_attempt_budget() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        for max_pre_accept_attempts in [1_u32, 3] {
+            let Some(mut recovery) = RecoveryFixture::new().await else {
+                return;
+            };
+            let process_log = recovery
+                .workspace
+                .join(format!("restart-budget-{max_pre_accept_attempts}.jsonl"));
+            let mut invocation_id = None;
+
+            for ordinal in 0..max_pre_accept_attempts {
+                let crash_barrier = Arc::new(AcpTestBarrier::new_disarmed(
+                    "initialize",
+                    AcpTestBarrierPoint::BeforeWrite,
+                ));
+                let (dispatcher, observation) = recovery
+                    .dispatcher_with_attempt_limit(
+                        "core-success.json",
+                        Some("preaccept-process-death.json"),
+                        crash_barrier.clone(),
+                        None,
+                        max_pre_accept_attempts,
+                        Some(&process_log),
+                    )
+                    .await;
+                if ordinal > 0 {
+                    let report = dispatcher.recover_harness_invocations(1).await.unwrap();
+                    assert_eq!(report.retryable_pre_accept, 1);
+                    assert_eq!(report.terminal, 0);
+                    let prepared = recovery.invocation().await.unwrap();
+                    assert_eq!(prepared.state, HarnessInvocationState::Prepared);
+                    assert_eq!(prepared.attempt, u64::from(ordinal));
+                }
+                crash_barrier.arm();
+                let crashing = tokio::spawn(async move { dispatcher.tick_agent_commands(8).await });
+                crash_barrier.wait_until_entered().await;
+                let started = recovery.invocation().await.unwrap();
+                let expected_id =
+                    invocation_id.get_or_insert_with(|| started.invocation_id.clone());
+                assert_eq!(&started.invocation_id, expected_id);
+                assert_eq!(started.state, HarnessInvocationState::Started);
+                assert_eq!(started.attempt, u64::from(ordinal));
+                assert_eq!(prompt_count(&observation), 0);
+                assert_eq!(
+                    process_log_counts(&process_log),
+                    (usize::try_from(ordinal + 1).unwrap(), 0)
+                );
+                crashing.abort();
+                crash_barrier.release();
+                assert!(crashing.await.unwrap_err().is_cancelled());
+            }
+
+            let (restarted, observation) = recovery
+                .dispatcher_with_attempt_limit(
+                    "core-success.json",
+                    None,
+                    Arc::new(AcpTestBarrier::new_disarmed(
+                        "unused",
+                        AcpTestBarrierPoint::BeforeWrite,
+                    )),
+                    None,
+                    max_pre_accept_attempts,
+                    Some(&process_log),
+                )
+                .await;
+            let report = restarted.recover_harness_invocations(1).await.unwrap();
+            assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 0);
+            assert_eq!(
+                restarted.recover_harness_invocations(1).await.unwrap(),
+                kiteframe::HarnessRecoveryReport::default()
+            );
+            let terminal = recovery.invocation().await.unwrap();
+            let process_counts = process_log_counts(&process_log);
+            let restart_prompts = prompt_count(&observation);
+            recovery.cleanup().await;
+
+            assert_eq!(report.terminal, 1);
+            assert_eq!(report.retryable_pre_accept, 0);
+            assert_eq!(terminal.invocation_id, invocation_id.unwrap());
+            assert_eq!(terminal.state, HarnessInvocationState::Failed);
+            assert_eq!(terminal.attempt, u64::from(max_pre_accept_attempts - 1));
+            assert_eq!(
+                process_counts,
+                (max_pre_accept_attempts as usize, 0),
+                "limit {max_pre_accept_attempts} launches no fourth process"
+            );
+            assert_eq!(restart_prompts, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_racing_stale_advancement_remains_authoritative() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let process_log = recovery.workspace.join("cancel-stale-processes.jsonl");
+        let crash_barrier = Arc::new(AcpTestBarrier::new_disarmed(
+            "initialize",
+            AcpTestBarrierPoint::BeforeWrite,
+        ));
+        let (first_dispatcher, first_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                Some("preaccept-process-death.json"),
+                crash_barrier.clone(),
+                None,
+                3,
+                Some(&process_log),
+            )
+            .await;
+        crash_barrier.arm();
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        crash_barrier.wait_until_entered().await;
+        assert_eq!(
+            recovery.invocation().await.unwrap().state,
+            HarnessInvocationState::Started
+        );
+        first.abort();
+        crash_barrier.release();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let (restarted, second_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                None,
+                3,
+                Some(&process_log),
+            )
+            .await;
+        let authority = recovery
+            .store
+            .get_agent_execution(recovery.session_id.clone(), recovery.task_id.clone())
+            .await
+            .unwrap();
+        let cancellation = recovery.kernel.cancel_task(
+            &recovery.principal,
+            kiteframe::CancelUserTask {
+                session_id: recovery.session_id.clone(),
+                task_id: recovery.task_id.clone(),
+                expected_task_revision: authority.task_revision,
+                expected_goal_revision: authority.goal_revision,
+                reason: Some("Cancellation races stale harness advancement.".to_owned()),
+                idempotency_key: IdempotencyKey::new(format!(
+                    "cancel-stale-{}",
+                    recovery.task_id.as_uuid()
+                ))
+                .unwrap(),
+            },
+        );
+        let (cancelled, report) =
+            tokio::join!(cancellation, restarted.recover_harness_invocations(1));
+        cancelled.unwrap();
+        let report = report.unwrap();
+        assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 0);
+        let terminal = recovery.invocation().await.unwrap();
+        let command = recovery.pending_or_owned_command().await;
+        let process_counts = process_log_counts(&process_log);
+        let prompts = prompt_count(&first_observation) + prompt_count(&second_observation);
+        recovery.cleanup().await;
+
+        assert!(report.retryable_pre_accept + report.terminal <= 1);
+        assert_eq!(terminal.state, HarnessInvocationState::Cancelled);
+        assert_eq!(command.state, kiteframe::AgentCommandState::Cancelled);
+        assert_eq!(process_counts, (1, 0));
+        assert_eq!(prompts, 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_dispatchers_reserve_one_process_for_one_prepared_ordinal() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        let Some(mut recovery) = RecoveryFixture::new().await else {
+            return;
+        };
+        let prepare = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterPrepare,
+        ));
+        let (preparer, _) = recovery
+            .dispatcher_with_barriers(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(prepare.clone()),
+            )
+            .await;
+        let preparing = tokio::spawn(async move { preparer.tick_agent_commands(8).await });
+        prepare.wait_until_entered().await;
+        assert_eq!(
+            recovery.invocation().await.unwrap().state,
+            HarnessInvocationState::Prepared
+        );
+        preparing.abort();
+        prepare.release();
+        assert!(preparing.await.unwrap_err().is_cancelled());
+
+        let process_log = recovery.workspace.join("reservation-race-processes.jsonl");
+        let first_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterPrepare,
+        ));
+        let second_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+            HarnessDispatcherTestBarrierPoint::AfterPrepare,
+        ));
+        let (first_dispatcher, first_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(first_barrier.clone()),
+                3,
+                Some(&process_log),
+            )
+            .await;
+        let (second_dispatcher, second_observation) = recovery
+            .dispatcher_with_attempt_limit(
+                "core-success.json",
+                None,
+                Arc::new(AcpTestBarrier::new_disarmed(
+                    "unused",
+                    AcpTestBarrierPoint::BeforeWrite,
+                )),
+                Some(second_barrier.clone()),
+                3,
+                Some(&process_log),
+            )
+            .await;
+        let first = tokio::spawn(async move { first_dispatcher.tick_agent_commands(8).await });
+        let second = tokio::spawn(async move { second_dispatcher.tick_agent_commands(8).await });
+        first_barrier.wait_until_entered().await;
+        second_barrier.wait_until_entered().await;
+        first_barrier.release();
+        second_barrier.release();
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+        assert_eq!(second.await.unwrap().unwrap(), 1);
+        let terminal = recovery.invocation().await.unwrap();
+        let process_counts = process_log_counts(&process_log);
+        let prompts = prompt_count(&first_observation) + prompt_count(&second_observation);
+        recovery.cleanup().await;
+
+        assert_eq!(terminal.state, HarnessInvocationState::Completed);
+        assert_eq!(terminal.attempt, 0);
+        assert_eq!(process_counts, (1, 1));
+        assert_eq!(prompts, 1);
     }
 
     #[tokio::test]
@@ -1793,12 +2170,14 @@ mod integrated_postgres_fake_restart {
                 assert_eq!(recovery.authority().await, authority_before);
             } else {
                 assert_eq!(report.retryable_pre_accept, 1, "{method:?} {point:?}");
+                assert_eq!(recovered.state, HarnessInvocationState::Prepared);
+                assert_eq!(recovered.attempt, crashed.attempt + 1);
                 assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
-                let still_started = recovery.invocation().await.unwrap();
-                assert_eq!(still_started.invocation_id, crashed.invocation_id);
-                assert_eq!(still_started.attempt, crashed.attempt);
-                assert_eq!(still_started.state, HarnessInvocationState::Started);
-                assert_eq!(prompt_count(&second_observation), 0);
+                let completed = recovery.invocation().await.unwrap();
+                assert_eq!(completed.invocation_id, crashed.invocation_id);
+                assert_eq!(completed.attempt, crashed.attempt + 1);
+                assert_eq!(completed.state, HarnessInvocationState::Completed);
+                assert_eq!(prompt_count(&second_observation), 1);
             }
             assert_eq!(prompt_count(&first_observation), first_prompts);
             recovery.cleanup().await;
