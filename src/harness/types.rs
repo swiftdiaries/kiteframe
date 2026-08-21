@@ -228,7 +228,41 @@ impl HarnessRouteTable {
     }
 }
 
-#[allow(dead_code)]
-pub type HarnessEventSender = mpsc::Sender<HarnessPendingEvent>;
+#[derive(Clone, Debug)]
+pub struct HarnessEventSender {
+    sender: mpsc::Sender<HarnessPendingEvent>,
+    admission_open: std::sync::Arc<std::sync::Mutex<bool>>,
+}
+
+impl HarnessEventSender {
+    pub(crate) fn new(sender: mpsc::Sender<HarnessPendingEvent>) -> Self {
+        Self {
+            sender,
+            admission_open: std::sync::Arc::new(std::sync::Mutex::new(true)),
+        }
+    }
+
+    pub async fn send(
+        &self,
+        pending: HarnessPendingEvent,
+    ) -> Result<(), mpsc::error::SendError<HarnessPendingEvent>> {
+        if !*self
+            .admission_open
+            .lock()
+            .expect("harness event admission lock is not poisoned")
+        {
+            return Err(mpsc::error::SendError(pending));
+        }
+        self.sender.send(pending).await
+    }
+
+    pub(crate) fn close_admission(&self) {
+        *self
+            .admission_open
+            .lock()
+            .expect("harness event admission lock is not poisoned") = false;
+    }
+}
+
 #[allow(dead_code)]
 pub type HarnessCancellation = CancellationToken;

@@ -25,6 +25,11 @@ impl PostgresStore {
             event.sequence,
             event.event.clone(),
         )?;
+        if record.event_digest != event.event_digest {
+            return Err(StoreError::InvalidData(
+                "harness envelope digest is incompatible with the journal".to_owned(),
+            ));
+        }
         self.append_harness_invocation_event(&record).await
     }
 

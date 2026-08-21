@@ -5,21 +5,54 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSink, HarnessFailure,
-    HarnessInvocationEvent, HarnessInvocationId, HarnessInvocationRequest, HarnessPlugin,
+    HarnessApprovalBroker, HarnessEventEnvelope, HarnessEventSender, HarnessEventSink,
+    HarnessFailure, HarnessInvocationId, HarnessInvocationRequest, HarnessPlugin,
     HarnessRequestEnvelope, HarnessTerminal,
 };
 
 #[derive(Clone)]
 pub struct HarnessRegistry {
     plugins: Arc<Mutex<BTreeMap<super::HarnessProfileId, RegisteredPlugin>>>,
-    active: Arc<Mutex<BTreeMap<super::HarnessInvocationId, CancellationToken>>>,
+    active: Arc<Mutex<ActiveInvocations>>,
 }
 
 #[derive(Clone)]
 struct RegisteredPlugin {
     digest: String,
     plugin: Arc<dyn HarnessPlugin>,
+}
+
+struct ActiveInvocations {
+    next_generation: u64,
+    entries: BTreeMap<HarnessInvocationId, ActiveInvocation>,
+}
+
+#[derive(Clone)]
+struct ActiveInvocation {
+    generation: u64,
+    token: CancellationToken,
+}
+
+struct ActiveInvocationGuard {
+    active: Arc<Mutex<ActiveInvocations>>,
+    invocation_id: HarnessInvocationId,
+    generation: u64,
+}
+
+impl Drop for ActiveInvocationGuard {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .expect("harness registry lock is not poisoned");
+        if active
+            .entries
+            .get(&self.invocation_id)
+            .is_some_and(|entry| entry.generation == self.generation)
+        {
+            active.entries.remove(&self.invocation_id);
+        }
+    }
 }
 
 impl Default for HarnessRegistry {
@@ -32,7 +65,10 @@ impl HarnessRegistry {
     pub fn new() -> Self {
         Self {
             plugins: Arc::new(Mutex::new(BTreeMap::new())),
-            active: Arc::new(Mutex::new(BTreeMap::new())),
+            active: Arc::new(Mutex::new(ActiveInvocations {
+                next_generation: 0,
+                entries: BTreeMap::new(),
+            })),
         }
     }
 
@@ -62,6 +98,7 @@ impl HarnessRegistry {
         self.active
             .lock()
             .expect("harness registry lock is not poisoned")
+            .entries
             .len()
     }
 
@@ -70,8 +107,9 @@ impl HarnessRegistry {
             .active
             .lock()
             .expect("harness registry lock is not poisoned")
+            .entries
             .get(invocation_id)
-            .cloned();
+            .map(|entry| entry.token.clone());
         if let Some(token) = token {
             token.cancel();
             true
@@ -102,64 +140,132 @@ impl HarnessRegistry {
         if let Err(error) = envelope.validate() {
             return HarnessTerminal::Failed(error);
         }
-        let token = CancellationToken::new();
-        self.active
-            .lock()
-            .expect("harness registry lock is not poisoned")
-            .insert(request.invocation_id.clone(), token.clone());
-        let (events_tx, mut events_rx) = mpsc::channel(64);
-        let invocation = plugin.start_invocation(envelope, events_tx, approvals, token);
+        let Some((token, _active_guard)) = self.reserve_active(&request.invocation_id) else {
+            return HarnessTerminal::Failed(HarnessFailure::new(
+                "harness_invocation_active",
+                "harness invocation id is already active",
+            ));
+        };
+        let (raw_events_tx, mut events_rx) = mpsc::channel(64);
+        let events_tx = HarnessEventSender::new(raw_events_tx);
+        let invocation = plugin.start_invocation(envelope, events_tx.clone(), approvals, token);
         tokio::pin!(invocation);
         let mut sequence = 0;
-        let terminal = loop {
+        let mut started = false;
+        let mut terminal = None;
+        let mut persistence_failure = None;
+
+        loop {
             tokio::select! {
-                terminal = &mut invocation => break terminal,
+                result = &mut invocation => {
+                    terminal = Some(result);
+                    break;
+                }
                 Some(pending) = events_rx.recv() => {
-                    match append_event(&sink, &request.invocation_id, sequence, pending.event).await {
-                        Ok(()) => {
-                            let _ = pending.persisted.send(Ok(()));
-                            sequence += 1;
-                        }
-                        Err(error) => {
-                            let _ = pending.persisted.send(Err(error.clone()));
-                            break HarnessTerminal::OutcomeUnknown(error);
-                        }
+                    if let Err(error) = append_pending(
+                        &sink,
+                        &request.invocation_id,
+                        &mut sequence,
+                        &mut started,
+                        pending,
+                    ).await {
+                        persistence_failure = Some(error);
+                        break;
                     }
                 }
             }
-        };
-        while let Ok(pending) = events_rx.try_recv() {
-            match append_event(&sink, &request.invocation_id, sequence, pending.event).await {
-                Ok(()) => {
-                    let _ = pending.persisted.send(Ok(()));
-                    sequence += 1;
-                }
-                Err(error) => {
-                    let _ = pending.persisted.send(Err(error.clone()));
-                    self.remove_active(&request.invocation_id);
-                    return HarnessTerminal::OutcomeUnknown(error);
-                }
+        }
+
+        events_tx.close_admission();
+        events_rx.close();
+        while let Some(pending) = events_rx.recv().await {
+            if let Some(error) = persistence_failure.as_ref() {
+                let _ = pending.persisted.send(Err(error.clone()));
+                continue;
+            }
+            if let Err(error) = append_pending(
+                &sink,
+                &request.invocation_id,
+                &mut sequence,
+                &mut started,
+                pending,
+            )
+            .await
+            {
+                persistence_failure = Some(error);
             }
         }
-        self.remove_active(&request.invocation_id);
+
+        if let Some(error) = persistence_failure {
+            return HarnessTerminal::OutcomeUnknown(error);
+        }
+        let terminal =
+            terminal.expect("plugin completion is required without a persistence failure");
+        if matches!(terminal, HarnessTerminal::Completed(_)) && !started {
+            return HarnessTerminal::Failed(HarnessFailure::new(
+                "harness_protocol_incompatible",
+                "harness invocation completed without a durable Started event",
+            ));
+        }
         terminal
     }
 
-    fn remove_active(&self, invocation_id: &HarnessInvocationId) {
-        self.active
+    fn reserve_active(
+        &self,
+        invocation_id: &HarnessInvocationId,
+    ) -> Option<(CancellationToken, ActiveInvocationGuard)> {
+        let mut active = self
+            .active
             .lock()
-            .expect("harness registry lock is not poisoned")
-            .remove(invocation_id);
+            .expect("harness registry lock is not poisoned");
+        if active.entries.contains_key(invocation_id) {
+            return None;
+        }
+        active.next_generation = active.next_generation.wrapping_add(1);
+        let generation = active.next_generation;
+        let token = CancellationToken::new();
+        active.entries.insert(
+            invocation_id.clone(),
+            ActiveInvocation {
+                generation,
+                token: token.clone(),
+            },
+        );
+        Some((
+            token,
+            ActiveInvocationGuard {
+                active: self.active.clone(),
+                invocation_id: invocation_id.clone(),
+                generation,
+            },
+        ))
     }
 }
 
-async fn append_event(
+async fn append_pending(
     sink: &Arc<dyn HarnessEventSink>,
     invocation_id: &HarnessInvocationId,
-    sequence: u64,
-    event: HarnessInvocationEvent,
+    sequence: &mut u64,
+    started: &mut bool,
+    pending: super::HarnessPendingEvent,
 ) -> Result<(), HarnessFailure> {
-    let envelope = HarnessEventEnvelope::new(invocation_id.clone(), sequence, event);
-    envelope.validate()?;
-    sink.append(envelope).await
+    let envelope = HarnessEventEnvelope::new(invocation_id.clone(), *sequence, pending.event);
+    if let Err(error) = envelope.validate() {
+        let _ = pending.persisted.send(Err(error.clone()));
+        return Err(error);
+    }
+    match sink.append(envelope).await {
+        Ok(()) => {
+            if *sequence == 0 {
+                *started = true;
+            }
+            *sequence += 1;
+            let _ = pending.persisted.send(Ok(()));
+            Ok(())
+        }
+        Err(error) => {
+            let _ = pending.persisted.send(Err(error.clone()));
+            Err(error)
+        }
+    }
 }

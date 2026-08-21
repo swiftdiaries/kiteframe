@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use kiteframe::harness::{
@@ -10,10 +11,12 @@ use kiteframe::harness::{
     HarnessProfile, HarnessProfileId, HarnessRegistry, HarnessRequestEnvelope, HarnessTerminal,
     HarnessTransport, emit_and_wait,
 };
+use kiteframe::store::HarnessInvocationEventRecord;
 use kiteframe::{
     AgentCommandId, ClosedSchema, GoalProjection, HarnessStructuralLimits, InvokeHarness, ModelRole,
 };
 use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -103,6 +106,24 @@ impl HarnessEventSink for FailingHarnessEventSink {
     }
 }
 
+struct FailAfterOneHarnessEventSink(Mutex<usize>);
+
+#[async_trait]
+impl HarnessEventSink for FailAfterOneHarnessEventSink {
+    async fn append(&self, _event: HarnessEventEnvelope) -> Result<(), HarnessFailure> {
+        let mut calls = self.0.lock().unwrap();
+        *calls += 1;
+        if *calls == 1 {
+            Ok(())
+        } else {
+            Err(HarnessFailure::new(
+                "harness_event_persistence_failed",
+                "test sink failed after the first append",
+            ))
+        }
+    }
+}
+
 enum FakeMode {
     Events(Vec<HarnessInvocationEvent>),
     WaitForCancel,
@@ -112,6 +133,53 @@ struct FakePlugin {
     profile: HarnessProfile,
     protocol_version: u16,
     mode: FakeMode,
+}
+
+struct BurstPlugin {
+    profile: HarnessProfile,
+    reports: mpsc::UnboundedSender<Result<(), HarnessFailure>>,
+}
+
+struct LateEmitterPlugin {
+    profile: HarnessProfile,
+    release: Arc<tokio::sync::Notify>,
+    reports: mpsc::UnboundedSender<Result<(), HarnessFailure>>,
+}
+
+impl LateEmitterPlugin {
+    fn new() -> (
+        Arc<Self>,
+        Arc<tokio::sync::Notify>,
+        mpsc::UnboundedReceiver<Result<(), HarnessFailure>>,
+    ) {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (reports, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                profile: profile(),
+                release: release.clone(),
+                reports,
+            }),
+            release,
+            receiver,
+        )
+    }
+}
+
+impl BurstPlugin {
+    fn new() -> (
+        Arc<Self>,
+        mpsc::UnboundedReceiver<Result<(), HarnessFailure>>,
+    ) {
+        let (reports, receiver) = mpsc::unbounded_channel();
+        (
+            Arc::new(Self {
+                profile: profile(),
+                reports,
+            }),
+            receiver,
+        )
+    }
 }
 
 impl FakePlugin {
@@ -178,6 +246,112 @@ impl HarnessPlugin for FakePlugin {
                 HarnessTerminal::Cancelled
             }
         }
+    }
+}
+
+#[async_trait]
+impl HarnessPlugin for BurstPlugin {
+    fn profile(&self) -> &HarnessProfile {
+        &self.profile
+    }
+
+    async fn describe_capabilities(&self) -> Result<HarnessCapabilities, HarnessFailure> {
+        Ok(HarnessCapabilities {
+            protocol_version: 1,
+            implementation_name: "burst".to_owned(),
+            implementation_version: "test".to_owned(),
+            supported: self.profile.required.clone(),
+        })
+    }
+
+    async fn start_invocation(
+        &self,
+        _request: HarnessRequestEnvelope,
+        events: HarnessEventSender,
+        _approvals: Arc<dyn HarnessApprovalBroker>,
+        _cancellation: CancellationToken,
+    ) -> HarnessTerminal {
+        let mut acknowledgements = Vec::new();
+        for event in [
+            HarnessInvocationEvent::Started,
+            HarnessInvocationEvent::Progress {
+                message: "second".to_owned(),
+            },
+            HarnessInvocationEvent::Progress {
+                message: "third".to_owned(),
+            },
+        ] {
+            let (persisted, acknowledgement) = oneshot::channel();
+            events
+                .send(kiteframe::harness::HarnessPendingEvent { event, persisted })
+                .await
+                .unwrap();
+            acknowledgements.push(acknowledgement);
+        }
+        let reports = self.reports.clone();
+        tokio::spawn(async move {
+            for acknowledgement in acknowledgements {
+                let result = acknowledgement.await.unwrap_or_else(|_| {
+                    Err(HarnessFailure::new(
+                        "harness_event_persistence_failed",
+                        "event acknowledgement was dropped",
+                    ))
+                });
+                let _ = reports.send(result);
+            }
+        });
+        HarnessTerminal::Completed(HarnessInvocationOutput {
+            outcome: "ok".to_owned(),
+            fields: json!({}),
+            history: vec![],
+        })
+    }
+}
+
+#[async_trait]
+impl HarnessPlugin for LateEmitterPlugin {
+    fn profile(&self) -> &HarnessProfile {
+        &self.profile
+    }
+
+    async fn describe_capabilities(&self) -> Result<HarnessCapabilities, HarnessFailure> {
+        Ok(HarnessCapabilities {
+            protocol_version: 1,
+            implementation_name: "late-emitter".to_owned(),
+            implementation_version: "test".to_owned(),
+            supported: self.profile.required.clone(),
+        })
+    }
+
+    async fn start_invocation(
+        &self,
+        _request: HarnessRequestEnvelope,
+        events: HarnessEventSender,
+        _approvals: Arc<dyn HarnessApprovalBroker>,
+        _cancellation: CancellationToken,
+    ) -> HarnessTerminal {
+        emit_and_wait(&events, HarnessInvocationEvent::Started)
+            .await
+            .unwrap();
+        let release = self.release.clone();
+        let reports = self.reports.clone();
+        tokio::spawn(async move {
+            release.notified().await;
+            let _ = reports.send(
+                emit_and_wait(
+                    &events,
+                    HarnessInvocationEvent::Progress {
+                        message: "late".to_owned(),
+                    },
+                )
+                .await,
+            );
+        });
+        HarnessTerminal::Completed(HarnessInvocationOutput {
+            outcome: "ok".to_owned(),
+            fields: json!({}),
+            history: vec![],
+        })
     }
 }
 
@@ -315,4 +489,160 @@ async fn default_approval_broker_rejects_every_request() {
         })
         .await;
     assert_eq!(decision, HarnessApprovalDecision::RejectOnce);
+}
+
+#[tokio::test]
+async fn duplicate_active_invocation_is_rejected_without_replacing_cancellation_ownership() {
+    let registry = registry_with(Arc::new(FakePlugin::wait_for_cancel())).await;
+    let invocation = request();
+    let invocation_id = invocation.invocation_id.clone();
+    let first = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .invoke(
+                    invocation,
+                    Arc::new(DenyAllHarnessApprovals),
+                    Arc::new(RecordingHarnessEventSink::default()),
+                )
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    let duplicate = tokio::time::timeout(
+        Duration::from_millis(100),
+        registry.invoke(
+            HarnessInvocationRequest {
+                invocation_id: invocation_id.clone(),
+                ..request()
+            },
+            Arc::new(DenyAllHarnessApprovals),
+            Arc::new(RecordingHarnessEventSink::default()),
+        ),
+    )
+    .await;
+    assert!(matches!(
+        duplicate,
+        Ok(HarnessTerminal::Failed(HarnessFailure {
+            code: "harness_invocation_active",
+            ..
+        }))
+    ));
+    assert!(registry.cancel(&invocation_id).await);
+    assert_eq!(first.await.unwrap(), HarnessTerminal::Cancelled);
+}
+
+#[tokio::test]
+async fn aborting_an_invocation_removes_its_exact_active_entry() {
+    let registry = registry_with(Arc::new(FakePlugin::wait_for_cancel())).await;
+    let task = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .invoke(
+                    request(),
+                    Arc::new(DenyAllHarnessApprovals),
+                    Arc::new(RecordingHarnessEventSink::default()),
+                )
+                .await
+        }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(registry.active_count(), 1);
+    task.abort();
+    let _ = task.await;
+    assert_eq!(registry.active_count(), 0);
+}
+
+#[tokio::test]
+async fn completed_plugin_without_started_event_fails_closed() {
+    let terminal = registry_with(Arc::new(FakePlugin::events_then_success(vec![])))
+        .await
+        .invoke(
+            request(),
+            Arc::new(DenyAllHarnessApprovals),
+            Arc::new(RecordingHarnessEventSink::default()),
+        )
+        .await;
+    assert!(matches!(
+        terminal,
+        HarnessTerminal::Failed(HarnessFailure {
+            code: "harness_protocol_incompatible",
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn sink_failure_acknowledges_every_accepted_pending_event() {
+    let (plugin, mut reports) = BurstPlugin::new();
+    let terminal = registry_with(plugin)
+        .await
+        .invoke(
+            request(),
+            Arc::new(DenyAllHarnessApprovals),
+            Arc::new(FailAfterOneHarnessEventSink(Mutex::new(0))),
+        )
+        .await;
+    assert!(matches!(terminal, HarnessTerminal::OutcomeUnknown(_)));
+    let acknowledgements = tokio::time::timeout(Duration::from_millis(100), async {
+        vec![
+            reports.recv().await.unwrap(),
+            reports.recv().await.unwrap(),
+            reports.recv().await.unwrap(),
+        ]
+    })
+    .await
+    .expect("every accepted event receives an acknowledgement");
+    assert!(acknowledgements[0].is_ok());
+    for acknowledgement in acknowledgements.iter().skip(1) {
+        assert!(matches!(
+            acknowledgement,
+            Err(HarnessFailure {
+                code: "harness_event_persistence_failed",
+                ..
+            })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn cloned_sender_cannot_admit_events_after_terminal_drain() {
+    let (plugin, release, mut reports) = LateEmitterPlugin::new();
+    let sink = Arc::new(RecordingHarnessEventSink::default());
+    let terminal = registry_with(plugin)
+        .await
+        .invoke(request(), Arc::new(DenyAllHarnessApprovals), sink.clone())
+        .await;
+    assert!(matches!(terminal, HarnessTerminal::Completed(_)));
+    release.notify_one();
+    let report = tokio::time::timeout(Duration::from_millis(100), reports.recv())
+        .await
+        .expect("late sender reports its rejected emission")
+        .unwrap();
+    assert!(matches!(
+        report,
+        Err(HarnessFailure {
+            code: "harness_protocol_incompatible",
+            ..
+        })
+    ));
+    assert_eq!(sink.sequences(), vec![0]);
+}
+
+#[test]
+fn journal_record_preserves_the_validated_envelope_digest() {
+    let envelope = HarnessEventEnvelope::new(
+        HarnessInvocationId::new(Uuid::now_v7()),
+        0,
+        HarnessInvocationEvent::Started,
+    );
+    let record = HarnessInvocationEventRecord::new(
+        envelope.invocation_id.clone(),
+        envelope.sequence,
+        envelope.event.clone(),
+    )
+    .unwrap();
+    assert_eq!(record.event_digest, envelope.event_digest);
+    assert!(record.validate_digest().is_ok());
 }

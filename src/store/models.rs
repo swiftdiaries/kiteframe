@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::dsl::{CompiledDefinition, DefinitionKind};
 use crate::harness::{
-    HarnessApprovalDecision, HarnessInvocationEvent, HarnessInvocationId, HarnessProfileId,
-    HarnessTransport,
+    HARNESS_PROTOCOL_VERSION, HarnessApprovalDecision, HarnessInvocationEvent, HarnessInvocationId,
+    HarnessProfileId, HarnessTransport,
 };
 use crate::{
     AgentCommandId, AgentExecutionView, AgentPolicyDecision, CatalogEpochId, FrameId, GoalContract,
@@ -131,14 +131,28 @@ pub struct HarnessInvocationEventRecord {
     pub event: HarnessInvocationEvent,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarnessEventDigestInput<'a> {
+    protocol_version: u16,
+    invocation_id: &'a HarnessInvocationId,
+    sequence: u64,
+    event: &'a HarnessInvocationEvent,
+}
+
 impl HarnessInvocationEventRecord {
     pub fn new(
         invocation_id: HarnessInvocationId,
         sequence: u64,
         event: HarnessInvocationEvent,
     ) -> Result<Self, StoreError> {
-        let event_digest =
-            canonical_sha256(&event).map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let event_digest = canonical_sha256(&HarnessEventDigestInput {
+            protocol_version: HARNESS_PROTOCOL_VERSION,
+            invocation_id: &invocation_id,
+            sequence,
+            event: &event,
+        })
+        .map_err(|error| StoreError::InvalidData(error.to_string()))?;
         Ok(Self {
             invocation_id,
             sequence,
@@ -148,9 +162,16 @@ impl HarnessInvocationEventRecord {
     }
 
     pub fn validate_digest(&self) -> Result<(), StoreError> {
-        let digest = canonical_sha256(&self.event)
+        let digest = canonical_sha256(&HarnessEventDigestInput {
+            protocol_version: HARNESS_PROTOCOL_VERSION,
+            invocation_id: &self.invocation_id,
+            sequence: self.sequence,
+            event: &self.event,
+        })
+        .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let legacy_digest = canonical_sha256(&self.event)
             .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-        if digest == self.event_digest {
+        if self.event_digest == digest || self.event_digest == legacy_digest {
             Ok(())
         } else {
             Err(StoreError::InvalidData(
