@@ -1758,7 +1758,94 @@ mod integrated_postgres_fake_restart {
     }
 
     #[tokio::test]
-    async fn direct_dispatch_consumes_stale_started_before_launching_ordinal_one() {
+    async fn late_dispatcher_cannot_steal_or_exhaust_a_live_reservation() {
+        let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
+        for max_pre_accept_attempts in [1_u32, 3] {
+            let Some(mut recovery) = RecoveryFixture::new().await else {
+                return;
+            };
+            let process_log = recovery
+                .workspace
+                .join(format!("live-owner-{max_pre_accept_attempts}.jsonl"));
+            let owner_barrier = Arc::new(HarnessDispatcherTestBarrier::new(
+                HarnessDispatcherTestBarrierPoint::AfterAttemptReservation,
+            ));
+            let (owner, owner_observation) = recovery
+                .dispatcher_with_attempt_limit(
+                    "core-success.json",
+                    None,
+                    Arc::new(AcpTestBarrier::new_disarmed(
+                        "unused",
+                        AcpTestBarrierPoint::BeforeWrite,
+                    )),
+                    Some(owner_barrier.clone()),
+                    max_pre_accept_attempts,
+                    Some(&process_log),
+                )
+                .await;
+            let owner = tokio::spawn(async move { owner.tick_agent_commands(8).await });
+            owner_barrier.wait_until_entered().await;
+            let reserved = recovery.invocation().await.unwrap();
+            assert_eq!(reserved.state, HarnessInvocationState::Started);
+            assert_eq!(reserved.attempt, 0);
+            assert_eq!(process_log_counts(&process_log), (0, 0));
+
+            let (late, late_observation) = recovery
+                .dispatcher_with_attempt_limit(
+                    "core-success.json",
+                    None,
+                    Arc::new(AcpTestBarrier::new_disarmed(
+                        "unused",
+                        AcpTestBarrierPoint::BeforeWrite,
+                    )),
+                    None,
+                    max_pre_accept_attempts,
+                    Some(&process_log),
+                )
+                .await;
+            let late_result = late.tick_agent_commands(8).await;
+            let after_late = recovery.invocation().await.unwrap();
+            let command_after_late = recovery.pending_or_owned_command().await;
+            let exhaustion_after_late: bool = sqlx::query_scalar(
+                "SELECT pre_accept_exhausted FROM harness_invocations WHERE invocation_id = $1",
+            )
+            .bind(reserved.invocation_id.as_uuid())
+            .fetch_one(recovery.store.pool())
+            .await
+            .unwrap();
+            let processes_after_late = process_log_counts(&process_log);
+            let late_prompts = prompt_count(&late_observation);
+
+            owner_barrier.release();
+            let owner_result = owner.await.unwrap();
+            let terminal = recovery.invocation().await.unwrap();
+            let command = recovery.pending_or_owned_command().await;
+            let process_counts = process_log_counts(&process_log);
+            let owner_prompts = prompt_count(&owner_observation);
+            recovery.cleanup().await;
+
+            assert_eq!(late_result.unwrap(), 1);
+            assert_eq!(after_late.state, HarnessInvocationState::Started);
+            assert_eq!(after_late.attempt, 0);
+            assert!(!after_late.terminal);
+            assert_eq!(
+                command_after_late.state,
+                kiteframe::AgentCommandState::Claimed
+            );
+            assert!(!exhaustion_after_late);
+            assert_eq!(processes_after_late, (0, 0));
+            assert_eq!(late_prompts, 0);
+            assert_eq!(owner_result.unwrap(), 1);
+            assert_eq!(terminal.state, HarnessInvocationState::Completed);
+            assert_eq!(terminal.attempt, 0);
+            assert_eq!(command.state, kiteframe::AgentCommandState::Completed);
+            assert_eq!(process_counts, (1, 1));
+            assert_eq!(owner_prompts, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_dispatch_leaves_stale_started_for_quiescent_recovery() {
         let _database = super::RECOVERY_DATABASE_LOCK.lock().await;
         let Some(mut recovery) = RecoveryFixture::new().await else {
             return;
@@ -1802,18 +1889,20 @@ mod integrated_postgres_fake_restart {
             )
             .await;
         assert_eq!(restarted.tick_agent_commands(8).await.unwrap(), 1);
-        let completed = recovery.invocation().await.unwrap();
+        let still_started = recovery.invocation().await.unwrap();
+        let command = recovery.pending_or_owned_command().await;
         let process_counts = process_log_counts(&process_log);
         let first_prompts = prompt_count(&first_observation);
         let second_prompts = prompt_count(&second_observation);
         recovery.cleanup().await;
 
-        assert_same_request_identity(&crashed, &completed);
-        assert_eq!(completed.state, HarnessInvocationState::Completed);
-        assert_eq!(completed.attempt, 1);
+        assert_same_request_identity(&crashed, &still_started);
+        assert_eq!(still_started.state, HarnessInvocationState::Started);
+        assert_eq!(still_started.attempt, 0);
+        assert_eq!(command.state, kiteframe::AgentCommandState::Claimed);
         assert_eq!(first_prompts, 0);
-        assert_eq!(second_prompts, 1);
-        assert_eq!(process_counts, (2, 1));
+        assert_eq!(second_prompts, 0);
+        assert_eq!(process_counts, (1, 0));
     }
 
     #[tokio::test]

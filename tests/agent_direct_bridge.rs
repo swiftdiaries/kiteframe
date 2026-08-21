@@ -1948,15 +1948,11 @@ async fn cancellation_during_model_or_tool_failure_audits_only_command_failure_m
         assert_eq!(audited.get::<i64, _>("revision"), 3);
         assert!(audited.get::<Option<Value>, _>("result").is_none());
         let failure = audited.get::<Option<Value>, _>("failure").unwrap();
-        if mode == "model" {
-            assert!(
-                failure == json!({"code":"harness_failed"})
-                    || failure == json!({"code":"harness_cancelled"}),
-                "the cancellation/failed-model race must retain one closed late-audit code"
-            );
-        } else {
-            assert_eq!(failure, json!({"code": expected_code}));
-        }
+        assert!(
+            failure == json!({"code": expected_code})
+                || failure == json!({"code":"harness_cancelled"}),
+            "the cancellation/late-failure race must retain one closed audit code"
+        );
         assert_eq!(fixture.evidence().await.len(), 0);
     }
 }

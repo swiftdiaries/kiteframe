@@ -438,27 +438,6 @@ impl AgentCommandDispatcher {
         #[cfg(feature = "test-support")]
         self.pause_test_barrier(HarnessDispatcherTestBarrierPoint::AfterPrepare)
             .await;
-        let prepared = if prepared.state == HarnessInvocationState::Started && !prepared.terminal {
-            match self.advance_stale_pre_accept_attempt(&prepared).await {
-                Ok(prepared) => prepared,
-                Err(StoreError::RevisionConflict) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        } else {
-            prepared
-        };
-        if !prepared.terminal
-            && self
-                .kernel
-                .store()
-                .harness_pre_accept_exhaustion(&prepared.invocation_id)
-                .await?
-                .is_some()
-        {
-            return self
-                .settle_pre_accept_exhausted(execution, &claimed, &prepared)
-                .await;
-        }
         let profile_id = prepared.profile_id.clone();
         let journal = PreparedHarnessTerminalJournal::new(&prepared);
         dispatch_with_terminal_journal(
