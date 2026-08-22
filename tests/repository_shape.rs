@@ -122,7 +122,7 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
     let migrations = embedded_migration_versions().unwrap();
     assert_status_evidence(&design, &reference, &migrations).unwrap();
 
-    let stale_head = reference.replacen("..b790a0c", "..d746ce5", 1);
+    let stale_head = reference.replacen("..7b989bf", "..b790a0c", 1);
     assert!(
         assert_status_evidence(&design, &stale_head, &migrations).is_err(),
         "status guard accepted stale Slice 3 evidence head"
@@ -160,7 +160,7 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
         );
     }
 
-    let canonical_range = "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c";
+    let canonical_range = "ca09f321672f90da5acca6aa2abf7e69ce6a6694..7b989bf";
     for rendered_range in [
         format!("`{canonical_range}`"),
         canonical_range.to_owned(),
@@ -212,10 +212,11 @@ fn assert_status_evidence(
         "\nCordis auto-composability",
     )?;
     for required in [
-        "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c",
+        "ca09f321672f90da5acca6aa2abf7e69ce6a6694..7b989bf",
         "Initial Tasks 1–7 implementation ended at `d746ce5`",
         "Later production remediations are `af0763b`, `424ffda`, `1a46135`, and `3887425`",
         "CI, documentation, and test evidence fixes are `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`",
+        "TypeScript local/remote smoke database isolation and cleanup remediations are `75a295d`, `8bae13e`, `baa6f9a`, and `7b989bf`",
         "Gate B is approved after the `af0763b` and `424ffda` fixes",
         "final APPROVE verdict and zero findings",
         "whole-branch re-review of the final evidence head is still pending",
@@ -321,7 +322,7 @@ fn normalize_markdown_whitespace(text: &str) -> String {
 }
 
 fn assert_exact_evidence_range(evidence: &str) -> Result<(), String> {
-    let canonical_range = "ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c";
+    let canonical_range = "ca09f321672f90da5acca6aa2abf7e69ce6a6694..7b989bf";
     let ranges = commit_ranges(evidence);
     if ranges == [canonical_range] {
         Ok(())

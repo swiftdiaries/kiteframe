@@ -350,11 +350,13 @@ policy, and evidence state. A harness terminal cannot complete or block a
 durable goal.
 
 - Implementation range and evidence head:
-  `ca09f321672f90da5acca6aa2abf7e69ce6a6694..b790a0c`. Initial Tasks 1–7
+  `ca09f321672f90da5acca6aa2abf7e69ce6a6694..7b989bf`. Initial Tasks 1–7
   implementation ended at `d746ce5`; `840b0fb` is the release-gating
   cancellation-test prerequisite. Later production remediations are
   `af0763b`, `424ffda`, `1a46135`, and `3887425`. CI, documentation, and test
   evidence fixes are `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`.
+  TypeScript local/remote smoke database isolation and cleanup remediations are
+  `75a295d`, `8bae13e`, `baa6f9a`, and `7b989bf`.
 - Review status: Gate B is approved after the `af0763b` and `424ffda` fixes.
   Its final APPROVE verdict and zero findings are recorded in
   `.superpowers/sdd/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses/progress.md`
@@ -367,13 +369,18 @@ durable goal.
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo fmt --all -- --check`, and
   `cargo build --all-targets --all-features` passed. `cargo test --test
-  repository_shape` passed 10 tests; `cargo test --test harness_profiles`
+  repository_shape` passed 13 tests; `cargo test --test harness_profiles`
   passed 15 tests; and `cargo test --test harness_acp_live -- --nocapture`
   passed 4 tests with both provider targets honestly skipped because their
   complete live configuration is absent. The strict CI wiring is present and
   verified: it runs the Python live smoke in an isolated disposable database
   after Rust tests, then always drops that database; the corresponding local
   PostgreSQL simulation passed all 25 Python client tests.
+- TypeScript CI now gives the local compiled-harness and remote-harness smokes
+  distinct disposable databases, with checked cleanup/PID ownership. The local
+  fresh-target smoke passed 10 tests. The remote fresh target received
+  migrations and its fixture/harness were reaped; no remote Bun test count is
+  asserted because that local runner did not capture a Bun summary.
 - PostgreSQL schema evidence: the current embedded SQLx migration set contains
   19 migrations (`0001` through `0019`). The configured PostgreSQL matrices
   were run against disposable PostgreSQL 16 instances; each such database was
