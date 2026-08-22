@@ -148,6 +148,12 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
         "status guard accepted an additional stale evidence range"
     );
 
+    let missing_catalog_entry = reference.replacen("`c6c8fd6`", "", 1);
+    assert!(
+        assert_status_evidence(&design, &missing_catalog_entry, &migrations).is_err(),
+        "status guard accepted a remediation catalog with an omitted entry"
+    );
+
     for explicitly_negative in [
         "Slices 4–8 are not implemented.",
         "Slices 4–8 are not yet implemented.",
@@ -214,9 +220,6 @@ fn assert_status_evidence(
     for required in [
         "ca09f321672f90da5acca6aa2abf7e69ce6a6694..7b989bf",
         "Initial Tasks 1–7 implementation ended at `d746ce5`",
-        "Later production remediations are `af0763b`, `424ffda`, `1a46135`, and `3887425`",
-        "CI, documentation, and test evidence fixes are `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`",
-        "TypeScript local/remote smoke database isolation and cleanup remediations are `75a295d`, `8bae13e`, `baa6f9a`, and `7b989bf`",
         "Gate B is approved after the `af0763b` and `424ffda` fixes",
         "final APPROVE verdict and zero findings",
         "whole-branch re-review of the final evidence head is still pending",
@@ -225,6 +228,7 @@ fn assert_status_evidence(
         require_text(evidence, required, "Slice 3 evidence is stale")?;
     }
     assert_exact_evidence_range(evidence)?;
+    assert_remediation_catalog(evidence)?;
 
     let expected_versions = (1..=migration_versions.len() as u32).collect::<Vec<_>>();
     if migration_versions != expected_versions {
@@ -331,6 +335,18 @@ fn assert_exact_evidence_range(evidence: &str) -> Result<(), String> {
             "expected exactly one canonical Slice 3 implementation range, found {ranges:?}"
         ))
     }
+}
+
+fn assert_remediation_catalog(evidence: &str) -> Result<(), String> {
+    for category in [
+        "Production remediations: `af0763b`, `424ffda`, `1a46135`, and `3887425`",
+        "CI, documentation, and test evidence fixes: `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`",
+        "Public status/evidence catalog fixes: `bfd8b5f` (Slice 3 status refresh), `e5c01be` (evidence-guard tightening), `2096ca8` (final-review wording), `a3f1811` (loophole closure), and `c6c8fd6` (normalized assertions)",
+        "TypeScript local/remote smoke database isolation and cleanup remediations: `75a295d`, `8bae13e`, `baa6f9a`, and `7b989bf`",
+    ] {
+        require_text(evidence, category, "remediation catalog is incomplete")?;
+    }
+    Ok(())
 }
 
 fn commit_ranges(text: &str) -> Vec<&str> {

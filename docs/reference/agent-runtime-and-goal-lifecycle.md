@@ -352,11 +352,16 @@ durable goal.
 - Implementation range and evidence head:
   `ca09f321672f90da5acca6aa2abf7e69ce6a6694..7b989bf`. Initial Tasks 1–7
   implementation ended at `d746ce5`; `840b0fb` is the release-gating
-  cancellation-test prerequisite. Later production remediations are
-  `af0763b`, `424ffda`, `1a46135`, and `3887425`. CI, documentation, and test
-  evidence fixes are `fa07acd`, `817f65e`, `7eb454c`, and `b790a0c`.
-  TypeScript local/remote smoke database isolation and cleanup remediations are
-  `75a295d`, `8bae13e`, `baa6f9a`, and `7b989bf`.
+  cancellation-test prerequisite.
+- Remediation catalog:
+  - Production remediations: `af0763b`, `424ffda`, `1a46135`, and `3887425`.
+  - CI, documentation, and test evidence fixes: `fa07acd`, `817f65e`,
+    `7eb454c`, and `b790a0c`.
+  - Public status/evidence catalog fixes: `bfd8b5f` (Slice 3 status refresh),
+    `e5c01be` (evidence-guard tightening), `2096ca8` (final-review wording),
+    `a3f1811` (loophole closure), and `c6c8fd6` (normalized assertions).
+  - TypeScript local/remote smoke database isolation and cleanup remediations:
+    `75a295d`, `8bae13e`, `baa6f9a`, and `7b989bf`.
 - Review status: Gate B is approved after the `af0763b` and `424ffda` fixes.
   Its final APPROVE verdict and zero findings are recorded in
   `.superpowers/sdd/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses/progress.md`
