@@ -154,6 +154,16 @@ fn public_status_evidence_tracks_completed_slice_three_and_prospective_later_sli
         "status guard accepted a remediation catalog with an omitted entry"
     );
 
+    let contradictory_final_review = reference.replacen(
+        "- Review status:",
+        "- Final whole-branch re-review is still pending.\n- Review status:",
+        1,
+    );
+    assert!(
+        assert_status_evidence(&design, &contradictory_final_review, &migrations).is_err(),
+        "status guard accepted a contradictory pending final-review claim"
+    );
+
     for explicitly_negative in [
         "Slices 4–8 are not implemented.",
         "Slices 4–8 are not yet implemented.",
@@ -222,13 +232,19 @@ fn assert_status_evidence(
         "Initial Tasks 1–7 implementation ended at `d746ce5`",
         "Gate B is approved after the `af0763b` and `424ffda` fixes",
         "final APPROVE verdict and zero findings",
-        "whole-branch re-review of the final evidence head is still pending",
+        "final whole-branch re-review at `f4ba45e` returned **Ready to merge: Yes**",
+        "**0 Critical**, **0 Important**, and **0 Minor** findings",
+        "the full Rust suite ran serially against PostgreSQL",
+        "Python client tests passed 25",
+        "TypeScript local and remote smoke tests each passed 10",
+        "provider commands remained entirely absent",
         "cargo test --test harness_acp_live -- --nocapture",
     ] {
         require_text(evidence, required, "Slice 3 evidence is stale")?;
     }
     assert_exact_evidence_range(evidence)?;
     assert_remediation_catalog(evidence)?;
+    assert_final_review_is_approved(evidence)?;
 
     let expected_versions = (1..=migration_versions.len() as u32).collect::<Vec<_>>();
     if migration_versions != expected_versions {
@@ -345,6 +361,14 @@ fn assert_remediation_catalog(evidence: &str) -> Result<(), String> {
         "TypeScript local/remote smoke database isolation and cleanup remediations: `75a295d`, `8bae13e`, `baa6f9a`, and `7b989bf`",
     ] {
         require_text(evidence, category, "remediation catalog is incomplete")?;
+    }
+    Ok(())
+}
+
+fn assert_final_review_is_approved(evidence: &str) -> Result<(), String> {
+    let normalized = normalize_markdown_whitespace(evidence).to_ascii_lowercase();
+    if normalized.contains("whole-branch re-review") && normalized.contains("pending") {
+        return Err("final whole-branch review is still recorded as pending".to_owned());
     }
     Ok(())
 }

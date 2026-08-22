@@ -367,9 +367,9 @@ durable goal.
   `.superpowers/sdd/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses/progress.md`
   and
   `.superpowers/sdd/2026-08-21-kiteframe-declarative-agents-slice-3-dual-acp-harnesses/gate-b-fix-report.md`.
-  The final-review remediation commits above are recorded, but a fresh
-  whole-branch re-review of the final evidence head is still pending; this
-  status does not claim final whole-branch approval.
+  The final whole-branch re-review at `f4ba45e` returned **Ready to merge:
+  Yes**, with **0 Critical**, **0 Important**, and **0 Minor** findings. This
+  status-only closure does not extend the implementation evidence range above.
 - Latest verified deterministic results: strict
   `cargo clippy --all-targets --all-features -- -D warnings`,
   `cargo fmt --all -- --check`, and
@@ -384,8 +384,12 @@ durable goal.
 - TypeScript CI now gives the local compiled-harness and remote-harness smokes
   distinct disposable databases, with checked cleanup/PID ownership. The local
   fresh-target smoke passed 10 tests. The remote fresh target received
-  migrations and its fixture/harness were reaped; no remote Bun test count is
-  asserted because that local runner did not capture a Bun summary.
+  migrations, passed 10 tests, and its fixture/harness were reaped.
+- Final workflow-equivalent verification passed: the full Rust suite ran
+  serially against PostgreSQL; Python client tests passed 25; TypeScript local
+  and remote smoke tests each passed 10; strict Rust and client gates passed.
+  Codex and DeepSeek provider commands remained entirely absent, so their live
+  gates produced only the documented all-absent skips rather than executions.
 - PostgreSQL schema evidence: the current embedded SQLx migration set contains
   19 migrations (`0001` through `0019`). The configured PostgreSQL matrices
   were run against disposable PostgreSQL 16 instances; each such database was
