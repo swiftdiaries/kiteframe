@@ -323,7 +323,7 @@ impl Engine {
         match request.choice {
             PermissionChoice::AllowOnce | PermissionChoice::AllowToolForSession => {
                 let binding = self.store.run_tool_binding(request.run_id.clone(), &pending.qualified_name).await?;
-                let (decision, policy_revision) = self
+                let evaluated = self
                     .evaluate_policy(PolicyRequest {
                         session: request.session_id.clone(),
                         qualified_name: binding.qualified_name.clone(),
@@ -331,7 +331,14 @@ impl Engine {
                         capabilities: binding.capabilities.clone(),
                         arguments: pending.arguments.clone(),
                     })
-                    .await?;
+                    .await;
+                let (decision, policy_revision) = match evaluated {
+                    Ok(evaluated) => evaluated,
+                    Err(error) => {
+                        self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, Err(json!({"code":"policy_evaluation_failed","message":error.to_string()}))).await?;
+                        return Err(error);
+                    }
+                };
                 if let PolicyDecision::Forbid { .. } = decision {
                     self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, Err(policy_denied())).await?;
                     return Ok(());

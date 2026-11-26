@@ -1351,3 +1351,50 @@ async fn tool_call_records_the_policy_revision_that_was_evaluated() {
         "the permit at revision 1 allowed the call, so the call must carry revision 1"
     );
 }
+
+struct NeedsPermissionThenFails(std::sync::atomic::AtomicBool);
+
+#[async_trait]
+impl SessionAuthorizer for NeedsPermissionThenFails {
+    async fn authorize(
+        &self,
+        _request: &PolicyRequest,
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            Err(kiteframe::PolicyError::Cedar(
+                "evaluation failed".to_owned(),
+            ))
+        } else {
+            Ok(PolicyDecision::NeedsPermission.into())
+        }
+    }
+}
+
+#[tokio::test]
+async fn approved_call_finishes_when_its_policy_recheck_fails() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let fixture = PolicyFixture::new(&database_url).await;
+    let engine = fixture.engine(Arc::new(NeedsPermissionThenFails(Default::default())));
+    engine.tick_run(fixture.run.id.clone()).await.unwrap();
+    let request_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM permission_requests WHERE run_id = $1")
+            .bind(*fixture.run.id.as_uuid())
+            .fetch_one(fixture.store.pool())
+            .await
+            .unwrap();
+    let approval = ResolvePermission {
+        session_id: fixture.session.clone(),
+        run_id: fixture.run.id.clone(),
+        permission_request_id: kiteframe::PermissionRequestId::new(request_id),
+        choice: PermissionChoice::AllowOnce,
+        idempotency_key: IdempotencyKey::new(format!("approve-{}", Uuid::now_v7())).unwrap(),
+    };
+    assert!(engine.resolve_permission(approval).await.is_err());
+    assert!(fixture.invocations.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.tool_error().await.unwrap()["code"],
+        "policy_evaluation_failed"
+    );
+}
