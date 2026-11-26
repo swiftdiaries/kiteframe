@@ -21,8 +21,8 @@ use thiserror::Error;
 
 use crate::{
     IdempotencyKey, ModelClient, ModelRequest, NewPermissionRequest, PermissionRequestId,
-    PolicyDecision, PolicyRequest, PostgresStore, RecoverySupport, SessionAuthorizer, StoreError,
-    ToolCall, ToolError, ToolResolver, ToolStatus, canonical_sha256,
+    PolicyDecision, PolicyRequest, PolicyRevision, PostgresStore, RecoverySupport,
+    SessionAuthorizer, StoreError, ToolCall, ToolError, ToolResolver, ToolStatus, canonical_sha256,
 };
 
 use crate::harness::{completion_tool, parse_completion_item, validate_completion};
@@ -168,20 +168,16 @@ impl Engine {
             )
             .into());
         }
-        let policy_revision = self.store.policy_revision(call.session_id.clone()).await?;
-        if !matches!(
-            self.authorizer
-                .authorize(&PolicyRequest {
-                    session: call.session_id.clone(),
-                    qualified_name: call.qualified_name.clone(),
-                    descriptor_digest: call.descriptor_digest.clone(),
-                    capabilities: tool.descriptor().capabilities().iter().cloned().collect(),
-                    arguments: call.arguments.clone(),
-                })
-                .await
-                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
-            PolicyDecision::Allow
-        ) {
+        let (decision, policy_revision) = self
+            .evaluate_policy(PolicyRequest {
+                session: call.session_id.clone(),
+                qualified_name: call.qualified_name.clone(),
+                descriptor_digest: call.descriptor_digest.clone(),
+                capabilities: tool.descriptor().capabilities().iter().cloned().collect(),
+                arguments: call.arguments.clone(),
+            })
+            .await?;
+        if decision != PolicyDecision::Allow {
             return Err(StoreError::InvalidData(
                 "recovery retry is not currently authorized by session policy".to_owned(),
             )
@@ -219,6 +215,22 @@ impl Engine {
             .finish_tool_call(call.frame_id, call.id, revision, outcome)
             .await?;
         Ok(())
+    }
+
+    async fn evaluate_policy(
+        &self,
+        request: PolicyRequest,
+    ) -> Result<(PolicyDecision, PolicyRevision), EngineError> {
+        let evaluation = self
+            .authorizer
+            .authorize(&request)
+            .await
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let revision = match evaluation.policy_revision {
+            Some(revision) => revision,
+            None => self.store.policy_revision(request.session).await?,
+        };
+        Ok((evaluation.decision, revision))
     }
 
     pub async fn resolve_permission(&self, request: ResolvePermission) -> Result<(), EngineError> {
@@ -311,17 +323,15 @@ impl Engine {
         match request.choice {
             PermissionChoice::AllowOnce | PermissionChoice::AllowToolForSession => {
                 let binding = self.store.run_tool_binding(request.run_id.clone(), &pending.qualified_name).await?;
-                let decision = self
-                    .authorizer
-                    .authorize(&PolicyRequest {
+                let (decision, policy_revision) = self
+                    .evaluate_policy(PolicyRequest {
                         session: request.session_id.clone(),
                         qualified_name: binding.qualified_name.clone(),
                         descriptor_digest: binding.descriptor_digest.clone(),
                         capabilities: binding.capabilities.clone(),
                         arguments: pending.arguments.clone(),
                     })
-                    .await
-                    .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                    .await?;
                 if let PolicyDecision::Forbid { .. } = decision {
                     self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, Err(policy_denied())).await?;
                     return Ok(());
@@ -343,7 +353,6 @@ impl Engine {
                     }
                     Err(error) => return Err(StoreError::InvalidData(error.to_string()).into()),
                 };
-                let policy_revision = self.store.policy_revision(request.session_id.clone()).await?;
                 let call = ToolCall::new(request.session_id, request.run_id, pending.frame_id.clone(), policy_revision, tool.descriptor(), pending.arguments, IdempotencyKey::new(format!("{}:{}", pending.frame_id.as_uuid(), pending.provider_call_id)).map_err(|error| StoreError::InvalidData(error.to_string()))?).map_err(|error| StoreError::InvalidData(error.to_string()))?;
                 let result = tool.invoke(call).await.map_err(|error| json!({"code":"tool_failed","message":error.to_string()}));
                 self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, result).await?;
@@ -614,7 +623,6 @@ impl Engine {
             .store
             .run_tool_binding(frame.run_id.clone(), &qualified_name)
             .await?;
-        let policy_revision = self.store.policy_revision(frame.session_id.clone()).await?;
         let intent = self
             .store
             .begin_tool_call(
@@ -628,18 +636,16 @@ impl Engine {
             )
             .await
             .map_err(|error| StoreError::InvalidData(format!("persist tool intent: {error}")))?;
-        match self
-            .authorizer
-            .authorize(&PolicyRequest {
+        let (decision, policy_revision) = self
+            .evaluate_policy(PolicyRequest {
                 session: frame.session_id.clone(),
                 qualified_name: binding.qualified_name.clone(),
                 descriptor_digest: binding.descriptor_digest.clone(),
                 capabilities: binding.capabilities,
                 arguments: arguments.clone(),
             })
-            .await
-            .map_err(|error| StoreError::InvalidData(error.to_string()))?
-        {
+            .await?;
+        match decision {
             PolicyDecision::Allow => {
                 let tool = match self.tools.bound_tool(
                     frame.session_id.clone(),

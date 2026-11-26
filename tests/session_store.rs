@@ -139,10 +139,13 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         capabilities: vec![],
         arguments: serde_json::json!({}),
     };
-    assert!(matches!(
-        authorizer.authorize(&request).await,
-        Ok(PolicyDecision::Allow)
-    ));
+    assert_eq!(
+        authorizer.authorize(&request).await.unwrap(),
+        kiteframe::PolicyEvaluation {
+            decision: PolicyDecision::Allow,
+            policy_revision: Some(PolicyRevision::new(2)),
+        }
+    );
     let forbid = SessionPolicy {
         version: 1,
         rules: vec![PolicyRule {
@@ -164,10 +167,15 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
         )
         .await
         .expect("append forbid");
-    assert!(matches!(
-        authorizer.authorize(&request).await,
-        Ok(PolicyDecision::Forbid { .. })
-    ));
+    assert_eq!(
+        authorizer.authorize(&request).await.unwrap(),
+        kiteframe::PolicyEvaluation {
+            decision: PolicyDecision::Forbid {
+                rule_ids: vec!["forbid-search".to_owned()]
+            },
+            policy_revision: Some(PolicyRevision::new(3)),
+        }
+    );
 
     let source = "workflow w() -> string { start t() } task t() -> string { prompt \"\"\"x\"\"\" tools [search] on ok() { done \"x\" } }";
     let workflow = compile(source, &catalog, &Limits::default()).expect("compile workflow");

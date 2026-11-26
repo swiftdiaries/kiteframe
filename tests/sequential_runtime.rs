@@ -38,8 +38,8 @@ impl SessionAuthorizer for AllowAll {
     async fn authorize(
         &self,
         _request: &PolicyRequest,
-    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
-        Ok(PolicyDecision::Allow)
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        Ok(PolicyDecision::Allow.into())
     }
 }
 
@@ -50,8 +50,8 @@ impl SessionAuthorizer for RequirePermission {
     async fn authorize(
         &self,
         _request: &PolicyRequest,
-    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
-        Ok(PolicyDecision::NeedsPermission)
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        Ok(PolicyDecision::NeedsPermission.into())
     }
 }
 
@@ -62,8 +62,8 @@ impl SessionAuthorizer for DenyAll {
     async fn authorize(
         &self,
         _request: &PolicyRequest,
-    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
-        Ok(PolicyDecision::Forbid { rule_ids: vec![] })
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        Ok(PolicyDecision::Forbid { rule_ids: vec![] }.into())
     }
 }
 
@@ -1137,6 +1137,62 @@ impl TrustedTool for RecordingTool {
     }
 }
 
+async fn append_search_policy(
+    store: &PostgresStore,
+    session: &kiteframe::SessionId,
+    catalog: &ToolCatalogSnapshot,
+    expected: u64,
+    effect: kiteframe::PolicyEffect,
+) {
+    let policy = kiteframe::SessionPolicy {
+        version: 1,
+        rules: vec![kiteframe::PolicyRule {
+            rule_id: format!("{effect:?}-search"),
+            effect,
+            target: kiteframe::PolicyTarget::Tool {
+                names: BTreeSet::from(["docs/search".to_owned()]),
+            },
+            input: BTreeMap::new(),
+        }],
+    };
+    store
+        .append_session_policy(
+            session.clone(),
+            kiteframe::PolicyRevision::new(expected),
+            format!("policy-{}", Uuid::now_v7()),
+            &policy,
+            catalog,
+        )
+        .await
+        .unwrap();
+}
+
+struct PermitLandsMidCall {
+    store: Arc<PostgresStore>,
+    session: kiteframe::SessionId,
+    catalog: ToolCatalogSnapshot,
+}
+
+#[async_trait]
+impl SessionAuthorizer for PermitLandsMidCall {
+    async fn authorize(
+        &self,
+        request: &PolicyRequest,
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        append_search_policy(
+            &self.store,
+            &self.session,
+            &self.catalog,
+            0,
+            kiteframe::PolicyEffect::Permit,
+        )
+        .await;
+        kiteframe::PersistedAuthorizer::new(self.store.clone())
+            .authorize(request)
+            .await
+    }
+}
+
 struct PolicyFixture {
     store: Arc<PostgresStore>,
     session: kiteframe::SessionId,
@@ -1230,27 +1286,7 @@ impl PolicyFixture {
     }
 
     async fn set_policy(&self, expected: u64, effect: kiteframe::PolicyEffect) {
-        let policy = kiteframe::SessionPolicy {
-            version: 1,
-            rules: vec![kiteframe::PolicyRule {
-                rule_id: format!("{effect:?}-search"),
-                effect,
-                target: kiteframe::PolicyTarget::Tool {
-                    names: BTreeSet::from(["docs/search".to_owned()]),
-                },
-                input: BTreeMap::new(),
-            }],
-        };
-        self.store
-            .append_session_policy(
-                self.session.clone(),
-                kiteframe::PolicyRevision::new(expected),
-                format!("policy-{}", Uuid::now_v7()),
-                &policy,
-                &self.catalog,
-            )
-            .await
-            .unwrap();
+        append_search_policy(&self.store, &self.session, &self.catalog, expected, effect).await;
     }
 
     async fn tool_error(&self) -> Option<Value> {
@@ -1295,4 +1331,23 @@ async fn forbid_added_while_waiting_for_approval_overrides_the_approval() {
         "approved tool ran despite a forbid added while it waited"
     );
     assert_eq!(fixture.tool_error().await.unwrap()["code"], "policy_denied");
+}
+
+#[tokio::test]
+async fn tool_call_records_the_policy_revision_that_was_evaluated() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let fixture = PolicyFixture::new(&database_url).await;
+    let engine = fixture.engine(Arc::new(PermitLandsMidCall {
+        store: fixture.store.clone(),
+        session: fixture.session.clone(),
+        catalog: fixture.catalog.clone(),
+    }));
+    engine.tick_run(fixture.run.id.clone()).await.unwrap();
+    assert_eq!(
+        *fixture.invocations.lock().unwrap(),
+        vec![kiteframe::PolicyRevision::new(1)],
+        "the permit at revision 1 allowed the call, so the call must carry revision 1"
+    );
 }

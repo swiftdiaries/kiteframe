@@ -42,8 +42,8 @@ impl SessionAuthorizer for AllowAll {
     async fn authorize(
         &self,
         _request: &PolicyRequest,
-    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
-        Ok(PolicyDecision::Allow)
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        Ok(PolicyDecision::Allow.into())
     }
 }
 
