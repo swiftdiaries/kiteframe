@@ -5,6 +5,8 @@ use crate::{Capability, ClosedSchema, PrimitiveValue, ToolCatalogSnapshot};
 
 use super::{PolicyEffect, PolicyError, PolicyTarget, SessionPolicy};
 
+pub(super) const RULE_ID_ANNOTATION: &str = "rule_id";
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CompiledPolicy {
     pub cedar: String,
@@ -23,27 +25,51 @@ pub fn compile(
             PolicyEffect::Permit => "permit",
             PolicyEffect::Forbid => "forbid",
         };
+        let annotation = format!("@{RULE_ID_ANNOTATION}({})", cedar_string(&rule.rule_id));
         match &rule.target {
+            PolicyTarget::Tool { names } if rule.effect == PolicyEffect::Forbid => {
+                let set = names
+                    .iter()
+                    .map(|name| cedar_string(name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                writeln!(
+                    &mut cedar,
+                    "{annotation}\nforbid(principal, action, resource) when {{ [{set}].contains(context.tool) }};"
+                )
+                .expect("write to string");
+            }
             PolicyTarget::Tool { names } => {
                 for name in names {
                     let tool = catalog
                         .tools()
                         .get(name)
                         .ok_or_else(|| PolicyError::InvisibleTool(name.clone()))?;
-                    let identity =
-                        format!("{}#{}", tool.qualified_name(), tool.descriptor_digest());
-                    writeln!(&mut cedar, "{effect}(principal, action == Action::\"{identity}\", resource == Kiteframe::Tool::\"{identity}\");").expect("write to string");
+                    let identity = cedar_string(&format!(
+                        "{}#{}",
+                        tool.qualified_name(),
+                        tool.descriptor_digest()
+                    ));
+                    writeln!(&mut cedar, "{annotation}\n{effect}(principal, action == Action::{identity}, resource == Kiteframe::Tool::{identity});").expect("write to string");
                 }
             }
             PolicyTarget::Capability { names } => {
-                for capability in names {
-                    writeln!(
-                        &mut cedar,
-                        "{effect}(principal, action == Action::\"capability:{}\", resource);",
-                        capability_name(capability)
-                    )
-                    .expect("write to string");
-                }
+                let set = names
+                    .iter()
+                    .map(|capability| cedar_string(capability_name(capability)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let condition = match rule.effect {
+                    PolicyEffect::Forbid => format!("context.capabilities.containsAny([{set}])"),
+                    PolicyEffect::Permit => format!(
+                        "!context.capabilities.isEmpty() && [{set}].containsAll(context.capabilities)"
+                    ),
+                };
+                writeln!(
+                    &mut cedar,
+                    "{annotation}\n{effect}(principal, action, resource) when {{ {condition} }};"
+                )
+                .expect("write to string");
             }
         }
     }
@@ -107,7 +133,11 @@ fn primitive_json(value: &PrimitiveValue) -> serde_json::Value {
     }
 }
 
-fn capability_name(capability: &Capability) -> &'static str {
+pub(super) fn cedar_string(value: &str) -> String {
+    format!("\"{}\"", value.escape_default())
+}
+
+pub(super) fn capability_name(capability: &Capability) -> &'static str {
     match capability {
         Capability::McpUnknown => "mcp_unknown",
         Capability::ReadData => "read_data",
