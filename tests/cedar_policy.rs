@@ -248,3 +248,186 @@ fn tool(name: &str) -> CatalogTool {
     )
     .unwrap()
 }
+
+struct Case {
+    label: &'static str,
+    qualified_name: &'static str,
+    stale_digest: bool,
+}
+
+const CASES: &[Case] = &[
+    Case {
+        label: "push",
+        qualified_name: "repo/push",
+        stale_digest: false,
+    },
+    Case {
+        label: "read",
+        qualified_name: "docs/read",
+        stale_digest: false,
+    },
+    Case {
+        label: "read-stale-digest",
+        qualified_name: "docs/read",
+        stale_digest: true,
+    },
+    Case {
+        label: "fetch",
+        qualified_name: "web/fetch",
+        stale_digest: false,
+    },
+    Case {
+        label: "noop",
+        qualified_name: "plain/noop",
+        stale_digest: false,
+    },
+];
+
+fn differential_catalog() -> ToolCatalogSnapshot {
+    let with = |name: &str, input: BTreeMap<String, ClosedSchema>, caps: &[Capability]| {
+        CatalogTool::new(
+            name,
+            name.split_once('/').unwrap().0,
+            "test",
+            ClosedSchema::object("input", input),
+            ClosedSchema::object("output", Default::default()),
+            caps.iter().cloned().collect(),
+            EffectKind::ReadOnly,
+            RecoverySupport::NotRequired,
+        )
+        .unwrap()
+    };
+    ToolCatalogSnapshot::new(
+        SessionId::new(Uuid::now_v7()),
+        Uuid::now_v7(),
+        [
+            with(
+                "repo/push",
+                BTreeMap::from([
+                    ("repo".to_owned(), ClosedSchema::string()),
+                    ("force".to_owned(), ClosedSchema::boolean()),
+                ]),
+                &[Capability::WriteData, Capability::Network],
+            ),
+            with("docs/read", BTreeMap::new(), &[Capability::ReadData]),
+            with(
+                "web/fetch",
+                BTreeMap::new(),
+                &[Capability::ReadData, Capability::Network],
+            ),
+            with("plain/noop", BTreeMap::new(), &[]),
+        ],
+    )
+    .unwrap()
+}
+
+fn differential_rules() -> Vec<(&'static str, Vec<PolicyRule>)> {
+    let rule = |id: &str, effect: PolicyEffect, target: PolicyTarget| PolicyRule {
+        rule_id: id.to_owned(),
+        effect,
+        target,
+        input: BTreeMap::new(),
+    };
+    let tools = |names: &[&str]| PolicyTarget::Tool {
+        names: names.iter().map(|name| (*name).to_owned()).collect(),
+    };
+    let caps = |names: &[Capability]| PolicyTarget::Capability {
+        names: names.iter().cloned().collect(),
+    };
+    vec![
+        (
+            "permit-tool-read",
+            vec![rule("r", PolicyEffect::Permit, tools(&["docs/read"]))],
+        ),
+        (
+            "forbid-tool-push",
+            vec![rule("r", PolicyEffect::Forbid, tools(&["repo/push"]))],
+        ),
+        (
+            "permit-cap-read",
+            vec![rule(
+                "r",
+                PolicyEffect::Permit,
+                caps(&[Capability::ReadData]),
+            )],
+        ),
+        (
+            "permit-cap-read-network",
+            vec![rule(
+                "r",
+                PolicyEffect::Permit,
+                caps(&[Capability::ReadData, Capability::Network]),
+            )],
+        ),
+        (
+            "forbid-cap-network",
+            vec![rule(
+                "r",
+                PolicyEffect::Forbid,
+                caps(&[Capability::Network]),
+            )],
+        ),
+        (
+            "permit-tool-fetch+forbid-cap-network",
+            vec![
+                rule("permit", PolicyEffect::Permit, tools(&["web/fetch"])),
+                rule("forbid", PolicyEffect::Forbid, caps(&[Capability::Network])),
+            ],
+        ),
+    ]
+}
+
+fn differential_request(catalog: &ToolCatalogSnapshot, case: &Case) -> PolicyRequest {
+    let tool = &catalog.tools()[case.qualified_name];
+    PolicyRequest {
+        session: catalog.session_id().clone(),
+        qualified_name: case.qualified_name.to_owned(),
+        descriptor_digest: if case.stale_digest {
+            "stale".to_owned()
+        } else {
+            tool.descriptor_digest().to_owned()
+        },
+        capabilities: tool.capabilities().iter().cloned().collect(),
+    }
+}
+
+/// Disagreements between the typed reference model and Cedar on `main`.
+/// Capability forbids agree only because `CedarAuthorizer` runs the typed
+/// authorizer first. Each fix removes its rows; the list must end empty.
+const KNOWN_MISMATCHES: &[(&str, &str)] = &[
+    // Typed matches tools by name only; Cedar binds name and descriptor digest.
+    ("permit-tool-read", "read-stale-digest"),
+    // Capability permits compile to `Action::"capability:…"`, which no request uses.
+    ("permit-cap-read", "read"),
+    ("permit-cap-read", "read-stale-digest"),
+    ("permit-cap-read", "fetch"),
+    ("permit-cap-read-network", "push"),
+    ("permit-cap-read-network", "read"),
+    ("permit-cap-read-network", "read-stale-digest"),
+    ("permit-cap-read-network", "fetch"),
+];
+
+#[tokio::test]
+async fn typed_and_cedar_authorizers_agree() {
+    let catalog = differential_catalog();
+    let mut mismatches = Vec::new();
+    for (label, rules) in differential_rules() {
+        let policy = SessionPolicy { version: 1, rules };
+        let compiled = compile(&policy, &catalog).unwrap();
+        let typed = TypedAuthorizer::new(policy.clone());
+        let cedar = CedarAuthorizer::new(&compiled, policy).unwrap();
+        for case in CASES {
+            let request = differential_request(&catalog, case);
+            let typed_decision = typed.authorize(&request).await.unwrap();
+            let cedar_decision = cedar.authorize(&request).await.unwrap();
+            if typed_decision != cedar_decision {
+                println!(
+                    "{label} x {}: typed {typed_decision:?}, cedar {cedar_decision:?}",
+                    case.label
+                );
+                mismatches.push((label, case.label));
+            }
+        }
+    }
+    assert_eq!(mismatches, KNOWN_MISMATCHES);
+}
