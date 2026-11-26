@@ -12,6 +12,7 @@ Choose the path that matches your work:
 |---|---|
 | Authoring a workflow or agent | [Kite language reference](../reference/kite-language.md), then [examples/babysit_pr.kite](../../examples/babysit_pr.kite) |
 | Submitting or controlling durable agent work | [UserTask and GoalContract reference](../reference/user-task-and-goal-contract.md) |
+| Writing or changing tool-call policy | [Session policy reference](../reference/session-policy.md) |
 | Changing runtime, kernel, store, or recovery behavior | [Agent runtime and goal lifecycle reference](../reference/agent-runtime-and-goal-lifecycle.md), then the [testing guide](testing-kiteframe.md) |
 
 ## Build with Kiteframe today
