@@ -311,6 +311,21 @@ impl Engine {
         match request.choice {
             PermissionChoice::AllowOnce | PermissionChoice::AllowToolForSession => {
                 let binding = self.store.run_tool_binding(request.run_id.clone(), &pending.qualified_name).await?;
+                let decision = self
+                    .authorizer
+                    .authorize(&PolicyRequest {
+                        session: request.session_id.clone(),
+                        qualified_name: binding.qualified_name.clone(),
+                        descriptor_digest: binding.descriptor_digest.clone(),
+                        capabilities: binding.capabilities.clone(),
+                        arguments: pending.arguments.clone(),
+                    })
+                    .await
+                    .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+                if let PolicyDecision::Forbid { .. } = decision {
+                    self.store.finish_tool_call(pending.frame_id, pending.tool_call_id, revision, Err(policy_denied())).await?;
+                    return Ok(());
+                }
                 let tool = match self.tools.bound_tool(
                     request.session_id.clone(),
                     &binding.qualified_name,
@@ -748,7 +763,17 @@ impl Engine {
                     })?;
             }
             PolicyDecision::Forbid { .. } => {
-                self.store.finish_tool_call(frame.id.clone(), intent.id, intent.revision, Err(json!({"code":"policy_denied","message":"Tool invocation denied by session policy"}))).await.map_err(|error| StoreError::InvalidData(format!("persist denied tool result: {error}")))?;
+                self.store
+                    .finish_tool_call(
+                        frame.id.clone(),
+                        intent.id,
+                        intent.revision,
+                        Err(policy_denied()),
+                    )
+                    .await
+                    .map_err(|error| {
+                        StoreError::InvalidData(format!("persist denied tool result: {error}"))
+                    })?;
             }
             PolicyDecision::NeedsPermission => {
                 self.store
@@ -770,6 +795,10 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+fn policy_denied() -> Value {
+    json!({"code":"policy_denied","message":"Tool invocation denied by session policy"})
 }
 
 fn active_execution_limit_millis(definition: &crate::dsl::CompiledDefinition) -> u64 {
