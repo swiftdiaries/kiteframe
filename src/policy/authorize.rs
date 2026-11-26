@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::compile::{RULE_ID_ANNOTATION, capability_name, cedar_string, compile};
+use super::compile::{
+    INPUT_CONTEXT_KEY, RULE_ID_ANNOTATION, UNCOMPARABLE_CONTEXT_KEY, capability_name, cedar_string,
+    compile,
+};
+use super::input::{Argument, argument_at, input_matches};
 use super::{PolicyEffect, PolicyError, PolicyRule, PolicyTarget, SessionPolicy};
 use crate::{Capability, SessionId, ToolCatalogSnapshot};
 
@@ -14,6 +18,7 @@ pub struct PolicyRequest {
     pub qualified_name: String,
     pub descriptor_digest: String,
     pub capabilities: Vec<Capability>,
+    pub arguments: serde_json::Value,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyDecision {
@@ -45,6 +50,11 @@ impl TypedAuthorizer {
     }
 
     fn applies(&self, rule: &PolicyRule, request: &PolicyRequest) -> bool {
+        self.target_applies(rule, request)
+            && input_matches(rule.effect, &rule.input, &request.arguments)
+    }
+
+    fn target_applies(&self, rule: &PolicyRule, request: &PolicyRequest) -> bool {
         match &rule.target {
             PolicyTarget::Tool { names } => {
                 names.contains(&request.qualified_name)
@@ -97,6 +107,7 @@ impl SessionAuthorizer for TypedAuthorizer {
 
 pub struct CedarAuthorizer {
     policy: cedar_policy::PolicySet,
+    input_pointers: BTreeSet<String>,
 }
 
 pub struct PersistedAuthorizer {
@@ -134,6 +145,11 @@ impl CedarAuthorizer {
         Ok(Self {
             policy: cedar_policy::PolicySet::from_str(&compiled.cedar)
                 .map_err(|error| PolicyError::Cedar(error.to_string()))?,
+            input_pointers: policy
+                .rules
+                .iter()
+                .flat_map(|rule| rule.input.keys().cloned())
+                .collect(),
         })
     }
 
@@ -171,11 +187,25 @@ impl SessionAuthorizer for CedarAuthorizer {
             .iter()
             .map(capability_name)
             .collect::<Vec<_>>();
-        let context = cedar_policy::Context::from_json_value(
-            serde_json::json!({ "capabilities": capabilities, "tool": request.qualified_name }),
-            None,
-        )
-        .map_err(|error| cedar_error(&error))?;
+        let mut input = serde_json::Map::new();
+        let mut uncomparable = Vec::new();
+        for pointer in &self.input_pointers {
+            match argument_at(&request.arguments, pointer) {
+                Argument::Missing => {}
+                Argument::Comparable(value) => {
+                    input.insert(pointer.clone(), value.clone());
+                }
+                Argument::Uncomparable => uncomparable.push(pointer.as_str()),
+            }
+        }
+        let context = serde_json::json!({
+            "capabilities": capabilities,
+            "tool": request.qualified_name,
+            INPUT_CONTEXT_KEY: input,
+            UNCOMPARABLE_CONTEXT_KEY: uncomparable,
+        });
+        let context = cedar_policy::Context::from_json_value(context, None)
+            .map_err(|error| cedar_error(&error))?;
         let cedar_request = cedar_policy::Request::new(principal, action, resource, context, None)
             .map_err(|error| cedar_error(&error))?;
         let response = cedar_policy::Authorizer::new().is_authorized(

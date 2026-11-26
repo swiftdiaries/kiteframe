@@ -176,6 +176,7 @@ impl Engine {
                     qualified_name: call.qualified_name.clone(),
                     descriptor_digest: call.descriptor_digest.clone(),
                     capabilities: tool.descriptor().capabilities().iter().cloned().collect(),
+                    arguments: call.arguments.clone(),
                 })
                 .await
                 .map_err(|error| StoreError::InvalidData(error.to_string()))?,
@@ -619,6 +620,7 @@ impl Engine {
                 qualified_name: binding.qualified_name.clone(),
                 descriptor_digest: binding.descriptor_digest.clone(),
                 capabilities: binding.capabilities,
+                arguments: arguments.clone(),
             })
             .await
             .map_err(|error| StoreError::InvalidData(error.to_string()))?

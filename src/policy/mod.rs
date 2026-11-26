@@ -1,5 +1,6 @@
 mod authorize;
 mod compile;
+mod input;
 mod types;
 
 pub use authorize::{

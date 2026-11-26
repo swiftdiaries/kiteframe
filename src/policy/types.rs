@@ -61,6 +61,8 @@ pub enum PolicyError {
     UnsupportedPath(String),
     #[error("policy input constraint contains a value outside the selected tool schema: {0}")]
     InvalidConstraintValue(String),
+    #[error("policy input constraint uses a non-integer number, which Cedar cannot compare: {0}")]
+    UnsupportedNumber(String),
     #[error("generated Cedar policy is invalid: {0}")]
     Cedar(String),
 }
@@ -99,6 +101,13 @@ impl SessionPolicy {
                 }
                 if allowed.0.is_empty() {
                     return Err(PolicyError::EmptyOneOf(pointer.clone()));
+                }
+                if allowed
+                    .0
+                    .iter()
+                    .any(|value| matches!(value, Primitive::Number(_)))
+                {
+                    return Err(PolicyError::UnsupportedNumber(pointer.clone()));
                 }
                 let PolicyTarget::Tool { names } = &rule.target else {
                     return Err(PolicyError::UnsupportedPath(pointer.clone()));
