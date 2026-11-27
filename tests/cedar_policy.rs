@@ -40,7 +40,8 @@ async fn typed_policy_validates_visible_targets_and_forbid_overrides_permit() {
         ],
     };
     policy.validate(&catalog).unwrap();
-    let decision = TypedAuthorizer::new(policy.clone())
+    let decision = TypedAuthorizer::new(policy.clone(), &catalog)
+        .unwrap()
         .authorize(&PolicyRequest {
             session: catalog.session_id().clone(),
             qualified_name: "docs/search".to_owned(),
@@ -55,8 +56,7 @@ async fn typed_policy_validates_visible_targets_and_forbid_overrides_permit() {
             rule_ids: vec!["deny-unknown".to_owned()]
         }
     );
-    let compiled = compile(&policy, &catalog).unwrap();
-    let cedar = CedarAuthorizer::new(&compiled, policy.clone()).unwrap();
+    let cedar = CedarAuthorizer::new(&policy, &catalog).unwrap();
     let cedar_decision = cedar
         .authorize(&PolicyRequest {
             session: catalog.session_id().clone(),
@@ -158,7 +158,11 @@ fn compiler_binds_exact_tool_rules_to_the_current_descriptor_digest() {
         catalog.tools()["docs/search"].descriptor_digest()
     );
     assert!(artifact.cedar.contains(&expected));
-    assert!(artifact.cedar.starts_with("permit("));
+    assert!(
+        artifact
+            .cedar
+            .starts_with("@rule_id(\"allow-search\")\npermit(")
+    );
     assert!(artifact.schema.contains("docs_search_"));
 }
 
@@ -340,6 +344,10 @@ fn differential_rules() -> Vec<(&'static str, Vec<PolicyRule>)> {
             vec![rule("r", PolicyEffect::Permit, tools(&["docs/read"]))],
         ),
         (
+            "forbid-tool-read",
+            vec![rule("r", PolicyEffect::Forbid, tools(&["docs/read"]))],
+        ),
+        (
             "forbid-tool-push",
             vec![rule("r", PolicyEffect::Forbid, tools(&["repo/push"]))],
         ),
@@ -391,31 +399,14 @@ fn differential_request(catalog: &ToolCatalogSnapshot, case: &Case) -> PolicyReq
     }
 }
 
-/// Disagreements between the typed reference model and Cedar on `main`.
-/// Capability forbids agree only because `CedarAuthorizer` runs the typed
-/// authorizer first. Each fix removes its rows; the list must end empty.
-const KNOWN_MISMATCHES: &[(&str, &str)] = &[
-    // Typed matches tools by name only; Cedar binds name and descriptor digest.
-    ("permit-tool-read", "read-stale-digest"),
-    // Capability permits compile to `Action::"capability:…"`, which no request uses.
-    ("permit-cap-read", "read"),
-    ("permit-cap-read", "read-stale-digest"),
-    ("permit-cap-read", "fetch"),
-    ("permit-cap-read-network", "push"),
-    ("permit-cap-read-network", "read"),
-    ("permit-cap-read-network", "read-stale-digest"),
-    ("permit-cap-read-network", "fetch"),
-];
-
 #[tokio::test]
 async fn typed_and_cedar_authorizers_agree() {
     let catalog = differential_catalog();
     let mut mismatches = Vec::new();
     for (label, rules) in differential_rules() {
         let policy = SessionPolicy { version: 1, rules };
-        let compiled = compile(&policy, &catalog).unwrap();
-        let typed = TypedAuthorizer::new(policy.clone());
-        let cedar = CedarAuthorizer::new(&compiled, policy).unwrap();
+        let typed = TypedAuthorizer::new(policy.clone(), &catalog).unwrap();
+        let cedar = CedarAuthorizer::new(&policy, &catalog).unwrap();
         for case in CASES {
             let request = differential_request(&catalog, case);
             let typed_decision = typed.authorize(&request).await.unwrap();
@@ -429,5 +420,87 @@ async fn typed_and_cedar_authorizers_agree() {
             }
         }
     }
-    assert_eq!(mismatches, KNOWN_MISMATCHES);
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+}
+
+#[tokio::test]
+async fn capability_permit_covers_only_tools_whose_capabilities_it_names() {
+    let catalog = differential_catalog();
+    let policy = SessionPolicy {
+        version: 1,
+        rules: vec![PolicyRule {
+            rule_id: "read-only".to_owned(),
+            effect: PolicyEffect::Permit,
+            target: PolicyTarget::Capability {
+                names: BTreeSet::from([Capability::ReadData]),
+            },
+            input: BTreeMap::new(),
+        }],
+    };
+    let cedar = CedarAuthorizer::new(&policy, &catalog).unwrap();
+    let decide = |name: &'static str| {
+        let request = differential_request(
+            &catalog,
+            &Case {
+                label: name,
+                qualified_name: name,
+                stale_digest: false,
+            },
+        );
+        let cedar = &cedar;
+        async move { cedar.authorize(&request).await.unwrap() }
+    };
+    assert_eq!(decide("docs/read").await, PolicyDecision::Allow);
+    assert_eq!(decide("web/fetch").await, PolicyDecision::NeedsPermission);
+    assert_eq!(decide("plain/noop").await, PolicyDecision::NeedsPermission);
+}
+
+#[tokio::test]
+async fn tool_forbid_covers_a_tool_whose_contract_changed() {
+    let catalog = differential_catalog();
+    let (_, rules) = differential_rules()
+        .into_iter()
+        .find(|(label, _)| *label == "forbid-tool-read")
+        .unwrap();
+    let policy = SessionPolicy { version: 1, rules };
+    let request = differential_request(&catalog, &CASES[2]);
+    assert_eq!(request.descriptor_digest, "stale");
+    assert_eq!(
+        CedarAuthorizer::new(&policy, &catalog)
+            .unwrap()
+            .authorize(&request)
+            .await
+            .unwrap(),
+        PolicyDecision::Forbid {
+            rule_ids: vec!["r".to_owned()]
+        }
+    );
+}
+
+#[tokio::test]
+async fn capability_forbid_overrides_tool_permit_in_cedar() {
+    let catalog = differential_catalog();
+    let (_, rules) = differential_rules()
+        .into_iter()
+        .find(|(label, _)| *label == "permit-tool-fetch+forbid-cap-network")
+        .unwrap();
+    let policy = SessionPolicy { version: 1, rules };
+    let compiled = compile(&policy, &catalog).unwrap();
+    assert!(
+        !compiled.cedar.contains("capability:"),
+        "{}",
+        compiled.cedar
+    );
+    let request = differential_request(&catalog, &CASES[3]);
+    assert_eq!(request.qualified_name, "web/fetch");
+    assert_eq!(
+        CedarAuthorizer::new(&policy, &catalog)
+            .unwrap()
+            .authorize(&request)
+            .await
+            .unwrap(),
+        PolicyDecision::Forbid {
+            rule_ids: vec!["forbid".to_owned()]
+        }
+    );
 }
