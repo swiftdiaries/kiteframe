@@ -497,11 +497,21 @@ mod fake_acp_boundaries {
         }
 
         async fn wait_for_method_count(&self, count: usize) {
+            self.wait_for_methods(|methods| methods.len() >= count)
+                .await;
+        }
+
+        async fn wait_for_method(&self, method: &str) {
+            self.wait_for_methods(|methods| methods.iter().any(|seen| seen == method))
+                .await;
+        }
+
+        async fn wait_for_methods(&self, done: impl Fn(&[Value]) -> bool) {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
                 if self.observation()["methods"]
                     .as_array()
-                    .is_some_and(|methods| methods.len() >= count)
+                    .is_some_and(|methods| done(methods))
                 {
                     return;
                 }
@@ -621,6 +631,7 @@ mod fake_acp_boundaries {
             }
         });
         shutdown_barrier.wait_until_entered().await;
+        run.wait_for_method("session/prompt").await;
         let observed = run.observation();
         assert_eq!(
             observed["methods"]
