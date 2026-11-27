@@ -3,9 +3,11 @@ use std::str::FromStr;
 
 use crate::{Capability, ClosedSchema, PrimitiveValue, ToolCatalogSnapshot};
 
-use super::{PolicyEffect, PolicyError, PolicyTarget, SessionPolicy};
+use super::{PolicyEffect, PolicyError, PolicyRule, PolicyTarget, Primitive, SessionPolicy};
 
 pub(super) const RULE_ID_ANNOTATION: &str = "rule_id";
+pub(super) const INPUT_CONTEXT_KEY: &str = "input";
+pub(super) const UNCOMPARABLE_CONTEXT_KEY: &str = "uncomparable";
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CompiledPolicy {
@@ -35,7 +37,8 @@ pub fn compile(
                     .join(", ");
                 writeln!(
                     &mut cedar,
-                    "{annotation}\nforbid(principal, action, resource) when {{ [{set}].contains(context.tool) }};"
+                    "{annotation}\nforbid(principal, action, resource) when {{ [{set}].contains(context.tool){} }};",
+                    input_clauses(rule).map(|clauses| format!(" && {clauses}")).unwrap_or_default()
                 )
                 .expect("write to string");
             }
@@ -50,7 +53,7 @@ pub fn compile(
                         tool.qualified_name(),
                         tool.descriptor_digest()
                     ));
-                    writeln!(&mut cedar, "{annotation}\n{effect}(principal, action == Action::{identity}, resource == Kiteframe::Tool::{identity});").expect("write to string");
+                    writeln!(&mut cedar, "{annotation}\n{effect}(principal, action == Action::{identity}, resource == Kiteframe::Tool::{identity}){};", input_clauses(rule).map(|clauses| format!(" when {{ {clauses} }}")).unwrap_or_default()).expect("write to string");
                 }
             }
             PolicyTarget::Capability { names } => {
@@ -131,6 +134,44 @@ fn primitive_json(value: &PrimitiveValue) -> serde_json::Value {
         PrimitiveValue::Integer(value) => serde_json::json!(value),
         PrimitiveValue::String(value) => serde_json::json!(value),
     }
+}
+
+fn input_clauses(rule: &PolicyRule) -> Option<String> {
+    if rule.input.is_empty() {
+        return None;
+    }
+    let clauses = rule
+        .input
+        .iter()
+        .map(|(pointer, allowed)| {
+            let key = cedar_string(pointer);
+            let present = format!("context.{INPUT_CONTEXT_KEY} has {key}");
+            let values = allowed
+                .0
+                .iter()
+                .filter_map(|value| match value {
+                    Primitive::String(value) => Some(cedar_string(value)),
+                    Primitive::Integer(value) => Some(value.to_string()),
+                    Primitive::Boolean(value) => Some(value.to_string()),
+                    Primitive::Number(_) | Primitive::Null => None,
+                })
+                .map(|literal| format!("context.{INPUT_CONTEXT_KEY}[{key}] == {literal}"))
+                .collect::<Vec<_>>();
+            let listed = if values.is_empty() {
+                "false".to_owned()
+            } else {
+                format!("({present} && ({}))", values.join(" || "))
+            };
+            match rule.effect {
+                PolicyEffect::Forbid => format!("(!({present}) || {listed})"),
+                PolicyEffect::Permit if allowed.0.contains(&Primitive::Null) => format!(
+                    "((!({present}) && !context.{UNCOMPARABLE_CONTEXT_KEY}.contains({key})) || {listed})"
+                ),
+                PolicyEffect::Permit => listed,
+            }
+        })
+        .collect::<Vec<_>>();
+    Some(clauses.join(" && "))
 }
 
 pub(super) fn cedar_string(value: &str) -> String {

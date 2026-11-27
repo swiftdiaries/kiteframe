@@ -137,6 +137,7 @@ async fn session_authority_enforces_identity_catalog_policy_and_publication_idem
             .descriptor_digest()
             .to_owned(),
         capabilities: vec![],
+        arguments: serde_json::json!({}),
     };
     assert!(matches!(
         authorizer.authorize(&request).await,

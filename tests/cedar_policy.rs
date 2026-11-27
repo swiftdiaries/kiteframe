@@ -47,6 +47,7 @@ async fn typed_policy_validates_visible_targets_and_forbid_overrides_permit() {
             qualified_name: "docs/search".to_owned(),
             descriptor_digest: "digest".to_owned(),
             capabilities: vec![Capability::McpUnknown],
+            arguments: serde_json::json!({}),
         })
         .await
         .unwrap();
@@ -65,6 +66,7 @@ async fn typed_policy_validates_visible_targets_and_forbid_overrides_permit() {
                 .descriptor_digest()
                 .to_owned(),
             capabilities: vec![Capability::McpUnknown],
+            arguments: serde_json::json!({}),
         })
         .await
         .unwrap();
@@ -257,33 +259,63 @@ struct Case {
     label: &'static str,
     qualified_name: &'static str,
     stale_digest: bool,
+    arguments: &'static str,
 }
 
 const CASES: &[Case] = &[
     Case {
-        label: "push",
+        label: "push-missing-args",
         qualified_name: "repo/push",
         stale_digest: false,
+        arguments: "{}",
+    },
+    Case {
+        label: "push-api",
+        qualified_name: "repo/push",
+        stale_digest: false,
+        arguments: r#"{"repo":"acme/api","force":false,"note":null,"opts":{"depth":1}}"#,
+    },
+    Case {
+        label: "push-other-forced",
+        qualified_name: "repo/push",
+        stale_digest: false,
+        arguments: r#"{"repo":"acme/other","force":true,"note":"hi","opts":{"depth":3}}"#,
+    },
+    Case {
+        label: "push-quoted",
+        qualified_name: "repo/push",
+        stale_digest: false,
+        arguments: r#"{"repo":"acme/\"api\"","force":false,"note":null}"#,
+    },
+    Case {
+        label: "push-wrong-type",
+        qualified_name: "repo/push",
+        stale_digest: false,
+        arguments: r#"{"repo":7,"force":"true","note":1.5,"opts":{"depth":18446744073709551615}}"#,
     },
     Case {
         label: "read",
         qualified_name: "docs/read",
         stale_digest: false,
+        arguments: "{}",
     },
     Case {
         label: "read-stale-digest",
         qualified_name: "docs/read",
         stale_digest: true,
+        arguments: "{}",
     },
     Case {
         label: "fetch",
         qualified_name: "web/fetch",
         stale_digest: false,
+        arguments: "{}",
     },
     Case {
         label: "noop",
         qualified_name: "plain/noop",
         stale_digest: false,
+        arguments: "{}",
     },
 ];
 
@@ -310,6 +342,17 @@ fn differential_catalog() -> ToolCatalogSnapshot {
                 BTreeMap::from([
                     ("repo".to_owned(), ClosedSchema::string()),
                     ("force".to_owned(), ClosedSchema::boolean()),
+                    (
+                        "note".to_owned(),
+                        ClosedSchema::nullable(ClosedSchema::string()),
+                    ),
+                    (
+                        "opts".to_owned(),
+                        ClosedSchema::object(
+                            "opts",
+                            BTreeMap::from([("depth".to_owned(), ClosedSchema::integer())]),
+                        ),
+                    ),
                 ]),
                 &[Capability::WriteData, Capability::Network],
             ),
@@ -338,6 +381,14 @@ fn differential_rules() -> Vec<(&'static str, Vec<PolicyRule>)> {
     let caps = |names: &[Capability]| PolicyTarget::Capability {
         names: names.iter().cloned().collect(),
     };
+    let limited = |id: &str, effect: PolicyEffect, input: &[(&str, Vec<Primitive>)]| PolicyRule {
+        input: input
+            .iter()
+            .map(|(pointer, values)| ((*pointer).to_owned(), OneOfPrimitive(values.clone())))
+            .collect(),
+        ..rule(id, effect, tools(&["repo/push"]))
+    };
+    let string = |value: &str| Primitive::String(value.to_owned());
     vec![
         (
             "permit-tool-read",
@@ -376,6 +427,79 @@ fn differential_rules() -> Vec<(&'static str, Vec<PolicyRule>)> {
             )],
         ),
         (
+            "permit-push-api",
+            vec![limited(
+                "r",
+                PolicyEffect::Permit,
+                &[("/repo", vec![string("acme/api"), string("acme/\"api\"")])],
+            )],
+        ),
+        (
+            "permit-push-api-unforced",
+            vec![limited(
+                "r",
+                PolicyEffect::Permit,
+                &[
+                    ("/repo", vec![string("acme/api")]),
+                    ("/force", vec![Primitive::Boolean(false)]),
+                ],
+            )],
+        ),
+        (
+            "permit-push-null-note",
+            vec![limited(
+                "r",
+                PolicyEffect::Permit,
+                &[("/note", vec![Primitive::Null])],
+            )],
+        ),
+        (
+            "permit-push-shallow",
+            vec![limited(
+                "r",
+                PolicyEffect::Permit,
+                &[(
+                    "/opts/depth",
+                    vec![Primitive::Integer(1), Primitive::Integer(2)],
+                )],
+            )],
+        ),
+        (
+            "forbid-push-deep",
+            vec![limited(
+                "r",
+                PolicyEffect::Forbid,
+                &[("/opts/depth", vec![Primitive::Integer(3)])],
+            )],
+        ),
+        (
+            "forbid-push-null-note",
+            vec![limited(
+                "r",
+                PolicyEffect::Forbid,
+                &[("/note", vec![Primitive::Null])],
+            )],
+        ),
+        (
+            "forbid-push-forced",
+            vec![limited(
+                "r",
+                PolicyEffect::Forbid,
+                &[("/force", vec![Primitive::Boolean(true)])],
+            )],
+        ),
+        (
+            "permit-push+forbid-push-other",
+            vec![
+                rule("permit", PolicyEffect::Permit, tools(&["repo/push"])),
+                limited(
+                    "forbid",
+                    PolicyEffect::Forbid,
+                    &[("/repo", vec![string("acme/other")])],
+                ),
+            ],
+        ),
+        (
             "permit-tool-fetch+forbid-cap-network",
             vec![
                 rule("permit", PolicyEffect::Permit, tools(&["web/fetch"])),
@@ -383,6 +507,10 @@ fn differential_rules() -> Vec<(&'static str, Vec<PolicyRule>)> {
             ],
         ),
     ]
+}
+
+fn case(label: &str) -> &'static Case {
+    CASES.iter().find(|case| case.label == label).unwrap()
 }
 
 fn differential_request(catalog: &ToolCatalogSnapshot, case: &Case) -> PolicyRequest {
@@ -396,6 +524,7 @@ fn differential_request(catalog: &ToolCatalogSnapshot, case: &Case) -> PolicyReq
             tool.descriptor_digest().to_owned()
         },
         capabilities: tool.capabilities().iter().cloned().collect(),
+        arguments: serde_json::from_str(case.arguments).unwrap(),
     }
 }
 
@@ -445,6 +574,7 @@ async fn capability_permit_covers_only_tools_whose_capabilities_it_names() {
                 label: name,
                 qualified_name: name,
                 stale_digest: false,
+                arguments: "{}",
             },
         );
         let cedar = &cedar;
@@ -463,7 +593,7 @@ async fn tool_forbid_covers_a_tool_whose_contract_changed() {
         .find(|(label, _)| *label == "forbid-tool-read")
         .unwrap();
     let policy = SessionPolicy { version: 1, rules };
-    let request = differential_request(&catalog, &CASES[2]);
+    let request = differential_request(&catalog, case("read-stale-digest"));
     assert_eq!(request.descriptor_digest, "stale");
     assert_eq!(
         CedarAuthorizer::new(&policy, &catalog)
@@ -491,7 +621,7 @@ async fn capability_forbid_overrides_tool_permit_in_cedar() {
         "{}",
         compiled.cedar
     );
-    let request = differential_request(&catalog, &CASES[3]);
+    let request = differential_request(&catalog, case("fetch"));
     assert_eq!(request.qualified_name, "web/fetch");
     assert_eq!(
         CedarAuthorizer::new(&policy, &catalog)
@@ -503,4 +633,147 @@ async fn capability_forbid_overrides_tool_permit_in_cedar() {
             rule_ids: vec!["forbid".to_owned()]
         }
     );
+}
+
+#[tokio::test]
+async fn input_constraints_limit_which_arguments_a_rule_covers() {
+    use PolicyDecision::{Allow, NeedsPermission};
+    let catalog = differential_catalog();
+    let forbid = |id: &str| PolicyDecision::Forbid {
+        rule_ids: vec![id.to_owned()],
+    };
+    let expected = [
+        ("permit-push-api", "push-api", Allow),
+        ("permit-push-api", "push-quoted", Allow),
+        ("permit-push-api", "push-other-forced", NeedsPermission),
+        ("permit-push-api", "push-missing-args", NeedsPermission),
+        ("permit-push-api", "push-wrong-type", NeedsPermission),
+        ("permit-push-api-unforced", "push-api", Allow),
+        ("permit-push-api-unforced", "push-quoted", NeedsPermission),
+        ("permit-push-null-note", "push-api", Allow),
+        ("permit-push-null-note", "push-missing-args", Allow),
+        ("permit-push-null-note", "push-wrong-type", NeedsPermission),
+        ("forbid-push-forced", "push-wrong-type", NeedsPermission),
+        ("forbid-push-null-note", "push-wrong-type", forbid("r")),
+        ("forbid-push-null-note", "push-missing-args", forbid("r")),
+        ("forbid-push-null-note", "push-api", forbid("r")),
+        (
+            "forbid-push-null-note",
+            "push-other-forced",
+            NeedsPermission,
+        ),
+        (
+            "permit-push-null-note",
+            "push-other-forced",
+            NeedsPermission,
+        ),
+        ("permit-push-shallow", "push-api", Allow),
+        ("permit-push-shallow", "push-other-forced", NeedsPermission),
+        ("permit-push-shallow", "push-missing-args", NeedsPermission),
+        ("permit-push-shallow", "push-wrong-type", NeedsPermission),
+        ("forbid-push-deep", "push-other-forced", forbid("r")),
+        ("forbid-push-deep", "push-api", NeedsPermission),
+        ("forbid-push-deep", "push-wrong-type", forbid("r")),
+        ("forbid-push-forced", "push-other-forced", forbid("r")),
+        ("forbid-push-forced", "push-missing-args", forbid("r")),
+        ("forbid-push-forced", "push-api", NeedsPermission),
+        ("permit-push+forbid-push-other", "push-api", Allow),
+        (
+            "permit-push+forbid-push-other",
+            "push-other-forced",
+            forbid("forbid"),
+        ),
+    ];
+    let rules = differential_rules();
+    for (rule_label, case_label, decision) in expected {
+        let (_, rules) = rules
+            .iter()
+            .find(|(label, _)| *label == rule_label)
+            .unwrap();
+        let policy = SessionPolicy {
+            version: 1,
+            rules: rules.clone(),
+        };
+        let request = differential_request(&catalog, case(case_label));
+        assert_eq!(
+            CedarAuthorizer::new(&policy, &catalog)
+                .unwrap()
+                .authorize(&request)
+                .await
+                .unwrap(),
+            decision,
+            "{rule_label} x {case_label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn input_constraint_strings_are_escaped_as_cedar_literals() {
+    let catalog = differential_catalog();
+    let awkward = "a\"b\\c\nd é\u{0}";
+    let policy = SessionPolicy {
+        version: 1,
+        rules: vec![PolicyRule {
+            rule_id: "awkward \"rule\"".to_owned(),
+            effect: PolicyEffect::Permit,
+            target: PolicyTarget::Tool {
+                names: BTreeSet::from(["repo/push".to_owned()]),
+            },
+            input: BTreeMap::from([(
+                "/repo".to_owned(),
+                OneOfPrimitive(vec![Primitive::String(awkward.to_owned())]),
+            )]),
+        }],
+    };
+    let cedar = CedarAuthorizer::new(&policy, &catalog).unwrap();
+    let mut request = differential_request(&catalog, case("push-api"));
+    request.arguments["repo"] = serde_json::json!(awkward);
+    assert_eq!(
+        cedar.authorize(&request).await.unwrap(),
+        PolicyDecision::Allow
+    );
+    request.arguments["repo"] = serde_json::json!("a\"b");
+    assert_eq!(
+        cedar.authorize(&request).await.unwrap(),
+        PolicyDecision::NeedsPermission
+    );
+}
+
+#[test]
+fn non_integer_number_constraints_are_rejected() {
+    let mut properties = BTreeMap::new();
+    properties.insert("ratio".to_owned(), ClosedSchema::number());
+    let tool = CatalogTool::new(
+        "math/scale",
+        "math",
+        "test",
+        ClosedSchema::object("input", properties),
+        ClosedSchema::object("output", Default::default()),
+        BTreeSet::new(),
+        EffectKind::ReadOnly,
+        RecoverySupport::NotRequired,
+    )
+    .unwrap();
+    let catalog =
+        ToolCatalogSnapshot::new(SessionId::new(Uuid::now_v7()), Uuid::now_v7(), [tool]).unwrap();
+    let policy = SessionPolicy {
+        version: 1,
+        rules: vec![PolicyRule {
+            rule_id: "ratio".to_owned(),
+            effect: PolicyEffect::Permit,
+            target: PolicyTarget::Tool {
+                names: BTreeSet::from(["math/scale".to_owned()]),
+            },
+            input: BTreeMap::from([(
+                "/ratio".to_owned(),
+                OneOfPrimitive(vec![Primitive::Number(
+                    serde_json::Number::from_f64(0.5).unwrap(),
+                )]),
+            )]),
+        }],
+    };
+    assert!(matches!(
+        policy.validate(&catalog),
+        Err(kiteframe::PolicyError::UnsupportedNumber(pointer)) if pointer == "/ratio"
+    ));
 }
