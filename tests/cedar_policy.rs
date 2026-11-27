@@ -50,7 +50,8 @@ async fn typed_policy_validates_visible_targets_and_forbid_overrides_permit() {
             arguments: serde_json::json!({}),
         })
         .await
-        .unwrap();
+        .unwrap()
+        .decision;
     assert_eq!(
         decision,
         PolicyDecision::Forbid {
@@ -69,7 +70,8 @@ async fn typed_policy_validates_visible_targets_and_forbid_overrides_permit() {
             arguments: serde_json::json!({}),
         })
         .await
-        .unwrap();
+        .unwrap()
+        .decision;
     assert_eq!(
         cedar_decision,
         PolicyDecision::Forbid {
@@ -538,8 +540,8 @@ async fn typed_and_cedar_authorizers_agree() {
         let cedar = CedarAuthorizer::new(&policy, &catalog).unwrap();
         for case in CASES {
             let request = differential_request(&catalog, case);
-            let typed_decision = typed.authorize(&request).await.unwrap();
-            let cedar_decision = cedar.authorize(&request).await.unwrap();
+            let typed_decision = typed.authorize(&request).await.unwrap().decision;
+            let cedar_decision = cedar.authorize(&request).await.unwrap().decision;
             if typed_decision != cedar_decision {
                 println!(
                     "{label} x {}: typed {typed_decision:?}, cedar {cedar_decision:?}",
@@ -578,7 +580,7 @@ async fn capability_permit_covers_only_tools_whose_capabilities_it_names() {
             },
         );
         let cedar = &cedar;
-        async move { cedar.authorize(&request).await.unwrap() }
+        async move { cedar.authorize(&request).await.unwrap().decision }
     };
     assert_eq!(decide("docs/read").await, PolicyDecision::Allow);
     assert_eq!(decide("web/fetch").await, PolicyDecision::NeedsPermission);
@@ -600,7 +602,8 @@ async fn tool_forbid_covers_a_tool_whose_contract_changed() {
             .unwrap()
             .authorize(&request)
             .await
-            .unwrap(),
+            .unwrap()
+            .decision,
         PolicyDecision::Forbid {
             rule_ids: vec!["r".to_owned()]
         }
@@ -628,7 +631,8 @@ async fn capability_forbid_overrides_tool_permit_in_cedar() {
             .unwrap()
             .authorize(&request)
             .await
-            .unwrap(),
+            .unwrap()
+            .decision,
         PolicyDecision::Forbid {
             rule_ids: vec!["forbid".to_owned()]
         }
@@ -700,7 +704,8 @@ async fn input_constraints_limit_which_arguments_a_rule_covers() {
                 .unwrap()
                 .authorize(&request)
                 .await
-                .unwrap(),
+                .unwrap()
+                .decision,
             decision,
             "{rule_label} x {case_label}"
         );
@@ -729,12 +734,12 @@ async fn input_constraint_strings_are_escaped_as_cedar_literals() {
     let mut request = differential_request(&catalog, case("push-api"));
     request.arguments["repo"] = serde_json::json!(awkward);
     assert_eq!(
-        cedar.authorize(&request).await.unwrap(),
+        cedar.authorize(&request).await.unwrap().decision,
         PolicyDecision::Allow
     );
     request.arguments["repo"] = serde_json::json!("a\"b");
     assert_eq!(
-        cedar.authorize(&request).await.unwrap(),
+        cedar.authorize(&request).await.unwrap().decision,
         PolicyDecision::NeedsPermission
     );
 }

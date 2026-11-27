@@ -10,7 +10,7 @@ use super::compile::{
 };
 use super::input::{Argument, argument_at, input_matches};
 use super::{PolicyEffect, PolicyError, PolicyRule, PolicyTarget, SessionPolicy};
-use crate::{Capability, SessionId, ToolCatalogSnapshot};
+use crate::{Capability, PolicyRevision, SessionId, ToolCatalogSnapshot};
 
 #[derive(Clone, Debug)]
 pub struct PolicyRequest {
@@ -20,6 +20,21 @@ pub struct PolicyRequest {
     pub capabilities: Vec<Capability>,
     pub arguments: serde_json::Value,
 }
+/// A decision and the policy revision it was evaluated against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyEvaluation {
+    pub decision: PolicyDecision,
+    /// `None` when the authorizer holds an in-memory policy with no persisted revision.
+    pub policy_revision: Option<PolicyRevision>,
+}
+impl From<PolicyDecision> for PolicyEvaluation {
+    fn from(decision: PolicyDecision) -> Self {
+        Self {
+            decision,
+            policy_revision: None,
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PolicyDecision {
     Allow,
@@ -28,7 +43,7 @@ pub enum PolicyDecision {
 }
 #[async_trait]
 pub trait SessionAuthorizer: Send + Sync {
-    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision, PolicyError>;
+    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyEvaluation, PolicyError>;
 }
 /// The reference model of a session policy, evaluated directly over the typed rules.
 pub struct TypedAuthorizer {
@@ -80,7 +95,7 @@ impl TypedAuthorizer {
 }
 #[async_trait]
 impl SessionAuthorizer for TypedAuthorizer {
-    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision, PolicyError> {
+    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyEvaluation, PolicyError> {
         let mut permits = false;
         let mut forbids = BTreeSet::new();
         for rule in &self.policy.rules {
@@ -101,7 +116,8 @@ impl SessionAuthorizer for TypedAuthorizer {
             PolicyDecision::Allow
         } else {
             PolicyDecision::NeedsPermission
-        })
+        }
+        .into())
     }
 }
 
@@ -123,20 +139,19 @@ impl PersistedAuthorizer {
 
 #[async_trait]
 impl SessionAuthorizer for PersistedAuthorizer {
-    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision, PolicyError> {
-        let policy = self
+    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyEvaluation, PolicyError> {
+        let (policy, revision, catalog) = self
             .store
-            .current_session_policy(request.session.clone())
+            .current_policy_and_catalog(request.session.clone())
             .await
             .map_err(|error| PolicyError::Cedar(error.to_string()))?;
-        let catalog = self
-            .store
-            .current_catalog(request.session.clone())
-            .await
-            .map_err(|error| PolicyError::Cedar(error.to_string()))?;
-        CedarAuthorizer::new(&policy, &catalog)?
+        let evaluation = CedarAuthorizer::new(&policy, &catalog)?
             .authorize(request)
-            .await
+            .await?;
+        Ok(PolicyEvaluation {
+            decision: evaluation.decision,
+            policy_revision: Some(revision),
+        })
     }
 }
 impl CedarAuthorizer {
@@ -167,7 +182,7 @@ impl CedarAuthorizer {
 }
 #[async_trait]
 impl SessionAuthorizer for CedarAuthorizer {
-    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyDecision, PolicyError> {
+    async fn authorize(&self, request: &PolicyRequest) -> Result<PolicyEvaluation, PolicyError> {
         let cedar_error = |error: &dyn std::fmt::Display| PolicyError::Cedar(error.to_string());
         let identity = cedar_string(&format!(
             "{}#{}",
@@ -222,6 +237,7 @@ impl SessionAuthorizer for CedarAuthorizer {
                 rule_ids if rule_ids.is_empty() => PolicyDecision::NeedsPermission,
                 rule_ids => PolicyDecision::Forbid { rule_ids },
             },
-        })
+        }
+        .into())
     }
 }

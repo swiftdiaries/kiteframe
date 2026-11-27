@@ -38,8 +38,8 @@ impl SessionAuthorizer for AllowAll {
     async fn authorize(
         &self,
         _request: &PolicyRequest,
-    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
-        Ok(PolicyDecision::Allow)
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        Ok(PolicyDecision::Allow.into())
     }
 }
 
@@ -50,8 +50,8 @@ impl SessionAuthorizer for RequirePermission {
     async fn authorize(
         &self,
         _request: &PolicyRequest,
-    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
-        Ok(PolicyDecision::NeedsPermission)
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        Ok(PolicyDecision::NeedsPermission.into())
     }
 }
 
@@ -62,8 +62,8 @@ impl SessionAuthorizer for DenyAll {
     async fn authorize(
         &self,
         _request: &PolicyRequest,
-    ) -> Result<PolicyDecision, kiteframe::PolicyError> {
-        Ok(PolicyDecision::Forbid { rule_ids: vec![] })
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        Ok(PolicyDecision::Forbid { rule_ids: vec![] }.into())
     }
 }
 
@@ -1116,4 +1116,285 @@ async fn scoped_answer_resumes_a_durable_question() {
         .unwrap()
         .get("state");
     assert_eq!(state, "completed");
+}
+
+struct RecordingTool {
+    descriptor: CatalogTool,
+    invocations: Arc<Mutex<Vec<kiteframe::PolicyRevision>>>,
+}
+
+#[async_trait]
+impl TrustedTool for RecordingTool {
+    fn descriptor(&self) -> &CatalogTool {
+        &self.descriptor
+    }
+    async fn invoke(&self, call: ToolCall) -> Result<Value, ToolError> {
+        self.invocations.lock().unwrap().push(call.policy_revision);
+        Ok(json!({"result":"found"}))
+    }
+    async fn status(&self, _key: &IdempotencyKey) -> Result<ToolStatus, ToolError> {
+        Ok(ToolStatus::NotStarted)
+    }
+}
+
+async fn append_search_policy(
+    store: &PostgresStore,
+    session: &kiteframe::SessionId,
+    catalog: &ToolCatalogSnapshot,
+    expected: u64,
+    effect: kiteframe::PolicyEffect,
+) {
+    let policy = kiteframe::SessionPolicy {
+        version: 1,
+        rules: vec![kiteframe::PolicyRule {
+            rule_id: format!("{effect:?}-search"),
+            effect,
+            target: kiteframe::PolicyTarget::Tool {
+                names: BTreeSet::from(["docs/search".to_owned()]),
+            },
+            input: BTreeMap::new(),
+        }],
+    };
+    store
+        .append_session_policy(
+            session.clone(),
+            kiteframe::PolicyRevision::new(expected),
+            format!("policy-{}", Uuid::now_v7()),
+            &policy,
+            catalog,
+        )
+        .await
+        .unwrap();
+}
+
+struct PermitLandsMidCall {
+    store: Arc<PostgresStore>,
+    session: kiteframe::SessionId,
+    catalog: ToolCatalogSnapshot,
+}
+
+#[async_trait]
+impl SessionAuthorizer for PermitLandsMidCall {
+    async fn authorize(
+        &self,
+        request: &PolicyRequest,
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        append_search_policy(
+            &self.store,
+            &self.session,
+            &self.catalog,
+            0,
+            kiteframe::PolicyEffect::Permit,
+        )
+        .await;
+        kiteframe::PersistedAuthorizer::new(self.store.clone())
+            .authorize(request)
+            .await
+    }
+}
+
+struct PolicyFixture {
+    store: Arc<PostgresStore>,
+    session: kiteframe::SessionId,
+    catalog: ToolCatalogSnapshot,
+    registry: Arc<InProcessToolRegistry>,
+    run: kiteframe::RunView,
+    invocations: Arc<Mutex<Vec<kiteframe::PolicyRevision>>>,
+}
+
+impl PolicyFixture {
+    async fn new(database_url: &str) -> Self {
+        let store = Arc::new(PostgresStore::connect(database_url).await.unwrap());
+        let session = store
+            .create_session(CreateSession {
+                principal: PrincipalId::new(format!("policy-{}", Uuid::now_v7())).unwrap(),
+                working_directory: "/work".to_owned(),
+                retention_until: OffsetDateTime::now_utc() + Duration::days(1),
+            })
+            .await
+            .unwrap();
+        let descriptor = CatalogTool::new(
+            "docs/search",
+            "docs",
+            "search",
+            ClosedSchema::object("input", BTreeMap::new()),
+            ClosedSchema::object("output", BTreeMap::new()),
+            BTreeSet::new(),
+            EffectKind::ReadOnly,
+            RecoverySupport::NotRequired,
+        )
+        .unwrap();
+        let invocations = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(InProcessToolRegistry::new());
+        registry
+            .register(bind_tool(Arc::new(RecordingTool {
+                descriptor: descriptor.clone(),
+                invocations: invocations.clone(),
+            })))
+            .unwrap();
+        let catalog = registry
+            .snapshot(
+                session.id.clone(),
+                Uuid::now_v7(),
+                &BTreeSet::from(["docs/search".to_owned()]),
+                &BTreeMap::from([(
+                    "docs/search".to_owned(),
+                    descriptor.descriptor_digest().to_owned(),
+                )]),
+            )
+            .unwrap();
+        store.append_catalog_epoch(&catalog).await.unwrap();
+        let name = format!("policy{}", Uuid::now_v7().simple());
+        let source = format!(
+            "workflow {name}() -> string {{ start t() }} task t() -> string {{ prompt \"\"\"x\"\"\" tools [search] on ok(answer: string) {{ done answer }} }}"
+        );
+        let workflow = compile(&source, &catalog, &Limits::default()).unwrap();
+        let definition = store
+            .publish(session.id.clone(), &workflow, &source)
+            .await
+            .unwrap();
+        let run = store
+            .start_run(StartRun {
+                session_id: session.id.clone(),
+                workflow_name: definition.name,
+                version: Some(definition.version),
+                input: json!({}),
+                idempotency_key: IdempotencyKey::new(format!("run-{}", Uuid::now_v7())).unwrap(),
+            })
+            .await
+            .unwrap();
+        Self {
+            store,
+            session: session.id,
+            catalog,
+            registry,
+            run,
+            invocations,
+        }
+    }
+
+    fn engine(&self, authorizer: Arc<dyn SessionAuthorizer>) -> Engine {
+        Engine {
+            store: self.store.clone(),
+            model: Arc::new(ScriptedModel(Mutex::new(VecDeque::from([vec![
+                json!({"type":"function_call","call_id":"call-1","name":"docs/search","arguments":{}}),
+            ]])))),
+            tools: self.registry.clone(),
+            authorizer,
+            config: EngineConfig::default(),
+        }
+    }
+
+    async fn set_policy(&self, expected: u64, effect: kiteframe::PolicyEffect) {
+        append_search_policy(&self.store, &self.session, &self.catalog, expected, effect).await;
+    }
+
+    async fn tool_error(&self) -> Option<Value> {
+        sqlx::query("SELECT error FROM tool_calls WHERE frame_id = $1")
+            .bind(*self.run.root_frame_id.as_uuid())
+            .fetch_one(self.store.pool())
+            .await
+            .unwrap()
+            .get("error")
+    }
+}
+
+#[tokio::test]
+async fn forbid_added_while_waiting_for_approval_overrides_the_approval() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let fixture = PolicyFixture::new(&database_url).await;
+    let engine = fixture.engine(Arc::new(kiteframe::PersistedAuthorizer::new(
+        fixture.store.clone(),
+    )));
+    engine.tick_run(fixture.run.id.clone()).await.unwrap();
+    let request_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM permission_requests WHERE run_id = $1")
+            .bind(*fixture.run.id.as_uuid())
+            .fetch_one(fixture.store.pool())
+            .await
+            .unwrap();
+    fixture.set_policy(0, kiteframe::PolicyEffect::Forbid).await;
+    engine
+        .resolve_permission(ResolvePermission {
+            session_id: fixture.session.clone(),
+            run_id: fixture.run.id.clone(),
+            permission_request_id: kiteframe::PermissionRequestId::new(request_id),
+            choice: PermissionChoice::AllowOnce,
+            idempotency_key: IdempotencyKey::new(format!("approve-{}", Uuid::now_v7())).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        fixture.invocations.lock().unwrap().is_empty(),
+        "approved tool ran despite a forbid added while it waited"
+    );
+    assert_eq!(fixture.tool_error().await.unwrap()["code"], "policy_denied");
+}
+
+#[tokio::test]
+async fn tool_call_records_the_policy_revision_that_was_evaluated() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let fixture = PolicyFixture::new(&database_url).await;
+    let engine = fixture.engine(Arc::new(PermitLandsMidCall {
+        store: fixture.store.clone(),
+        session: fixture.session.clone(),
+        catalog: fixture.catalog.clone(),
+    }));
+    engine.tick_run(fixture.run.id.clone()).await.unwrap();
+    assert_eq!(
+        *fixture.invocations.lock().unwrap(),
+        vec![kiteframe::PolicyRevision::new(1)],
+        "the permit at revision 1 allowed the call, so the call must carry revision 1"
+    );
+}
+
+struct NeedsPermissionThenFails(std::sync::atomic::AtomicBool);
+
+#[async_trait]
+impl SessionAuthorizer for NeedsPermissionThenFails {
+    async fn authorize(
+        &self,
+        _request: &PolicyRequest,
+    ) -> Result<kiteframe::PolicyEvaluation, kiteframe::PolicyError> {
+        if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            Err(kiteframe::PolicyError::Cedar(
+                "evaluation failed".to_owned(),
+            ))
+        } else {
+            Ok(PolicyDecision::NeedsPermission.into())
+        }
+    }
+}
+
+#[tokio::test]
+async fn approved_call_finishes_when_its_policy_recheck_fails() {
+    let Ok(database_url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let fixture = PolicyFixture::new(&database_url).await;
+    let engine = fixture.engine(Arc::new(NeedsPermissionThenFails(Default::default())));
+    engine.tick_run(fixture.run.id.clone()).await.unwrap();
+    let request_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM permission_requests WHERE run_id = $1")
+            .bind(*fixture.run.id.as_uuid())
+            .fetch_one(fixture.store.pool())
+            .await
+            .unwrap();
+    let approval = ResolvePermission {
+        session_id: fixture.session.clone(),
+        run_id: fixture.run.id.clone(),
+        permission_request_id: kiteframe::PermissionRequestId::new(request_id),
+        choice: PermissionChoice::AllowOnce,
+        idempotency_key: IdempotencyKey::new(format!("approve-{}", Uuid::now_v7())).unwrap(),
+    };
+    assert!(engine.resolve_permission(approval).await.is_err());
+    assert!(fixture.invocations.lock().unwrap().is_empty());
+    assert_eq!(
+        fixture.tool_error().await.unwrap()["code"],
+        "policy_evaluation_failed"
+    );
 }

@@ -221,42 +221,7 @@ impl PostgresStore {
         &self,
         session_id: SessionId,
     ) -> Result<ToolCatalogSnapshot, StoreError> {
-        let row = sqlx::query("SELECT s.current_catalog_epoch, e.descriptor_snapshot FROM sessions s LEFT JOIN mcp_catalog_epochs e ON e.epoch_id = s.current_catalog_epoch AND e.session_id = s.id WHERE s.id = $1")
-            .bind(*session_id.as_uuid())
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(StoreError::SessionNotFound)?;
-        let epoch_id = row
-            .get::<Option<uuid::Uuid>, _>("current_catalog_epoch")
-            .ok_or(StoreError::CatalogScopeViolation)?;
-        let snapshot = row
-            .get::<Option<Value>, _>("descriptor_snapshot")
-            .ok_or(StoreError::CatalogScopeViolation)?;
-        let tools = snapshot
-            .get("tools")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                StoreError::InvalidData("catalog snapshot tools are malformed".to_owned())
-            })?
-            .iter()
-            .map(|entry| {
-                let descriptor = entry.get("descriptor").ok_or_else(|| {
-                    StoreError::InvalidData("catalog entry descriptor is malformed".to_owned())
-                })?;
-                let tool = CatalogTool::from_normalized(descriptor)
-                    .map_err(|error| StoreError::InvalidData(error.to_string()))?;
-                if entry.get("qualified_name").and_then(Value::as_str)
-                    != Some(tool.qualified_name())
-                    || entry.get("descriptor_digest").and_then(Value::as_str)
-                        != Some(tool.descriptor_digest())
-                {
-                    return Err(StoreError::CatalogScopeViolation);
-                }
-                Ok(tool)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ToolCatalogSnapshot::new(session_id, epoch_id, tools)
-            .map_err(|error| StoreError::InvalidData(error.to_string()))
+        load_catalog(&self.pool, session_id).await
     }
 
     pub async fn append_policy_rules(
@@ -326,30 +291,24 @@ impl PostgresStore {
         &self,
         session: SessionId,
     ) -> Result<(crate::SessionPolicy, PolicyRevision), StoreError> {
-        let row = sqlx::query(
-            "SELECT s.current_policy_revision, p.typed_source \
-             FROM sessions s \
-             LEFT JOIN LATERAL ( \
-               SELECT typed_source FROM session_policy_rules \
-               WHERE session_id = s.id ORDER BY revision DESC LIMIT 1 \
-             ) p ON TRUE WHERE s.id = $1",
-        )
-        .bind(*session.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(StoreError::SessionNotFound)?;
-        let policy = match row.get::<Option<Value>, _>("typed_source") {
-            Some(source) => serde_json::from_value(source)
-                .map_err(|error| StoreError::InvalidData(error.to_string()))?,
-            None => crate::SessionPolicy {
-                version: 1,
-                rules: vec![],
-            },
-        };
-        Ok((
-            policy,
-            PolicyRevision::new(row.get::<i64, _>("current_policy_revision") as u64),
-        ))
+        load_session_policy(&self.pool, session).await
+    }
+
+    /// The session's current policy, its revision and its catalog, all read
+    /// from one snapshot so a concurrent policy or catalog update cannot land
+    /// between them.
+    pub async fn current_policy_and_catalog(
+        &self,
+        session: SessionId,
+    ) -> Result<(crate::SessionPolicy, PolicyRevision, ToolCatalogSnapshot), StoreError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
+        let (policy, revision) = load_session_policy(&mut *tx, session.clone()).await?;
+        let catalog = load_catalog(&mut *tx, session).await?;
+        tx.commit().await?;
+        Ok((policy, revision, catalog))
     }
 
     pub async fn submit_user_task(
@@ -2608,4 +2567,73 @@ async fn resume_parent_after_child(
         .await?;
     }
     Ok(())
+}
+
+async fn load_catalog<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    session_id: SessionId,
+) -> Result<ToolCatalogSnapshot, StoreError> {
+    let row = sqlx::query("SELECT s.current_catalog_epoch, e.descriptor_snapshot FROM sessions s LEFT JOIN mcp_catalog_epochs e ON e.epoch_id = s.current_catalog_epoch AND e.session_id = s.id WHERE s.id = $1")
+        .bind(*session_id.as_uuid())
+        .fetch_optional(executor)
+        .await?
+        .ok_or(StoreError::SessionNotFound)?;
+    let epoch_id = row
+        .get::<Option<uuid::Uuid>, _>("current_catalog_epoch")
+        .ok_or(StoreError::CatalogScopeViolation)?;
+    let snapshot = row
+        .get::<Option<Value>, _>("descriptor_snapshot")
+        .ok_or(StoreError::CatalogScopeViolation)?;
+    let tools = snapshot
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| StoreError::InvalidData("catalog snapshot tools are malformed".to_owned()))?
+        .iter()
+        .map(|entry| {
+            let descriptor = entry.get("descriptor").ok_or_else(|| {
+                StoreError::InvalidData("catalog entry descriptor is malformed".to_owned())
+            })?;
+            let tool = CatalogTool::from_normalized(descriptor)
+                .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+            if entry.get("qualified_name").and_then(Value::as_str) != Some(tool.qualified_name())
+                || entry.get("descriptor_digest").and_then(Value::as_str)
+                    != Some(tool.descriptor_digest())
+            {
+                return Err(StoreError::CatalogScopeViolation);
+            }
+            Ok(tool)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ToolCatalogSnapshot::new(session_id, epoch_id, tools)
+        .map_err(|error| StoreError::InvalidData(error.to_string()))
+}
+
+async fn load_session_policy<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    session: SessionId,
+) -> Result<(crate::SessionPolicy, PolicyRevision), StoreError> {
+    let row = sqlx::query(
+        "SELECT s.current_policy_revision, p.typed_source \
+         FROM sessions s \
+         LEFT JOIN LATERAL ( \
+           SELECT typed_source FROM session_policy_rules \
+           WHERE session_id = s.id ORDER BY revision DESC LIMIT 1 \
+         ) p ON TRUE WHERE s.id = $1",
+    )
+    .bind(*session.as_uuid())
+    .fetch_optional(executor)
+    .await?
+    .ok_or(StoreError::SessionNotFound)?;
+    let policy = match row.get::<Option<Value>, _>("typed_source") {
+        Some(source) => serde_json::from_value(source)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?,
+        None => crate::SessionPolicy {
+            version: 1,
+            rules: vec![],
+        },
+    };
+    Ok((
+        policy,
+        PolicyRevision::new(row.get::<i64, _>("current_policy_revision") as u64),
+    ))
 }

@@ -65,8 +65,8 @@ pub use model::{
 };
 pub use policy::{
     CedarAuthorizer, OneOfPrimitive, PersistedAuthorizer, PolicyDecision, PolicyEffect,
-    PolicyError, PolicyRequest, PolicyRule, PolicyTarget, Primitive, SessionAuthorizer,
-    SessionPolicy, TypedAuthorizer,
+    PolicyError, PolicyEvaluation, PolicyRequest, PolicyRule, PolicyTarget, Primitive,
+    SessionAuthorizer, SessionPolicy, TypedAuthorizer,
 };
 #[cfg(feature = "acp-v2")]
 pub use protocol::V2Adapter;
